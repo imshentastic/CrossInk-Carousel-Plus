@@ -612,7 +612,8 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
     // been cleared at the time of failure (recent.json persisted "")
     // but, defense in depth: also short-circuit here so a re-derivation
     // anywhere upstream can't reanimate the retry loop.
-    if (CoverThumbStatus::isMarkedFailed(book.path)) {
+    if (CoverThumbStatus::isMarkedFailed(book.path, LyraCarouselTheme::kCenterThumbW,
+                                         LyraCarouselTheme::kCenterThumbH)) {
       progress++;
       continue;
     }
@@ -659,10 +660,20 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
                       ESP.getFreeHeap(), ESP.getMaxAllocHeap());
               updateRecentBookCoverPath(book, "");
               book.coverBmpPath = "";
-              CoverThumbStatus::markFailed(book.path);
+              if (centerMissing)
+                CoverThumbStatus::markFailed(book.path, LyraCarouselTheme::kCenterThumbW,
+                                             LyraCarouselTheme::kCenterThumbH);
+              if (sideMissing)
+                CoverThumbStatus::markFailed(book.path, LyraCarouselTheme::kSideCoverW,
+                                             LyraCarouselTheme::kSideCoverH);
             } else {
               bookUpdated[bookIdx] = true;
-              CoverThumbStatus::clearFailed(book.path);
+              if (centerMissing)
+                CoverThumbStatus::clearFailed(book.path, LyraCarouselTheme::kCenterThumbW,
+                                              LyraCarouselTheme::kCenterThumbH);
+              if (sideMissing)
+                CoverThumbStatus::clearFailed(book.path, LyraCarouselTheme::kSideCoverW,
+                                              LyraCarouselTheme::kSideCoverH);
             }
             coverRendered = false;
             requestUpdate();
@@ -684,10 +695,20 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
               if (!success) {
                 updateRecentBookCoverPath(book, "");
                 book.coverBmpPath = "";
-                CoverThumbStatus::markFailed(book.path);
+                if (centerMissing)
+                  CoverThumbStatus::markFailed(book.path, LyraCarouselTheme::kCenterThumbW,
+                                               LyraCarouselTheme::kCenterThumbH);
+                if (sideMissing)
+                  CoverThumbStatus::markFailed(book.path, LyraCarouselTheme::kSideCoverW,
+                                               LyraCarouselTheme::kSideCoverH);
               } else {
                 bookUpdated[bookIdx] = true;
-                CoverThumbStatus::clearFailed(book.path);
+                if (centerMissing)
+                  CoverThumbStatus::clearFailed(book.path, LyraCarouselTheme::kCenterThumbW,
+                                                LyraCarouselTheme::kCenterThumbH);
+                if (sideMissing)
+                  CoverThumbStatus::clearFailed(book.path, LyraCarouselTheme::kSideCoverW,
+                                                LyraCarouselTheme::kSideCoverH);
               }
               coverRendered = false;
               requestUpdate();
@@ -708,6 +729,13 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
               popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
             }
             GUI.fillPopupProgress(renderer, popupRect, 10 + progress * progressIncrement);
+            // W,H the gen attempt below will resolve to -- mirrored here so the
+            // per-size CoverThumbStatus marker matches the dims of the actual
+            // generateThumbBmp*() call (otherwise the marker is silently ignored).
+            const int thumbW = useMinimalThumb
+                                   ? minimalHomeCoverWidth(coverHeight)
+                                   : static_cast<int>((static_cast<int64_t>(coverHeight) * 3 + 2) / 5);
+            const int thumbH = useMinimalThumb ? minimalHomeCoverHeight(coverHeight) : coverHeight;
             bool success;
             if (useMinimalThumb) {
               // Minimal uses an ADAPTIVE thumbnail (contain unusual ratios),
@@ -722,7 +750,7 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
                 // a Loading popup + a second of SD I/O per visit. If a
                 // future build improves cache load, the user can clear
                 // /.crosspoint/<hash>/thumb_failed.marker manually.
-                CoverThumbStatus::markFailed(book.path);
+                CoverThumbStatus::markFailed(book.path, thumbW, thumbH);
                 coverRendered = false;
                 requestUpdate();
                 progress++;
@@ -742,10 +770,10 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
                       ESP.getFreeHeap(), ESP.getMaxAllocHeap());
               updateRecentBookCoverPath(book, "");
               book.coverBmpPath = "";
-              CoverThumbStatus::markFailed(book.path);
+              CoverThumbStatus::markFailed(book.path, thumbW, thumbH);
             } else {
               bookUpdated[bookIdx] = true;  // non-carousel path reuses same tracking
-              CoverThumbStatus::clearFailed(book.path);
+              CoverThumbStatus::clearFailed(book.path, thumbW, thumbH);
             }
             coverRendered = false;
             requestUpdate();
@@ -757,6 +785,11 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
                 popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
               }
               GUI.fillPopupProgress(renderer, popupRect, 10 + progress * progressIncrement);
+              // Mirror the W,H the gen attempt resolves to: Xtc::generateThumbBmp(h)
+              // derives width as static_cast<uint16_t>(h * 0.6).
+              const int thumbW = useMinimalThumb ? minimalHomeCoverWidth(coverHeight)
+                                                 : static_cast<int>(static_cast<uint16_t>(coverHeight * 0.6));
+              const int thumbH = useMinimalThumb ? minimalHomeCoverHeight(coverHeight) : coverHeight;
               const bool success =
                   useMinimalThumb ? xtc.generateThumbBmp(static_cast<uint16_t>(minimalHomeCoverWidth(coverHeight)),
                                                          static_cast<uint16_t>(minimalHomeCoverHeight(coverHeight)))
@@ -764,10 +797,10 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
               if (!success) {
                 updateRecentBookCoverPath(book, "");
                 book.coverBmpPath = "";
-                CoverThumbStatus::markFailed(book.path);
+                CoverThumbStatus::markFailed(book.path, thumbW, thumbH);
               } else {
                 bookUpdated[bookIdx] = true;
-                CoverThumbStatus::clearFailed(book.path);
+                CoverThumbStatus::clearFailed(book.path, thumbW, thumbH);
               }
               coverRendered = false;
               requestUpdate();
@@ -857,10 +890,16 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
   // via CoverThumbStatus so we don't retry forever on undecodable
   // covers.
   if (!isMinimal) {
+    // Mirrors UITheme::getCoverThumbPath(coverBmpPath, coverHeight) and
+    // Epub::generateThumbBmpNoIndex(0, coverHeight) -- both derive W from H
+    // via (H*3+2)/5. For XTC we resolve the marker per-call below since
+    // generateThumbBmp(h) derives W via static_cast<uint16_t>(h*0.6) and
+    // can round to a different value at certain heights.
+    const int statsThumbWEpub = static_cast<int>((static_cast<int64_t>(coverHeight) * 3 + 2) / 5);
     const auto& allRecents = RECENT_BOOKS.getBooks();
     for (const RecentBook& sb : allRecents) {
       if (sb.coverBmpPath.empty()) continue;
-      if (CoverThumbStatus::isMarkedFailed(sb.path)) continue;
+      if (CoverThumbStatus::isMarkedFailed(sb.path, statsThumbWEpub, coverHeight)) continue;
       const std::string thumbPath = UITheme::getCoverThumbPath(sb.coverBmpPath, coverHeight);
       if (thumbPath.empty() || Storage.exists(thumbPath.c_str())) continue;
       if (!Storage.exists(sb.path.c_str())) continue;  // book deleted from SD
@@ -875,18 +914,20 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
         popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
       }
       bool success = false;
+      int attemptedW = statsThumbWEpub;
       if (FsHelpers::hasEpubExtension(sb.path)) {
         Epub epub(sb.path, "/.crosspoint");
         success = epub.generateThumbBmpNoIndex(0, coverHeight);
       } else if (FsHelpers::hasXtcExtension(sb.path)) {
         Xtc xtc(sb.path, "/.crosspoint");
+        attemptedW = static_cast<int>(static_cast<uint16_t>(coverHeight * 0.6));
         if (xtc.load()) {
           success = xtc.generateThumbBmp(coverHeight);
         }
       }
       if (!success) {
         LOG_DBG("HOME", "Stats cover gen failed: %s (free=%u)", sb.path.c_str(), ESP.getFreeHeap());
-        CoverThumbStatus::markFailed(sb.path);
+        CoverThumbStatus::markFailed(sb.path, attemptedW, coverHeight);
       }
     }
   }
@@ -1038,7 +1079,7 @@ void HomeActivity::loadShelfCovers(int cellWidth, int cellHeight, int scrollOffs
     // home visit to allow a single transient-failure retry). If gen has
     // been marked permanently failed for this book, render the
     // placeholder and don't even pay the existence-check below.
-    if (CoverThumbStatus::isMarkedFailed(bookPath)) {
+    if (CoverThumbStatus::isMarkedFailed(bookPath, cellWidth, cellHeight)) {
       processed++;
       continue;
     }
@@ -1129,13 +1170,13 @@ void HomeActivity::loadShelfCovers(int cellWidth, int cellHeight, int scrollOffs
       failedShelfCovers.push_back(bookPath);
       // Persist across boots so the next session's home doesn't repeat
       // the same Loading-popup flash for this book.
-      CoverThumbStatus::markFailed(bookPath);
+      CoverThumbStatus::markFailed(bookPath, cellWidth, cellHeight);
       LOG_ERR("HOME", "shelf: thumb generation failed for %s; rendering blank (won't retry)",
               bookPath.c_str());
     } else if (genSucceeded) {
       // Wipe the persistent marker on the rare cross-build "fixed cover"
       // case (decoder improved or user replaced the book file).
-      CoverThumbStatus::clearFailed(bookPath);
+      CoverThumbStatus::clearFailed(bookPath, cellWidth, cellHeight);
     }
     // Count this generation attempt toward the first-index cap (only enforced
     // while wasFreshFirstBoot(); harmless to increment otherwise).

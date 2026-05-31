@@ -234,12 +234,12 @@ std::string getReusableCoverPath(const RecentBook& book) {
   return book.coverBmpPath;
 }
 
-void ensureReusableCoverPath(RecentBook& book) {
+void ensureReusableCoverPath(RecentBook& book, int coverWidth, int coverHeight) {
   // Books whose thumb-gen has previously failed should stay on the
   // placeholder path. Without this gate, the re-derivation below would
   // refill coverBmpPath with the template, which trips needsCoverThumbGeneration
   // -> Loading popup -> repeat failure on every shelf revisit.
-  if (CoverThumbStatus::isMarkedFailed(book.path)) {
+  if (CoverThumbStatus::isMarkedFailed(book.path, coverWidth, coverHeight)) {
     if (!book.coverBmpPath.empty()) {
       book.coverBmpPath = "";
       updateRecentBookCoverPath(book, "");
@@ -289,7 +289,7 @@ void RecentBooksGridActivity::loadRecentBooks() {
       // previous generation has been marked permanently-failed so we don't
       // re-derive a path that will only trigger a doomed retry below
       // (loading popup + same failure every revisit).
-      if (!CoverThumbStatus::isMarkedFailed(path)) {
+      if (!CoverThumbStatus::isMarkedFailed(path, coverWidth_, coverHeight_)) {
         if (FsHelpers::hasEpubExtension(path)) {
           book.coverBmpPath = Epub(path, "/.crosspoint").getThumbBmpPath();
         } else if (FsHelpers::hasXtcExtension(path)) {
@@ -393,10 +393,10 @@ void RecentBooksGridActivity::loadPageCovers(int pageStart) {
   bool needsGeneration = false;
   for (int i = pageStart; i < pageEnd; ++i) {
     RecentBook& book = recentBooks[i].book;
-    ensureReusableCoverPath(book);
+    ensureReusableCoverPath(book, coverWidth_, coverHeight_);
     // Books with a "thumb generation failed" marker render the placeholder
     // (coverBmpPath stays empty) and never trigger the Loading popup.
-    if (CoverThumbStatus::isMarkedFailed(book.path)) continue;
+    if (CoverThumbStatus::isMarkedFailed(book.path, coverWidth_, coverHeight_)) continue;
     if (book.coverBmpPath.empty()) {
       needsGeneration = true;
       break;
@@ -420,7 +420,7 @@ void RecentBooksGridActivity::loadPageCovers(int pageStart) {
   for (int i = pageStart; i < pageEnd; ++i) {
     RecentBook& book = recentBooks[i].book;
     // Already-known-failed books: render placeholder, no Loading popup.
-    if (CoverThumbStatus::isMarkedFailed(book.path)) {
+    if (CoverThumbStatus::isMarkedFailed(book.path, coverWidth_, coverHeight_)) {
       processedCount++;
       continue;
     }
@@ -455,7 +455,7 @@ void RecentBooksGridActivity::loadPageCovers(int pageStart) {
           const std::string reusablePath = epub.getThumbBmpPath();
           book.coverBmpPath = reusablePath;
           updateRecentBookCoverPath(book, reusablePath);
-          CoverThumbStatus::clearFailed(book.path);
+          CoverThumbStatus::clearFailed(book.path, coverWidth_, coverHeight_);
         } else {
           // CrumBLE #133 follow-up: re-enabled markFailed after BOTH
           // gen paths fail (NoIndex AND heavy). Earlier this branch
@@ -469,7 +469,7 @@ void RecentBooksGridActivity::loadPageCovers(int pageStart) {
           // for the same books on every Bookshelf entry.
           book.coverBmpPath = "";
           updateRecentBookCoverPath(book, "");
-          CoverThumbStatus::markFailed(book.path);
+          CoverThumbStatus::markFailed(book.path, coverWidth_, coverHeight_);
         }
       } else if (FsHelpers::hasXtcExtension(book.path)) {
         Xtc xtc(book.path, "/.crosspoint");
@@ -486,11 +486,11 @@ void RecentBooksGridActivity::loadPageCovers(int pageStart) {
             const std::string reusablePath = xtc.getThumbBmpPath();
             book.coverBmpPath = reusablePath;
             updateRecentBookCoverPath(book, reusablePath);
-            CoverThumbStatus::clearFailed(book.path);
+            CoverThumbStatus::clearFailed(book.path, coverWidth_, coverHeight_);
           } else {
             book.coverBmpPath = "";
             updateRecentBookCoverPath(book, "");
-            CoverThumbStatus::markFailed(book.path);
+            CoverThumbStatus::markFailed(book.path, coverWidth_, coverHeight_);
           }
         }
       }
