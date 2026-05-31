@@ -355,12 +355,17 @@ int prebakeAllThumbs(const std::string& epubPath, const std::string& cacheDir,
     LOG_INF("PRE", "no cover image href; skipping thumb gen");
     return 0;
   }
-  // Canonical thumb sizes pinned in DESIGN.md (LyraCarousel center inner
-  // + side covers). Same for X4 and X3 -- thumb dimensions are theme
-  // constants, not device-dependent.
+  // Canonical thumb sizes -- revised 2A.3-revealed set, see DESIGN.md for
+  // the screen each one renders on. 222x370 and 192x320 cover the common
+  // home screens (Base/non-Carousel theme + LyraFlow sleep screen); 100x150
+  // covers Bookshelf grid cells. LyraCarousel-specific sizes (296x468 and
+  // 200x390) are NOT included here -- they're only generated on cover-miss
+  // self-heal and only when LyraCarousel is the active theme. Add a per-
+  // theme override flag once we have telemetry on which themes users run.
   constexpr int kThumbSizes[][2] = {
-      {296, 468},  // LyraCarousel center inner -- HomeActivity.cpp:648
-      {200, 390},  // LyraCarousel side covers -- LyraCarouselTheme.cpp:335
+      {222, 370},  // Base/non-Carousel home cover
+      {192, 320},  // LyraFlow sleep-screen center cover
+      {100, 150},  // Bookshelf grid cell / recents list
   };
   int failures = 0;
   for (const auto& [w, h] : kThumbSizes) {
@@ -423,7 +428,7 @@ int main(int argc, char** argv) {
     if (thumbFails == 0) {
       LOG_INF("CLI", "  thumbs OK (%u ms)", dtThumbs);
     } else {
-      LOG_INF("CLI", "  thumbs PARTIAL: %d of 2 failed (%u ms)", thumbFails, dtThumbs);
+      LOG_INF("CLI", "  thumbs PARTIAL: %d of 3 failed (%u ms)", thumbFails, dtThumbs);
     }
   }
 

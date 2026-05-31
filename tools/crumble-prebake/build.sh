@@ -94,6 +94,22 @@ CXXFLAGS=(
   # context window. Both are pulled from the on-device platformio.ini.
   -DXML_GE=0
   -DXML_CONTEXT_BYTES=1024
+  # Phase 2A: force JPEGDEC to take the same C-reference code paths the
+  # device uses (ESP32-C3 RV32 defines neither HAS_NEON nor ALLOWS_UNALIGNED).
+  # Without this, host arm64 builds take the NEON SIMD IDCT path and
+  # produce different pixel values than the device, breaking byte-match.
+  # See vendor/JPEGDEC/src/JPEGDEC.h for the corresponding #undef block.
+  -DCRUMBLE_PREBAKE_MATCH_DEVICE_DECODE
+  # Floating-point determinism: the resize step in JpegToBmpConverter and
+  # color/dither math elsewhere occasionally pivot on `float`. Without
+  # these flags the host compiler is free to fuse multiply-add (FMA),
+  # round in 80-bit extended precision, or reorder operations relative
+  # to source order, producing tiny pixel-value drifts that cascade
+  # through error-diffusion dither. -ffp-contract=off disables FMA
+  # fusion; -fno-fast-math keeps strict IEEE 754 (no -Ofast-style
+  # reassociation).
+  -ffp-contract=off
+  -fno-fast-math
 )
 # Separate flag set for the C TUs we pull in (expat + uzlib). Same
 # overall hygiene, but C-only switches.
@@ -105,6 +121,9 @@ CFLAGS=(
   # rejects the build.
   -DXML_GE=0
   -DXML_CONTEXT_BYTES=1024
+  -DCRUMBLE_PREBAKE_MATCH_DEVICE_DECODE
+  -ffp-contract=off
+  -fno-fast-math
 )
 
 CXX="${CXX:-g++}"
