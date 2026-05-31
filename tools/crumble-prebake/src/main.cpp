@@ -33,6 +33,9 @@
 #include <builtinFonts/lexenddeca_14_bolditalic.h>
 #include "fontIds.h"  // LEXENDDECA_14_FONT_ID (matches src/fontIds.h)
 
+#include <ArduinoJson.h>
+#include <curl/curl.h>
+
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -42,6 +45,113 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+// Section-header layout settings. Mirror the 12 fields baked into
+// Section::writeSectionFileHeader. If --device-url is set we GET these
+// from /api/reader-render-info (extends fitVersion=2). Otherwise we
+// fall back to factory defaults that match CrossPointSettings.h's
+// in-struct initializers -- which won't match a user who's customized
+// any setting, so the section cache will get invalidated on first
+// open in that case (graceful: device just rebuilds).
+struct SectionSettings {
+  int fontId = -90104999;      // LEXENDDECA_14_FONT_ID with OMIT_EMOJI_FONTS;
+                                // overridden when --device-url returns the live id.
+  uint16_t viewportWidth = 800;
+  uint16_t viewportHeight = 480;
+  float lineCompression = 1.0f;
+  bool extraParagraphSpacing = true;    // CrossPointSettings.h:339 default = 1
+  bool forceParagraphIndents = false;
+  uint8_t paragraphAlignment = 0;       // JUSTIFIED enum (verify against enum order)
+  bool hyphenationEnabled = false;      // CrossPointSettings.h default = 0
+  bool embeddedStyle = true;
+  uint8_t imageRendering = 0;
+  bool bionicReadingEnabled = false;
+  bool guideReadingEnabled = false;
+};
+
+// libcurl write callback: appends incoming bytes to a std::string.
+size_t curlWriteToString(void* ptr, size_t size, size_t nmemb, void* userdata) {
+  auto* str = static_cast<std::string*>(userdata);
+  str->append(static_cast<char*>(ptr), size * nmemb);
+  return size * nmemb;
+}
+
+// Fetch /api/reader-render-info from the device + populate sectionSettings.
+// Returns true on success. Uses libcurl with a short timeout because the
+// device's web server can hang under tight heap (the user has hit this
+// chip-tracked bug; we don't want prebake to wedge waiting for a stalled
+// /api/settings response). On failure, sectionSettings stays at the
+// caller-provided defaults.
+bool fetchDeviceSettings(const std::string& deviceUrl, SectionSettings& out) {
+  CURL* curl = curl_easy_init();
+  if (!curl) {
+    LOG_ERR("CFG", "curl_easy_init failed");
+    return false;
+  }
+  const std::string url = deviceUrl + "/api/reader-render-info";
+  std::string body;
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteToString);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);          // 10 s hard cap
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);    // 5 s connect cap
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  const CURLcode rc = curl_easy_perform(curl);
+  long httpCode = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+  curl_easy_cleanup(curl);
+  if (rc != CURLE_OK) {
+    LOG_ERR("CFG", "GET %s failed: %s", url.c_str(), curl_easy_strerror(rc));
+    return false;
+  }
+  if (httpCode != 200) {
+    LOG_ERR("CFG", "GET %s returned HTTP %ld", url.c_str(), httpCode);
+    return false;
+  }
+
+  // ArduinoJson handles host parsing just like firmware. We only read
+  // fields we care about; extras the server adds (orientation, screenMargin,
+  // sdFontFamilyName, emSize, etc.) get ignored.
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    LOG_ERR("CFG", "render-info JSON parse failed: %s", err.c_str());
+    return false;
+  }
+  const int fitVersion = doc["fitVersion"] | 1;
+  if (fitVersion < 2) {
+    LOG_ERR("CFG",
+            "device reports fitVersion=%d; need >=2 for prebake settings sync. "
+            "Update firmware to a build that includes the v2 render-info fields.",
+            fitVersion);
+    return false;
+  }
+
+  if (doc["fontId"].is<int>()) out.fontId = doc["fontId"].as<int>();
+  if (doc["viewportWidth"].is<int>()) out.viewportWidth = doc["viewportWidth"].as<int>();
+  if (doc["viewportHeight"].is<int>()) out.viewportHeight = doc["viewportHeight"].as<int>();
+  if (doc["lineCompression"].is<float>()) out.lineCompression = doc["lineCompression"].as<float>();
+  if (doc["extraParagraphSpacing"].is<int>())
+    out.extraParagraphSpacing = doc["extraParagraphSpacing"].as<int>() != 0;
+  if (doc["forceParagraphIndents"].is<int>())
+    out.forceParagraphIndents = doc["forceParagraphIndents"].as<int>() != 0;
+  if (doc["paragraphAlignment"].is<int>()) out.paragraphAlignment = doc["paragraphAlignment"].as<int>();
+  if (doc["hyphenationEnabled"].is<int>()) out.hyphenationEnabled = doc["hyphenationEnabled"].as<int>() != 0;
+  if (doc["embeddedStyle"].is<int>()) out.embeddedStyle = doc["embeddedStyle"].as<int>() != 0;
+  if (doc["imageRendering"].is<int>()) out.imageRendering = doc["imageRendering"].as<int>();
+  if (doc["bionicReadingEnabled"].is<int>())
+    out.bionicReadingEnabled = doc["bionicReadingEnabled"].as<int>() != 0;
+  if (doc["guideReadingEnabled"].is<int>())
+    out.guideReadingEnabled = doc["guideReadingEnabled"].as<int>() != 0;
+
+  LOG_INF("CFG",
+          "device settings: fontId=%d viewport=%ux%u lineCompression=%.3f extraPS=%d fpI=%d pA=%u "
+          "hyph=%d embed=%d imgR=%u bionic=%d guide=%d",
+          out.fontId, out.viewportWidth, out.viewportHeight, static_cast<double>(out.lineCompression),
+          out.extraParagraphSpacing, out.forceParagraphIndents, out.paragraphAlignment, out.hyphenationEnabled,
+          out.embeddedStyle, out.imageRendering, out.bionicReadingEnabled, out.guideReadingEnabled);
+  return true;
+}
 
 void usage(const char* argv0) {
   std::fprintf(stderr,
@@ -57,6 +167,14 @@ void usage(const char* argv0) {
                "                         other than the SD root on-device (e.g. /Books/X.epub).\n"
                "                         Only valid with a single input EPUB. Defaults to\n"
                "                         \"/\" + filename, matching the drop-at-root workflow.\n"
+               "  --device-url <url>     Pull live reader settings from the device's File\n"
+               "                         Transfer web server. e.g. --device-url http://192.168.5.158\n"
+               "                         Reads /api/reader-render-info (fitVersion >= 2) and uses\n"
+               "                         the returned font id + viewport + layout settings for\n"
+               "                         section header generation, so the device's cache check\n"
+               "                         passes on first open. Without this flag, prebake uses\n"
+               "                         factory defaults -- sections will get invalidated for\n"
+               "                         users who have customized any reader setting.\n"
                "  --check                Skip books whose existing book.bin is fresh against\n"
                "                         the input EPUB's mtime.\n"
                "  --verbose              Per-step timing on stderr.\n"
@@ -67,6 +185,8 @@ void usage(const char* argv0) {
 struct Options {
   std::string outputDir;
   std::string devicePathOverride;
+  std::string deviceUrl;  // base URL like "http://192.168.5.158"; query
+                          // /api/reader-render-info for live settings.
   std::vector<std::string> epubs;
   bool check = false;
   bool verbose = false;
@@ -82,6 +202,12 @@ bool parseArgs(int argc, char** argv, Options& out) {
       out.outputDir = argv[++i];
     } else if (a == "--device-path" && i + 1 < argc) {
       out.devicePathOverride = argv[++i];
+    } else if (a == "--device-url" && i + 1 < argc) {
+      out.deviceUrl = argv[++i];
+      // Strip a trailing slash so callers can pass either "http://x" or
+      // "http://x/" without the joined URL ending up as "/api/.." vs
+      // "//api/..".
+      if (!out.deviceUrl.empty() && out.deviceUrl.back() == '/') out.deviceUrl.pop_back();
     } else if (a == "--check") {
       out.check = true;
     } else if (a == "--verbose") {
@@ -375,8 +501,8 @@ bool prebakeCoverThumb(const std::string& epubPath, const std::string& cacheDir,
 //
 // Returns the number of spine entries that failed to emit (0 = clean).
 int prebakeSections(const std::string& epubPath, const std::string& realCacheDir,
-                    const std::string& cacheDirParent, GfxRenderer& renderer, int fontId,
-                    uint16_t viewportWidth, uint16_t viewportHeight) {
+                    const std::string& cacheDirParent, GfxRenderer& renderer,
+                    const SectionSettings& s) {
   // Epub computes cachePath as cacheDir + "/epub_" + fnvHash(filepath),
   // where filepath is the HOST EPUB path -- but our Phase 1 cache lives
   // under "/.crosspoint/epub_<deviceHash>/" with the DEVICE path hash.
@@ -421,31 +547,16 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
   }
   LOG_INF("PRE", "section gen: %d spine entries to build", spineCount);
 
-  // Factory-default layout settings (mirror src/CrossPointSettings.h).
-  // Reader activity passes these from SETTINGS.* at section-build time;
-  // any divergence here will change the section file header fingerprint
-  // and force the device to rebuild on first open. Once we have telemetry
-  // on which settings users actually customize, we'll either ship the
-  // most common combo as the default or expose explicit overrides.
-  constexpr float kLineCompression = 1.0f;
-  constexpr bool kExtraParagraphSpacing = false;
-  constexpr bool kForceParagraphIndents = false;
-  constexpr uint8_t kParagraphAlignment = 0;  // "default" (per CrossPointSettings)
-  constexpr bool kHyphenationEnabled = true;
-  constexpr bool kEmbeddedStyle = true;
-  constexpr uint8_t kImageRendering = 0;  // "fit"
-  constexpr bool kBionicReadingEnabled = false;
-  constexpr bool kGuideReadingEnabled = false;
-
   int failures = 0;
   for (int spineIdx = 0; spineIdx < spineCount; ++spineIdx) {
     Section section(epub, spineIdx, renderer);
     bool imagesWereSuppressed = false;
     bool layoutAbortedForLowMemory = false;
     const bool ok = section.createSectionFile(
-        fontId, kLineCompression, kExtraParagraphSpacing, kForceParagraphIndents, kParagraphAlignment, viewportWidth,
-        viewportHeight, kHyphenationEnabled, kEmbeddedStyle, kImageRendering, kBionicReadingEnabled,
-        kGuideReadingEnabled, /*popupFn=*/nullptr, &imagesWereSuppressed, &layoutAbortedForLowMemory);
+        s.fontId, s.lineCompression, s.extraParagraphSpacing, s.forceParagraphIndents, s.paragraphAlignment,
+        s.viewportWidth, s.viewportHeight, s.hyphenationEnabled, s.embeddedStyle, s.imageRendering,
+        s.bionicReadingEnabled, s.guideReadingEnabled, /*popupFn=*/nullptr, &imagesWereSuppressed,
+        &layoutAbortedForLowMemory);
     if (!ok) {
       LOG_ERR("PRE", "section %d FAILED", spineIdx);
       ++failures;
@@ -530,12 +641,23 @@ int main(int argc, char** argv) {
 
   GfxRenderer renderer;
   renderer.insertFont(LEXENDDECA_14_FONT_ID, lexenddeca14Family);
-  // X4 viewport in landscape (the default device target). --device x3
-  // would set 792x528 here; left as a static default for first byte-
-  // match milestone.
-  constexpr uint16_t kViewportWidth = 800;
-  constexpr uint16_t kViewportHeight = 480;
-  renderer.setViewport(kViewportWidth, kViewportHeight);
+
+  // Resolve section settings: GET /api/reader-render-info if the user
+  // passed --device-url, otherwise factory defaults (which won't match
+  // any customized user -- cache will get invalidated on first open).
+  SectionSettings sectionSettings;
+  if (!opts.deviceUrl.empty()) {
+    if (!fetchDeviceSettings(opts.deviceUrl, sectionSettings)) {
+      LOG_ERR("CLI",
+              "Could not fetch settings from %s. Aborting rather than baking with stale "
+              "factory defaults that the device will reject.",
+              opts.deviceUrl.c_str());
+      return 3;
+    }
+  } else {
+    LOG_INF("CLI", "no --device-url; baking with factory defaults (sections may not cache-hit on customized devices)");
+  }
+  renderer.setViewport(sectionSettings.viewportWidth, sectionSettings.viewportHeight);
 
   int failures = 0;
   for (const auto& epubPath : opts.epubs) {
@@ -591,8 +713,7 @@ int main(int argc, char** argv) {
     // build is recoverable on-device (the reader self-rebuilds when the
     // user navigates to that chapter), so partial success still ships.
     const uint32_t t2 = millis();
-    const int sectionFails = prebakeSections(epubPath, cacheDir, cacheDirParent, renderer, LEXENDDECA_14_FONT_ID,
-                                              kViewportWidth, kViewportHeight);
+    const int sectionFails = prebakeSections(epubPath, cacheDir, cacheDirParent, renderer, sectionSettings);
     const uint32_t dtSections = millis() - t2;
     if (sectionFails == 0) {
       LOG_INF("CLI", "  sections OK (%u ms)", dtSections);

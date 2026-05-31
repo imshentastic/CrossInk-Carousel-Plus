@@ -111,6 +111,7 @@ INCLUDES=(
   -I "$REPO_ROOT/lib/Memory"
   -I "$SCRIPT_DIR/vendor/JPEGDEC/src"
   -I "$SCRIPT_DIR/vendor/PNGdec/src"
+  -I "$SCRIPT_DIR/vendor/ArduinoJson/src"
   # Phase 2C includes.
   -I "$REPO_ROOT/lib/EpdFont"
   -I "$REPO_ROOT/lib/Utf8"
@@ -209,6 +210,11 @@ for src in "${CXXSRCS[@]}"; do
 done
 
 echo "[link]  $BINARY"
-"$CXX" "${OBJS[@]}" -o "$BINARY"
+# -lcurl: libcurl for the --device-url settings sync against the device's
+# /api/reader-render-info endpoint (Phase 2C.4b). macOS ships it in the
+# CommandLineTools SDK; -lcurl picks up the system installation. If a
+# future port to a system without libcurl needs to skip the HTTP path,
+# guard the curl includes + this link flag behind a build var.
+"$CXX" "${OBJS[@]}" -lcurl -o "$BINARY"
 
 echo "[done]  $BINARY"
