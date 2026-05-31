@@ -520,16 +520,19 @@ std::vector<ShelfEntry> CollectionsStore::resolveShelfEntries(const std::string&
   std::vector<ShelfEntry> out;
   out.reserve(paths.size());
   auto& seriesIdx = SeriesIndex::getInstance();
+  auto nameStr = [&](const SeriesEntry* se) { return se ? std::string{seriesIdx.nameOf(*se)} : std::string{}; };
+  auto indexStr = [&](const SeriesEntry* se) { return se ? std::string{seriesIdx.indexOf(*se)} : std::string{}; };
   for (const auto& p : paths) {
     const SeriesEntry* se = seriesIdx.find(p);
-    if (se == nullptr || se->name.empty()) {
+    const std::string seName = nameStr(se);
+    if (se == nullptr || seName.empty()) {
       ShelfEntry e;
       e.firstPath = p;
       e.memberPaths.push_back(p);
       out.push_back(std::move(e));
       continue;
     }
-    const std::string key = SeriesIndex::seriesKey(se->name);
+    const std::string key = SeriesIndex::seriesKey(seName);
     if (seenKeys.count(key)) continue;  // grouped already; subsequent members suppressed.
     seenKeys.insert(key);
 
@@ -537,7 +540,8 @@ std::vector<ShelfEntry> CollectionsStore::resolveShelfEntries(const std::string&
     std::vector<std::string> members;
     for (const auto& q : paths) {
       const SeriesEntry* qse = seriesIdx.find(q);
-      if (qse != nullptr && !qse->name.empty() && SeriesIndex::seriesKey(qse->name) == key) {
+      const std::string qName = nameStr(qse);
+      if (qse != nullptr && !qName.empty() && SeriesIndex::seriesKey(qName) == key) {
         members.push_back(q);
       }
     }
@@ -554,11 +558,11 @@ std::vector<ShelfEntry> CollectionsStore::resolveShelfEntries(const std::string&
     std::sort(members.begin(), members.end(), [&](const std::string& a, const std::string& b) {
       const SeriesEntry* ea = seriesIdx.find(a);
       const SeriesEntry* eb = seriesIdx.find(b);
-      return SeriesIndex::indexLess(ea ? ea->index : "", eb ? eb->index : "");
+      return SeriesIndex::indexLess(indexStr(ea), indexStr(eb));
     });
     ShelfEntry e;
     e.firstPath = members.front();
-    e.seriesName = se->name;
+    e.seriesName = seName;
     e.memberPaths = std::move(members);
     out.push_back(std::move(e));
   }
