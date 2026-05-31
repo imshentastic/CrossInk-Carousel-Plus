@@ -839,11 +839,14 @@ void LyraFlowTheme::drawBookshelfStrip(GfxRenderer& renderer, Rect rect, const c
               : nullptr;
       if (cellTitle != nullptr) {
         constexpr int kPlaceholderPadX = 4;
-        // CrumBLE: cap chosen to comfortably fit any real-world title at
-        // SMALL font (~10 px line height) within the 150 px cell. cap is
-        // generous so we never truncate; wrappedText returns only as
-        // many lines as the text actually needs.
-        constexpr int kPlaceholderMaxLines = 10;
+        // Cap title wrapping so a long boxed-set title (e.g. "George R. R.
+        // Martin's A Game of Thrones 5-Book Boxed Set") doesn't fill the
+        // entire placeholder cell with wrapped text. 4 lines matches the
+        // MinimalTheme placeholder convention and leaves visual room for
+        // the cell to read as "missing cover, here's a hint of the title"
+        // rather than a wall of small bold text. wrappedText auto-
+        // ellipsizes on the last line when the title overflows the cap.
+        constexpr int kPlaceholderMaxLines = 4;
         const auto titleLines = renderer.wrappedText(SMALL_FONT_ID, cellTitle->c_str(),
                                                       kCellWidth - 2 * kPlaceholderPadX, kPlaceholderMaxLines,
                                                       EpdFontFamily::BOLD);
