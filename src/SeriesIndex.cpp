@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 
 namespace {
 constexpr char SERIES_INDEX_FILE[] = "/.crosspoint/series_index.json";
@@ -13,6 +14,51 @@ constexpr uint8_t SERIES_INDEX_VERSION = 1;
 }  // namespace
 
 SeriesIndex SeriesIndex::instance;
+
+uint32_t SeriesIndex::appendString(std::string_view s) {
+  const uint32_t offset = static_cast<uint32_t>(stringPool.size());
+  stringPool.insert(stringPool.end(), s.begin(), s.end());
+  stringPool.push_back('\0');
+  return offset;
+}
+
+int SeriesIndex::indexOfPath(std::string_view path) const {
+  for (size_t i = 0; i < entries.size(); ++i) {
+    if (path == pathOf(entries[i])) return static_cast<int>(i);
+  }
+  return -1;
+}
+
+void SeriesIndex::rebuildFrom(std::vector<ScratchEntry>& scratch) {
+  // Compute the rough pool size upfront so the new pool lands in a
+  // single contiguous allocation -- the whole point of this refactor is
+  // to give the heap allocator big atomic blocks to work with instead
+  // of N small ones.
+  size_t poolBytes = 0;
+  for (const auto& s : scratch) poolBytes += s.path.size() + s.name.size() + s.index.size() + 3;
+
+  std::vector<SeriesEntry> newEntries;
+  std::vector<char> newPool;
+  newEntries.reserve(scratch.size());
+  newPool.reserve(poolBytes);
+
+  for (auto& s : scratch) {
+    SeriesEntry e{};
+    e.pathOffset = static_cast<uint32_t>(newPool.size());
+    newPool.insert(newPool.end(), s.path.begin(), s.path.end());
+    newPool.push_back('\0');
+    e.nameOffset = static_cast<uint32_t>(newPool.size());
+    newPool.insert(newPool.end(), s.name.begin(), s.name.end());
+    newPool.push_back('\0');
+    e.indexOffset = static_cast<uint32_t>(newPool.size());
+    newPool.insert(newPool.end(), s.index.begin(), s.index.end());
+    newPool.push_back('\0');
+    newEntries.push_back(e);
+  }
+
+  entries.swap(newEntries);
+  stringPool.swap(newPool);
+}
 
 void SeriesIndex::begin() {
   if (jsonLoaded) return;
@@ -22,32 +68,52 @@ void SeriesIndex::begin() {
 
 void SeriesIndex::record(const std::string& path, const std::string& name, const std::string& index) {
   if (path.empty()) return;
-  auto it = byPath.find(path);
-  if (it != byPath.end() && it->second.name == name && it->second.index == index) {
-    return;  // no-op: already recorded with same values, skip disk write.
+  const int existing = indexOfPath(path);
+  if (existing >= 0) {
+    const SeriesEntry& e = entries[existing];
+    if (name == nameOf(e) && index == indexOf(e)) {
+      // no-op: already recorded with same values, skip disk write.
+      return;
+    }
   }
-  SeriesEntry e;
-  e.path = path;
-  e.name = name;
-  e.index = index;
-  byPath[path] = std::move(e);
+
+  // Build a scratch list off the current pool, mutate the target entry,
+  // then rebuild atomically. The rebuild guarantees the new pool is one
+  // fresh contiguous block (matches LibraryIndex's pattern + reasoning).
+  std::vector<ScratchEntry> scratch;
+  scratch.reserve(entries.size() + 1);
+  for (const auto& e : entries) {
+    scratch.push_back({pathOf(e), nameOf(e), indexOf(e)});
+  }
+  if (existing >= 0) {
+    scratch[existing].name = name;
+    scratch[existing].index = index;
+  } else {
+    scratch.push_back({path, name, index});
+  }
+  rebuildFrom(scratch);
   saveToFile();
 }
 
-bool SeriesIndex::hasBeenChecked(const std::string& path) const {
-  return byPath.find(path) != byPath.end();
-}
+bool SeriesIndex::hasBeenChecked(const std::string& path) const { return indexOfPath(path) >= 0; }
 
 const SeriesEntry* SeriesIndex::find(const std::string& path) const {
-  auto it = byPath.find(path);
-  if (it == byPath.end()) return nullptr;
-  return &it->second;
+  const int i = indexOfPath(path);
+  if (i < 0) return nullptr;
+  return &entries[i];
 }
 
 void SeriesIndex::forgetPath(const std::string& path) {
-  if (byPath.erase(path) > 0) {
-    saveToFile();
+  const int existing = indexOfPath(path);
+  if (existing < 0) return;
+  std::vector<ScratchEntry> scratch;
+  scratch.reserve(entries.size());
+  for (size_t i = 0; i < entries.size(); ++i) {
+    if (static_cast<int>(i) == existing) continue;
+    scratch.push_back({pathOf(entries[i]), nameOf(entries[i]), indexOf(entries[i])});
   }
+  rebuildFrom(scratch);
+  saveToFile();
 }
 
 std::string SeriesIndex::seriesKey(const std::string& rawName) {
@@ -109,21 +175,27 @@ bool SeriesIndex::loadFromFile() {
     LOG_ERR("SER", "series_index.json parse error: %s", err.c_str());
     return false;
   }
-  byPath.clear();
+
+  // Stage entries into a scratch list, then rebuild atomically so the
+  // final entries + stringPool land in single contiguous allocations
+  // (the ArduinoJson DOM already pinned ~the JSON bytes; once we're done
+  // staging the scratch list goes out of scope and frees those, leaving
+  // only our compact pool behind).
+  std::vector<ScratchEntry> scratch;
   JsonArrayConst arr = doc["books"];
   if (!arr.isNull()) {
-    byPath.reserve(arr.size());
+    scratch.reserve(arr.size());
     for (JsonObjectConst entry : arr) {
-      const std::string path = entry["path"] | std::string("");
-      if (path.empty()) continue;
-      SeriesEntry e;
-      e.path = path;
-      e.name = entry["name"] | std::string("");
-      e.index = entry["index"] | std::string("");
-      byPath[path] = std::move(e);
+      ScratchEntry s;
+      s.path = entry["path"] | std::string("");
+      if (s.path.empty()) continue;
+      s.name = entry["name"] | std::string("");
+      s.index = entry["index"] | std::string("");
+      scratch.push_back(std::move(s));
     }
   }
-  LOG_DBG("SER", "Loaded series index with %zu entries", byPath.size());
+  rebuildFrom(scratch);
+  LOG_DBG("SER", "Loaded series index with %zu entries", entries.size());
   return true;
 }
 
@@ -132,11 +204,11 @@ bool SeriesIndex::saveToFile() const {
   JsonDocument doc;
   doc["version"] = SERIES_INDEX_VERSION;
   JsonArray arr = doc["books"].to<JsonArray>();
-  for (const auto& kv : byPath) {
+  for (const auto& e : entries) {
     JsonObject entry = arr.add<JsonObject>();
-    entry["path"] = kv.second.path;
-    entry["name"] = kv.second.name;
-    entry["index"] = kv.second.index;
+    entry["path"] = pathOf(e);
+    entry["name"] = nameOf(e);
+    entry["index"] = indexOf(e);
   }
   String json;
   serializeJson(doc, json);
