@@ -4,7 +4,11 @@
 // css_rules.cache, cover thumbs) follow on the same scaffolding.
 
 #include <Arduino.h>
+#include <Epub.h>
+#include <EpdFont.h>
+#include <EpdFontFamily.h>
 #include <FsHelpers.h>
+#include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <JpegToBmpConverter.h>
 #include <Logging.h>
@@ -12,10 +16,22 @@
 #include <ZipFile.h>
 
 #include <Epub/BookMetadataCache.h>
+#include <Epub/Section.h>
 #include <Epub/parsers/ContainerParser.h>
 #include <Epub/parsers/ContentOpfParser.h>
 #include <Epub/parsers/TocNavParser.h>
 #include <Epub/parsers/TocNcxParser.h>
+
+// Phase 2C font tables. Pure-data PROGMEM headers; including them on host
+// pulls in the same uint8_t[] bitmaps + metadata tables the device links
+// against. Default reading font is LexendDeca Medium (14px). Add the four
+// styles a single family needs (regular, bold, italic, bold-italic) here
+// when expanding to more font sizes / variants.
+#include <builtinFonts/lexenddeca_14_regular.h>
+#include <builtinFonts/lexenddeca_14_bold.h>
+#include <builtinFonts/lexenddeca_14_italic.h>
+#include <builtinFonts/lexenddeca_14_bolditalic.h>
+#include "fontIds.h"  // LEXENDDECA_14_FONT_ID (matches src/fontIds.h)
 
 #include <cstdio>
 #include <cstring>
@@ -344,6 +360,123 @@ bool prebakeCoverThumb(const std::string& epubPath, const std::string& cacheDir,
   return ok;
 }
 
+// Phase 2C: emit sections/<spineIdx>.bin for every spine entry in the
+// EPUB, byte-targeting the device's section file format. Loads an Epub
+// instance from the same on-disk cache Phase 1 just wrote, then loops
+// the spine and calls Section::createSectionFile per chapter.
+//
+// fontId, viewport, and the eight layout/setting flags are the same
+// inputs the device's reader activity passes from SETTINGS. To stay
+// byte-identical, these MUST match the active device default for the
+// target user. For first acceptance we pick the X4 (800x480) factory
+// defaults: LexendDeca-14 + hyphenation on + embedded style on +
+// imageRendering 0 ("fit") + bionic/guide off + line compression 1.0f
+// + paragraph alignment 0 ("default") + no extra spacing/indents.
+//
+// Returns the number of spine entries that failed to emit (0 = clean).
+int prebakeSections(const std::string& epubPath, const std::string& realCacheDir,
+                    const std::string& cacheDirParent, GfxRenderer& renderer, int fontId,
+                    uint16_t viewportWidth, uint16_t viewportHeight) {
+  // Epub computes cachePath as cacheDir + "/epub_" + fnvHash(filepath),
+  // where filepath is the HOST EPUB path -- but our Phase 1 cache lives
+  // under "/.crosspoint/epub_<deviceHash>/" with the DEVICE path hash.
+  // To make Epub::load find the book.bin we already wrote, we shadow-
+  // copy book.bin to where Epub will look (cacheDirParent +
+  // "/epub_<hostPathHash>/"), let load run, then sections land in that
+  // shadow tree. After section gen, we'll copy sections/ back to the
+  // real device-hash location so the SD-card-bound output has the
+  // device-expected layout.
+  //
+  // This is a workaround. The cleaner answer is to extend Epub with an
+  // explicit-cachePath ctor that decouples ZIP-read filepath from
+  // cache-dir computation. Recorded for 2C.4 chip.
+  const std::string shadowCacheDir = cacheDirParent + "/epub_" +
+                                     std::to_string(ZipFile::fnvHash64(epubPath.c_str(), epubPath.size()));
+
+  std::error_code ec;
+  fs::create_directories(shadowCacheDir, ec);
+  if (ec) {
+    LOG_ERR("PRE", "could not create shadow cache dir %s: %s", shadowCacheDir.c_str(), ec.message().c_str());
+    return -1;
+  }
+  fs::copy_file(realCacheDir + "/book.bin", shadowCacheDir + "/book.bin",
+                fs::copy_options::overwrite_existing, ec);
+  if (ec) {
+    LOG_ERR("PRE", "could not shadow-copy book.bin from %s: %s", realCacheDir.c_str(), ec.message().c_str());
+    return -1;
+  }
+
+  // Construct an Epub instance whose internal cachePath now resolves to
+  // the shadow location (cacheDirParent + "/epub_<hostHash>"). load()
+  // hits the shadow's book.bin and short-circuits the OPF parse.
+  auto epub = std::make_shared<Epub>(epubPath, cacheDirParent);
+  if (!epub->load(/*buildIfMissing=*/false, /*skipLoadingCss=*/false)) {
+    LOG_ERR("PRE", "Epub::load failed for %s (shadow=%s)", epubPath.c_str(), shadowCacheDir.c_str());
+    return -1;
+  }
+  const int spineCount = epub->getSpineItemsCount();
+  if (spineCount <= 0) {
+    LOG_INF("PRE", "no spine entries; skipping section gen");
+    return 0;
+  }
+  LOG_INF("PRE", "section gen: %d spine entries to build", spineCount);
+
+  // Factory-default layout settings (mirror src/CrossPointSettings.h).
+  // Reader activity passes these from SETTINGS.* at section-build time;
+  // any divergence here will change the section file header fingerprint
+  // and force the device to rebuild on first open. Once we have telemetry
+  // on which settings users actually customize, we'll either ship the
+  // most common combo as the default or expose explicit overrides.
+  constexpr float kLineCompression = 1.0f;
+  constexpr bool kExtraParagraphSpacing = false;
+  constexpr bool kForceParagraphIndents = false;
+  constexpr uint8_t kParagraphAlignment = 0;  // "default" (per CrossPointSettings)
+  constexpr bool kHyphenationEnabled = true;
+  constexpr bool kEmbeddedStyle = true;
+  constexpr uint8_t kImageRendering = 0;  // "fit"
+  constexpr bool kBionicReadingEnabled = false;
+  constexpr bool kGuideReadingEnabled = false;
+
+  int failures = 0;
+  for (int spineIdx = 0; spineIdx < spineCount; ++spineIdx) {
+    Section section(epub, spineIdx, renderer);
+    bool imagesWereSuppressed = false;
+    bool layoutAbortedForLowMemory = false;
+    const bool ok = section.createSectionFile(
+        fontId, kLineCompression, kExtraParagraphSpacing, kForceParagraphIndents, kParagraphAlignment, viewportWidth,
+        viewportHeight, kHyphenationEnabled, kEmbeddedStyle, kImageRendering, kBionicReadingEnabled,
+        kGuideReadingEnabled, /*popupFn=*/nullptr, &imagesWereSuppressed, &layoutAbortedForLowMemory);
+    if (!ok) {
+      LOG_ERR("PRE", "section %d FAILED", spineIdx);
+      ++failures;
+    } else {
+      LOG_INF("PRE", "section %d wrote %u pages%s", spineIdx, static_cast<unsigned>(section.pageCount),
+              imagesWereSuppressed ? " (images suppressed)" : "");
+    }
+  }
+
+  // Sections were written into the shadow dir (epub_<hostHash>/sections/).
+  // Copy them back to the real device-hash location so the SD-bound output
+  // looks like what the device generates. We could rename instead of copy
+  // since the shadow dir is throwaway, but copying keeps Epub::load happy
+  // if the same binary gets invoked twice on the same EPUB (idempotent).
+  std::error_code ec2;
+  const std::string realSectionsDir = realCacheDir + "/sections";
+  fs::create_directories(realSectionsDir, ec2);
+  if (ec2) {
+    LOG_ERR("PRE", "could not create real sections dir %s: %s", realSectionsDir.c_str(), ec2.message().c_str());
+    return failures;
+  }
+  fs::copy(shadowCacheDir + "/sections", realSectionsDir,
+           fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec2);
+  if (ec2) {
+    LOG_ERR("PRE", "could not copy sections back to %s: %s", realSectionsDir.c_str(), ec2.message().c_str());
+  } else {
+    LOG_INF("PRE", "copied %d section files to real cache dir", spineCount);
+  }
+  return failures;
+}
+
 // Convenience: emit the full Phase 2A MVP thumb set (296x468 + 200x390).
 // One log line per size; we don't bail the whole run if one size fails so
 // the user sees both attempts (a corrupt-cover EPUB might fail at the
@@ -382,6 +515,27 @@ int main(int argc, char** argv) {
     usage(argv[0]);
     return 2;
   }
+
+  // Phase 2C: construct the font + renderer up-front so the per-EPUB
+  // loop can pass them in. Single shared GfxRenderer holds the font
+  // map; expanding to multiple sizes/families means more EpdFontFamily
+  // instances + insertFont calls here. fontIds.h defines the integer
+  // hash constants the device + host both bake into section headers.
+  EpdFont lexenddeca14Regular(&lexenddeca_14_regular);
+  EpdFont lexenddeca14Bold(&lexenddeca_14_bold);
+  EpdFont lexenddeca14Italic(&lexenddeca_14_italic);
+  EpdFont lexenddeca14BoldItalic(&lexenddeca_14_bolditalic);
+  EpdFontFamily lexenddeca14Family(&lexenddeca14Regular, &lexenddeca14Bold,
+                                   &lexenddeca14Italic, &lexenddeca14BoldItalic);
+
+  GfxRenderer renderer;
+  renderer.insertFont(LEXENDDECA_14_FONT_ID, lexenddeca14Family);
+  // X4 viewport in landscape (the default device target). --device x3
+  // would set 792x528 here; left as a static default for first byte-
+  // match milestone.
+  constexpr uint16_t kViewportWidth = 800;
+  constexpr uint16_t kViewportHeight = 480;
+  renderer.setViewport(kViewportWidth, kViewportHeight);
 
   int failures = 0;
   for (const auto& epubPath : opts.epubs) {
@@ -429,6 +583,23 @@ int main(int argc, char** argv) {
       LOG_INF("CLI", "  thumbs OK (%u ms)", dtThumbs);
     } else {
       LOG_INF("CLI", "  thumbs PARTIAL: %d of 3 failed (%u ms)", thumbFails, dtThumbs);
+    }
+
+    // Phase 2C: section files. Builds sections/<spineIdx>.bin per spine
+    // entry, mirroring the device's reader-activity behavior on first
+    // book open. Doesn't bump `failures` -- a section that fails to
+    // build is recoverable on-device (the reader self-rebuilds when the
+    // user navigates to that chapter), so partial success still ships.
+    const uint32_t t2 = millis();
+    const int sectionFails = prebakeSections(epubPath, cacheDir, cacheDirParent, renderer, LEXENDDECA_14_FONT_ID,
+                                              kViewportWidth, kViewportHeight);
+    const uint32_t dtSections = millis() - t2;
+    if (sectionFails == 0) {
+      LOG_INF("CLI", "  sections OK (%u ms)", dtSections);
+    } else if (sectionFails > 0) {
+      LOG_INF("CLI", "  sections PARTIAL: %d failed (%u ms)", sectionFails, dtSections);
+    } else {
+      LOG_INF("CLI", "  sections SKIPPED (Epub::load failed, %u ms)", dtSections);
     }
   }
 

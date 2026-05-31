@@ -115,6 +115,7 @@ INCLUDES=(
   -I "$REPO_ROOT/lib/EpdFont"
   -I "$REPO_ROOT/lib/Utf8"
   -I "$REPO_ROOT/lib/MemoryBudget"
+  -I "$REPO_ROOT/src"  # for fontIds.h (font ID hash constants)
 )
 
 CXXFLAGS=(
