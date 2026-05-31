@@ -454,6 +454,89 @@ counterpart.
   specific order (manifest order, then per-element inline). Any
   divergence here cascades into different layout.
 
+### Phase 2C.2 status update (2026-05-31)
+
+Completed in this session (commits 9291562d, c7dbbc0e):
+
+1. **All six GfxRenderer measurement methods are implemented**
+   (host_shim/GfxRenderer.cpp) -- forward into EpdFontFamily, mirror the
+   device's integer fixed-point + fp4 snap chain exactly.
+2. **EpdFont host build wired** -- EpdFont.cpp / EpdFontFamily.cpp /
+   FontDecompressor.cpp / Utf8.cpp compile-share with device. micros()
+   added to Arduino.h shim. Phase 1 book.bin byte-identical regression
+   check passes.
+3. **MemoryBudget header-only shim works as-is** -- our ESP{} stub
+   returns 1 GB free so all hasHeap() checks pass on host.
+4. **Full Epub layout chain compiles + links on host**:
+     lib/Epub/Epub.cpp
+     lib/Epub/Epub/Section.cpp
+     lib/Epub/Epub/Page.cpp
+     lib/Epub/Epub/ParsedText.cpp
+     lib/Epub/Epub/htmlEntities.cpp
+     lib/Epub/Epub/blocks/{TextBlock,ImageBlock}.cpp
+     lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp
+     lib/Epub/Epub/hyphenation/{Hyphenator,LanguageRegistry,
+                                 LiangHyphenation,HyphenationCommon}.cpp
+     lib/Epub/Epub/css/CssParser.cpp
+     lib/Epub/Epub/converters/{ImageDecoderFactory,JpegToFramebuffer,
+                                PngToFramebuffer,ImageToFramebuffer
+                                Decoder}.cpp
+5. **host_shim/GfxRenderer.h fully fleshed out** with the enums and
+   query methods DirectPixelWriter.h needs to parse (Orientation,
+   RenderMode, getDisplayWidth/Height/WidthBytes, getOrientation,
+   getRenderMode, getFrameBuffer, isSdCardFont, the
+   vector<string> overload of ensureSdCardFontReady).
+
+What's still needed for a first section_*.bin emission:
+
+A. **Builtin font header includes + font construction.** main.cpp needs
+   to include the four LexendDeca-14 headers and construct EpdFont +
+   EpdFontFamily instances mirroring src/main.cpp:107-112:
+       #include <builtinFonts/lexenddeca_14_regular.h>
+       #include <builtinFonts/lexenddeca_14_bold.h>
+       #include <builtinFonts/lexenddeca_14_italic.h>
+       #include <builtinFonts/lexenddeca_14_bolditalic.h>
+       EpdFont lexenddeca14RegularFont(&lexenddeca_14_regular);
+       ... (3 more)
+       EpdFontFamily lexenddeca14FontFamily(&...regular, &...bold,
+                                             &...italic, &...bolditalic);
+       renderer.insertFont(LEXENDDECA_14_FONT_ID, lexenddeca14FontFamily);
+   The fontId constant lives in src/fontIds.h
+   (LEXENDDECA_14_FONT_ID = 1797004611 for non-OMIT_EMOJI_FONTS builds).
+   Verify the headers parse cleanly on host (they're pure data so should
+   be a no-op compile).
+
+B. **Epub instance construction.** After Phase 1 emits book.bin, the
+   metadata is on disk; construct an Epub for it:
+       auto epub = std::make_shared<Epub>(epubPath, cacheDirParent);
+       epub->load();  // pulls book.bin back in as the metadata cache
+   This loads the spine into Epub's internal state so getSpineItem(N)
+   returns paths for each chapter.
+
+C. **Section loop in main.cpp.** For each spine entry, construct a
+   Section and call createSectionFile with device-matching settings.
+   The settings should mirror what device defaults to -- check
+   src/CrossPointSettings.h for the default values (lineCompression,
+   paragraphAlignment, imageRendering, etc.) so the section header
+   fingerprint matches and the device will reuse the cache instead of
+   rebuilding.
+
+D. **Acceptance:** for one spine entry, byte-compare host's
+   sections/N.bin against the device's. First chapter is simplest --
+   likely just title.xhtml or chapter 1 with plain text.
+
+E. **Expected first-emission divergence sources** (handle in 2C.4):
+   - The header's `buildMaxAlloc` field (~12 bytes in) gets the
+     ESP.getMaxAllocHeap() snapshot. On host this is 1<<30 -> our value
+     will differ from device. Either write 0 (Section::loadSectionFile
+     skips the check if it's 0) or override in build flag.
+   - The header's `imagesSuppressed` bit. On host with infinite heap we
+     never suppress; this is `false` consistently, which matches device
+     for any chapter that doesn't hit OOM.
+   - CSS application order if the test chapter has any styling.
+   - Hyphenator language fallback: setPreferredLanguage("en") for
+     English content -- check src/main.cpp for the call pattern.
+
 ### Phase 2C.2 handoff (skeleton committed; next-session pick-up)
 
 A skeleton `tools/crumble-prebake/host_shim/GfxRenderer.h` is checked in
