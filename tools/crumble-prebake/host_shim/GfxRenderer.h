@@ -44,9 +44,23 @@
 
 #include <cstdint>
 #include <map>
+#include <string>
+#include <vector>
 
 class GfxRenderer {
  public:
+  // Enums + types pulled in by DirectPixelWriter.h (via ImageBlock.cpp).
+  // The layout pass doesn't touch any of these at runtime, but they have
+  // to be reachable through the GfxRenderer namespace for the header to
+  // parse + the file to compile.
+  enum Orientation {
+    Portrait,
+    LandscapeClockwise,
+    PortraitInverted,
+    LandscapeCounterClockwise,
+  };
+  enum RenderMode { BW, GRAYSCALE_MSB, GRAYSCALE_LSB };
+
   GfxRenderer() = default;
   ~GfxRenderer() = default;
 
@@ -61,6 +75,17 @@ class GfxRenderer {
   void setViewport(int w, int h) { screenWidth_ = w; screenHeight_ = h; }
   int getScreenWidth() const { return screenWidth_; }
   int getScreenHeight() const { return screenHeight_; }
+  // Physical display geometry queries used by DirectPixelWriter. Layout
+  // pass doesn't actually use these (no rasterization), but ImageBlock
+  // metadata reads might call them defensively. Match the viewport.
+  int getDisplayWidth() const { return screenWidth_; }
+  int getDisplayHeight() const { return screenHeight_; }
+  int getDisplayWidthBytes() const { return (screenWidth_ + 7) / 8; }
+  Orientation getOrientation() const { return LandscapeClockwise; }
+  RenderMode getRenderMode() const { return BW; }
+  // Framebuffer pointer is only consumed by drawing code that we no-op.
+  // Returning nullptr is safe because the layout chain doesn't deref it.
+  uint8_t* getFrameBuffer() const { return nullptr; }
 
   // --- Measurement (MUST produce device-identical values; not yet wired) ---
   int getTextWidth(int fontId, const char* text,
@@ -80,7 +105,12 @@ class GfxRenderer {
   void markImageRepaintUnsafe() const {}
   void markRenderStarved() const {}
   bool releaseSdCardFontForLowMemory(int) const { return false; }
+  // Both ensureSdCardFontReady overloads (single string + vector<string>)
+  // are no-ops on host -- we never use SD-resident fonts.
   void ensureSdCardFontReady(int, const char*, uint8_t) const {}
+  void ensureSdCardFontReady(int, const std::vector<std::string>&, bool, uint8_t) const {}
+  // No SD fonts on host -> no font is an SD font.
+  bool isSdCardFont(int) const { return false; }
 
   // --- Drawing (permanent no-ops -- section build doesn't rasterize) ---
   // We declare these inline-no-op so the linker is satisfied when

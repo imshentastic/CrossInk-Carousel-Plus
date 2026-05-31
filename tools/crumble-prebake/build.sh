@@ -69,6 +69,28 @@ SOURCES=(
   "$SCRIPT_DIR/vendor/PNGdec/src/inflate.c"
   "$SCRIPT_DIR/vendor/PNGdec/src/inftrees.c"
   "$SCRIPT_DIR/vendor/PNGdec/src/zutil.c"
+  # Phase 2C layout chain. Section orchestrates; ChapterHtmlSlimParser
+  # drives XHTML -> block tree pagination; Page + blocks are the
+  # serializable output. The host's GfxRenderer is measurement-only
+  # (drawing methods inline no-op), so the layout pass measures glyph
+  # advances without rasterizing anything.
+  "$REPO_ROOT/lib/Epub/Epub.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/Section.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/Page.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/ParsedText.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/htmlEntities.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/blocks/TextBlock.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/blocks/ImageBlock.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/hyphenation/Hyphenator.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/hyphenation/LanguageRegistry.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/hyphenation/LiangHyphenation.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/hyphenation/HyphenationCommon.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/css/CssParser.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/converters/ImageDecoderFactory.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/converters/JpegToFramebufferConverter.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/converters/PngToFramebufferConverter.cpp"
+  "$REPO_ROOT/lib/Epub/Epub/converters/ImageToFramebufferDecoder.cpp"
 )
 
 INCLUDES=(
@@ -92,6 +114,7 @@ INCLUDES=(
   # Phase 2C includes.
   -I "$REPO_ROOT/lib/EpdFont"
   -I "$REPO_ROOT/lib/Utf8"
+  -I "$REPO_ROOT/lib/MemoryBudget"
 )
 
 CXXFLAGS=(
