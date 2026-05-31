@@ -189,6 +189,11 @@ bool prebakeBookBin(const std::string& epubPath, const std::string& cacheDir) {
     bookMetadata.author = opfParser.author;
     bookMetadata.language = opfParser.language;
     bookMetadata.coverItemHref = opfParser.coverItemHref;
+    // The "start reading" location pulled from <guide reference type="text">
+    // (or "start" as fallback). Persisted in book.bin so QuickResume and the
+    // first-render path don't have to re-parse content.opf to find where the
+    // body content begins. See Epub.cpp:351 for the same assignment on-device.
+    bookMetadata.textReferenceHref = opfParser.textReferenceHref;
     // tocNcxPath / tocNavPath are absolute (ZIP-root-relative); the OPF
     // parser has already resolved them against contentBasePath.
     if (!opfParser.tocNcxPath.empty()) tocNcxItem = opfParser.tocNcxPath;
