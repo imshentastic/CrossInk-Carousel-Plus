@@ -4,8 +4,11 @@
 // css_rules.cache, cover thumbs) follow on the same scaffolding.
 
 #include <Arduino.h>
+#include <FsHelpers.h>
 #include <HalStorage.h>
+#include <JpegToBmpConverter.h>
 #include <Logging.h>
+#include <PngToBmpConverter.h>
 #include <ZipFile.h>
 
 #include <Epub/BookMetadataCache.h>
@@ -106,7 +109,11 @@ std::string deviceCacheDir(const std::string& cacheRoot, const std::string& devi
 // BookMetadataCache directly and call buildBookBin to emit the output.
 // Returns true on success. `epubPath` is the path TO THE INPUT FILE on
 // the host filesystem; `cacheDir` is where the per-book artifacts land.
-bool prebakeBookBin(const std::string& epubPath, const std::string& cacheDir) {
+// On success, `outMetadata` is populated with the parsed metadata so
+// downstream phases (2A cover thumbs, 2C section files) can pick up
+// coverItemHref / spine info without re-parsing the OPF.
+bool prebakeBookBin(const std::string& epubPath, const std::string& cacheDir,
+                    BookMetadataCache::BookMetadata* outMetadata = nullptr) {
   if (!fs::exists(epubPath)) {
     LOG_ERR("PRE", "input EPUB does not exist: %s", epubPath.c_str());
     return false;
@@ -248,7 +255,118 @@ bool prebakeBookBin(const std::string& epubPath, const std::string& cacheDir) {
     return false;
   }
   cache.cleanupTmpFiles();
+  if (outMetadata) *outMetadata = bookMetadata;
   return true;
+}
+
+// Phase 2A: emit a single thumb_<W>x<H>.bmp for the EPUB's cover. Mirrors
+// Epub::convertCoverToThumbBmp from lib/Epub/Epub.cpp: extract the cover
+// image to a temp file inside cacheDir, hand it to the appropriate
+// converter (JPEG or PNG), let the converter write the dithered 1-bit BMP
+// to thumbPath, then clean up the temp file. adaptiveContain=false here
+// because the LyraCarousel canonical thumbs use crop-to-fill, not
+// letterbox; _fit.bmp variants would pass true.
+//
+// Returns false if the cover is empty, unsupported, or any step in the
+// extract/decode pipeline fails. The output file at thumbPath is removed
+// on failure so subsequent runs see the same "no thumb yet" state.
+bool prebakeCoverThumb(const std::string& epubPath, const std::string& cacheDir, const std::string& coverItemHref,
+                      int width, int height) {
+  if (coverItemHref.empty()) return false;
+
+  // Pick converter + temp-file extension from the cover's filename
+  // (mirrors the device's hasJpgExtension/hasPngExtension dispatch).
+  const bool isJpg = FsHelpers::hasJpgExtension(coverItemHref);
+  const bool isPng = !isJpg && FsHelpers::hasPngExtension(coverItemHref);
+  if (!isJpg && !isPng) {
+    LOG_ERR("PRE", "unsupported cover format for thumb: %s", coverItemHref.c_str());
+    return false;
+  }
+
+  const std::string thumbPath =
+      cacheDir + "/thumb_" + std::to_string(width) + "x" + std::to_string(height) + ".bmp";
+  const std::string coverTmpPath = cacheDir + (isJpg ? "/.cover.jpg" : "/.cover.png");
+
+  // Extract the cover image from the EPUB ZIP into the temp file.
+  // ZipFile::readFileToStream writes via the Print interface, which our
+  // HalFile shim implements -- the same path Phase 1's XML parser uses.
+  {
+    ZipFile zip(epubPath);
+    FsFile coverTmp;
+    if (!Storage.openFileForWrite("PRE", coverTmpPath, coverTmp)) {
+      LOG_ERR("PRE", "could not open temp cover for write: %s", coverTmpPath.c_str());
+      return false;
+    }
+    if (!zip.readFileToStream(coverItemHref.c_str(), coverTmp, 1024)) {
+      LOG_ERR("PRE", "could not read cover from EPUB: %s", coverItemHref.c_str());
+      coverTmp.close();
+      Storage.remove(coverTmpPath.c_str());
+      return false;
+    }
+    coverTmp.close();
+  }
+
+  // Reopen the temp cover for reading and open the destination BMP.
+  FsFile coverIn;
+  if (!Storage.openFileForRead("PRE", coverTmpPath, coverIn)) {
+    Storage.remove(coverTmpPath.c_str());
+    return false;
+  }
+  FsFile thumbOut;
+  if (!Storage.openFileForWrite("PRE", thumbPath, thumbOut)) {
+    coverIn.close();
+    Storage.remove(coverTmpPath.c_str());
+    return false;
+  }
+
+  // Drive the same converter the device uses. 1-bit output is what the
+  // LyraCarousel home theme renders -- not the multi-bit variant. False
+  // for adaptiveContain because the carousel uses crop-to-fill, NOT
+  // letterbox/contain (_fit.bmp variants do, but those aren't in the
+  // 2A MVP canonical set).
+  bool ok = false;
+  if (isJpg) {
+    ok = JpegToBmpConverter::jpegFileTo1BitBmpStreamWithSize(coverIn, thumbOut, width, height, false);
+  } else {
+    ok = PngToBmpConverter::pngFileTo1BitBmpStreamWithSize(coverIn, thumbOut, width, height, false);
+  }
+
+  coverIn.close();
+  thumbOut.close();
+  Storage.remove(coverTmpPath.c_str());
+
+  if (!ok) {
+    LOG_ERR("PRE", "thumb gen failed: %s", thumbPath.c_str());
+    Storage.remove(thumbPath.c_str());
+  } else {
+    LOG_INF("PRE", "wrote thumb %dx%d -> %s", width, height, thumbPath.c_str());
+  }
+  return ok;
+}
+
+// Convenience: emit the full Phase 2A MVP thumb set (296x468 + 200x390).
+// One log line per size; we don't bail the whole run if one size fails so
+// the user sees both attempts (a corrupt-cover EPUB might fail at the
+// larger size but succeed at the smaller, or vice versa, and we want the
+// transcript to show that).
+int prebakeAllThumbs(const std::string& epubPath, const std::string& cacheDir,
+                     const std::string& coverItemHref) {
+  if (coverItemHref.empty()) {
+    LOG_INF("PRE", "no cover image href; skipping thumb gen");
+    return 0;
+  }
+  // Canonical thumb sizes pinned in DESIGN.md (LyraCarousel center inner
+  // + side covers). Same for X4 and X3 -- thumb dimensions are theme
+  // constants, not device-dependent.
+  constexpr int kThumbSizes[][2] = {
+      {296, 468},  // LyraCarousel center inner -- HomeActivity.cpp:648
+      {200, 390},  // LyraCarousel side covers -- LyraCarouselTheme.cpp:335
+  };
+  int failures = 0;
+  for (const auto& [w, h] : kThumbSizes) {
+    if (!prebakeCoverThumb(epubPath, cacheDir, coverItemHref, w, h)) ++failures;
+  }
+  return failures;
 }
 
 }  // namespace
@@ -284,13 +402,28 @@ int main(int argc, char** argv) {
 
     LOG_INF("CLI", "prebake %s -> %s", epubPath.c_str(), cacheDir.c_str());
     const uint32_t t0 = millis();
-    const bool ok = prebakeBookBin(epubPath, cacheDir);
-    const uint32_t dt = millis() - t0;
-    if (ok) {
-      LOG_INF("CLI", "  OK (%u ms) -- book.bin at %s/book.bin", dt, cacheDir.c_str());
-    } else {
-      LOG_ERR("CLI", "  FAILED (%u ms)", dt);
+    BookMetadataCache::BookMetadata bookMetadata;
+    const bool ok = prebakeBookBin(epubPath, cacheDir, &bookMetadata);
+    const uint32_t dtBookBin = millis() - t0;
+    if (!ok) {
+      LOG_ERR("CLI", "  book.bin FAILED (%u ms)", dtBookBin);
       ++failures;
+      continue;
+    }
+    LOG_INF("CLI", "  book.bin OK (%u ms) at %s/book.bin", dtBookBin, cacheDir.c_str());
+
+    // Phase 2A: cover thumbs. Continues even on partial failure -- a book
+    // with no cover image is fine, we just skip thumbs for it. The exit
+    // code only counts book.bin failures since thumbs are recoverable
+    // on-device (the reader will generate them itself on first cover
+    // render).
+    const uint32_t t1 = millis();
+    const int thumbFails = prebakeAllThumbs(epubPath, cacheDir, bookMetadata.coverItemHref);
+    const uint32_t dtThumbs = millis() - t1;
+    if (thumbFails == 0) {
+      LOG_INF("CLI", "  thumbs OK (%u ms)", dtThumbs);
+    } else {
+      LOG_INF("CLI", "  thumbs PARTIAL: %d of 2 failed (%u ms)", thumbFails, dtThumbs);
     }
   }
 

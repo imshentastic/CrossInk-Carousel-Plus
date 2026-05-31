@@ -36,6 +36,29 @@ SOURCES=(
   "$REPO_ROOT/lib/expat/xmlparse.c"
   "$REPO_ROOT/lib/expat/xmltok.c"
   "$REPO_ROOT/lib/expat/xmlrole.c"
+  # Phase 2A: image pipeline (cover -> resized 1bpp BMP).
+  # JpegToBmpConverter + PngToBmpConverter are firmware-side wrappers;
+  # they delegate to the vendored JPEGDEC + PNGdec decoders below.
+  "$REPO_ROOT/lib/JpegToBmpConverter/JpegToBmpConverter.cpp"
+  "$REPO_ROOT/lib/PngToBmpConverter/PngToBmpConverter.cpp"
+  "$REPO_ROOT/lib/GfxRenderer/BitmapHelpers.cpp"
+  # Vendored decoders -- copies of bitbank2/JPEGDEC + bitbank2/PNGdec at the
+  # same upstream pins the firmware platformio.ini uses, with the
+  # scripts/jpegdec_patches/* applied (DC-write + wild-pointer fixes for
+  # progressive grayscale JPEGs). Both decoders already #ifdef cleanly for
+  # __MACH__ so they build without modification on macOS host.
+  "$SCRIPT_DIR/vendor/JPEGDEC/src/JPEGDEC.cpp"
+  "$SCRIPT_DIR/vendor/PNGdec/src/PNGdec.cpp"
+  # PNGdec bundles a copy of zlib in its src/ dir for the inflate path used
+  # to decompress IDAT chunks. We pull only the chunks PNGdec.cpp actually
+  # references (not infback/inflate proper for the cover-decoding use case;
+  # add them if a real cover trips an undefined symbol).
+  "$SCRIPT_DIR/vendor/PNGdec/src/adler32.c"
+  "$SCRIPT_DIR/vendor/PNGdec/src/crc32.c"
+  "$SCRIPT_DIR/vendor/PNGdec/src/inffast.c"
+  "$SCRIPT_DIR/vendor/PNGdec/src/inflate.c"
+  "$SCRIPT_DIR/vendor/PNGdec/src/inftrees.c"
+  "$SCRIPT_DIR/vendor/PNGdec/src/zutil.c"
 )
 
 INCLUDES=(
@@ -49,6 +72,13 @@ INCLUDES=(
   -I "$REPO_ROOT/lib/Serialization"
   -I "$REPO_ROOT/lib/XmlParserUtils"
   -I "$REPO_ROOT/lib/expat"
+  # Phase 2A includes.
+  -I "$REPO_ROOT/lib/JpegToBmpConverter"
+  -I "$REPO_ROOT/lib/PngToBmpConverter"
+  -I "$REPO_ROOT/lib/GfxRenderer"
+  -I "$REPO_ROOT/lib/Memory"
+  -I "$SCRIPT_DIR/vendor/JPEGDEC/src"
+  -I "$SCRIPT_DIR/vendor/PNGdec/src"
 )
 
 CXXFLAGS=(
