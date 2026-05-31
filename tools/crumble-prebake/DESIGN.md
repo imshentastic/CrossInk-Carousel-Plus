@@ -342,36 +342,88 @@ match, all sizes).
 - Color space. If the device dithers to a 4-color (red + 3-gray) or
   similar e-ink palette, the palette + mapping has to be identical.
 
-### Phase 2C — section files
+### Phase 2C — section files (revised after 2C.1 survey)
 
-**Goal:** emit `sections/N.bin` for each spine entry, byte-identical
-to device output, given a fixed settings combo and viewport.
+**Survey finding 1 (2026-05-31): scope is much smaller than originally
+sketched.** Section files do NOT contain rendered pixel data. They
+contain a **paginated block tree with positions**: each `PageLine` is
+(xPos, yPos, TextBlock); each `PageImage` is (xPos, yPos, ImageBlock
+ref). All `Page::serialize` does is `tryWritePod` the positions + serialize
+the block's metadata. No rasterization happens during section build.
+That means GfxRenderer's *drawing* surface (drawText, drawLine, fillRect,
+drawArc, drawRoundedRect, drawPixel, all the dither variants) is
+unused during layout — these can all be no-ops on host. The only thing
+that has to match device output is the *measurement* surface.
+
+**Survey finding 2 (2026-05-31): the EPUB optimizer already handles
+chapter image decode via `.pxc` bake.** lib/Epub/Epub/blocks/ImageBlock.cpp:23
+and lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp:929 ("if the optimizer
+bundled a pre-rendered .pxc pixel cache..."). So the heaviest part of
+chapter rendering on first-open (JPEG decode + dither at fitted size) is
+ALREADY off-device when the user has run their EPUB through the optimizer
+with the default "Generate .pxc image cache" toggle. Phase 2C's remaining
+job is purely **text layout** — font measurement + page-break + anchor LUT.
+
+**Goal (revised):** emit `sections/N.bin` for each spine entry,
+byte-identical to device output, given a fixed settings combo and viewport.
+ImageBlock references in the output are paths to `.pxc` files; those
+files come from the optimizer, not from this CLI.
 
 **Firmware code to pull onto the host:**
-- `lib/Epub/Epub/Section.cpp` — orchestrates the section build
-- `lib/Epub/Epub/Page.cpp` — page object, page-break logic
-- `lib/Epub/Epub/parsers/ChapterHtmlSlimParser` — XHTML → block tree
-- `lib/Epub/Epub/css/CssParser` + sibling files — CSS application
-- `lib/Epub/Epub/blocks/TextBlock` / `ImageBlock` — block hierarchy,
-  layout, draw stubs
-- `lib/GfxRenderer/` — **the big one.** Font measurement, glyph
-  metrics, line-breaking. The device pulls glyph advance widths out
-  of `EpdFont`; we need that same data on host.
-- `lib/EpdFont/` — bitmap font tables. The exact same binary fonts
-  that ship in firmware have to be linkable on host (or we pull the
-  metrics out of them and embed the table).
+- `lib/Epub/Epub/Section.cpp` — orchestrates the section build (write
+  header, run parser, write LUT/anchors/paragraph-LUT/li-LUT, patch
+  header back with final values)
+- `lib/Epub/Epub/Page.cpp` — page object, page-break, serialize
+- `lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp` — XHTML → block
+  tree → pagination (this is the 5-15s on-device cost we're moving)
+- `lib/Epub/Epub/css/CssParser` + siblings — CSS rule application
+- `lib/Epub/Epub/blocks/TextBlock.cpp` + `ImageBlock.cpp` — block
+  hierarchy, serialize (ImageBlock's actual decode path is unused
+  during layout; only the metadata path is touched)
+- `lib/EpdFont/EpdFont.cpp` + `EpdFontFamily.cpp` + `builtinFonts/` —
+  bitmap font tables. The exact same binary fonts that ship in firmware
+  have to be linkable on host. `getAdvance(codepoint, styleIdx)` is the
+  only EpdFont entry the layout path actually needs.
 
-**Host-shim gaps (bigger than Phase 1's):**
-- `GfxRenderer` is built around a 1bpp/2bpp framebuffer abstraction;
-  needs a no-op draw stub on host (we measure but don't actually
-  rasterize). The text-flow code paths must work without touching
-  any pixel buffer.
-- Glyph metrics: must produce identical advance widths to on-device.
-  Floating-point determinism is a risk if any kerning / fractional
-  advance is involved — early acceptance test on a single chapter
-  will catch this fast.
-- Image blocks: depend on Phase 2A's pipeline being landed and
-  tested. Sequencing matters here.
+**GfxRenderer surface we actually need on host** (from 2C.1 grep over
+ChapterHtmlSlimParser + TextBlock + ImageBlock + Page):
+
+Measurement (must produce device-identical values):
+- `getLineHeight(fontId)`
+- `getFontAscenderSize(fontId)`
+- `getTextWidth(fontId, text, style)`
+- `getTextAdvanceX(fontId, text, style)`
+- `getSpaceWidth(fontId, style)`
+- `getScreenWidth()` / `getScreenHeight()`
+
+Housekeeping (no-op stubs OK):
+- `suppressImages()` → false (host always has heap)
+- `markImageRepaintUnsafe()` / `markRenderStarved()` → no-op
+- `releaseSdCardFontForLowMemory()` → false (host never under memory pressure)
+- `ensureSdCardFontReady()` → no-op (assume font preloaded)
+
+Drawing (no-op stubs OK — section build doesn't rasterize):
+- `drawText`, `drawLine`, `drawRect`, `fillRect`, `drawPixel`,
+  `drawPixelDither<Color>`, `drawArc`, `drawRoundedRect`, etc.
+
+The entire GfxRenderer.cpp (~2900 lines) is mostly draw paths. The
+host stub is probably <150 lines — mostly forwarding the measurement
+calls into an `EpdFontFamily` and stubbing the rest.
+
+**Host-shim gaps (revised down — smaller than Phase 1's):**
+- GfxRenderer stub: ~150 lines forwarding the 6 measurement methods
+  into an EpdFontFamily instance, returning hardcoded screen-w/screen-h
+  from `--viewport`, no-op everything else. The text-flow code paths
+  in ChapterHtmlSlimParser call only the measurement subset, so a thin
+  forwarding stub is enough.
+- Glyph metrics determinism: must produce identical advance widths to
+  on-device. EpdFont stores advance per glyph as plain integers
+  (no float). If both sides use the exact same builtin-fonts data
+  AND the same `getAdvance` lookup, host and device should agree by
+  construction. Early acceptance on a single chapter validates this.
+- Image blocks: NO host-side image pipeline work needed for Phase 2C.
+  The optimizer already produces `.pxc` files; the layout pass only
+  reads ImageBlock's *metadata* (dimensions, src path) — never decodes.
 
 **CLI integration:** new code path triggered by absence of
 `--book-bin-only` / `--thumbs-only`. After Phase 1 + 2A finish, loop
