@@ -33,6 +33,11 @@ void usage(const char* argv0) {
                "                         instead of next to each input EPUB.\n"
                "  --sd-mount <path>      Alias for --output-dir; self-documents the SD-card\n"
                "                         workflow.\n"
+               "  --device-path <path>   Override the SD-relative path the cache-dir hash is\n"
+               "                         computed from. Required when the EPUB lives anywhere\n"
+               "                         other than the SD root on-device (e.g. /Books/X.epub).\n"
+               "                         Only valid with a single input EPUB. Defaults to\n"
+               "                         \"/\" + filename, matching the drop-at-root workflow.\n"
                "  --check                Skip books whose existing book.bin is fresh against\n"
                "                         the input EPUB's mtime.\n"
                "  --verbose              Per-step timing on stderr.\n"
@@ -42,6 +47,7 @@ void usage(const char* argv0) {
 
 struct Options {
   std::string outputDir;
+  std::string devicePathOverride;
   std::vector<std::string> epubs;
   bool check = false;
   bool verbose = false;
@@ -55,6 +61,8 @@ bool parseArgs(int argc, char** argv, Options& out) {
       std::exit(0);
     } else if ((a == "--output-dir" || a == "--sd-mount") && i + 1 < argc) {
       out.outputDir = argv[++i];
+    } else if (a == "--device-path" && i + 1 < argc) {
+      out.devicePathOverride = argv[++i];
     } else if (a == "--check") {
       out.check = true;
     } else if (a == "--verbose") {
@@ -68,6 +76,18 @@ bool parseArgs(int argc, char** argv, Options& out) {
   }
   if (out.epubs.empty()) {
     std::fprintf(stderr, "Error: at least one EPUB path required.\n");
+    return false;
+  }
+  if (!out.devicePathOverride.empty() && out.epubs.size() != 1) {
+    std::fprintf(stderr,
+                 "Error: --device-path is only valid with a single input EPUB "
+                 "(got %zu).\n", out.epubs.size());
+    return false;
+  }
+  if (!out.devicePathOverride.empty() && out.devicePathOverride.front() != '/') {
+    std::fprintf(stderr,
+                 "Error: --device-path must be absolute (start with '/'). Got: %s\n",
+                 out.devicePathOverride.c_str());
     return false;
   }
   return true;
@@ -237,21 +257,25 @@ int main(int argc, char** argv) {
 
   int failures = 0;
   for (const auto& epubPath : opts.epubs) {
-    // For phase 1, the cache dir lives next to the input EPUB unless
-    // --output-dir is set. The output-dir variant matches the device's
-    // /.crosspoint/epub_<hash>/ layout.
-    std::string cacheDir;
-    if (!opts.outputDir.empty()) {
-      // The hash assumes the device sees this EPUB at the same path it
-      // has on the host. Reasonable default for "user prepares SD card on
-      // desktop, drops the EPUBs in / and the prebake'd cache in /.crosspoint/".
-      const std::string devicePath = "/" + fs::path(epubPath).filename().string();
-      cacheDir = opts.outputDir + "/.crosspoint/" +
-                 fs::path(deviceCacheDir("", devicePath)).filename().string();
-    } else {
-      cacheDir = fs::path(epubPath).parent_path().string() + "/.crosspoint/" +
-                 fs::path(deviceCacheDir("", fs::path(epubPath).filename().string())).filename().string();
-    }
+    // Cache-dir layout mirrors the device's /.crosspoint/epub_<hash>/. The
+    // hash is computed over the SD-card-absolute path the device sees -- NOT
+    // the host filesystem path. Both branches below agree on this derivation;
+    // they only differ in where the .crosspoint/ tree itself lands on disk
+    // (next to the input EPUB, or under --output-dir / --sd-mount).
+    //
+    // Default device path: "/" + filename, matching the common "drop EPUBs at
+    // SD root" workflow. Override with --device-path when the EPUB lives in a
+    // subdirectory on-device (e.g. /Books/X.epub) -- otherwise the cache dir
+    // we emit won't match the dir the device generates and a byte-comparison
+    // (or a warm-cache drop-in) will silently land in the wrong place.
+    const std::string devicePath = opts.devicePathOverride.empty()
+                                       ? "/" + fs::path(epubPath).filename().string()
+                                       : opts.devicePathOverride;
+    const std::string cacheDirSuffix = "/.crosspoint/" +
+                                       fs::path(deviceCacheDir("", devicePath)).filename().string();
+    const std::string cacheDirParent =
+        opts.outputDir.empty() ? fs::path(epubPath).parent_path().string() : opts.outputDir;
+    const std::string cacheDir = cacheDirParent + cacheDirSuffix;
 
     LOG_INF("CLI", "prebake %s -> %s", epubPath.c_str(), cacheDir.c_str());
     const uint32_t t0 = millis();
