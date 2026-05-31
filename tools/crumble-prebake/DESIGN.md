@@ -454,6 +454,84 @@ counterpart.
   specific order (manifest order, then per-element inline). Any
   divergence here cascades into different layout.
 
+### Phase 2C.2 handoff (skeleton committed; next-session pick-up)
+
+A skeleton `tools/crumble-prebake/host_shim/GfxRenderer.h` is checked in
+with all six measurement methods declared, no-op drawing stubs inline,
+and viewport state plumbed via `setViewport(w, h)`. The measurement
+method *bodies* (signatures only) are NOT yet written -- they need to
+forward into `fontMap[fontId]`'s EpdFontFamily.getAdvance() chain.
+
+The minimum bring-up steps to get a buildable host binary for 2C.3:
+
+1. **Pick the test font**. The session's test EPUB is English Latin
+   text. The default reading font (per src/main.cpp's insertFont loop)
+   is the `tiny`-env active set: no Teensy (8px), no Itty-Bitty (9px),
+   no XLarge (18px), no Huge (20px). Probably bitter_14_regular for
+   default size. Cross-check src/CrossPointSettings.cpp for the default
+   font preference.
+
+2. **Compile-share EpdFont**. Add to build.sh SOURCES:
+     lib/EpdFont/EpdFont.cpp
+     lib/EpdFont/EpdFontFamily.cpp
+     lib/EpdFont/FontDecompressor.cpp
+   And add include path -I "$REPO_ROOT/lib/EpdFont".
+
+3. **Include only the builtin-font headers we need.** The full set is
+   139 files (~3-5 MB). For a first byte-match test we need only one
+   size's four styles (bitter_14_regular/bold/italic/bolditalic, say).
+   They're pure-data header-only PROGMEM tables; should compile straight
+   on host.
+
+4. **Implement the six measurement methods in a new
+   tools/crumble-prebake/host_shim/GfxRenderer.cpp**, each forwarding
+   into the EpdFontFamily for the requested fontId. Mirror the
+   logic in the device's GfxRenderer.cpp (line numbers in the survey).
+
+5. **Add no-op MemoryBudget host shim** (lib/MemoryBudget/MemoryBudget.h
+   gets #included by Section.cpp; the snapshot() call returns a
+   heap-stats struct that's only used for debug logs on device -- the
+   host stub can return zeros).
+
+6. **Compile-share the Epub-side layout chain**:
+     lib/Epub/Epub/Section.cpp
+     lib/Epub/Epub/Page.cpp
+     lib/Epub/Epub/blocks/TextBlock.cpp
+     lib/Epub/Epub/blocks/ImageBlock.cpp
+     lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp
+     lib/Epub/Epub/css/CssParser.cpp
+     lib/Epub/Epub/hyphenation/Hyphenator.cpp (+ siblings)
+
+7. **Try to build.** Each missing-symbol error narrows the remaining
+   shim surface. The likely casualties (in order of probability):
+     - Bitmap.cpp -- referenced from GfxRenderer.cpp's draw paths; on
+       host, our skeleton inlines no-op drawing so Bitmap may not be
+       needed at all. If TextBlock or ImageBlock pulls it for some
+       coord helper, stub.
+     - DirectPixelWriter / ImageDecoderFactory -- ImageBlock.cpp
+       imports these; we don't run the decode path during layout but
+       the linker still needs the symbols. Stub no-op.
+     - SdCardFontManager -- referenced via the SD font fallback path.
+       Stub: no SD-resident fonts on host.
+
+8. **Wire Section::createSectionFile call from main.cpp**. After
+   Phase 1 emits book.bin, loop the spine entries from BookMetadata
+   and call Section.createSectionFile(...) for each. Default settings:
+     fontId = (default reading font for --device)
+     viewport = X4 800x480 or X3 792x528
+     lineCompression = 1.0f (or device default)
+     paragraphAlignment = (device default)
+     hyphenationEnabled = true
+     embeddedStyle = true (use bundled CSS)
+     imageRendering = (device default, probably "fit")
+     bionicReading = false
+     guideReading = false
+
+9. **Byte-compare** first chapter's sections/0.bin against device.
+   If different: hex-diff to find first divergence. Likely candidates:
+   font advance width difference, page-break position difference,
+   CSS rule application order.
+
 ### Sequencing
 
 1. **2A scope refinement** — enumerate the canonical thumb-size set
