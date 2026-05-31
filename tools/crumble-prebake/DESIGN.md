@@ -266,12 +266,45 @@ from actual users (do most users customize a lot?).
 **Goal:** emit `thumb_WxH.bmp` and `thumb_WxH_fit.bmp` in
 `epub_<hash>/`, byte-identical to device output.
 
-**Canonical thumb-size set per device:** TBD — survey the
-`getThumbBmpPath(w, h)` call sites in the theme code
-(`src/components/themes/*/*Theme.cpp`, particularly the home grid,
-collection grid, carousel) and enumerate every (W, H) pair the device
-generates by default. Likely 3-5 sizes per device. List goes in a
-constant table in the CLI keyed by `--device`.
+**Canonical thumb-size set (pinned during 2A.1 survey, 2026-05-31):**
+
+The default home theme since v2.1 is `LyraCarousel`. It draws three
+covers on home: a focused center book and two side books. EPUB-self-
+healing in `HomeActivity` pre-generates thumbnails at the inner (visual
+-inset-adjusted) size; XTC reader pre-generates at the outer slot size.
+Sizes are theme constants (`src/components/themes/lyra/LyraCarouselTheme.h`),
+NOT device-dependent — X4 and X3 generate the same thumb sizes; only
+viewport layout differs.
+
+| Variant     | W × H    | Call site                                                | Filename                |
+|-------------|----------|----------------------------------------------------------|-------------------------|
+| Center inner| 296×468  | `HomeActivity.cpp:648` — self-heal on cover-miss          | `thumb_296x468.bmp`     |
+| Side cover  | 200×390  | `LyraCarouselTheme.cpp:335`, `HomeActivity.cpp:652`       | `thumb_200x390.bmp`     |
+| Center outer| 340×540  | `XtcReaderActivity.cpp:65` (XTC only)                     | `thumb_340x540.bmp`     |
+
+**Phase 2A MVP scope:** ship `thumb_296x468.bmp` + `thumb_200x390.bmp`
+for every EPUB. That covers home-screen rendering for ~90% of users on
+first boot with the default theme.
+
+**Out of scope for 2A v1** (add later as separate phases or once
+telemetry shows usage):
+- XTC center 340×540 — only applies when the user opens an XTC file
+- LyraFlow sleep-screen center cover — height computed dynamically
+  per screen, so requires `--viewport` awareness
+- Bookshelf grid sizes (`RecentBooksGridActivity` — coverWidth_,
+  coverHeight_) — computed at runtime from the 2x2/3x3/4x4 grid
+  selection; would need either a `--grid 3x3` flag or shipping all
+  three variants
+- Non-Lyra themes (Minimal home 350×583, Base home 222×370,
+  RoundedRaff home 156×260, Lyra basic home 136×226) — only relevant
+  if the user has switched away from LyraCarousel
+- Adaptive (`_fit.bmp`) variants — generated only by Minimal-style
+  themes for adaptive contain, not LyraCarousel
+
+The CLI `--device` flag still selects between X4 and X3, but for 2A
+v1 both produce the same three (well, two) thumb files. Device-level
+divergence shows up first in Phase 2C section files (viewport-baked
+into header).
 
 **Firmware code to pull onto the host:**
 - `lib/JpegToBmpConverter/` — JPEG decode (already host-buildable)
