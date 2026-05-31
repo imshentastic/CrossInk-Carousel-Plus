@@ -78,6 +78,13 @@ bool iLess(const std::string& a, const std::string& b) {
 
 LibraryIndex LibraryIndex::instance;
 
+uint32_t LibraryIndex::appendPath(std::string_view path) {
+  const uint32_t offset = static_cast<uint32_t>(pathPool.size());
+  pathPool.insert(pathPool.end(), path.begin(), path.end());
+  pathPool.push_back('\0');
+  return offset;
+}
+
 bool LibraryIndex::isBookPath(const std::string& path) {
   if (!(FsHelpers::hasEpubExtension(path) || FsHelpers::hasXtcExtension(path) ||
         FsHelpers::hasTxtExtension(path) || FsHelpers::hasMarkdownExtension(path))) {
@@ -139,46 +146,79 @@ void LibraryIndex::rescan(const std::function<void(int)>& progress) {
   uint64_t nextSeq = 1;
   for (const auto& e : entries) nextSeq = std::max<uint64_t>(nextSeq, e.firstSeenMillis + 1);
 
-  // Incremental diff against the existing index so books keep their order across
-  // walks. Map existing path -> index; a seen flag tracks survivors for pruning.
-  std::unordered_map<std::string, size_t> idxByPath;
-  idxByPath.reserve(entries.size());
-  for (size_t i = 0; i < entries.size(); ++i) idxByPath[entries[i].path] = i;
-  const size_t originalCount = entries.size();
-  std::vector<bool> seen(originalCount, false);
+  // Build a lookup of EXISTING paths (string_view over the current pool) so the
+  // diff doesn't allocate N transient std::string keys -- that was a hidden
+  // fragmentation contributor in the pre-pool implementation.
+  std::unordered_map<std::string_view, size_t> oldIdxByPath;
+  oldIdxByPath.reserve(entries.size());
+  for (size_t i = 0; i < entries.size(); ++i) oldIdxByPath[pathViewOf(entries[i])] = i;
+
+  // We rebuild entries + pathPool atomically rather than mutating in place.
+  // In-place mutation would invalidate string_view keys the moment we appended
+  // a new path into the pool (vector<char> reallocation); the rebuild is also
+  // simpler and gives the allocator a single fresh contiguous block to land in
+  // instead of a stream of incremental grows.
+  std::vector<LibraryEntry> newEntries;
+  std::vector<char> newPool;
+  newEntries.reserve(discovered.size());
+  // Reserve a rough first-cut for the pool so it doesn't realloc on every
+  // append. Average path ~80 chars; round up generously.
+  newPool.reserve(discovered.size() * 96);
+
+  auto appendIntoNewPool = [&newPool](std::string_view path) -> uint32_t {
+    const uint32_t offset = static_cast<uint32_t>(newPool.size());
+    newPool.insert(newPool.end(), path.begin(), path.end());
+    newPool.push_back('\0');
+    return offset;
+  };
 
   for (size_t i = 0; i < discovered.size(); ++i) {
-    auto it = idxByPath.find(discovered[i]);
-    if (it != idxByPath.end()) {
-      seen[it->second] = true;
-      LibraryEntry& e = entries[it->second];
-      // A known path whose size changed = the file was replaced -> re-date it as
-      // freshly added. Skip when the stored size is unknown (0, legacy entry) so
-      // the first scan after upgrade doesn't reshuffle the whole library.
-      if (e.fileSize != 0 && e.fileSize != discoveredSizes[i]) {
+    const std::string& p = discovered[i];
+    auto it = oldIdxByPath.find(std::string_view{p});
+    if (it != oldIdxByPath.end()) {
+      // Carry forward the existing metadata, but re-allocate the path into
+      // the new pool. firstSeenMillis is preserved (the user's "when did this
+      // book first appear" ordering survives the rebuild).
+      const LibraryEntry& old = entries[it->second];
+      LibraryEntry e{};
+      e.pathOffset = appendIntoNewPool(p);
+      e.firstSeenMillis = old.firstSeenMillis;
+      e.fileSize = discoveredSizes[i];
+      // A known path whose size changed = the file was replaced -> re-date it.
+      // Skip when the stored size is unknown (0, legacy entry) so the first
+      // scan after upgrade doesn't reshuffle the whole library.
+      if (old.fileSize != 0 && old.fileSize != discoveredSizes[i]) {
         e.firstSeenMillis = nextSeq++;
       }
-      e.fileSize = discoveredSizes[i];
+      newEntries.push_back(e);
     } else {
-      // Brand-new book -> newest. (push_back may realloc, but idxByPath holds
-      // indices and string-key copies, both unaffected.)
-      entries.push_back({std::move(discovered[i]), nextSeq++, discoveredSizes[i]});
+      // Brand-new book -> newest.
+      LibraryEntry e{};
+      e.pathOffset = appendIntoNewPool(p);
+      e.firstSeenMillis = nextSeq++;
+      e.fileSize = discoveredSizes[i];
+      newEntries.push_back(e);
     }
   }
   if (progress) progress(85);
 
-  // Prune originals whose file disappeared (appended new ones are always
-  // present). Reverse-erase so earlier indices stay valid.
-  for (int i = static_cast<int>(originalCount) - 1; i >= 0; --i) {
-    if (!seen[i]) entries.erase(entries.begin() + i);
-  }
-
-  // Free the walk's scratch vectors before saving so the (streaming) writer runs
-  // with maximum heap headroom.
+  // Free the walk's scratch vectors AND the old pool/entries before saving so
+  // the (streaming) writer runs with maximum heap headroom. The old idx-by-path
+  // map also goes here.
+  std::unordered_map<std::string_view, size_t>().swap(oldIdxByPath);
   discovered.clear();
   discovered.shrink_to_fit();
   discoveredSizes.clear();
   discoveredSizes.shrink_to_fit();
+  // Atomic swap into the new in-place. The old entries/pool's memory drops
+  // back to the allocator as a single contiguous chunk (modulo whatever else
+  // the allocator stitched into it).
+  entries.swap(newEntries);
+  pathPool.swap(newPool);
+  newEntries.clear();
+  newEntries.shrink_to_fit();
+  newPool.clear();
+  newPool.shrink_to_fit();
 
   walkPerformed = true;
   saveToFile();
@@ -193,37 +233,44 @@ void LibraryIndex::rescan(const std::function<void(int)>& progress) {
 std::vector<std::string> LibraryIndex::getAllBookPaths() const {
   std::vector<std::string> out;
   out.reserve(entries.size());
-  for (const auto& e : entries) out.push_back(e.path);
+  for (const auto& e : entries) out.emplace_back(pathOf(e));
   std::sort(out.begin(), out.end(), iLess);
   return out;
 }
 
 std::vector<std::string> LibraryIndex::getRecentlyAddedPaths(int maxCount) const {
-  // Copy + sort the entries by firstSeen DESC, then materialize the
-  // top-N paths. We sort the whole vector rather than partial_sort
-  // because N is small (vector size is bounded by physical books) and
-  // the simpler code is easier to reason about.
-  std::vector<LibraryEntry> sorted = entries;
-  std::sort(sorted.begin(), sorted.end(),
-            [](const LibraryEntry& a, const LibraryEntry& b) { return a.firstSeenMillis > b.firstSeenMillis; });
+  // Sort indices (cheap: 4 bytes each) by the underlying firstSeenMillis,
+  // then materialize the top-N paths out of the pool. Avoids copying the
+  // whole entry vector just to sort it.
+  std::vector<size_t> idx(entries.size());
+  for (size_t i = 0; i < entries.size(); ++i) idx[i] = i;
+  std::sort(idx.begin(), idx.end(), [this](size_t a, size_t b) {
+    return entries[a].firstSeenMillis > entries[b].firstSeenMillis;
+  });
   std::vector<std::string> out;
-  const int n = std::min(maxCount, static_cast<int>(sorted.size()));
+  const int n = std::min(maxCount, static_cast<int>(idx.size()));
   out.reserve(n);
-  for (int i = 0; i < n; ++i) out.push_back(sorted[i].path);
+  for (int i = 0; i < n; ++i) out.emplace_back(pathOf(entries[idx[i]]));
   return out;
 }
 
 uint64_t LibraryIndex::getFirstSeen(const std::string& path) const {
   for (const auto& e : entries) {
-    if (e.path == path) return e.firstSeenMillis;
+    if (path == pathOf(e)) return e.firstSeenMillis;
   }
   return 0;
 }
 
 void LibraryIndex::forgetPath(const std::string& path) {
   auto it = std::find_if(entries.begin(), entries.end(),
-                         [&](const LibraryEntry& e) { return e.path == path; });
+                         [&](const LibraryEntry& e) { return path == pathOf(e); });
   if (it == entries.end()) return;
+  // Just drop the entry from the vector. The pool keeps the dead path
+  // bytes around until the next rescan() rebuilds the pool from scratch
+  // -- the slop is negligible vs. the cost of compacting the pool on
+  // every delete (would require re-targeting every other entry's
+  // pathOffset). Rescan happens on every web-server-exit / explicit
+  // refresh, so the slop never accumulates.
   entries.erase(it);
   saveToFile();
 }
@@ -307,6 +354,7 @@ bool LibraryIndex::loadFromFile() {
   // single-blob JSON index won't match (it starts with '{'), so we reject it
   // and let a rescan rewrite it — without ever slurping the huge old file.
   entries.clear();
+  pathPool.clear();
   LineReader reader(file);
   std::string line;
   bool headerOk = false;
@@ -324,21 +372,27 @@ bool LibraryIndex::loadFromFile() {
     const uint64_t firstSeen = strtoull(line.c_str(), nullptr, 10);
     const size_t tab2 = line.find('\t', tab1 + 1);
     uint32_t fileSize = 0;
-    std::string path;
+    std::string_view path;
     if (tab2 == std::string::npos) {
       // Legacy 2-field line: "<firstSeen>\t<path>" (pre-size index).
-      path = line.substr(tab1 + 1);
+      path = std::string_view{line}.substr(tab1 + 1);
     } else {
       fileSize = static_cast<uint32_t>(strtoul(line.c_str() + tab1 + 1, nullptr, 10));
-      path = line.substr(tab2 + 1);
+      path = std::string_view{line}.substr(tab2 + 1);
     }
     if (path.empty()) continue;
-    entries.push_back({std::move(path), firstSeen, fileSize});
+    LibraryEntry e{};
+    e.pathOffset = appendPath(path);
+    e.firstSeenMillis = firstSeen;
+    e.fileSize = fileSize;
+    entries.push_back(e);
   }
   file.close();
 
   if (!headerOk) {
-    entries.clear();  // legacy/corrupt file — treat as no index, force a rescan
+    // Legacy/corrupt file — treat as no index, force a rescan.
+    entries.clear();
+    pathPool.clear();
     return false;
   }
   LOG_DBG("LIB", "Loaded library index with %zu entries", entries.size());
@@ -364,7 +418,7 @@ bool LibraryIndex::saveToFile() const {
              static_cast<unsigned long>(e.fileSize));
     file.print(numbuf);
     file.print("\t");
-    file.print(e.path.c_str());
+    file.print(pathOf(e));
     file.print("\n");
   }
   file.close();
