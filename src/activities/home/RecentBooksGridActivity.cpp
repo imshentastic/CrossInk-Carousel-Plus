@@ -148,6 +148,20 @@ int moveVerticalInGrid(const int currentIndex, const int totalItems, const int c
       if (nextRowCandidate < totalItems && (nextRowCandidate / safeItemsPerPage) == currentPage) {
         return nextRowCandidate;
       }
+      // Partial last row on this page (e.g. 3 books in a 2x2, or 5 books in
+      // a 3x3, or 6 books in a 4x4): the same-column slot doesn't exist
+      // in the next row, but some cells DO. Snap to the rightmost
+      // available cell of that partial row so pressing DOWN feels like a
+      // real move instead of a no-op or a jarring jump to the next page.
+      const int currentPageStart = currentPage * safeItemsPerPage;
+      const int currentPageEnd = std::min(currentPageStart + safeItemsPerPage, totalItems);
+      const int nextRowStartOnPage = currentPageStart + (currentRow + 1) * columns;
+      if (nextRowStartOnPage < currentPageEnd) {
+        // currentPageEnd-1 is the last cell of the partial row (since the
+        // row above DOES have currentColumn filled, partial truncation
+        // necessarily lands within this row).
+        return currentPageEnd - 1;
+      }
     }
 
     const int nextPage = (currentPage + 1) % totalPages;
