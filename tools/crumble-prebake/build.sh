@@ -49,6 +49,16 @@ SOURCES=(
   # __MACH__ so they build without modification on macOS host.
   "$SCRIPT_DIR/vendor/JPEGDEC/src/JPEGDEC.cpp"
   "$SCRIPT_DIR/vendor/PNGdec/src/PNGdec.cpp"
+  # Phase 2C: text layout for section_*.bin emission.
+  # EpdFont + EpdFontFamily provide the font tables + getTextDimensions
+  # path that GfxRenderer's measurement methods forward into. Compile-
+  # share with device verbatim; the math is pure integer fixed-point
+  # so host/device output is deterministic by construction.
+  "$REPO_ROOT/lib/EpdFont/EpdFont.cpp"
+  "$REPO_ROOT/lib/EpdFont/EpdFontFamily.cpp"
+  "$REPO_ROOT/lib/EpdFont/FontDecompressor.cpp"
+  "$REPO_ROOT/lib/Utf8/Utf8.cpp"
+  "$SCRIPT_DIR/host_shim/GfxRenderer.cpp"
   # PNGdec bundles a copy of zlib in its src/ dir for the inflate path used
   # to decompress IDAT chunks. We pull only the chunks PNGdec.cpp actually
   # references (not infback/inflate proper for the cover-decoding use case;
@@ -79,6 +89,9 @@ INCLUDES=(
   -I "$REPO_ROOT/lib/Memory"
   -I "$SCRIPT_DIR/vendor/JPEGDEC/src"
   -I "$SCRIPT_DIR/vendor/PNGdec/src"
+  # Phase 2C includes.
+  -I "$REPO_ROOT/lib/EpdFont"
+  -I "$REPO_ROOT/lib/Utf8"
 )
 
 CXXFLAGS=(

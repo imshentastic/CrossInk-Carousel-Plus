@@ -20,12 +20,17 @@ using String = std::string;
 // Arduino byte type.
 using byte = uint8_t;
 
-// Arduino timing helpers. millis() is monotonic ms since process start;
-// delay() is a no-op on host (we never need it for prebake).
+// Arduino timing helpers. millis() and micros() are monotonic since
+// process start; delay() is a no-op on host (we never need it for prebake).
 inline uint32_t millis() {
   static const auto t0 = std::chrono::steady_clock::now();
   const auto now = std::chrono::steady_clock::now();
   return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count());
+}
+inline uint32_t micros() {
+  static const auto t0 = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - t0).count());
 }
 inline void delay(uint32_t) {}
 inline void yield() {}
