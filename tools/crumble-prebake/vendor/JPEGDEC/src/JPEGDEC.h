@@ -49,11 +49,15 @@
 // byte-identical output on host arm64 (Apple Silicon), we suppress the
 // NEON SIMD fast path so the host runs the same IDCT the device does.
 //
-// We intentionally do NOT undef ALLOWS_UNALIGNED -- that macro doesn't
-// just gate fast memory access; it changes decoder data-flow enough to
-// break the bitstream parse if cleared on x86_64/arm64 hosts. The output
-// pixels are byte-equivalent whether ALLOWS_UNALIGNED is on or off (just
-// faster vs slower memory access), so leaving it on is correct.
+// (The real gate that prevents HAS_NEON from being re-set in jpeg.inl is
+// the -DNO_SIMD build flag; this #undef block is belt-and-suspenders.)
+//
+// We intentionally do NOT undef ALLOWS_UNALIGNED. Empirically (verified
+// 2026-05-31 with and without -DNO_SIMD) clearing it breaks JPEG decode
+// entirely -- err=2 returned -- because the byte-by-byte access helper
+// has a real bug on x86_64/arm64. The pixels emitted whether
+// ALLOWS_UNALIGNED is on or off ARE the same when decode succeeds; the
+// macro just gates fast memory access. So leaving it on is correct.
 //
 // Defined via -D in tools/crumble-prebake/build.sh.
 #ifdef CRUMBLE_PREBAKE_MATCH_DEVICE_DECODE
