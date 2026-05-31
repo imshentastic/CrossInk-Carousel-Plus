@@ -95,10 +95,18 @@ CXXFLAGS=(
   -DXML_GE=0
   -DXML_CONTEXT_BYTES=1024
   # Phase 2A: force JPEGDEC to take the same C-reference code paths the
-  # device uses (ESP32-C3 RV32 defines neither HAS_NEON nor ALLOWS_UNALIGNED).
-  # Without this, host arm64 builds take the NEON SIMD IDCT path and
-  # produce different pixel values than the device, breaking byte-match.
-  # See vendor/JPEGDEC/src/JPEGDEC.h for the corresponding #undef block.
+  # device uses (ESP32-C3 RV32 has no SIMD path enabled in JPEGDEC's
+  # jpeg.inl preprocessor checks). The critical define is NO_SIMD --
+  # both __arm64__ HAS_NEON (line 57 of jpeg.inl) and __x86_64__ HAS_SSE
+  # (line 49) are gated on !defined(NO_SIMD). Setting it once on the
+  # command line covers both host architectures.
+  #
+  # An earlier attempt #undef'd HAS_NEON at the end of vendored JPEGDEC.h.
+  # That didn't work because jpeg.inl is included inside JPEGDEC.cpp
+  # AFTER JPEGDEC.h and re-defines HAS_NEON unconditionally. NO_SIMD is
+  # the right knob -- prevents jpeg.inl from setting any SIMD flag in
+  # the first place.
+  -DNO_SIMD
   -DCRUMBLE_PREBAKE_MATCH_DEVICE_DECODE
   # Floating-point determinism: the resize step in JpegToBmpConverter and
   # color/dither math elsewhere occasionally pivot on `float`. Without
@@ -121,6 +129,7 @@ CFLAGS=(
   # rejects the build.
   -DXML_GE=0
   -DXML_CONTEXT_BYTES=1024
+  -DNO_SIMD
   -DCRUMBLE_PREBAKE_MATCH_DEVICE_DECODE
   -ffp-contract=off
   -fno-fast-math
