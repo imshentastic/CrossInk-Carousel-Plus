@@ -976,7 +976,44 @@ void CrossPointWebServer::handlePrebakeCacheUploadPost(PrebakeCacheUploadState& 
   int extracted = 0;
   size_t totalBytes = 0;
   String firstBadEntry;
-  for (const auto& kv : entries) {
+  String firstFailedEntry;  // for JSON failure-detail response
+  String firstFailureReason;
+  // Heap floor for STORE extracts (no inflate dict window needed): small
+  // FsFile + 4 KB read buffer, ~6 KB headroom is plenty. DEFLATE entries
+  // would need ~40 KB here, but the optimizer ships STORE-only zips so
+  // this floor stays low and we extract under tighter heap conditions.
+  static constexpr uint32_t EXTRACT_HEAP_MIN = 12 * 1024;
+
+  // Iterate in a deterministic priority order. The unordered_map's hash-
+  // bucket order is arbitrary, and if heap pressure forces us to bail
+  // partway through, we want book.bin + sections/ to be on SD already
+  // before thumbs (the reader works without thumbs; without book.bin it
+  // re-parses the OPF on every cold open). Critical-first sort:
+  //   0  - book.bin / css_rules.cache  (cold-open prerequisites)
+  //   1  - sections/*.bin              (cold-open of chapter 1)
+  //   2  - thumb_*.bmp                 (library grid; nice-to-have)
+  //   3  - everything else             (forward-compat catchall)
+  std::vector<const std::string*> sortedNames;
+  sortedNames.reserve(entries.size());
+  for (const auto& kv : entries) sortedNames.push_back(&kv.first);
+  auto priority = [](const std::string& n) -> int {
+    if (n.find("/book.bin") != std::string::npos ||
+        n.find("/css_rules.cache") != std::string::npos) return 0;
+    if (n.find("/sections/") != std::string::npos) return 1;
+    if (n.find("/thumb_") != std::string::npos) return 2;
+    return 3;
+  };
+  std::sort(sortedNames.begin(), sortedNames.end(),
+            [&](const std::string* a, const std::string* b) {
+              const int pa = priority(*a), pb = priority(*b);
+              if (pa != pb) return pa < pb;
+              return *a < *b;  // stable lex order within bucket
+            });
+
+  LOG_INF("WEB", "[PRE-EXT] starting: %u entries, heap free=%u maxAlloc=%u",
+          static_cast<unsigned>(sortedNames.size()), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  for (const std::string* pName : sortedNames) {
+    const auto& kv = *entries.find(*pName);
     esp_task_wdt_reset();
     const std::string& entryName = kv.first;
     if (entryName.empty() || entryName.back() == '/') continue;  // skip directories
@@ -988,6 +1025,21 @@ void CrossPointWebServer::handlePrebakeCacheUploadPost(PrebakeCacheUploadState& 
       firstBadEntry = entryName.c_str();
       break;
     }
+
+    // Heap pre-check: refuse the inflate if we don't have room for the
+    // dict window. Better to extract N of M entries with a clear partial-
+    // success report than to crash partway through.
+    const uint32_t maxAllocBefore = ESP.getMaxAllocHeap();
+    if (maxAllocBefore < INFLATE_HEAP_MIN) {
+      LOG_ERR("WEB", "[PRE-EXT] BAIL on %s: maxAllocHeap=%u < %u",
+              entryName.c_str(), maxAllocBefore, INFLATE_HEAP_MIN);
+      if (firstFailedEntry.isEmpty()) {
+        firstFailedEntry = entryName.c_str();
+        firstFailureReason = "low_heap_before_inflate";
+      }
+      break;  // remaining entries will fail for the same reason
+    }
+
     // Final SD destination = "/" + entry name.
     String destPath = "/";
     destPath += entryName.c_str();
@@ -1004,19 +1056,38 @@ void CrossPointWebServer::handlePrebakeCacheUploadPost(PrebakeCacheUploadState& 
     FsFile outFile;
     if (Storage.exists(destPath.c_str())) Storage.remove(destPath.c_str());
     if (!Storage.openFileForWrite("WEB", destPath, outFile)) {
-      LOG_ERR("WEB", "[PRE-EXT] open %s failed", destPath.c_str());
+      LOG_ERR("WEB", "[PRE-EXT] open %s failed (heap free=%u maxAlloc=%u)",
+              destPath.c_str(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      if (firstFailedEntry.isEmpty()) {
+        firstFailedEntry = entryName.c_str();
+        firstFailureReason = "open_for_write_failed";
+      }
       continue;
     }
     if (!zip.readFileToStream(entryName.c_str(), outFile, 4096)) {
-      LOG_ERR("WEB", "[PRE-EXT] inflate %s failed", entryName.c_str());
+      LOG_ERR("WEB", "[PRE-EXT] inflate %s failed (heap free=%u maxAlloc=%u)",
+              entryName.c_str(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
       outFile.close();
       Storage.remove(destPath.c_str());
+      if (firstFailedEntry.isEmpty()) {
+        firstFailedEntry = entryName.c_str();
+        firstFailureReason = "inflate_failed";
+      }
       continue;
     }
     const uint32_t sz = outFile.size();
     outFile.close();
     extracted++;
     totalBytes += sz;
+
+    LOG_INF("WEB", "[PRE-EXT] %d/%u: %s (%u B) heap free=%u maxAlloc=%u",
+            extracted, static_cast<unsigned>(entries.size()), entryName.c_str(),
+            static_cast<unsigned>(sz), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
+    // Yield between entries so the WiFi + WebSocket + NimBLE tasks get a slice.
+    // A long-running tight loop here is the classic ESP32 "everything else stalls"
+    // failure mode; even 1 ms is enough for the scheduler to flush pending work.
+    delay(1);
   }
 
   // Always remove the temp zip whether extraction fully succeeded or not --
@@ -1035,16 +1106,35 @@ void CrossPointWebServer::handlePrebakeCacheUploadPost(PrebakeCacheUploadState& 
   }
 
   // JSON summary so optimizer.js can log a precise success line.
+  // When extraction is partial, surface failure detail so the optimizer
+  // log shows which entry died and why (low heap, SD failure, inflate).
   String body = "{\"extracted\":";
   body += String(extracted);
   body += ",\"bytes\":";
   body += String(static_cast<uint32_t>(totalBytes));
   body += ",\"total_entries\":";
   body += String(static_cast<uint32_t>(entries.size()));
+  body += ",\"heap_free\":";
+  body += String(static_cast<uint32_t>(ESP.getFreeHeap()));
+  body += ",\"heap_max_alloc\":";
+  body += String(static_cast<uint32_t>(ESP.getMaxAllocHeap()));
+  if (!firstFailedEntry.isEmpty()) {
+    body += ",\"first_failed_entry\":\"";
+    body += firstFailedEntry;
+    body += "\",\"first_failure_reason\":\"";
+    body += firstFailureReason;
+    body += "\"";
+  }
   body += "}";
-  server->send(200, "application/json", body);
-  LOG_INF("WEB", "[PRE-EXT] extracted %d/%u entries, %u bytes",
-          extracted, static_cast<unsigned>(entries.size()), static_cast<unsigned>(totalBytes));
+  // Status: 200 only if every entry made it. Partial extract is a 207
+  // Multi-Status -- valid HTTP code that lets the optimizer's log line
+  // distinguish "all good" from "some entries dropped".
+  const int status = (extracted == static_cast<int>(entries.size())) ? 200 : 207;
+  server->send(status, "application/json", body);
+  LOG_INF("WEB", "[PRE-EXT] %s: %d/%u entries, %u bytes total, final heap free=%u maxAlloc=%u",
+          (status == 200 ? "FULL" : "PARTIAL"), extracted,
+          static_cast<unsigned>(entries.size()), static_cast<unsigned>(totalBytes),
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 }
 
 void CrossPointWebServer::handleCreateFolder() const {

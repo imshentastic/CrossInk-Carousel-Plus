@@ -3123,8 +3123,25 @@ async function uploadFile() {
             method: 'POST',
             body: fd,
           });
-          if (resp.ok) {
-            log(`Pre-bake cache uploaded (${formatBytes(cacheZipForUpload.size)})`, 'success', 'PRE');
+          if (resp.ok || resp.status === 207) {
+            // 200 = full extract, 207 = partial. Parse the JSON summary so
+            // the log line shows exactly which entry died if partial.
+            let summary = null;
+            try { summary = await resp.json(); } catch (e) { /* non-fatal */ }
+            if (summary) {
+              if (summary.extracted === summary.total_entries) {
+                log(`Pre-bake cache extracted: ${summary.extracted}/${summary.total_entries} entries, ` +
+                    `${formatBytes(summary.bytes)} on SD (device heap free=${formatBytes(summary.heap_free)}, ` +
+                    `maxAlloc=${formatBytes(summary.heap_max_alloc)})`, 'success', 'PRE');
+              } else {
+                log(`Pre-bake cache PARTIAL: ${summary.extracted}/${summary.total_entries} entries written. ` +
+                    `Failed at "${summary.first_failed_entry}" (${summary.first_failure_reason}). ` +
+                    `Device heap free=${formatBytes(summary.heap_free)}, maxAlloc=${formatBytes(summary.heap_max_alloc)}. ` +
+                    `Book will open with partial cache.`, 'warning', 'PRE');
+              }
+            } else {
+              log(`Pre-bake cache uploaded (${formatBytes(cacheZipForUpload.size)})`, 'success', 'PRE');
+            }
           } else if (resp.status === 404) {
             // Endpoint not in this firmware; fall back to download.
             triggerCacheZipDownload(cacheZipForUpload, cacheZipBookName);

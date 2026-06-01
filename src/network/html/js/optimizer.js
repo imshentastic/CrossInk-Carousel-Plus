@@ -128,9 +128,14 @@
             const data = m.FS.readFile(full);
             // Strip the /output prefix so zip entries match the device path.
             const zipPath = full.substring('/output/'.length);
-            out.file(zipPath, data, { compression: 'DEFLATE',
-                                       compressionOptions: { level: 6 },
-                                       createFolders: false });
+            // STORE (no compression) deliberately: the device side has to
+            // inflate each DEFLATE entry into a ~32 KB sliding window, and
+            // doing that ~50 times sequentially under tight heap fragments
+            // the budget enough to fail extraction partway through. STORE
+            // makes each entry a flat SD copy with no heap alloc beyond the
+            // 4 KB read buffer ZipFile already uses. Cost: a few hundred KB
+            // of extra upload (~0.5 s over WiFi); worth it.
+            out.file(zipPath, data, { compression: 'STORE', createFolders: false });
             fileCount += 1;
           }
         }
