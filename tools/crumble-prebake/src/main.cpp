@@ -510,30 +510,38 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
                     const std::string& /*cacheDirParent*/, GfxRenderer& renderer,
                     const SectionSettings& s) {
   // Epub computes cachePath as cacheDir + "/epub_" + fnvHash(filepath).
-  // Our Phase 1 output lives at realCacheDir = "<output>/.crosspoint/epub_<deviceHash>".
-  // We need section files' embedded paths (img_*.jpg, img_*.pxc) to point at
-  // realCacheDir exactly so the device can find them at the corresponding
-  // location on SD. Since we can't change Epub's internal hashing, we
-  // arrange for the shadow location to have the SAME LENGTH as realCacheDir
-  // and do a byte-level substitute in the emitted section files afterward.
-  // Length-preserving substitution keeps file sizes and offset tables
-  // intact, so we don't have to rewrite Page::serialize.
+  // The HOST has output at "<outputDir>/.crosspoint/epub_<deviceHash>", but
+  // the DEVICE will see the same files at "/.crosspoint/epub_<deviceHash>"
+  // (SD root is "/" on device). Section files embed image paths -- those
+  // paths must be the DEVICE-VISIBLE path, not the host's outputDir-rooted
+  // path, or the device's image lookups all fail and chapter renders go
+  // blank.
   //
-  // shadowCacheDir = "<shadowParent>/epub_<hostHash>" where shadowParent's
-  // length is chosen so the full shadow path == realCacheDir length. If
-  // the hashes differ in decimal digit count enough that no valid
-  // shadowParent fits, we fall back to no substitute (old behavior --
-  // device runs runtime image decode for chapters that have images).
+  // So we do path substitute against the DEVICE-RELATIVE prefix, not
+  // realCacheDir. Length-preserving substitute keeps file sizes + LUT
+  // offsets intact -- pick shadowParent length so
+  // "<shadowParent>/epub_<hostHash>" == "/.crosspoint/epub_<deviceHash>".
+  //
+  // The deviceCacheDir on SD is literally "/.crosspoint/epub_<deviceHash>" --
+  // we derive it from realCacheDir by stripping the host outputDir prefix.
+  // realCacheDir always ends in "/.crosspoint/epub_<deviceHash>" because
+  // main() builds it that way.
+  const std::string deviceCacheDirOnSd = [&]() {
+    const std::string suffix = "/.crosspoint/";
+    const size_t pos = realCacheDir.find(suffix);
+    if (pos == std::string::npos) return realCacheDir;  // unexpected; fall back
+    return realCacheDir.substr(pos);  // includes the leading "/.crosspoint/..."
+  }();
+
   const std::string hostHashStr =
       std::to_string(ZipFile::fnvHash64(epubPath.c_str(), epubPath.size()));
   const size_t hostSuffixLen = 6 + hostHashStr.size();  // "/epub_" + hash
-  const size_t targetTotalLen = realCacheDir.size();
+  const size_t targetTotalLen = deviceCacheDirOnSd.size();
   std::string shadowParent;
   bool pathSubstituteEnabled = false;
   if (targetTotalLen > hostSuffixLen + 4) {  // need at least "/tmp/" parent prefix
     const size_t parentLen = targetTotalLen - hostSuffixLen;
-    // Compose "/tmp/" + (parentLen-5) padding chars. macOS allows arbitrary
-    // ASCII; we use 'p' so the dir name is obviously "prebake padding".
+    // Compose "/tmp/" + (parentLen-5) padding chars.
     shadowParent = "/tmp/" + std::string(parentLen - 5, 'p');
     if (shadowParent.size() == parentLen) {
       pathSubstituteEnabled = true;
@@ -543,7 +551,6 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
     LOG_INF("PRE",
             "hash length mismatch prevents path substitute; sections will embed shadow paths and "
             "the device will runtime-decode chapter images instead of using bundled .pxc");
-    // Fall back to legacy shadow location
     shadowParent = "/tmp/inkprebake_fallback";
   }
   const std::string shadowCacheDir = shadowParent + "/epub_" + hostHashStr;
@@ -562,8 +569,8 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
   }
 
   if (pathSubstituteEnabled) {
-    LOG_INF("PRE", "path substitute enabled: shadow=%s real=%s (len=%zu)",
-            shadowCacheDir.c_str(), realCacheDir.c_str(), shadowCacheDir.size());
+    LOG_INF("PRE", "path substitute enabled: shadow=%s device=%s (len=%zu)",
+            shadowCacheDir.c_str(), deviceCacheDirOnSd.c_str(), shadowCacheDir.size());
   }
 
   // Construct an Epub instance whose internal cachePath resolves to the
@@ -623,12 +630,15 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
     std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     in.close();
     if (pathSubstituteEnabled) {
-      // In-place substring replace -- shadow and real prefixes are the same
-      // length, so we can walk the buffer with std::string::find.
+      // In-place substring replace -- shadow and device prefixes are the same
+      // length, so we can walk the buffer with std::string::find. The target
+      // is the DEVICE-VISIBLE path (e.g. "/.crosspoint/epub_<deviceHash>"),
+      // not the host's outputDir-rooted realCacheDir -- the device sees its
+      // SD root as "/" and won't find files under our host outputDir prefix.
       size_t pos = 0;
       while ((pos = content.find(shadowCacheDir, pos)) != std::string::npos) {
-        std::memcpy(content.data() + pos, realCacheDir.data(), realCacheDir.size());
-        pos += realCacheDir.size();
+        std::memcpy(content.data() + pos, deviceCacheDirOnSd.data(), deviceCacheDirOnSd.size());
+        pos += deviceCacheDirOnSd.size();
       }
     }
     std::ofstream out(dstPath, std::ios::binary | std::ios::trunc);
