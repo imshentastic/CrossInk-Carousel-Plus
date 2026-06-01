@@ -1265,10 +1265,15 @@ void CrossPointWebServer::handleExtractPrebakeCache() const {
     delay(1);
   }
 
-  // Remove the source zip after extraction completes (full or partial).
-  // Leaving multi-MB zips lying around in /.crosspoint/ wastes SD and
-  // confuses future debugging.
-  Storage.remove(pathArg.c_str());
+  // Remove the source zip ONLY on full success. If extraction was partial
+  // (e.g., heap-pressure bail on the first entry), leave the zip so the
+  // JS-side retry has something to extract on the next attempt. The
+  // previous behaviour deleted on partial too, which made retries 404 out
+  // and silently fall back to the local-download path.
+  const bool fullSuccess = (extracted == static_cast<int>(entries.size())) && firstFailedEntry.isEmpty();
+  if (fullSuccess) {
+    Storage.remove(pathArg.c_str());
+  }
 
   if (!firstBadEntry.isEmpty()) {
     String body = "Refused cache zip: unsafe entry '";
