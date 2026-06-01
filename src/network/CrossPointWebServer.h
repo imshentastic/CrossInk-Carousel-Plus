@@ -55,6 +55,14 @@ class CrossPointWebServer {
   // the FILE_END hook extracts the zip's contents to SD instead of leaving
   // the upload as-is. Separate state from UploadState so a concurrent
   // file-manager upload doesn't trample the prebake cache extract.
+  //
+  // Buffer is allocated LAZILY in UPLOAD_FILE_START and freed in
+  // UPLOAD_FILE_END / _ABORTED so we don't pin 4 KB of heap for the
+  // device's whole uptime when the user isn't running a prebake. The
+  // file-manager hang reports (chip-tracked, recurring) put any
+  // pre-allocated buffer on the suspect list -- the prebake cache flow is
+  // ~1 % of sessions but the buffer would be sitting in heap 100 % of the
+  // time, contributing to fragmentation pressure for no good reason.
   struct PrebakeCacheUploadState {
     FsFile file;
     String tmpPath = "/.crosspoint/_inflight_prebake_cache.zip";
@@ -65,10 +73,8 @@ class CrossPointWebServer {
     size_t extractedBytes = 0;
 
     static constexpr size_t UPLOAD_BUFFER_SIZE = 4096;
-    std::vector<uint8_t> buffer;
+    std::vector<uint8_t> buffer;  // empty until first UPLOAD_FILE_START
     size_t bufferPos = 0;
-
-    PrebakeCacheUploadState() { buffer.resize(UPLOAD_BUFFER_SIZE); }
   } prebakeCacheUpload;
 
   CrossPointWebServer();

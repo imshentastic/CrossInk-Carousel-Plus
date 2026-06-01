@@ -879,6 +879,18 @@ void CrossPointWebServer::handlePrebakeCacheUpload(PrebakeCacheUploadState& stat
     state.extractedBytes = 0;
     state.bufferPos = 0;
 
+    // Lazy buffer alloc -- claim 4 KB only for the lifetime of this
+    // upload, freed in UPLOAD_FILE_END / _ABORTED. Keeps heap free for
+    // file-manager listing requests that often arrive concurrently.
+    if (state.buffer.size() < PrebakeCacheUploadState::UPLOAD_BUFFER_SIZE) {
+      state.buffer.resize(PrebakeCacheUploadState::UPLOAD_BUFFER_SIZE);
+      if (state.buffer.size() < PrebakeCacheUploadState::UPLOAD_BUFFER_SIZE) {
+        state.error = "Out of heap for upload buffer";
+        LOG_ERR("WEB", "[PRE-UP] failed to alloc upload buffer");
+        return;
+      }
+    }
+
     // Ensure the /.crosspoint cache root exists; the inflight zip lives
     // alongside the per-book cache dirs that the extraction will populate.
     Storage.mkdir("/.crosspoint");
@@ -923,11 +935,19 @@ void CrossPointWebServer::handlePrebakeCacheUpload(PrebakeCacheUploadState& stat
     state.file.close();
     if (state.error.isEmpty()) state.success = true;
     LOG_INF("WEB", "[PRE-UP] received %u bytes", static_cast<unsigned>(state.size));
+    // Reclaim the 4 KB upload buffer immediately -- the extract step in the
+    // POST handler reads via ZipFile which uses its own SD reader buffers;
+    // we don't need to hold the upload buffer past this point. shrink_to_fit
+    // is required because std::vector::clear leaves capacity intact.
+    state.buffer.clear();
+    state.buffer.shrink_to_fit();
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
     if (state.file) state.file.close();
     Storage.remove(state.tmpPath.c_str());
     state.error = "Upload aborted";
     LOG_DBG("WEB", "[PRE-UP] aborted");
+    state.buffer.clear();
+    state.buffer.shrink_to_fit();
   }
 }
 
