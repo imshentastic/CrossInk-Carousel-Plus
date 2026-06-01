@@ -53,26 +53,35 @@ namespace fs = std::filesystem;
 namespace {
 
 // Section-header layout settings. Mirror the 12 fields baked into
-// Section::writeSectionFileHeader. If --device-url is set we GET these
-// from /api/reader-render-info (extends fitVersion=2). Otherwise we
-// fall back to factory defaults that match CrossPointSettings.h's
-// in-struct initializers -- which won't match a user who's customized
-// any setting, so the section cache will get invalidated on first
-// open in that case (graceful: device just rebuilds).
+// Section::writeSectionFileHeader. All values come from the device's
+// /api/reader-render-info endpoint (fitVersion=2). --device-url is
+// mandatory for section generation -- we used to allow factory-default
+// fallback but in practice every real user has customized at least one
+// of the 12 settings (font, viewport, line compression, etc.), so any
+// factory-defaults-generated section would get rejected by the device's
+// load-time fingerprint check anyway and trigger an on-board rebuild,
+// defeating the whole point of prebaking. Requiring --device-url makes
+// the CLI honest about its assumptions.
 struct SectionSettings {
-  int fontId = -90104999;      // LEXENDDECA_14_FONT_ID with OMIT_EMOJI_FONTS;
-                                // overridden when --device-url returns the live id.
-  uint16_t viewportWidth = 800;
-  uint16_t viewportHeight = 480;
+  // All defaults are placeholder values overridden by fetchDeviceSettings.
+  // They only matter if section gen is somehow attempted without a
+  // successful settings fetch, in which case we would (correctly) error
+  // out before reaching the section build step.
+  int fontId = 0;
+  uint16_t viewportWidth = 0;
+  uint16_t viewportHeight = 0;
   float lineCompression = 1.0f;
-  bool extraParagraphSpacing = true;    // CrossPointSettings.h:339 default = 1
+  bool extraParagraphSpacing = false;
   bool forceParagraphIndents = false;
-  uint8_t paragraphAlignment = 0;       // JUSTIFIED enum (verify against enum order)
-  bool hyphenationEnabled = false;      // CrossPointSettings.h default = 0
+  uint8_t paragraphAlignment = 0;
+  bool hyphenationEnabled = false;
   bool embeddedStyle = true;
   uint8_t imageRendering = 0;
   bool bionicReadingEnabled = false;
   bool guideReadingEnabled = false;
+  // Device target ("X4" or "X3") detected from the render-info response.
+  // Used by future per-device thumb-set logic; currently only logged.
+  std::string device;
 };
 
 // libcurl write callback: appends incoming bytes to a std::string.
@@ -133,6 +142,8 @@ bool fetchDeviceSettings(const std::string& deviceUrl, SectionSettings& out) {
     return false;
   }
 
+  // Device target (X4 / X3 / future SKUs) auto-detected from the endpoint.
+  if (doc["device"].is<const char*>()) out.device = doc["device"].as<const char*>();
   if (doc["fontId"].is<int>()) out.fontId = doc["fontId"].as<int>();
   if (doc["viewportWidth"].is<int>()) out.viewportWidth = doc["viewportWidth"].as<int>();
   if (doc["viewportHeight"].is<int>()) out.viewportHeight = doc["viewportHeight"].as<int>();
@@ -151,11 +162,12 @@ bool fetchDeviceSettings(const std::string& deviceUrl, SectionSettings& out) {
     out.guideReadingEnabled = doc["guideReadingEnabled"].as<int>() != 0;
 
   LOG_INF("CFG",
-          "device settings: fontId=%d viewport=%ux%u lineCompression=%.3f extraPS=%d fpI=%d pA=%u "
+          "device=%s settings: fontId=%d viewport=%ux%u lineCompression=%.3f extraPS=%d fpI=%d pA=%u "
           "hyph=%d embed=%d imgR=%u bionic=%d guide=%d",
-          out.fontId, out.viewportWidth, out.viewportHeight, static_cast<double>(out.lineCompression),
-          out.extraParagraphSpacing, out.forceParagraphIndents, out.paragraphAlignment, out.hyphenationEnabled,
-          out.embeddedStyle, out.imageRendering, out.bionicReadingEnabled, out.guideReadingEnabled);
+          out.device.empty() ? "(unknown)" : out.device.c_str(), out.fontId, out.viewportWidth, out.viewportHeight,
+          static_cast<double>(out.lineCompression), out.extraParagraphSpacing, out.forceParagraphIndents,
+          out.paragraphAlignment, out.hyphenationEnabled, out.embeddedStyle, out.imageRendering,
+          out.bionicReadingEnabled, out.guideReadingEnabled);
   return true;
 }
 
@@ -173,14 +185,22 @@ void usage(const char* argv0) {
                "                         other than the SD root on-device (e.g. /Books/X.epub).\n"
                "                         Only valid with a single input EPUB. Defaults to\n"
                "                         \"/\" + filename, matching the drop-at-root workflow.\n"
-               "  --device-url <url>     Pull live reader settings from the device's File\n"
-               "                         Transfer web server. e.g. --device-url http://192.168.5.158\n"
-               "                         Reads /api/reader-render-info (fitVersion >= 2) and uses\n"
-               "                         the returned font id + viewport + layout settings for\n"
-               "                         section header generation, so the device's cache check\n"
-               "                         passes on first open. Without this flag, prebake uses\n"
-               "                         factory defaults -- sections will get invalidated for\n"
-               "                         users who have customized any reader setting.\n"
+               "  --device-url <url>     REQUIRED. Pull live reader settings from the device's\n"
+               "                         File Transfer web server. e.g.\n"
+               "                            --device-url http://192.168.5.158\n"
+               "                         Reads /api/reader-render-info (fitVersion >= 2) which\n"
+               "                         returns the user's font, viewport, layout settings, and\n"
+               "                         device target (X4 / X3). Every real device has at least\n"
+               "                         one customized setting, so a factory-defaults build\n"
+               "                         would fail the device's load-time fingerprint check\n"
+               "                         and trigger an on-board rebuild -- defeating the point\n"
+               "                         of prebaking. Use --skip-sections if you only need\n"
+               "                         book.bin + thumbs and don't have a device available.\n"
+               "  --skip-sections        Generate book.bin + thumbs only, no sections/. Removes\n"
+               "                         the --device-url requirement. Useful for batch-\n"
+               "                         processing on systems without device network access;\n"
+               "                         the resulting cache still saves ~3s of cold-open time\n"
+               "                         from the OPF + thumb-gen skip.\n"
                "  --check                Skip books whose existing book.bin is fresh against\n"
                "                         the input EPUB's mtime.\n"
                "  --verbose              Per-step timing on stderr.\n"
@@ -193,9 +213,12 @@ struct Options {
   std::string devicePathOverride;
   std::string deviceUrl;  // base URL like "http://192.168.5.158"; query
                           // /api/reader-render-info for live settings.
+                          // Required unless skipSections is set.
   std::vector<std::string> epubs;
   bool check = false;
   bool verbose = false;
+  bool skipSections = false;  // skip section gen; book.bin + thumbs only.
+                              // Removes the --device-url requirement.
 };
 
 bool parseArgs(int argc, char** argv, Options& out) {
@@ -214,6 +237,8 @@ bool parseArgs(int argc, char** argv, Options& out) {
       // "http://x/" without the joined URL ending up as "/api/.." vs
       // "//api/..".
       if (!out.deviceUrl.empty() && out.deviceUrl.back() == '/') out.deviceUrl.pop_back();
+    } else if (a == "--skip-sections") {
+      out.skipSections = true;
     } else if (a == "--check") {
       out.check = true;
     } else if (a == "--verbose") {
@@ -239,6 +264,12 @@ bool parseArgs(int argc, char** argv, Options& out) {
     std::fprintf(stderr,
                  "Error: --device-path must be absolute (start with '/'). Got: %s\n",
                  out.devicePathOverride.c_str());
+    return false;
+  }
+  if (out.deviceUrl.empty() && !out.skipSections) {
+    std::fprintf(stderr,
+                 "Error: --device-url is required for section generation. To prebake without\n"
+                 "       a device available, pass --skip-sections (book.bin + thumbs only).\n");
     return false;
   }
   return true;
@@ -750,22 +781,32 @@ int main(int argc, char** argv) {
   renderer.insertFont(LEXENDDECA_14_FONT_ID, lexenddeca14Family);
   renderer.insertFont(BITTER_12_FONT_ID, bitter12Family);
 
-  // Resolve section settings: GET /api/reader-render-info if the user
-  // passed --device-url, otherwise factory defaults (which won't match
-  // any customized user -- cache will get invalidated on first open).
+  // Resolve section settings. If section gen is enabled, fetch from the
+  // device's render-info endpoint -- arg parsing already enforced that
+  // --device-url is set in that case. Without sections (book.bin + thumbs
+  // only mode), we still construct a SectionSettings but it's unused.
   SectionSettings sectionSettings;
-  if (!opts.deviceUrl.empty()) {
+  if (!opts.skipSections) {
     if (!fetchDeviceSettings(opts.deviceUrl, sectionSettings)) {
-      LOG_ERR("CLI",
-              "Could not fetch settings from %s. Aborting rather than baking with stale "
-              "factory defaults that the device will reject.",
-              opts.deviceUrl.c_str());
+      LOG_ERR("CLI", "Could not fetch settings from %s -- aborting.", opts.deviceUrl.c_str());
       return 3;
     }
+    // Sanity-check the device target we just detected. Today only X4 and X3
+    // ship; new SKUs will need a viewport-defaults entry here before they
+    // can prebake reliably. If a new SKU shows up, warn but proceed --
+    // the live settings from /api/reader-render-info are still used.
+    if (sectionSettings.device != "X4" && sectionSettings.device != "X3") {
+      LOG_INF("CLI",
+              "Unrecognized device target '%s' from /api/reader-render-info. Continuing with "
+              "the reported viewport (%dx%d), but verify behaviour against the actual device.",
+              sectionSettings.device.c_str(), sectionSettings.viewportWidth, sectionSettings.viewportHeight);
+    } else {
+      LOG_INF("CLI", "device target detected: %s", sectionSettings.device.c_str());
+    }
+    renderer.setViewport(sectionSettings.viewportWidth, sectionSettings.viewportHeight);
   } else {
-    LOG_INF("CLI", "no --device-url; baking with factory defaults (sections may not cache-hit on customized devices)");
+    LOG_INF("CLI", "--skip-sections set; section generation disabled. Producing book.bin + thumbs only.");
   }
-  renderer.setViewport(sectionSettings.viewportWidth, sectionSettings.viewportHeight);
 
   int failures = 0;
   for (const auto& epubPath : opts.epubs) {
@@ -820,15 +861,19 @@ int main(int argc, char** argv) {
     // book open. Doesn't bump `failures` -- a section that fails to
     // build is recoverable on-device (the reader self-rebuilds when the
     // user navigates to that chapter), so partial success still ships.
-    const uint32_t t2 = millis();
-    const int sectionFails = prebakeSections(epubPath, cacheDir, cacheDirParent, renderer, sectionSettings);
-    const uint32_t dtSections = millis() - t2;
-    if (sectionFails == 0) {
-      LOG_INF("CLI", "  sections OK (%u ms)", dtSections);
-    } else if (sectionFails > 0) {
-      LOG_INF("CLI", "  sections PARTIAL: %d failed (%u ms)", sectionFails, dtSections);
+    if (opts.skipSections) {
+      LOG_INF("CLI", "  sections SKIPPED (--skip-sections)");
     } else {
-      LOG_INF("CLI", "  sections SKIPPED (Epub::load failed, %u ms)", dtSections);
+      const uint32_t t2 = millis();
+      const int sectionFails = prebakeSections(epubPath, cacheDir, cacheDirParent, renderer, sectionSettings);
+      const uint32_t dtSections = millis() - t2;
+      if (sectionFails == 0) {
+        LOG_INF("CLI", "  sections OK (%u ms)", dtSections);
+      } else if (sectionFails > 0) {
+        LOG_INF("CLI", "  sections PARTIAL: %d failed (%u ms)", sectionFails, dtSections);
+      } else {
+        LOG_INF("CLI", "  sections SKIPPED (Epub::load failed, %u ms)", dtSections);
+      }
     }
   }
 
