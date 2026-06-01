@@ -2803,6 +2803,35 @@ function triggerCacheZipDownload(blob, bookName) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+// CrumBLE: upload a file via /upload to an EXPLICIT device path, ignoring
+// the current file-manager directory. Used by the prebake cache flow to
+// drop the .crumble-cache.zip into /.crosspoint/ regardless of where the
+// user happens to be browsing. Wraps the same XHR + multipart machinery
+// as uploadFileHTTP -- only the ?path= argument and onProgress wiring
+// differ. Returns a Promise that resolves when the device responds 200.
+//
+// devicePath must be an absolute SD path including the filename's parent
+// dir (e.g. "/.crosspoint/Foo.crumble-cache.zip"). The device's /upload
+// handler treats ?path= as the destination directory and appends the
+// multipart file's filename, so we split here.
+function uploadFileHTTPToPath(file, devicePath) {
+  return new Promise((resolve, reject) => {
+    const lastSlash = devicePath.lastIndexOf('/');
+    const dirPath = lastSlash > 0 ? devicePath.substring(0, lastSlash) : '/';
+    const formData = new FormData();
+    formData.append('file', file);
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/upload?path=' + encodeURIComponent(dirPath), true);
+    xhr.onload = function() {
+      if (xhr.status === 200) resolve();
+      else reject(new Error(xhr.responseText || `Upload failed: HTTP ${xhr.status}`));
+    };
+    xhr.onerror = function() { reject(new Error('Network error during upload')); };
+    xhr.ontimeout = function() { reject(new Error('Upload timed out')); };
+    xhr.send(formData);
+  });
+}
+
 // Upload file via HTTP (fallback method)
 function uploadFileHTTP(file, onProgress, onComplete, onError) {
   return new Promise((resolve, reject) => {
@@ -3130,23 +3159,36 @@ async function uploadFile() {
       // (e.g. user updated optimizer.js but not the device firmware), we
       // fall back to a browser download so the artifact isn't lost.
       if (cacheZipForUpload) {
+        // Split-flow: (1) upload the zip to /.crosspoint/<name>.crumble-cache.zip
+        // using the same uploadFileHTTP path the file manager uses every day,
+        // (2) POST /api/extract-prebake-cache?path=<that path> to trigger the
+        // unzip server-side. The previous monolithic /api/upload-prebake-cache
+        // endpoint took the same body as a multipart stream and unzipped in
+        // the same request -- but 3+ device crashes during testing pinned
+        // that path to a WebSocket/lwIP assertion under multi-MB multipart.
+        // The split flow uses battle-tested transport for the heavy bytes,
+        // and the extract trigger is a tiny query-string request with no
+        // body, so no multipart parser touches it.
+        const baseName = (cacheZipBookName || 'book').replace(/\.epub$/i, '');
+        const cacheZipName = `${baseName}.crumble-cache.zip`;
+        const cacheZipDevicePath = `/.crosspoint/${cacheZipName}`;
         try {
-          // Multipart upload: ESP32 WebServer can't buffer multi-MB raw bodies
-          // in heap, so we ride the same streamed-upload code path that the
-          // EPUB upload uses. The device-side handler accumulates chunks into
-          // a temp SD file and extracts on FILE_END.
-          const fd = new FormData();
-          const baseName = (cacheZipBookName || 'book').replace(/\.epub$/i, '');
-          fd.append('file', cacheZipForUpload, `${baseName}.crumble-cache.zip`);
-          const resp = await fetch('/api/upload-prebake-cache', {
-            method: 'POST',
-            body: fd,
-          });
-          if (resp.ok || resp.status === 207) {
-            // 200 = full extract, 207 = partial. Parse the JSON summary so
-            // the log line shows exactly which entry died if partial.
+          log(`Pre-bake: uploading cache zip (${formatBytes(cacheZipForUpload.size)}) to ${cacheZipDevicePath}...`,
+              '', 'PRE');
+          const cacheZipFile = new File([cacheZipForUpload], cacheZipName,
+                                         { type: 'application/zip' });
+          // Reuses the file manager's normal HTTP upload path -- multipart,
+          // streamed to SD via the standard /upload handler, no custom
+          // multi-MB body code on the receiving side.
+          await uploadFileHTTPToPath(cacheZipFile, cacheZipDevicePath);
+          log(`Pre-bake: cache zip uploaded; triggering extraction...`, '', 'PRE');
+
+          const extractResp = await fetch(
+            '/api/extract-prebake-cache?path=' + encodeURIComponent(cacheZipDevicePath),
+            { method: 'POST' });
+          if (extractResp.ok || extractResp.status === 207) {
             let summary = null;
-            try { summary = await resp.json(); } catch (e) { /* non-fatal */ }
+            try { summary = await extractResp.json(); } catch (e) { /* non-fatal */ }
             if (summary) {
               if (summary.extracted === summary.total_entries) {
                 log(`Pre-bake cache extracted: ${summary.extracted}/${summary.total_entries} entries, ` +
@@ -3159,21 +3201,26 @@ async function uploadFile() {
                     `Book will open with partial cache.`, 'warning', 'PRE');
               }
             } else {
-              log(`Pre-bake cache uploaded (${formatBytes(cacheZipForUpload.size)})`, 'success', 'PRE');
+              log(`Pre-bake cache extracted (device returned no summary)`, 'success', 'PRE');
             }
-          } else if (resp.status === 404) {
-            // Endpoint not in this firmware; fall back to download.
+          } else if (extractResp.status === 404) {
+            // Extract endpoint not in this firmware. Cache zip is sitting on
+            // SD ready; user can either manually drop the locally-downloaded
+            // copy via the file picker on a newer firmware, or open the book
+            // and accept the slower cold open.
             triggerCacheZipDownload(cacheZipForUpload, cacheZipBookName);
-            log('Pre-bake cache endpoint not on device; downloaded zip instead -- drop it on the file picker to ingest.',
+            log('Pre-bake extract endpoint not on device firmware; downloaded zip locally as backup.',
                 'warning', 'PRE');
           } else {
-            log(`Pre-bake cache upload failed: HTTP ${resp.status} ${resp.statusText}`, 'warning', 'PRE');
+            const errText = await extractResp.text().catch(() => `HTTP ${extractResp.status}`);
+            log(`Pre-bake cache extraction failed: ${errText}`, 'warning', 'PRE');
           }
         } catch (e) {
-          console.error('cache zip upload failed', e);
-          // Network failure -- offer the download as a safety net.
+          console.error('cache zip upload/extract failed', e);
+          // Network failure during either upload or extract -- offer download
+          // so the artifact isn't lost.
           triggerCacheZipDownload(cacheZipForUpload, cacheZipBookName);
-          log(`Pre-bake cache upload errored (${e && e.message ? e.message : e}); downloaded zip instead.`,
+          log(`Pre-bake failed (${e && e.message ? e.message : e}); downloaded zip locally as backup.`,
               'warning', 'PRE');
         }
       }

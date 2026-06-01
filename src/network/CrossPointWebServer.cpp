@@ -202,6 +202,10 @@ void CrossPointWebServer::begin() {
   server->on("/api/upload-prebake-cache", HTTP_POST,
              [this] { handlePrebakeCacheUploadPost(prebakeCacheUpload); },
              [this] { handlePrebakeCacheUpload(prebakeCacheUpload); });
+  // Split-flow endpoint (preferred): the zip is already on SD via the
+  // standard /upload endpoint; we just trigger the extract step against
+  // ?path=. Avoids the multipart body that was crashing the older route.
+  server->on("/api/extract-prebake-cache", HTTP_POST, [this] { handleExtractPrebakeCache(); });
 
   // Create folder endpoint
   server->on("/mkdir", HTTP_POST, [this] { handleCreateFolder(); });
@@ -1030,9 +1034,9 @@ void CrossPointWebServer::handlePrebakeCacheUploadPost(PrebakeCacheUploadState& 
     // dict window. Better to extract N of M entries with a clear partial-
     // success report than to crash partway through.
     const uint32_t maxAllocBefore = ESP.getMaxAllocHeap();
-    if (maxAllocBefore < INFLATE_HEAP_MIN) {
+    if (maxAllocBefore < EXTRACT_HEAP_MIN) {
       LOG_ERR("WEB", "[PRE-EXT] BAIL on %s: maxAllocHeap=%u < %u",
-              entryName.c_str(), maxAllocBefore, INFLATE_HEAP_MIN);
+              entryName.c_str(), maxAllocBefore, EXTRACT_HEAP_MIN);
       if (firstFailedEntry.isEmpty()) {
         firstFailedEntry = entryName.c_str();
         firstFailureReason = "low_heap_before_inflate";
@@ -1132,6 +1136,168 @@ void CrossPointWebServer::handlePrebakeCacheUploadPost(PrebakeCacheUploadState& 
   const int status = (extracted == static_cast<int>(entries.size())) ? 200 : 207;
   server->send(status, "application/json", body);
   LOG_INF("WEB", "[PRE-EXT] %s: %d/%u entries, %u bytes total, final heap free=%u maxAlloc=%u",
+          (status == 200 ? "FULL" : "PARTIAL"), extracted,
+          static_cast<unsigned>(entries.size()), static_cast<unsigned>(totalBytes),
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+}
+
+// POST /api/extract-prebake-cache?path=/path/to/cache.zip
+// Reads the zip at the given path (already on SD via /upload), extracts every
+// entry to its zip-encoded path under SD root, deletes the source zip on
+// success. Same extraction logic + path safety as handlePrebakeCacheUploadPost
+// but driven by a query-string path instead of a streamed upload, which means
+// the heavy multipart-body path that has been crashing under WS/lwIP isn't on
+// this code's request path at all. The file got there via /upload, which is
+// what the file manager uses every day.
+void CrossPointWebServer::handleExtractPrebakeCache() const {
+  if (!server->hasArg("path")) {
+    server->send(400, "text/plain", "Missing required ?path= query parameter");
+    return;
+  }
+  const String pathArg = server->arg("path");
+  if (pathArg.isEmpty() || pathArg[0] != '/' || pathArg.indexOf("..") >= 0) {
+    server->send(400, "text/plain", "path must be absolute and free of '..' segments");
+    return;
+  }
+  if (!Storage.exists(pathArg.c_str())) {
+    server->send(404, "text/plain", "Zip not found at requested path");
+    return;
+  }
+
+  // Same extraction body as handlePrebakeCacheUploadPost, but reading from
+  // the path the caller specifies (which they uploaded via /upload). The
+  // structure is duplicated rather than DRY'd to keep this commit focused on
+  // routing; consolidation is a follow-up.
+  const std::string zipPathStd(pathArg.c_str());
+  ZipFile zip(zipPathStd);
+  if (!zip.loadAllFileStatSlims()) {
+    server->send(400, "text/plain", "Failed to parse zip at requested path");
+    return;
+  }
+  const auto& entries = zip.getEntries();
+  static constexpr uint32_t EXTRACT_HEAP_MIN = 12 * 1024;
+
+  int extracted = 0;
+  size_t totalBytes = 0;
+  String firstBadEntry;
+  String firstFailedEntry;
+  String firstFailureReason;
+
+  std::vector<const std::string*> sortedNames;
+  sortedNames.reserve(entries.size());
+  for (const auto& kv : entries) sortedNames.push_back(&kv.first);
+  auto priority = [](const std::string& n) -> int {
+    if (n.find("/book.bin") != std::string::npos ||
+        n.find("/css_rules.cache") != std::string::npos) return 0;
+    if (n.find("/sections/") != std::string::npos) return 1;
+    if (n.find("/thumb_") != std::string::npos) return 2;
+    return 3;
+  };
+  std::sort(sortedNames.begin(), sortedNames.end(),
+            [&](const std::string* a, const std::string* b) {
+              const int pa = priority(*a), pb = priority(*b);
+              if (pa != pb) return pa < pb;
+              return *a < *b;
+            });
+
+  LOG_INF("WEB", "[PRE-EXT2] extract %s: %u entries, heap free=%u maxAlloc=%u",
+          pathArg.c_str(), static_cast<unsigned>(sortedNames.size()),
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
+  for (const std::string* pName : sortedNames) {
+    const auto& kv = *entries.find(*pName);
+    esp_task_wdt_reset();
+    const std::string& entryName = kv.first;
+    if (entryName.empty() || entryName.back() == '/') continue;
+    if (entryName.rfind(".crosspoint/", 0) != 0 ||
+        entryName.find("..") != std::string::npos ||
+        entryName[0] == '/') {
+      firstBadEntry = entryName.c_str();
+      break;
+    }
+    const uint32_t maxAllocBefore = ESP.getMaxAllocHeap();
+    if (maxAllocBefore < EXTRACT_HEAP_MIN) {
+      LOG_ERR("WEB", "[PRE-EXT2] BAIL on %s: maxAllocHeap=%u < %u",
+              entryName.c_str(), maxAllocBefore, EXTRACT_HEAP_MIN);
+      if (firstFailedEntry.isEmpty()) {
+        firstFailedEntry = entryName.c_str();
+        firstFailureReason = "low_heap_before_inflate";
+      }
+      break;
+    }
+    String destPath = "/";
+    destPath += entryName.c_str();
+    {
+      int slash = destPath.indexOf('/', 1);
+      while (slash > 0) {
+        const String parent = destPath.substring(0, slash);
+        Storage.mkdir(parent.c_str());
+        slash = destPath.indexOf('/', slash + 1);
+      }
+    }
+    FsFile outFile;
+    if (Storage.exists(destPath.c_str())) Storage.remove(destPath.c_str());
+    if (!Storage.openFileForWrite("WEB", destPath, outFile)) {
+      LOG_ERR("WEB", "[PRE-EXT2] open %s failed", destPath.c_str());
+      if (firstFailedEntry.isEmpty()) {
+        firstFailedEntry = entryName.c_str();
+        firstFailureReason = "open_for_write_failed";
+      }
+      continue;
+    }
+    if (!zip.readFileToStream(entryName.c_str(), outFile, 4096)) {
+      LOG_ERR("WEB", "[PRE-EXT2] inflate %s failed", entryName.c_str());
+      outFile.close();
+      Storage.remove(destPath.c_str());
+      if (firstFailedEntry.isEmpty()) {
+        firstFailedEntry = entryName.c_str();
+        firstFailureReason = "inflate_failed";
+      }
+      continue;
+    }
+    const uint32_t sz = outFile.size();
+    outFile.close();
+    extracted++;
+    totalBytes += sz;
+    LOG_INF("WEB", "[PRE-EXT2] %d/%u: %s (%u B) heap free=%u maxAlloc=%u",
+            extracted, static_cast<unsigned>(entries.size()), entryName.c_str(),
+            static_cast<unsigned>(sz), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    delay(1);
+  }
+
+  // Remove the source zip after extraction completes (full or partial).
+  // Leaving multi-MB zips lying around in /.crosspoint/ wastes SD and
+  // confuses future debugging.
+  Storage.remove(pathArg.c_str());
+
+  if (!firstBadEntry.isEmpty()) {
+    String body = "Refused cache zip: unsafe entry '";
+    body += firstBadEntry;
+    body += "' (must be under .crosspoint/ and free of '..' segments)";
+    server->send(400, "text/plain", body);
+    return;
+  }
+  String body = "{\"extracted\":";
+  body += String(extracted);
+  body += ",\"bytes\":";
+  body += String(static_cast<uint32_t>(totalBytes));
+  body += ",\"total_entries\":";
+  body += String(static_cast<uint32_t>(entries.size()));
+  body += ",\"heap_free\":";
+  body += String(static_cast<uint32_t>(ESP.getFreeHeap()));
+  body += ",\"heap_max_alloc\":";
+  body += String(static_cast<uint32_t>(ESP.getMaxAllocHeap()));
+  if (!firstFailedEntry.isEmpty()) {
+    body += ",\"first_failed_entry\":\"";
+    body += firstFailedEntry;
+    body += "\",\"first_failure_reason\":\"";
+    body += firstFailureReason;
+    body += "\"";
+  }
+  body += "}";
+  const int status = (extracted == static_cast<int>(entries.size())) ? 200 : 207;
+  server->send(status, "application/json", body);
+  LOG_INF("WEB", "[PRE-EXT2] %s: %d/%u entries, %u bytes total, final heap free=%u maxAlloc=%u",
           (status == 200 ? "FULL" : "PARTIAL"), extracted,
           static_cast<unsigned>(entries.size()), static_cast<unsigned>(totalBytes),
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());

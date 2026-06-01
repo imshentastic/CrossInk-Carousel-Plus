@@ -140,8 +140,19 @@ class CrossPointWebServer {
   // extracts each entry to its zip-encoded path under SD root, then deletes
   // the temp. Result: the device has a populated cache before the user
   // opens the book for the first time -> sub-second cold open.
+  //
+  // DEPRECATED in favour of the split flow below. Multipart bodies of 2+ MB
+  // were aborting under WebSocket / lwIP assertions; the split flow uploads
+  // via the same /upload endpoint the file manager has used reliably for
+  // months, then triggers extraction via /api/extract-prebake-cache.
   void handlePrebakeCacheUpload(PrebakeCacheUploadState& state);
   void handlePrebakeCacheUploadPost(PrebakeCacheUploadState& state) const;
+  // POST /api/extract-prebake-cache?path=/path/to/cache.zip
+  // Reads the zip at the given path (already on SD from a prior /upload),
+  // extracts each entry under SD root, and deletes the source zip. Same
+  // path-safety and priority-order rules as handlePrebakeCacheUploadPost;
+  // they share most of the implementation. No request body needed.
+  void handleExtractPrebakeCache() const;
   void handleNotFound() const;
   void handleStatus() const;
   void handleFileList() const;
