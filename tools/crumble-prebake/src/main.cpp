@@ -177,13 +177,76 @@ bool fetchDeviceSettings(const std::string& deviceUrl, SectionSettings& out) {
   return true;
 }
 #else
-// WASM mode: render-info is delivered as a JSON string from JS. This stub
-// keeps callsite arity intact for the upcoming 28.3 refactor that will
-// replace the call entirely. For now nothing in the WASM build calls it.
+// WASM mode: render-info is delivered via --settings-file (loaded below
+// by loadSettingsFromFile). fetchDeviceSettings stays around as a stub
+// to keep CLI-shared parseArgs validation simple but is never called.
 bool fetchDeviceSettings(const std::string& /*deviceUrl*/, SectionSettings& /*out*/) {
   return false;
 }
 #endif  // CRUMBLE_PREBAKE_WASM
+
+// Load render-info JSON from a local file and populate sectionSettings.
+// Same schema as /api/reader-render-info (fitVersion >= 2). Returns true
+// on success. Used by the --settings-file CLI flag and -- by virtue of
+// MEMFS -- by the WASM build's optimizer.js integration: JS writes the
+// fetched JSON into MEMFS at a known path, then passes that path through
+// argv to main(). No HTTP / no libcurl, so this path is identical on the
+// CLI build and the WASM build, which keeps test coverage shared.
+bool loadSettingsFromFile(const std::string& path, SectionSettings& out) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    LOG_ERR("CFG", "could not open settings file: %s", path.c_str());
+    return false;
+  }
+  std::string body((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  in.close();
+  if (body.empty()) {
+    LOG_ERR("CFG", "settings file %s is empty", path.c_str());
+    return false;
+  }
+
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    LOG_ERR("CFG", "settings file JSON parse failed: %s", err.c_str());
+    return false;
+  }
+  const int fitVersion = doc["fitVersion"] | 1;
+  if (fitVersion < 2) {
+    LOG_ERR("CFG",
+            "settings file reports fitVersion=%d; need >=2 for prebake. Regenerate from a "
+            "firmware build that includes the v2 render-info fields.",
+            fitVersion);
+    return false;
+  }
+
+  if (doc["device"].is<const char*>()) out.device = doc["device"].as<const char*>();
+  if (doc["fontId"].is<int>()) out.fontId = doc["fontId"].as<int>();
+  if (doc["viewportWidth"].is<int>()) out.viewportWidth = doc["viewportWidth"].as<int>();
+  if (doc["viewportHeight"].is<int>()) out.viewportHeight = doc["viewportHeight"].as<int>();
+  if (doc["lineCompression"].is<float>()) out.lineCompression = doc["lineCompression"].as<float>();
+  if (doc["extraParagraphSpacing"].is<int>())
+    out.extraParagraphSpacing = doc["extraParagraphSpacing"].as<int>() != 0;
+  if (doc["forceParagraphIndents"].is<int>())
+    out.forceParagraphIndents = doc["forceParagraphIndents"].as<int>() != 0;
+  if (doc["paragraphAlignment"].is<int>()) out.paragraphAlignment = doc["paragraphAlignment"].as<int>();
+  if (doc["hyphenationEnabled"].is<int>()) out.hyphenationEnabled = doc["hyphenationEnabled"].as<int>() != 0;
+  if (doc["embeddedStyle"].is<int>()) out.embeddedStyle = doc["embeddedStyle"].as<int>() != 0;
+  if (doc["imageRendering"].is<int>()) out.imageRendering = doc["imageRendering"].as<int>();
+  if (doc["bionicReadingEnabled"].is<int>())
+    out.bionicReadingEnabled = doc["bionicReadingEnabled"].as<int>() != 0;
+  if (doc["guideReadingEnabled"].is<int>())
+    out.guideReadingEnabled = doc["guideReadingEnabled"].as<int>() != 0;
+
+  LOG_INF("CFG",
+          "device=%s settings (from file): fontId=%d viewport=%ux%u lineCompression=%.3f "
+          "extraPS=%d fpI=%d pA=%u hyph=%d embed=%d imgR=%u bionic=%d guide=%d",
+          out.device.empty() ? "(unknown)" : out.device.c_str(), out.fontId, out.viewportWidth, out.viewportHeight,
+          static_cast<double>(out.lineCompression), out.extraParagraphSpacing, out.forceParagraphIndents,
+          out.paragraphAlignment, out.hyphenationEnabled, out.embeddedStyle, out.imageRendering,
+          out.bionicReadingEnabled, out.guideReadingEnabled);
+  return true;
+}
 
 void usage(const char* argv0) {
   std::fprintf(stderr,
@@ -215,6 +278,16 @@ void usage(const char* argv0) {
                "                         processing on systems without device network access;\n"
                "                         the resulting cache still saves ~3s of cold-open time\n"
                "                         from the OPF + thumb-gen skip.\n"
+               "  --settings-file <path> Load render-info from a JSON file on disk instead\n"
+               "                         of fetching it from a live device. The file must\n"
+               "                         contain the same JSON schema as /api/reader-render-info\n"
+               "                         (fitVersion >= 2). Use this for batch processing,\n"
+               "                         CI, or any flow where the device URL isn't reachable\n"
+               "                         but the user's render-info is already known. Mutually\n"
+               "                         exclusive with --device-url; one of the two is required\n"
+               "                         when generating sections. This is also the entry point\n"
+               "                         the WASM build uses: optimizer.js writes the settings\n"
+               "                         JSON into MEMFS and points at it via this flag.\n"
                "  --check                Skip books whose existing book.bin is fresh against\n"
                "                         the input EPUB's mtime.\n"
                "  --verbose              Per-step timing on stderr.\n"
@@ -225,14 +298,18 @@ void usage(const char* argv0) {
 struct Options {
   std::string outputDir;
   std::string devicePathOverride;
-  std::string deviceUrl;  // base URL like "http://192.168.5.158"; query
-                          // /api/reader-render-info for live settings.
-                          // Required unless skipSections is set.
+  std::string deviceUrl;     // base URL like "http://192.168.5.158"; query
+                             // /api/reader-render-info for live settings.
+                             // Required unless skipSections or settingsFile is set.
+  std::string settingsFile;  // local JSON file with the same schema as
+                             // /api/reader-render-info. Alternative to
+                             // --device-url for batch / CI / WASM flows
+                             // where the device URL isn't reachable.
   std::vector<std::string> epubs;
   bool check = false;
   bool verbose = false;
   bool skipSections = false;  // skip section gen; book.bin + thumbs only.
-                              // Removes the --device-url requirement.
+                              // Removes the settings-source requirement.
 };
 
 bool parseArgs(int argc, char** argv, Options& out) {
@@ -251,6 +328,8 @@ bool parseArgs(int argc, char** argv, Options& out) {
       // "http://x/" without the joined URL ending up as "/api/.." vs
       // "//api/..".
       if (!out.deviceUrl.empty() && out.deviceUrl.back() == '/') out.deviceUrl.pop_back();
+    } else if (a == "--settings-file" && i + 1 < argc) {
+      out.settingsFile = argv[++i];
     } else if (a == "--skip-sections") {
       out.skipSections = true;
     } else if (a == "--check") {
@@ -280,10 +359,18 @@ bool parseArgs(int argc, char** argv, Options& out) {
                  out.devicePathOverride.c_str());
     return false;
   }
-  if (out.deviceUrl.empty() && !out.skipSections) {
+  if (!out.deviceUrl.empty() && !out.settingsFile.empty()) {
     std::fprintf(stderr,
-                 "Error: --device-url is required for section generation. To prebake without\n"
-                 "       a device available, pass --skip-sections (book.bin + thumbs only).\n");
+                 "Error: --device-url and --settings-file are mutually exclusive. Pick one\n"
+                 "       source for the render-info -- live device fetch OR local JSON file.\n");
+    return false;
+  }
+  if (out.deviceUrl.empty() && out.settingsFile.empty() && !out.skipSections) {
+    std::fprintf(stderr,
+                 "Error: one of --device-url, --settings-file, or --skip-sections is required.\n"
+                 "       --device-url <url>     fetch live render-info from the device\n"
+                 "       --settings-file <p>    load render-info JSON from disk (batch / WASM)\n"
+                 "       --skip-sections        emit book.bin + thumbs only, no sections/\n");
     return false;
   }
   return true;
@@ -795,24 +882,35 @@ int main(int argc, char** argv) {
   renderer.insertFont(LEXENDDECA_14_FONT_ID, lexenddeca14Family);
   renderer.insertFont(BITTER_12_FONT_ID, bitter12Family);
 
-  // Resolve section settings. If section gen is enabled, fetch from the
-  // device's render-info endpoint -- arg parsing already enforced that
-  // --device-url is set in that case. Without sections (book.bin + thumbs
-  // only mode), we still construct a SectionSettings but it's unused.
+  // Resolve section settings. Section gen needs the same 12-field header
+  // payload the device computes; we can get it from a live device fetch
+  // (--device-url) or a local JSON file (--settings-file). Arg parsing has
+  // already enforced exactly one of those is set when sections are on.
+  // Without sections (book.bin + thumbs only), the settings struct is
+  // constructed but unused.
   SectionSettings sectionSettings;
   if (!opts.skipSections) {
-    if (!fetchDeviceSettings(opts.deviceUrl, sectionSettings)) {
-      LOG_ERR("CLI", "Could not fetch settings from %s -- aborting.", opts.deviceUrl.c_str());
-      return 3;
+    bool settingsOk = false;
+    if (!opts.settingsFile.empty()) {
+      settingsOk = loadSettingsFromFile(opts.settingsFile, sectionSettings);
+      if (!settingsOk) {
+        LOG_ERR("CLI", "Could not load settings from %s -- aborting.", opts.settingsFile.c_str());
+        return 3;
+      }
+    } else {
+      settingsOk = fetchDeviceSettings(opts.deviceUrl, sectionSettings);
+      if (!settingsOk) {
+        LOG_ERR("CLI", "Could not fetch settings from %s -- aborting.", opts.deviceUrl.c_str());
+        return 3;
+      }
     }
-    // Sanity-check the device target we just detected. Today only X4 and X3
-    // ship; new SKUs will need a viewport-defaults entry here before they
-    // can prebake reliably. If a new SKU shows up, warn but proceed --
-    // the live settings from /api/reader-render-info are still used.
+    // Sanity-check the device target. Today only X4 and X3 ship; a new
+    // SKU should warn but proceed using the reported viewport so we
+    // don't fail closed on hardware we haven't validated against.
     if (sectionSettings.device != "X4" && sectionSettings.device != "X3") {
       LOG_INF("CLI",
-              "Unrecognized device target '%s' from /api/reader-render-info. Continuing with "
-              "the reported viewport (%dx%d), but verify behaviour against the actual device.",
+              "Unrecognized device target '%s' from render-info. Continuing with the reported "
+              "viewport (%dx%d), but verify behaviour against the actual device.",
               sectionSettings.device.c_str(), sectionSettings.viewportWidth, sectionSettings.viewportHeight);
     } else {
       LOG_INF("CLI", "device target detected: %s", sectionSettings.device.c_str());
