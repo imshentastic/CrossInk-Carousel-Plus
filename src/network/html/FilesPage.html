@@ -3097,10 +3097,29 @@ async function uploadFile() {
         }
       }
 
-      if (useWebSocket) {
-        await uploadFileWebSocket(file, onProgress, null, null);
-      } else {
-        await uploadFileHTTP(file, onProgress, null, null);
+      // EPUB upload: try WebSocket first if enabled; if it fails with a
+      // connection-level error (the chip-tracked intermittent), retry over
+      // HTTP inline. This nested try-catch is what lets the cache-zip
+      // upload below still run after a WebSocket hiccup -- the previous
+      // structure had the WS error propagate to the outer catch, which
+      // skipped the cache upload entirely.
+      try {
+        if (useWebSocket) {
+          await uploadFileWebSocket(file, onProgress, null, null);
+        } else {
+          await uploadFileHTTP(file, onProgress, null, null);
+        }
+      } catch (wsErr) {
+        if (operationCancelled) throw wsErr;
+        if (useWebSocket && wsErr && wsErr.message &&
+            (wsErr.message.includes('WebSocket') || wsErr.message.includes('closed'))) {
+          console.log('WebSocket upload failed; retrying via HTTP', wsErr);
+          log(`WebSocket upload hiccupped (${wsErr.message}); retrying over HTTP...`, 'warning', 'INFO');
+          useWebSocket = false;
+          await uploadFileHTTP(file, onProgress, null, null);
+        } else {
+          throw wsErr;
+        }
       }
 
       // CrumBLE: ship the prebake cache zip right after the EPUB lands. The
