@@ -31,7 +31,11 @@
 #include <builtinFonts/lexenddeca_14_bold.h>
 #include <builtinFonts/lexenddeca_14_italic.h>
 #include <builtinFonts/lexenddeca_14_bolditalic.h>
-#include "fontIds.h"  // LEXENDDECA_14_FONT_ID (matches src/fontIds.h)
+#include <builtinFonts/bitter_12_regular.h>
+#include <builtinFonts/bitter_12_bold.h>
+#include <builtinFonts/bitter_12_italic.h>
+#include <builtinFonts/bitter_12_bolditalic.h>
+#include "fontIds.h"  // LEXENDDECA_14_FONT_ID / BITTER_12_FONT_ID
 
 #include <ArduinoJson.h>
 #include <curl/curl.h>
@@ -39,6 +43,8 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -501,23 +507,46 @@ bool prebakeCoverThumb(const std::string& epubPath, const std::string& cacheDir,
 //
 // Returns the number of spine entries that failed to emit (0 = clean).
 int prebakeSections(const std::string& epubPath, const std::string& realCacheDir,
-                    const std::string& cacheDirParent, GfxRenderer& renderer,
+                    const std::string& /*cacheDirParent*/, GfxRenderer& renderer,
                     const SectionSettings& s) {
-  // Epub computes cachePath as cacheDir + "/epub_" + fnvHash(filepath),
-  // where filepath is the HOST EPUB path -- but our Phase 1 cache lives
-  // under "/.crosspoint/epub_<deviceHash>/" with the DEVICE path hash.
-  // To make Epub::load find the book.bin we already wrote, we shadow-
-  // copy book.bin to where Epub will look (cacheDirParent +
-  // "/epub_<hostPathHash>/"), let load run, then sections land in that
-  // shadow tree. After section gen, we'll copy sections/ back to the
-  // real device-hash location so the SD-card-bound output has the
-  // device-expected layout.
+  // Epub computes cachePath as cacheDir + "/epub_" + fnvHash(filepath).
+  // Our Phase 1 output lives at realCacheDir = "<output>/.crosspoint/epub_<deviceHash>".
+  // We need section files' embedded paths (img_*.jpg, img_*.pxc) to point at
+  // realCacheDir exactly so the device can find them at the corresponding
+  // location on SD. Since we can't change Epub's internal hashing, we
+  // arrange for the shadow location to have the SAME LENGTH as realCacheDir
+  // and do a byte-level substitute in the emitted section files afterward.
+  // Length-preserving substitution keeps file sizes and offset tables
+  // intact, so we don't have to rewrite Page::serialize.
   //
-  // This is a workaround. The cleaner answer is to extend Epub with an
-  // explicit-cachePath ctor that decouples ZIP-read filepath from
-  // cache-dir computation. Recorded for 2C.4 chip.
-  const std::string shadowCacheDir = cacheDirParent + "/epub_" +
-                                     std::to_string(ZipFile::fnvHash64(epubPath.c_str(), epubPath.size()));
+  // shadowCacheDir = "<shadowParent>/epub_<hostHash>" where shadowParent's
+  // length is chosen so the full shadow path == realCacheDir length. If
+  // the hashes differ in decimal digit count enough that no valid
+  // shadowParent fits, we fall back to no substitute (old behavior --
+  // device runs runtime image decode for chapters that have images).
+  const std::string hostHashStr =
+      std::to_string(ZipFile::fnvHash64(epubPath.c_str(), epubPath.size()));
+  const size_t hostSuffixLen = 6 + hostHashStr.size();  // "/epub_" + hash
+  const size_t targetTotalLen = realCacheDir.size();
+  std::string shadowParent;
+  bool pathSubstituteEnabled = false;
+  if (targetTotalLen > hostSuffixLen + 4) {  // need at least "/tmp/" parent prefix
+    const size_t parentLen = targetTotalLen - hostSuffixLen;
+    // Compose "/tmp/" + (parentLen-5) padding chars. macOS allows arbitrary
+    // ASCII; we use 'p' so the dir name is obviously "prebake padding".
+    shadowParent = "/tmp/" + std::string(parentLen - 5, 'p');
+    if (shadowParent.size() == parentLen) {
+      pathSubstituteEnabled = true;
+    }
+  }
+  if (!pathSubstituteEnabled) {
+    LOG_INF("PRE",
+            "hash length mismatch prevents path substitute; sections will embed shadow paths and "
+            "the device will runtime-decode chapter images instead of using bundled .pxc");
+    // Fall back to legacy shadow location
+    shadowParent = "/tmp/inkprebake_fallback";
+  }
+  const std::string shadowCacheDir = shadowParent + "/epub_" + hostHashStr;
 
   std::error_code ec;
   fs::create_directories(shadowCacheDir, ec);
@@ -532,10 +561,14 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
     return -1;
   }
 
-  // Construct an Epub instance whose internal cachePath now resolves to
-  // the shadow location (cacheDirParent + "/epub_<hostHash>"). load()
-  // hits the shadow's book.bin and short-circuits the OPF parse.
-  auto epub = std::make_shared<Epub>(epubPath, cacheDirParent);
+  if (pathSubstituteEnabled) {
+    LOG_INF("PRE", "path substitute enabled: shadow=%s real=%s (len=%zu)",
+            shadowCacheDir.c_str(), realCacheDir.c_str(), shadowCacheDir.size());
+  }
+
+  // Construct an Epub instance whose internal cachePath resolves to the
+  // shadow location.
+  auto epub = std::make_shared<Epub>(epubPath, shadowParent);
   if (!epub->load(/*buildIfMissing=*/false, /*skipLoadingCss=*/false)) {
     LOG_ERR("PRE", "Epub::load failed for %s (shadow=%s)", epubPath.c_str(), shadowCacheDir.c_str());
     return -1;
@@ -566,11 +599,11 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
     }
   }
 
-  // Sections were written into the shadow dir (epub_<hostHash>/sections/).
-  // Copy them back to the real device-hash location so the SD-bound output
-  // looks like what the device generates. We could rename instead of copy
-  // since the shadow dir is throwaway, but copying keeps Epub::load happy
-  // if the same binary gets invoked twice on the same EPUB (idempotent).
+  // Copy section files back to real cache dir. If path substitution is
+  // enabled, rewrite each section file's embedded shadow path -> real
+  // device path on the way over. Length-preserving (we matched
+  // shadowCacheDir's length to realCacheDir's), so file sizes and offset
+  // tables stay intact.
   std::error_code ec2;
   const std::string realSectionsDir = realCacheDir + "/sections";
   fs::create_directories(realSectionsDir, ec2);
@@ -578,13 +611,58 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
     LOG_ERR("PRE", "could not create real sections dir %s: %s", realSectionsDir.c_str(), ec2.message().c_str());
     return failures;
   }
-  fs::copy(shadowCacheDir + "/sections", realSectionsDir,
-           fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec2);
-  if (ec2) {
-    LOG_ERR("PRE", "could not copy sections back to %s: %s", realSectionsDir.c_str(), ec2.message().c_str());
-  } else {
-    LOG_INF("PRE", "copied %d section files to real cache dir", spineCount);
+
+  int copiedSections = 0;
+  for (int spineIdx = 0; spineIdx < spineCount; ++spineIdx) {
+    const std::string srcPath = shadowCacheDir + "/sections/" + std::to_string(spineIdx) + ".bin";
+    const std::string dstPath = realSectionsDir + "/" + std::to_string(spineIdx) + ".bin";
+    if (!fs::exists(srcPath)) continue;
+    // Read full file, do prefix substitute, write to real location.
+    std::ifstream in(srcPath, std::ios::binary);
+    if (!in) continue;
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    if (pathSubstituteEnabled) {
+      // In-place substring replace -- shadow and real prefixes are the same
+      // length, so we can walk the buffer with std::string::find.
+      size_t pos = 0;
+      while ((pos = content.find(shadowCacheDir, pos)) != std::string::npos) {
+        std::memcpy(content.data() + pos, realCacheDir.data(), realCacheDir.size());
+        pos += realCacheDir.size();
+      }
+    }
+    std::ofstream out(dstPath, std::ios::binary | std::ios::trunc);
+    if (!out) continue;
+    out.write(content.data(), content.size());
+    out.close();
+    ++copiedSections;
   }
+  LOG_INF("PRE", "copied %d section files to real cache dir%s", copiedSections,
+          pathSubstituteEnabled ? " (with path substitute)" : "");
+
+  // Also carry over the image artifacts that ChapterHtmlSlimParser extracted
+  // into the shadow dir during section build: img_<spine>_<n>.jpg (or .png)
+  // plus the optimizer-bundled .pxc files that the parser carried over from
+  // the EPUB zip. Plus css_rules.cache if present. Without these the device
+  // falls back to runtime image decode -- ~5-7 s per full-size image on
+  // first display, which is exactly what the optimizer's .pxc baking exists
+  // to avoid.
+  int copiedImages = 0;
+  int copiedPxc = 0;
+  for (const auto& entry : fs::directory_iterator(shadowCacheDir, ec2)) {
+    if (!entry.is_regular_file()) continue;
+    const std::string name = entry.path().filename().string();
+    if (name.rfind("img_", 0) == 0 || name == "css_rules.cache") {
+      fs::copy_file(entry.path(), realCacheDir + "/" + name,
+                    fs::copy_options::overwrite_existing, ec2);
+      if (!ec2) {
+        if (name.size() > 4 && name.substr(name.size() - 4) == ".pxc") ++copiedPxc;
+        else ++copiedImages;
+      }
+      ec2.clear();
+    }
+  }
+  LOG_INF("PRE", "copied %d image files + %d pxc caches + css to real cache dir", copiedImages, copiedPxc);
   return failures;
 }
 
@@ -638,9 +716,16 @@ int main(int argc, char** argv) {
   EpdFont lexenddeca14BoldItalic(&lexenddeca_14_bolditalic);
   EpdFontFamily lexenddeca14Family(&lexenddeca14Regular, &lexenddeca14Bold,
                                    &lexenddeca14Italic, &lexenddeca14BoldItalic);
+  EpdFont bitter12Regular(&bitter_12_regular);
+  EpdFont bitter12Bold(&bitter_12_bold);
+  EpdFont bitter12Italic(&bitter_12_italic);
+  EpdFont bitter12BoldItalic(&bitter_12_bolditalic);
+  EpdFontFamily bitter12Family(&bitter12Regular, &bitter12Bold,
+                               &bitter12Italic, &bitter12BoldItalic);
 
   GfxRenderer renderer;
   renderer.insertFont(LEXENDDECA_14_FONT_ID, lexenddeca14Family);
+  renderer.insertFont(BITTER_12_FONT_ID, bitter12Family);
 
   // Resolve section settings: GET /api/reader-render-info if the user
   // passed --device-url, otherwise factory defaults (which won't match
