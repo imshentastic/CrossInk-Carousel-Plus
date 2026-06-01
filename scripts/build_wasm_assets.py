@@ -36,7 +36,12 @@ import gzip
 import os
 import sys
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# PIO's SCons pre-script runner exec()s this file without setting __file__,
+# so we can't use it to locate the repo root. PIO chdirs to the project
+# root before invoking pre-scripts, and the same is true when this script
+# is run directly (callers cd into the repo first), so cwd is the
+# reliable anchor.
+REPO_ROOT = os.getcwd()
 WASM_BUILD_DIR = os.path.join(REPO_ROOT, "tools", "crumble-prebake", "build-wasm")
 OUT_DIR = os.path.join(REPO_ROOT, "src", "network", "html", "wasm")
 

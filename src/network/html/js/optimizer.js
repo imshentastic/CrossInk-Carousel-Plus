@@ -31,19 +31,18 @@
 
     // Inject the prebake module's JS glue exactly once. emscripten emits a
     // factory function on `window.CrumblePrebake`. Returns the factory.
+    // No pre-flight HEAD probe -- ESP32's Arduino WebServer registers HEAD
+    // and GET on separate route tables, so a HEAD against an HTTP_GET-only
+    // route returns 404 even when the GET works. We let the <script> tag's
+    // own onerror handle the absent-asset case (which fires for 404s),
+    // which collapses the loader into a single round trip.
     async function loadFactory() {
       if (moduleFactory) return moduleFactory;
-      // Probe: was the wasm baked into this firmware? If not, /js/crumble-prebake.js
-      // 404s and we throw so the caller can fall back to the legacy bake-pxc flow.
-      const probe = await fetch('/js/crumble-prebake.js', { method: 'HEAD' });
-      if (!probe.ok) {
-        throw new Error('prebake module not available in this firmware (404)');
-      }
       await new Promise((resolve, reject) => {
         const s = document.createElement('script');
         s.src = '/js/crumble-prebake.js';
         s.onload = resolve;
-        s.onerror = () => reject(new Error('failed to load /js/crumble-prebake.js'));
+        s.onerror = () => reject(new Error('prebake module not available in this firmware (script load failed)'));
         document.head.appendChild(s);
       });
       if (typeof window.CrumblePrebake !== 'function') {
