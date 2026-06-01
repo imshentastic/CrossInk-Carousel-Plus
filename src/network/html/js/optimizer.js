@@ -2077,18 +2077,26 @@ async function convertEpubFile(file, progressCallback) {
     log('Bluetooth image cache: skipped (superseded by Pre-bake reader cache; .pxc files ship in the cache zip instead of the EPUB)',
         '', 'INFO');
   }
+  // Render-info is needed by EITHER feature: bakePxc uses it to compute
+  // fitted dimensions for the .pxc raster; prebake uses it to populate
+  // the section file headers (viewport, fontId, line compression, etc.)
+  // so the device's load-time fingerprint check passes. Fetch it whenever
+  // either toggle is on; let each downstream feature check the populated
+  // renderInfo against its own needs.
   let renderInfo = null;
-  if (bakePxcEnabled) {
+  const needsRenderInfo = bakePxcEnabled || prebakeReaderCacheEnabled;
+  if (needsRenderInfo) {
     try {
       const resp = await fetch('/api/reader-render-info');
       if (resp.ok) renderInfo = await resp.json();
     } catch (e) { renderInfo = null; }
     if (!renderInfo || !(renderInfo.viewportWidth > 0) || !(renderInfo.viewportHeight > 0)) {
       renderInfo = null;
-    } else {
+    } else if (bakePxcEnabled) {
       log(`Bluetooth image cache: baking .pxc for ${renderInfo.device} viewport ${renderInfo.viewportWidth}x${renderInfo.viewportHeight}`, '', 'INFO');
     }
-  } else {
+  }
+  if (!bakePxcEnabled && !prebakeReaderCacheEnabled) {
     log('Bluetooth image cache: skipped (user opted out)', '', 'INFO');
   }
   // CrumBLE: track how many .pxc files we actually wrote. We only emit the
