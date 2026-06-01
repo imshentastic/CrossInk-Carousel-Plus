@@ -38,7 +38,9 @@
 #include "fontIds.h"  // LEXENDDECA_14_FONT_ID / BITTER_12_FONT_ID
 
 #include <ArduinoJson.h>
+#ifndef CRUMBLE_PREBAKE_WASM
 #include <curl/curl.h>
+#endif
 
 #include <cstdio>
 #include <cstring>
@@ -84,6 +86,7 @@ struct SectionSettings {
   std::string device;
 };
 
+#ifndef CRUMBLE_PREBAKE_WASM
 // libcurl write callback: appends incoming bytes to a std::string.
 size_t curlWriteToString(void* ptr, size_t size, size_t nmemb, void* userdata) {
   auto* str = static_cast<std::string*>(userdata);
@@ -97,6 +100,9 @@ size_t curlWriteToString(void* ptr, size_t size, size_t nmemb, void* userdata) {
 // chip-tracked bug; we don't want prebake to wedge waiting for a stalled
 // /api/settings response). On failure, sectionSettings stays at the
 // caller-provided defaults.
+//
+// WASM mode bypasses this entirely: JS calls fetch() against the device
+// directly and passes the parsed JSON into the WASM core (see step 28.3).
 bool fetchDeviceSettings(const std::string& deviceUrl, SectionSettings& out) {
   CURL* curl = curl_easy_init();
   if (!curl) {
@@ -170,6 +176,14 @@ bool fetchDeviceSettings(const std::string& deviceUrl, SectionSettings& out) {
           out.bionicReadingEnabled, out.guideReadingEnabled);
   return true;
 }
+#else
+// WASM mode: render-info is delivered as a JSON string from JS. This stub
+// keeps callsite arity intact for the upcoming 28.3 refactor that will
+// replace the call entirely. For now nothing in the WASM build calls it.
+bool fetchDeviceSettings(const std::string& /*deviceUrl*/, SectionSettings& /*out*/) {
+  return false;
+}
+#endif  // CRUMBLE_PREBAKE_WASM
 
 void usage(const char* argv0) {
   std::fprintf(stderr,
