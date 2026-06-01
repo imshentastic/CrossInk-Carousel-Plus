@@ -10,6 +10,164 @@
 // functions below reference them through the shared global scope.
 
   // ============================================================================
+  // CrumBLE reader-cache prebake runner (WASM)
+  // ============================================================================
+  // Loads crumble-prebake.{js,wasm} on demand and exposes a single
+  // runPrebake(epubBlob, renderInfo) -> { cacheZip, deviceCacheDir, log }
+  // call. The C++ prebake CLI is cross-compiled to WebAssembly so the same
+  // pipeline that runs as a developer command line runs here in the browser:
+  // book.bin emission, cover thumbs, section files. The output is a zip
+  // matching the device's cache-dir layout, which the user then uploads via
+  // file-transfer; the device-side handler (28.6) unpacks it into
+  // /.crosspoint/epub_<hash>/ so the first cold open lands in chapter 1
+  // without an on-device build cycle.
+  //
+  // We lazy-load to keep the optimizer's initial download light (1.6 MB
+  // wasm + ~170 KB JS glue, gzipped to ~900 KB total). The first use pays
+  // the load cost; subsequent uses reuse the cached module.
+  const crumblePrebakeRunner = (function() {
+    let moduleFactory = null;       // Top-level CrumblePrebake factory (set by /js/crumble-prebake.js).
+    let modulePromise = null;       // Cached factory invocation; Module instance reused across runs.
+
+    // Inject the prebake module's JS glue exactly once. emscripten emits a
+    // factory function on `window.CrumblePrebake`. Returns the factory.
+    async function loadFactory() {
+      if (moduleFactory) return moduleFactory;
+      // Probe: was the wasm baked into this firmware? If not, /js/crumble-prebake.js
+      // 404s and we throw so the caller can fall back to the legacy bake-pxc flow.
+      const probe = await fetch('/js/crumble-prebake.js', { method: 'HEAD' });
+      if (!probe.ok) {
+        throw new Error('prebake module not available in this firmware (404)');
+      }
+      await new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = '/js/crumble-prebake.js';
+        s.onload = resolve;
+        s.onerror = () => reject(new Error('failed to load /js/crumble-prebake.js'));
+        document.head.appendChild(s);
+      });
+      if (typeof window.CrumblePrebake !== 'function') {
+        throw new Error('CrumblePrebake factory missing after script load');
+      }
+      moduleFactory = window.CrumblePrebake;
+      return moduleFactory;
+    }
+
+    // Instantiate (or reuse) the WASM module. Tells emscripten where to
+    // fetch the wasm binary from -- the device serves it at /wasm/
+    // crumble-prebake.wasm with Content-Encoding: gzip already applied,
+    // so WebAssembly.instantiateStreaming() decompresses on the fly.
+    async function getModule() {
+      if (modulePromise) return modulePromise;
+      const factory = await loadFactory();
+      modulePromise = factory({
+        locateFile: (name) => name.endsWith('.wasm') ? '/wasm/crumble-prebake.wasm' : name,
+        // Quiet emscripten's default console.log spam; we route prebake
+        // diagnostics into the optimizer's own log surface via stderr.
+        print: () => {},
+        printErr: (s) => log(s, '', 'PRE'),
+      });
+      return modulePromise;
+    }
+
+    // Drive the full prebake against one EPUB blob. Returns:
+    //   { cacheZipBlob, deviceCacheDir, durationMs, summary }
+    // cacheZipBlob is a zip whose entries mirror the on-device layout under
+    // /.crosspoint/epub_<hash>/ (book.bin, sections/, thumb_*.bmp); the
+    // device-side ingest handler walks this verbatim.
+    async function runPrebake(epubBlob, renderInfo, opts) {
+      opts = opts || {};
+      const m = await getModule();
+
+      // Stage inputs in MEMFS.
+      const epubBytes = new Uint8Array(await epubBlob.arrayBuffer());
+      const settingsJson = JSON.stringify(renderInfo);
+      try { m.FS.mkdir('/input'); } catch (e) { /* already exists */ }
+      m.FS.writeFile('/input/book.epub', epubBytes);
+      m.FS.writeFile('/input/settings.json', settingsJson);
+
+      // Run main() with the same args a CLI user would pass. The settings
+      // file path here lives in MEMFS, not on the user's disk; --output-dir
+      // controls where the .crosspoint/ tree lands (also in MEMFS).
+      const t0 = performance.now();
+      const args = ['--settings-file', '/input/settings.json',
+                    '--output-dir', '/output',
+                    '/input/book.epub'];
+      if (opts.deviceBookPath) { args.unshift('--device-path', opts.deviceBookPath); }
+      try { m.FS.mkdir('/output'); } catch (e) { /* already exists */ }
+      const rc = m.callMain(args);
+      const durationMs = Math.round(performance.now() - t0);
+      if (rc !== 0) {
+        throw new Error(`prebake failed: callMain returned ${rc}`);
+      }
+
+      // Walk MEMFS under /output and stage each emitted file into a zip
+      // we hand back to the caller. The on-device layout the user expects
+      // is /.crosspoint/epub_<hash>/..., which is exactly what the C++ side
+      // wrote (rooted at --output-dir, so paths look like
+      // /output/.crosspoint/epub_<hash>/book.bin -- we strip the /output
+      // prefix before zipping so the bundle's paths match the device's).
+      const out = new JSZip();
+      let deviceCacheDir = null;
+      let fileCount = 0;
+      const walk = (dir) => {
+        let ents;
+        try { ents = m.FS.readdir(dir).filter(n => n !== '.' && n !== '..'); }
+        catch (e) { return; }
+        for (const n of ents) {
+          const full = dir === '/' ? '/' + n : dir + '/' + n;
+          const stat = m.FS.stat(full);
+          if (m.FS.isDir(stat.mode)) {
+            // Capture the per-book cache dir name so the caller can tell the
+            // device "land this bundle at /.crosspoint/epub_<hash>/" without
+            // re-deriving the hash.
+            if (!deviceCacheDir && full.indexOf('/.crosspoint/epub_') === 7) {
+              deviceCacheDir = full.substring('/output'.length);
+            }
+            walk(full);
+          } else {
+            const data = m.FS.readFile(full);
+            // Strip the /output prefix so zip entries match the device path.
+            const zipPath = full.substring('/output/'.length);
+            out.file(zipPath, data, { compression: 'DEFLATE',
+                                       compressionOptions: { level: 6 },
+                                       createFolders: false });
+            fileCount += 1;
+          }
+        }
+      };
+      walk('/output');
+
+      // Clean up MEMFS for the next run so we don't leak the previous book.
+      // (FS.unlink each + rmdir; if that fails we still return the result --
+      // the WASM module gets discarded on page reload anyway.)
+      try {
+        const cleanup = (dir) => {
+          const ents = m.FS.readdir(dir).filter(n => n !== '.' && n !== '..');
+          for (const n of ents) {
+            const full = dir === '/' ? '/' + n : dir + '/' + n;
+            const st = m.FS.stat(full);
+            if (m.FS.isDir(st.mode)) { cleanup(full); m.FS.rmdir(full); }
+            else { m.FS.unlink(full); }
+          }
+        };
+        cleanup('/output');
+        cleanup('/input');
+      } catch (e) { /* best-effort */ }
+
+      const cacheZipBlob = await out.generateAsync({ type: 'blob', mimeType: 'application/zip' });
+      return {
+        cacheZipBlob,
+        deviceCacheDir,         // e.g. "/.crosspoint/epub_8805760495705147147"
+        fileCount,
+        durationMs,
+      };
+    }
+
+    return { runPrebake };
+  })();
+
+  // ============================================================================
   // Image Picker Functions
   // ============================================================================
 
@@ -2314,6 +2472,37 @@ async function convertEpubFile(file, progressCallback) {
   log('Conversion complete!', 'success', 'DONE');
   logSummary(originalSize, newSize, timeElapsed);
 
+  // CrumBLE: optional WASM prebake step. When the user has the toggle on,
+  // run the C++ prebake pipeline (compiled to WASM) against the freshly
+  // optimized EPUB. The output is a separate cache zip that the device
+  // unpacks into /.crosspoint/epub_<hash>/ -- so the first cold open on
+  // device skips the OPF parse + cover thumb gen + section build entirely
+  // and lands in chapter 1 in under a second. If the toggle is off, or if
+  // the WASM blob wasn't baked into this firmware (404), we silently fall
+  // through and return just the EPUB blob -- the legacy bake-pxc path
+  // above already ran, so the user still gets the BLE-friendly cache.
+  const prebakeEnabled = !!document.getElementById('prebake-reader-cache-checkbox')?.checked;
+  let cacheZipBlob = null;
+  if (prebakeEnabled) {
+    if (!renderInfo) {
+      log('Pre-bake: skipped (render-info fetch failed; device not reachable?)', 'warning', 'PRE');
+    } else {
+      try {
+        log('Pre-bake: running WASM pipeline (book.bin + sections + thumbs)...', '', 'PRE');
+        const pre = await crumblePrebakeRunner.runPrebake(newBlob, renderInfo, {
+          deviceBookPath: '/' + file.name,
+        });
+        cacheZipBlob = pre.cacheZipBlob;
+        log(`Pre-bake: ${pre.fileCount} cache file(s) ready at ${pre.deviceCacheDir} ` +
+            `(${formatBytes(cacheZipBlob.size)}, ${pre.durationMs} ms)`, 'success', 'PRE');
+      } catch (e) {
+        console.error('prebake failed', e);
+        log(`Pre-bake: failed (${e && e.message ? e.message : e}). EPUB will still upload normally.`,
+            'warning', 'PRE');
+      }
+    }
+  }
+
   // Auto-export only if NOT in batch mode (batch mode exports at the end)
   if (!isBatchMode && exportLogCheckbox && exportLogCheckbox.checked) {
     setTimeout(() => {
@@ -2321,5 +2510,11 @@ async function convertEpubFile(file, progressCallback) {
     }, 100);
   }
 
+  // Callers that want the cache zip read it off the blob (attaching it as
+  // a property keeps the function's old signature intact for the upload
+  // and single-file paths that only consume the EPUB itself).
+  if (cacheZipBlob) {
+    newBlob.crumbleCacheZip = cacheZipBlob;
+  }
   return newBlob;
 }

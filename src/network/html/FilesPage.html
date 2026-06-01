@@ -1690,6 +1690,25 @@
               </label>
             </div>
           </div>
+          <!-- CrumBLE: prebake the device's reader cache (book.bin + sections +
+               thumbs) right here in the browser so the first time the user opens
+               the book on-device it boots into chapter 1 in under a second. Runs
+               the same C++ pipeline the device uses on cold-open, but here it's
+               compiled to WASM and runs on the user's CPU + heap. When this is
+               on, the .pxc bake above is unnecessary -- prebake ships the same
+               artifacts in a separate cache zip instead of inflating the EPUB. -->
+          <div class="advanced-setting-row">
+            <div class="setting-label">
+              <div class="setting-title">⚡ Pre-bake reader cache (beta)</div>
+              <div class="setting-desc">Produces a separate cache zip that lands chapter 1 in &lt;1s on first open<br>Requires firmware with prebake support (this build); supersedes the .pxc bake above when enabled</div>
+            </div>
+            <div class="setting-controls">
+              <label class="toggle-switch">
+                <input type="checkbox" id="prebake-reader-cache-checkbox">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
           </div><!-- advanced-settings-content -->
       </div><!-- end convert-options -->
       <!-- Image Picker Section - in picker-columns for two-column layout -->
