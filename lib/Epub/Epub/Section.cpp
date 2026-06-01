@@ -166,7 +166,44 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
         embeddedStyle != fileEmbeddedStyle || imageRendering != fileImageRendering ||
         bionicReadingEnabled != fileBionicReadingEnabled || guideReadingEnabled != fileGuideReadingEnabled) {
       file.close();
-      LOG_ERR("SCT", "Deserialization failed: Parameters do not match");
+      // CrumBLE prebake debug: prebake'd sections are arriving but the device
+      // refuses them with a fingerprint mismatch -- and the previous LOG_ERR
+      // just said "Parameters do not match" without naming the offender. Log
+      // both sides of all 12 fields so the optimizer-integration tests can
+      // see exactly which one differs.
+      LOG_ERR("SCT",
+              "Fingerprint mismatch on %s:\n"
+              "  fontId:                file=%d   device=%d   %s\n"
+              "  lineCompression:       file=%.4f device=%.4f %s\n"
+              "  extraParagraphSpacing: file=%d   device=%d   %s\n"
+              "  forceParagraphIndents: file=%d   device=%d   %s\n"
+              "  paragraphAlignment:    file=%u   device=%u   %s\n"
+              "  viewportWidth:         file=%u   device=%u   %s\n"
+              "  viewportHeight:        file=%u   device=%u   %s\n"
+              "  hyphenationEnabled:    file=%d   device=%d   %s\n"
+              "  embeddedStyle:         file=%d   device=%d   %s\n"
+              "  imageRendering:        file=%u   device=%u   %s\n"
+              "  bionicReadingEnabled:  file=%d   device=%d   %s\n"
+              "  guideReadingEnabled:   file=%d   device=%d   %s",
+              filePath.c_str(),
+              fileFontId, fontId, (fileFontId == fontId ? "OK" : "MISMATCH"),
+              fileLineCompression, lineCompression, (fileLineCompression == lineCompression ? "OK" : "MISMATCH"),
+              fileExtraParagraphSpacing, extraParagraphSpacing,
+              (fileExtraParagraphSpacing == extraParagraphSpacing ? "OK" : "MISMATCH"),
+              fileForceParagraphIndents, forceParagraphIndents,
+              (fileForceParagraphIndents == forceParagraphIndents ? "OK" : "MISMATCH"),
+              fileParagraphAlignment, paragraphAlignment,
+              (fileParagraphAlignment == paragraphAlignment ? "OK" : "MISMATCH"),
+              fileViewportWidth, viewportWidth, (fileViewportWidth == viewportWidth ? "OK" : "MISMATCH"),
+              fileViewportHeight, viewportHeight, (fileViewportHeight == viewportHeight ? "OK" : "MISMATCH"),
+              fileHyphenationEnabled, hyphenationEnabled,
+              (fileHyphenationEnabled == hyphenationEnabled ? "OK" : "MISMATCH"),
+              fileEmbeddedStyle, embeddedStyle, (fileEmbeddedStyle == embeddedStyle ? "OK" : "MISMATCH"),
+              fileImageRendering, imageRendering, (fileImageRendering == imageRendering ? "OK" : "MISMATCH"),
+              fileBionicReadingEnabled, bionicReadingEnabled,
+              (fileBionicReadingEnabled == bionicReadingEnabled ? "OK" : "MISMATCH"),
+              fileGuideReadingEnabled, guideReadingEnabled,
+              (fileGuideReadingEnabled == guideReadingEnabled ? "OK" : "MISMATCH"));
       clearCache();
       return false;
     }
