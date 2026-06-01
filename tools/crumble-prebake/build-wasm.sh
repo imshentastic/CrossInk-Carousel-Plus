@@ -163,7 +163,16 @@ LDFLAGS=(
   -sALLOW_MEMORY_GROWTH=1
   -sINITIAL_MEMORY=64MB
   -sINVOKE_RUN=0
-  -sEXIT_RUNTIME=1
+  # EXIT_RUNTIME=0: the JS caller (optimizer.js) reads output files from
+  # MEMFS AFTER callMain() returns, which requires libc functions like
+  # strerror to stay reachable. With EXIT_RUNTIME=1 emscripten tears down
+  # the runtime as soon as main() exits, and the post-run FS.readFile /
+  # FS.unlink walk we do to collect book.bin + sections + thumbs hits
+  # "native function called after runtime exit" assertions. Keeping the
+  # runtime alive costs a few KB of resident JS state per page session,
+  # which is fine -- the module is already cached and reused across
+  # multiple book prebakes anyway.
+  -sEXIT_RUNTIME=0
   -sENVIRONMENT=web,worker,node
   -sEXPORTED_RUNTIME_METHODS=callMain,FS,HEAPU8,stringToUTF8,UTF8ToString
   -sFORCE_FILESYSTEM=1
