@@ -33,6 +33,12 @@
 #include "html/SettingsPageHtml.generated.h"
 #include "html/js/jszip_minJs.generated.h"
 #include "html/js/optimizerJs.generated.h"
+// Prebake CLI compiled to WASM (~870 KB gzipped). build_wasm_assets.py
+// produces these from tools/crumble-prebake/build-wasm/. If the prebake CLI
+// hasn't been built, the headers contain zero-length payloads and the
+// optimizer.js loader detects-and-falls-back to the legacy per-image bake.
+#include "html/wasm/crumblePrebakeJs.generated.h"
+#include "html/wasm/crumblePrebakeWasm.generated.h"
 #include "util/BookCacheUtils.h"
 #include "util/StringUtils.h"
 
@@ -183,6 +189,8 @@ void CrossPointWebServer::begin() {
   server->on("/files", HTTP_GET, [this] { handleFileList(); });
   server->on("/js/jszip.min.js", HTTP_GET, [this] { handleJszip(); });
   server->on("/js/optimizer.js", HTTP_GET, [this] { handleOptimizerJs(); });
+  server->on("/js/crumble-prebake.js", HTTP_GET, [this] { handleCrumblePrebakeJs(); });
+  server->on("/wasm/crumble-prebake.wasm", HTTP_GET, [this] { handleCrumblePrebakeWasm(); });
 
   server->on("/api/status", HTTP_GET, [this] { handleStatus(); });
   server->on("/api/files", HTTP_GET, [this] { handleFileListData(); });
@@ -428,6 +436,30 @@ void CrossPointWebServer::handleJszip() const {
 void CrossPointWebServer::handleOptimizerJs() const {
   sendBufferGzip(server.get(), "application/javascript", optimizerJs,
                  optimizerJsCompressedSize, "optimizer.js");
+}
+
+void CrossPointWebServer::handleCrumblePrebakeJs() const {
+  // Empty payload (WASM not built before firmware): 404 so optimizer.js
+  // detects the absence and falls back to its legacy per-image bake. This
+  // path keeps the firmware buildable even when build-wasm.sh wasn't run.
+  if (crumblePrebakeJsCompressedSize == 0) {
+    server->send(404, "text/plain", "crumble-prebake.js not baked into this build");
+    return;
+  }
+  sendBufferGzip(server.get(), "application/javascript", crumblePrebakeJs,
+                 crumblePrebakeJsCompressedSize, "crumble-prebake.js");
+}
+
+void CrossPointWebServer::handleCrumblePrebakeWasm() const {
+  if (crumblePrebakeWasmCompressedSize == 0) {
+    server->send(404, "application/wasm", "");
+    return;
+  }
+  // application/wasm + Content-Encoding: gzip is what browsers expect for
+  // a pre-gzipped wasm response. WebAssembly.instantiateStreaming() handles
+  // the decompression transparently.
+  sendBufferGzip(server.get(), "application/wasm", crumblePrebakeWasm,
+                 crumblePrebakeWasmCompressedSize, "crumble-prebake.wasm");
 }
 
 void CrossPointWebServer::handleNotFound() const {

@@ -100,6 +100,12 @@ class CrossPointWebServer {
   void handleRoot() const;
   void handleJszip() const;
   void handleOptimizerJs() const;
+  // CrumBLE prebake WASM module (~870 KB gzipped total). Optimizer.js loads
+  // these on demand to run the off-device book.bin/section/thumb pipeline
+  // client-side in the browser. Returns Content-Encoding: gzip; the handler
+  // serves the raw PROGMEM bytes verbatim.
+  void handleCrumblePrebakeJs() const;
+  void handleCrumblePrebakeWasm() const;
   void handleNotFound() const;
   void handleStatus() const;
   void handleFileList() const;
