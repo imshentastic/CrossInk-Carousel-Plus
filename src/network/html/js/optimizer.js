@@ -2178,7 +2178,11 @@ async function convertEpubFile(file, progressCallback) {
         // device can render this image decoder-free over a Bluetooth remote. Only
         // the common single-image (non-split) case for now; split parts fall back
         // to on-device decode. A dimension mismatch on-device just falls back too.
-        if (renderInfo) {
+        // bakePxcEnabled is the effective gate -- false when the prebake
+        // toggle is on (per 2C.7 supersession). renderInfo can be non-null
+        // for prebake purposes even when bakePxc is skipped, so we MUST
+        // check the explicit flag here, not just renderInfo.
+        if (renderInfo && bakePxcEnabled) {
           try {
             const pxc = await bakePxc(parts[0].data, renderInfo.viewportWidth, renderInfo.viewportHeight);
             if (pxc) {
