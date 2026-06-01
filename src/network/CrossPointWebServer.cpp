@@ -1164,56 +1164,42 @@ void CrossPointWebServer::handleExtractPrebakeCache() const {
     return;
   }
 
-  // Same extraction body as handlePrebakeCacheUploadPost, but reading from
-  // the path the caller specifies (which they uploaded via /upload). The
-  // structure is duplicated rather than DRY'd to keep this commit focused on
-  // routing; consolidation is a follow-up.
+  // Streaming extraction: walk the central directory one entry at a
+  // time via ZipFile::iterateEntries(). The previous loadAllFileStatSlims
+  // path built a ~13 KB unordered_map of all entries before extracting
+  // anything, and on this device's post-upload heap budget (~16 KB max
+  // contiguous), that 13 KB alloc starved the actual extract loop and
+  // every entry failed the heap-floor check. Streaming keeps the alloc
+  // footprint to a few hundred bytes per entry, well under the budget.
+  //
+  // Trade-off: no upfront priority sort. Entries are extracted in zip
+  // order. The JS-side optimizer builds the zip via JSZip in MEMFS-walk
+  // order, which is alphabetical at FS.readdir level -- so book.bin
+  // (alphabetically first under .crosspoint/epub_<hash>/) gets written
+  // before anything else, which is exactly the priority we want.
   const std::string zipPathStd(pathArg.c_str());
   ZipFile zip(zipPathStd);
-  if (!zip.loadAllFileStatSlims()) {
-    server->send(400, "text/plain", "Failed to parse zip at requested path");
-    return;
-  }
-  const auto& entries = zip.getEntries();
-  static constexpr uint32_t EXTRACT_HEAP_MIN = 12 * 1024;
+  static constexpr uint32_t EXTRACT_HEAP_MIN = 6 * 1024;
 
   int extracted = 0;
+  int totalEntries = 0;
   size_t totalBytes = 0;
   String firstBadEntry;
   String firstFailedEntry;
   String firstFailureReason;
 
-  std::vector<const std::string*> sortedNames;
-  sortedNames.reserve(entries.size());
-  for (const auto& kv : entries) sortedNames.push_back(&kv.first);
-  auto priority = [](const std::string& n) -> int {
-    if (n.find("/book.bin") != std::string::npos ||
-        n.find("/css_rules.cache") != std::string::npos) return 0;
-    if (n.find("/sections/") != std::string::npos) return 1;
-    if (n.find("/thumb_") != std::string::npos) return 2;
-    return 3;
-  };
-  std::sort(sortedNames.begin(), sortedNames.end(),
-            [&](const std::string* a, const std::string* b) {
-              const int pa = priority(*a), pb = priority(*b);
-              if (pa != pb) return pa < pb;
-              return *a < *b;
-            });
+  LOG_INF("WEB", "[PRE-EXT2] extract %s: streaming entries, heap free=%u maxAlloc=%u",
+          pathArg.c_str(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
-  LOG_INF("WEB", "[PRE-EXT2] extract %s: %u entries, heap free=%u maxAlloc=%u",
-          pathArg.c_str(), static_cast<unsigned>(sortedNames.size()),
-          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-
-  for (const std::string* pName : sortedNames) {
-    const auto& kv = *entries.find(*pName);
+  zip.iterateEntries([&](const std::string& entryName, const ZipFile::FileStatSlim& /*stat*/) -> bool {
     esp_task_wdt_reset();
-    const std::string& entryName = kv.first;
-    if (entryName.empty() || entryName.back() == '/') continue;
+    totalEntries++;
+    if (entryName.empty() || entryName.back() == '/') return true;  // skip directories
     if (entryName.rfind(".crosspoint/", 0) != 0 ||
         entryName.find("..") != std::string::npos ||
         entryName[0] == '/') {
       firstBadEntry = entryName.c_str();
-      break;
+      return false;  // stop iteration on bad entry
     }
     const uint32_t maxAllocBefore = ESP.getMaxAllocHeap();
     if (maxAllocBefore < EXTRACT_HEAP_MIN) {
@@ -1223,7 +1209,7 @@ void CrossPointWebServer::handleExtractPrebakeCache() const {
         firstFailedEntry = entryName.c_str();
         firstFailureReason = "low_heap_before_inflate";
       }
-      break;
+      return false;
     }
     String destPath = "/";
     destPath += entryName.c_str();
@@ -1243,7 +1229,7 @@ void CrossPointWebServer::handleExtractPrebakeCache() const {
         firstFailedEntry = entryName.c_str();
         firstFailureReason = "open_for_write_failed";
       }
-      continue;
+      return true;  // continue to next entry; this one is skipped
     }
     if (!zip.readFileToStream(entryName.c_str(), outFile, 4096)) {
       LOG_ERR("WEB", "[PRE-EXT2] inflate %s failed", entryName.c_str());
@@ -1253,24 +1239,32 @@ void CrossPointWebServer::handleExtractPrebakeCache() const {
         firstFailedEntry = entryName.c_str();
         firstFailureReason = "inflate_failed";
       }
-      continue;
+      return true;
     }
     const uint32_t sz = outFile.size();
     outFile.close();
     extracted++;
     totalBytes += sz;
-    LOG_INF("WEB", "[PRE-EXT2] %d/%u: %s (%u B) heap free=%u maxAlloc=%u",
-            extracted, static_cast<unsigned>(entries.size()), entryName.c_str(),
-            static_cast<unsigned>(sz), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    if ((extracted & 0x07) == 0) {  // log every 8th entry to keep serial readable
+      LOG_INF("WEB", "[PRE-EXT2] %d entries done, last=%s (%u B) heap free=%u maxAlloc=%u",
+              extracted, entryName.c_str(), static_cast<unsigned>(sz),
+              ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    }
     delay(1);
-  }
+    return true;
+  });
+
+  // Synthesise the "entries.size()" reference used by the rest of the
+  // handler. Below, fullSuccess and the JSON response compare against
+  // this count instead of the now-gone map.
+  const int entriesSize = totalEntries;
 
   // Remove the source zip ONLY on full success. If extraction was partial
   // (e.g., heap-pressure bail on the first entry), leave the zip so the
   // JS-side retry has something to extract on the next attempt. The
   // previous behaviour deleted on partial too, which made retries 404 out
   // and silently fall back to the local-download path.
-  const bool fullSuccess = (extracted == static_cast<int>(entries.size())) && firstFailedEntry.isEmpty();
+  const bool fullSuccess = (extracted == entriesSize) && firstFailedEntry.isEmpty();
   if (fullSuccess) {
     Storage.remove(pathArg.c_str());
   }
@@ -1287,7 +1281,7 @@ void CrossPointWebServer::handleExtractPrebakeCache() const {
   body += ",\"bytes\":";
   body += String(static_cast<uint32_t>(totalBytes));
   body += ",\"total_entries\":";
-  body += String(static_cast<uint32_t>(entries.size()));
+  body += String(static_cast<uint32_t>(entriesSize));
   body += ",\"heap_free\":";
   body += String(static_cast<uint32_t>(ESP.getFreeHeap()));
   body += ",\"heap_max_alloc\":";
@@ -1300,11 +1294,11 @@ void CrossPointWebServer::handleExtractPrebakeCache() const {
     body += "\"";
   }
   body += "}";
-  const int status = (extracted == static_cast<int>(entries.size())) ? 200 : 207;
+  const int status = fullSuccess ? 200 : 207;
   server->send(status, "application/json", body);
   LOG_INF("WEB", "[PRE-EXT2] %s: %d/%u entries, %u bytes total, final heap free=%u maxAlloc=%u",
           (status == 200 ? "FULL" : "PARTIAL"), extracted,
-          static_cast<unsigned>(entries.size()), static_cast<unsigned>(totalBytes),
+          static_cast<unsigned>(entriesSize), static_cast<unsigned>(totalBytes),
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 }
 

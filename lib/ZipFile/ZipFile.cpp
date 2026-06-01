@@ -57,6 +57,60 @@ int zipReadCallback(uzlib_uncomp* uncomp) {
 }
 }  // namespace
 
+int ZipFile::iterateEntries(const std::function<bool(const std::string&, const FileStatSlim&)>& callback) {
+  // Streaming variant of loadAllFileStatSlims that NEVER builds the
+  // ~13 KB unordered_map. Same central-dir walk logic, but each entry
+  // is yielded to the caller (typically for immediate extraction) and
+  // then discarded before reading the next one. Memory ceiling: a few
+  // hundred bytes max.
+  const ScopedOpenClose zip{*this};
+  if (!zip) return 0;
+
+  if (!loadZipDetails()) return 0;
+
+  file.seek(zipDetails.centralDirOffset);
+
+  uint32_t sig;
+  char itemName[256];
+  int count = 0;
+
+  while (file.available()) {
+    if (file.read(&sig, 4) != 4) break;
+    if (sig != 0x02014b50) break;  // End of central directory marker hit.
+
+    FileStatSlim fileStat = {};
+    file.seekCur(6);
+    file.read(&fileStat.method, 2);
+    file.seekCur(8);
+    file.read(&fileStat.compressedSize, 4);
+    file.read(&fileStat.uncompressedSize, 4);
+    uint16_t nameLen, m, k;
+    file.read(&nameLen, 2);
+    file.read(&m, 2);
+    file.read(&k, 2);
+    file.seekCur(8);
+    file.read(&fileStat.localHeaderOffset, 4);
+
+    if (nameLen >= sizeof(itemName)) {
+      // Oversized name: skip past it + its extra/comment, keep walking.
+      file.seekCur(nameLen + m + k);
+      continue;
+    }
+    file.read(itemName, nameLen);
+    itemName[nameLen] = '\0';
+    file.seekCur(m + k);  // skip extra field + comment
+    count++;
+
+    // Build a small std::string just for the callback signature. This
+    // is a transient heap allocation (~length of itemName + sizeof header)
+    // that gets freed as soon as the callback returns.
+    const std::string nameStr(itemName, nameLen);
+    if (!callback(nameStr, fileStat)) break;
+  }
+
+  return count;
+}
+
 bool ZipFile::loadAllFileStatSlims() {
   const ScopedOpenClose zip{*this};
   if (!zip) return false;
