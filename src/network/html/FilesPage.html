@@ -3186,14 +3186,41 @@ async function uploadFile() {
           // streamed to SD via the standard /upload handler, no custom
           // multi-MB body code on the receiving side.
           await uploadFileHTTPToPath(cacheZipFile, cacheZipDevicePath);
-          log(`Pre-bake: cache zip uploaded; triggering extraction...`, '', 'PRE');
+          log(`Pre-bake: cache zip uploaded; waiting for device heap to recover...`, '', 'PRE');
 
-          const extractResp = await fetch(
-            '/api/extract-prebake-cache?path=' + encodeURIComponent(cacheZipDevicePath),
-            { method: 'POST' });
+          // Heap-recovery wait: after the EPUB upload + the cache-zip upload
+          // back to back, the device's max-contiguous heap dips to ~2 KB
+          // (fragmentation from upload buffers + WebSocket + NimBLE all
+          // holding slots). Extracting the zip needs ~12 KB contiguous for
+          // the read buffer + transient allocations. Empirically the heap
+          // recovers within a few seconds once the upload's request scope
+          // exits and its buffers get freed -- giving it a moment here
+          // turns "PARTIAL: 0/N entries" into a clean full extract.
+          await new Promise(resolve => setTimeout(resolve, 3000));
+          log(`Pre-bake: triggering extraction...`, '', 'PRE');
+
+          // Up to 3 attempts: extract handler returns 207 with extracted=0
+          // when heap is still pinched. Each retry waits an additional 3 s
+          // for heap to free up. Total worst case ~12 s.
+          let extractResp = null;
+          let summary = null;
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            extractResp = await fetch(
+              '/api/extract-prebake-cache?path=' + encodeURIComponent(cacheZipDevicePath),
+              { method: 'POST' });
+            try { summary = await extractResp.json(); } catch (e) { summary = null; }
+            if (summary && summary.extracted > 0) break;  // got at least one file out
+            if (!extractResp.ok && extractResp.status !== 207) break;  // hard error; no point retrying
+            if (attempt < 3) {
+              log(`Pre-bake: heap still tight (${summary ? summary.first_failure_reason : 'no summary'}), waiting and retrying (${attempt}/3)...`,
+                  'warning', 'PRE');
+              await new Promise(resolve => setTimeout(resolve, 3000));
+            }
+          }
+          // Log the final result from the retry loop above. summary and
+          // extractResp are already populated from the last attempt; do NOT
+          // call .json() again here (body's been consumed).
           if (extractResp.ok || extractResp.status === 207) {
-            let summary = null;
-            try { summary = await extractResp.json(); } catch (e) { /* non-fatal */ }
             if (summary) {
               if (summary.extracted === summary.total_entries) {
                 log(`Pre-bake cache extracted: ${summary.extracted}/${summary.total_entries} entries, ` +
