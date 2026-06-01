@@ -1704,7 +1704,7 @@
             </div>
             <div class="setting-controls">
               <label class="toggle-switch">
-                <input type="checkbox" id="prebake-reader-cache-checkbox">
+                <input type="checkbox" id="prebake-reader-cache-checkbox" checked>
                 <span class="toggle-slider"></span>
               </label>
             </div>
@@ -3205,15 +3205,29 @@ async function uploadFile() {
           // so retries can re-attempt. Total worst case ~22 s.
           let extractResp = null;
           let summary = null;
+          let lastRawBody = null;
           for (let attempt = 1; attempt <= 3; attempt++) {
             extractResp = await fetch(
               '/api/extract-prebake-cache?path=' + encodeURIComponent(cacheZipDevicePath),
               { method: 'POST' });
-            try { summary = await extractResp.json(); } catch (e) { summary = null; }
+            // Read response as text first so we can surface the raw body
+            // when JSON parsing fails. The mid-session "no summary" mystery
+            // earlier turned out to be unparseable bodies whose contents
+            // would have pinpointed the bug instantly; the .text() route
+            // makes the next iteration's failure self-explanatory.
+            try {
+              lastRawBody = await extractResp.text();
+              summary = JSON.parse(lastRawBody);
+            } catch (e) {
+              summary = null;
+              console.warn(`Pre-bake extract attempt ${attempt}: JSON parse failed. Raw body:`, lastRawBody);
+            }
             if (summary && summary.extracted > 0) break;  // got at least one file out
             if (!extractResp.ok && extractResp.status !== 207) break;  // hard error; no point retrying
             if (attempt < 3) {
-              log(`Pre-bake: heap still tight (${summary ? summary.first_failure_reason : 'no summary'}), waiting 8s and retrying (${attempt}/3)...`,
+              const why = summary ? summary.first_failure_reason :
+                          (lastRawBody && lastRawBody.length > 0 ? `unparseable: "${lastRawBody.slice(0, 120)}"` : 'empty body');
+              log(`Pre-bake: heap still tight (${why}), waiting 8s and retrying (${attempt}/3)...`,
                   'warning', 'PRE');
               await new Promise(resolve => setTimeout(resolve, 8000));
             }
@@ -3234,7 +3248,9 @@ async function uploadFile() {
                     `Book will open with partial cache.`, 'warning', 'PRE');
               }
             } else {
-              log(`Pre-bake cache extracted (device returned no summary)`, 'success', 'PRE');
+              const rawSnippet = lastRawBody && lastRawBody.length > 0
+                ? `: "${lastRawBody.slice(0, 200)}"` : ' (empty body)';
+              log(`Pre-bake: device returned unparseable response${rawSnippet}`, 'warning', 'PRE');
             }
           } else if (extractResp.status === 404) {
             // Extract endpoint not in this firmware. Cache zip is sitting on
