@@ -2786,6 +2786,23 @@ function uploadFileWebSocket(file, onProgress, onComplete, onError) {
   });
 }
 
+// CrumBLE: download fallback for the prebake cache zip when the device
+// endpoint isn't available. Constructs a download from the in-memory blob
+// and triggers a click on a hidden anchor, then revokes the object URL so
+// the blob doesn't pin memory.
+function triggerCacheZipDownload(blob, bookName) {
+  const baseName = (bookName || 'book').replace(/\.epub$/i, '');
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${baseName}.crumble-cache.zip`;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 // Upload file via HTTP (fallback method)
 function uploadFileHTTP(file, onProgress, onComplete, onError) {
   return new Promise((resolve, reject) => {
@@ -2944,6 +2961,14 @@ async function uploadFile() {
     let conversionFailed = false;  // Track if conversion actually failed
     let convOriginalSize = 0;      // Picked-file size; 0 unless conversion succeeded
     let convNewSize = 0;           // Generated blob size; 0 unless conversion succeeded
+    // CrumBLE: prebake cache zip captured from convertEpubFile's output.
+    // Populated only when the user has the prebake toggle on AND the WASM
+    // run succeeded. Uploaded to /api/upload-prebake-cache after the EPUB
+    // upload below; if the endpoint isn't on this firmware (404), we fall
+    // back to triggering a browser download so the user still gets the
+    // artifact and can drop it on the device via the file picker.
+    let cacheZipForUpload = null;
+    let cacheZipBookName = null;
 
     const methodText = useWebSocket ? ' [WS]' : ' [HTTP]';
     const stageText = needsConversion ? 'Converting & uploading' : 'Uploading';
@@ -3032,6 +3057,17 @@ async function uploadFile() {
             progressFill.style.width = (percent * 0.5) + '%'; // Conversion takes first 50%
           });
 
+          // CrumBLE: pull the WASM-prebake cache zip OFF the converted blob
+          // before it gets reassigned into a new File (which strips custom
+          // properties). The upload sequence below ships this zip to the
+          // device's prebake-cache endpoint AFTER the EPUB upload completes,
+          // so the device side has both the EPUB and a populated cache dir
+          // by the time the user opens the book.
+          if (convertedBlob.crumbleCacheZip) {
+            cacheZipForUpload = convertedBlob.crumbleCacheZip;
+            cacheZipBookName = file.name;
+          }
+
           // Create new File from converted blob
           file = new File([convertedBlob], file.name, { type: 'application/epub+zip' });
           progressFill.style.backgroundColor = '#27ae60'; // Back to green for upload
@@ -3066,6 +3102,43 @@ async function uploadFile() {
       } else {
         await uploadFileHTTP(file, onProgress, null, null);
       }
+
+      // CrumBLE: ship the prebake cache zip right after the EPUB lands. The
+      // device's prebake-cache endpoint accepts the zip body, unpacks each
+      // entry under SD root, and the next time the user opens this book the
+      // cold-open path finds book.bin/sections already populated -- chapter 1
+      // in under a second. If the endpoint isn't present on this firmware
+      // (e.g. user updated optimizer.js but not the device firmware), we
+      // fall back to a browser download so the artifact isn't lost.
+      if (cacheZipForUpload) {
+        try {
+          const resp = await fetch('/api/upload-prebake-cache', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/zip',
+              'X-Crumble-Book-Name': encodeURIComponent(cacheZipBookName || ''),
+            },
+            body: cacheZipForUpload,
+          });
+          if (resp.ok) {
+            log(`Pre-bake cache uploaded (${formatBytes(cacheZipForUpload.size)})`, 'success', 'PRE');
+          } else if (resp.status === 404) {
+            // Endpoint not in this firmware; fall back to download.
+            triggerCacheZipDownload(cacheZipForUpload, cacheZipBookName);
+            log('Pre-bake cache endpoint not on device; downloaded zip instead -- drop it on the file picker to ingest.',
+                'warning', 'PRE');
+          } else {
+            log(`Pre-bake cache upload failed: HTTP ${resp.status} ${resp.statusText}`, 'warning', 'PRE');
+          }
+        } catch (e) {
+          console.error('cache zip upload failed', e);
+          // Network failure -- offer the download as a safety net.
+          triggerCacheZipDownload(cacheZipForUpload, cacheZipBookName);
+          log(`Pre-bake cache upload errored (${e && e.message ? e.message : e}); downloaded zip instead.`,
+              'warning', 'PRE');
+        }
+      }
+
       // Ensure progress bar shows 100% before moving to next file
       progressFill.style.width = '100%';
       progressText.textContent = `Upload complete: ${file.name}`;
