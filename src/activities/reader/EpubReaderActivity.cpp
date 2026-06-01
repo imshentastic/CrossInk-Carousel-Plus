@@ -352,6 +352,8 @@ void EpubReaderActivity::onEnter() {
   // where it's invisible.
   readerSettingsCache_.clear();
   pxcManifest_.reset();
+  prebakeManifest_.reset();
+  prebakePromptAnsweredThisSession_ = false;
   deferredOnEnterPending_ = true;
   firstRenderCompleted_ = false;
   // Reset BLE-link edge state on every book open: a fresh book may have a
@@ -545,6 +547,20 @@ void EpubReaderActivity::runDeferredOnEnter() {
       }
     }
   }
+
+  // CrumBLE: parse the prebake'd section-0 fingerprint if the cache exists.
+  // Cheap: one SD open + 25-byte read. The result drives the switch-back
+  // prompt in tick() below when current SETTINGS would invalidate the cache.
+  {
+    PrebakeManifest pm;
+    if (tryLoadPrebakeManifest(epub->getCachePath(), pm)) {
+      prebakeManifest_ = pm;
+      LOG_INF("ERA", "Loaded prebake manifest: fontId=%ld viewport=%ux%u lineComp=%.3f embed=%d",
+              static_cast<long>(pm.fontId), static_cast<unsigned>(pm.viewportWidth),
+              static_cast<unsigned>(pm.viewportHeight), static_cast<double>(pm.lineCompression),
+              pm.embeddedStyle);
+    }
+  }
 }
 
 void EpubReaderActivity::onExit() {
@@ -661,6 +677,98 @@ void EpubReaderActivity::loop() {
     pendingLayoutRetryAfterBleOff = false;
     requestUpdate();
     return;
+  }
+
+  // CrumBLE: prebake-cache mismatch prompt on book open.
+  //
+  // Fires once per book-open session, after the first render has completed
+  // (so the user sees the page they tapped into before being prompted) and
+  // only when this book actually has a prebake'd cache to switch back to.
+  // Without the prompt, the user gets the SLOW path on every chapter -- the
+  // device's Section::loadSectionFile fingerprint check rejects the cached
+  // section and rebuilds from HTML, defeating the whole prebake speedup
+  // AND running the chapter parser under tight heap (the chip-tracked
+  // file-transfer-page heap-pressure failure mode the user has flagged
+  // separately).
+  if (prebakeManifest_.has_value() && firstRenderCompleted_ && !prebakePromptAnsweredThisSession_) {
+    const PrebakeManifest& pm = *prebakeManifest_;
+    const int32_t curFontId = SETTINGS.getReaderFontId();
+    const float curLineComp = SETTINGS.getReaderLineCompression();
+    // 10-field comparison. Viewport is excluded because it's derived from
+    // orientation + screenMargin, and the orientation change path already
+    // hits the .pxc-manifest prompt above for users who have that manifest.
+    // Keeping the prompt list flat (rather than chained with .pxc) avoids
+    // double-prompting users who have both artifacts.
+    const bool mismatch =
+        (pm.fontId != curFontId) ||
+        (pm.lineCompression != curLineComp) ||
+        (pm.extraParagraphSpacing != SETTINGS.extraParagraphSpacing) ||
+        (pm.forceParagraphIndents != SETTINGS.forceParagraphIndents) ||
+        (pm.paragraphAlignment != SETTINGS.paragraphAlignment) ||
+        (pm.hyphenationEnabled != SETTINGS.hyphenationEnabled) ||
+        (pm.embeddedStyle != SETTINGS.embeddedStyle) ||
+        (pm.imageRendering != SETTINGS.imageRendering) ||
+        (pm.bionicReadingEnabled != SETTINGS.bionicReadingEnabled) ||
+        (pm.guideReadingEnabled != SETTINGS.guideReadingEnabled);
+    prebakePromptAnsweredThisSession_ = true;  // one-shot per book regardless of branch
+    if (mismatch) {
+      LOG_INF("ERA",
+              "Prebake fingerprint mismatch: cur fontId=%ld lineComp=%.3f ePS=%d fPI=%d pA=%u "
+              "hyph=%d embed=%d imgR=%u bionic=%d guide=%d vs prebake fontId=%ld lineComp=%.3f "
+              "ePS=%d fPI=%d pA=%u hyph=%d embed=%d imgR=%u bionic=%d guide=%d",
+              static_cast<long>(curFontId), static_cast<double>(curLineComp),
+              SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
+              static_cast<unsigned>(SETTINGS.paragraphAlignment), SETTINGS.hyphenationEnabled,
+              SETTINGS.embeddedStyle, static_cast<unsigned>(SETTINGS.imageRendering),
+              SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled,
+              static_cast<long>(pm.fontId), static_cast<double>(pm.lineCompression),
+              pm.extraParagraphSpacing, pm.forceParagraphIndents,
+              static_cast<unsigned>(pm.paragraphAlignment), pm.hyphenationEnabled,
+              pm.embeddedStyle, static_cast<unsigned>(pm.imageRendering),
+              pm.bionicReadingEnabled, pm.guideReadingEnabled);
+      // Plain-English body. Hardcoded English -- rare prompt, layman wording
+      // matches the existing .pxc manifest prompt's style.
+      const std::string promptBody =
+          "This book was prepared with different reader settings. Your current settings "
+          "would make every chapter rebuild from scratch -- slower opens and possible "
+          "memory errors. Switch to the prepared settings?";
+      startActivityForResult(
+          std::make_unique<ConfirmationActivity>(
+              renderer, mappedInput, "Restore prepared layout?", promptBody,
+              /*ignoreInitialConfirmRelease=*/true),
+          [this](const ActivityResult& result) {
+            if (result.isCancelled) {
+              requestUpdate();
+              return;
+            }
+            if (!prebakeManifest_.has_value()) return;
+            const PrebakeManifest& pm2 = *prebakeManifest_;
+            // Apply the 9 directly-settable fields. fontId is omitted because
+            // SETTINGS doesn't store it directly -- it's derived from
+            // fontFamily + fontSize, and reversing that on-device without the
+            // font registry isn't trivial. Same caveat the existing .pxc
+            // manifest path documents at line 749. User keeps current font;
+            // the other 9 fields update so margins / paragraph layout /
+            // hyphenation / etc. match the prebake. Most users who hit this
+            // prompt changed one or two settings, not the font itself.
+            SETTINGS.extraParagraphSpacing = pm2.extraParagraphSpacing;
+            SETTINGS.forceParagraphIndents = pm2.forceParagraphIndents;
+            SETTINGS.paragraphAlignment = pm2.paragraphAlignment;
+            SETTINGS.hyphenationEnabled = pm2.hyphenationEnabled;
+            SETTINGS.embeddedStyle = pm2.embeddedStyle;
+            SETTINGS.imageRendering = pm2.imageRendering;
+            SETTINGS.bionicReadingEnabled = pm2.bionicReadingEnabled;
+            SETTINGS.guideReadingEnabled = pm2.guideReadingEnabled;
+            // lineCompression maps to lineSpacing enum; without a reverse
+            // map, leave lineSpacing as-is and accept fingerprint mismatch
+            // on that field too. Follow-up: add reverse lookup or store
+            // lineSpacing alongside lineCompression in the manifest.
+            SETTINGS.saveToFile();
+            if (section) section.reset();  // force fresh layout next render
+            requestUpdate();
+          });
+      return;
+    }
   }
 
   // BT No Images Quick Connect auto-restore. The no-images flag exists only to

@@ -14,6 +14,7 @@
 #include "EpubReaderMenuActivity.h"
 #include "GlobalReadingStats.h"
 #include "PxcManifest.h"  // shared with BookSettingsDrawerActivity
+#include "PrebakeManifest.h"  // section-0 fingerprint for switch-back prompt
 #include "activities/Activity.h"
 #include "activities/settings/SettingsActivity.h"  // for SettingInfo (drawer cache)
 
@@ -163,6 +164,15 @@ class EpubReaderActivity final : public Activity {
   // edge detector below to decide whether to prompt the user to switch to
   // the prepared layout when they connect a remote.
   std::optional<PxcManifest> pxcManifest_;
+
+  // CrumBLE: parsed prebake manifest -- the 12-field fingerprint baked into
+  // section 0's header by the off-device prebake CLI. Optional (only books
+  // the user ran through /optimizer with Pre-bake on have this). On book
+  // open, compared against current SETTINGS; on mismatch the reader prompts
+  // the user to switch back to the prebake'd layout so the cached sections
+  // can actually load instead of being rebuilt from HTML on every chapter.
+  std::optional<PrebakeManifest> prebakeManifest_;
+  bool prebakePromptAnsweredThisSession_ = false;  // one-shot per book open
 
   // CrumBLE Phase 1 fast-open: non-critical onEnter work (font buffer
   // pre-grow, reader-settings cache build, .pxc manifest parse) is
