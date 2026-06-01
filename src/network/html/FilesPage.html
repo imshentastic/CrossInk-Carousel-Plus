@@ -1558,7 +1558,7 @@
         <div class="convert-options" id="convertOptions" style="display:none;">
           <div class="convert-row">
             <label class="convert-checkbox">
-              <input type="checkbox" id="convertBeforeUpload" onchange="toggleConvertOptions()">
+              <input type="checkbox" id="convertBeforeUpload" onchange="toggleConvertOptions()" checked>
               <span>Optimize EPUB</span>
             </label>
             <span class="convert-separator">—</span>
@@ -2153,7 +2153,12 @@
     document.getElementById('progress-container').style.display = 'none';
     document.getElementById('progress-fill').style.width = '0%';
     document.getElementById('progress-fill').style.backgroundColor = '#27ae60';
-    document.getElementById('convertBeforeUpload').checked = false;
+    // CrumBLE: Optimize EPUB defaults ON. The user feedback was that
+    // basically every EPUB they upload benefits from optimization, so
+    // making them tick the box every time was friction without payoff.
+    // They can still uncheck for a specific upload, but the modal-close
+    // reset puts it back to on for next time.
+    document.getElementById('convertBeforeUpload').checked = true;
     document.getElementById('convertInfo').style.display = 'none';
     document.getElementById('convertWarning').style.display = 'none';
     const btFriendlyOption = document.getElementById('btFriendlyOption');
