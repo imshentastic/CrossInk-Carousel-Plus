@@ -1571,15 +1571,29 @@
           <div id="convertInfo" style="display:none; margin-bottom: 10px; font-size: 0.9em;">
           </div>
 
-          <!-- Bluetooth-friendly chapters: shown whenever Optimize EPUB is checked -->
+          <!-- Primary feature toggles: surfaced outside Advanced because they
+               carry the headline value props users care about most.
+               Bluetooth-friendly chapters helps BT-remote readers; Pre-bake
+               reader cache makes any device's cold open feel near-instant.
+               Both shown whenever Optimize EPUB is checked. -->
           <div class="bt-friendly-option" id="btFriendlyOption">
             <div class="bt-friendly-row">
               <div class="bt-friendly-text">
-                <div class="setting-title">📖 Bluetooth-friendly chapters</div>
-                <div class="setting-desc">Store chapter text uncompressed for best BT performance<br>Note: EPUB file size up to 4x larger</div>
+                <div class="setting-title">📖 Bluetooth-friendly chapters — Vital for BT!</div>
+                <div class="setting-desc">Stores chapter text uncompressed so Bluetooth remotes can flip pages reliably<br>Note: EPUB file size up to 4x larger; not needed if you don't read with a BT remote</div>
               </div>
               <label class="toggle-switch">
                 <input type="checkbox" id="store-text-uncompressed-checkbox">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="bt-friendly-row">
+              <div class="bt-friendly-text">
+                <div class="setting-title">⚡ Pre-bake reader cache — Fast Book Open + No Indexing Between Chapters</div>
+                <div class="setting-desc">Renders book.bin + sections + thumbs in your browser, ships them to the device alongside the EPUB — first cold open is under 4 s and chapter-to-chapter navigation is instant<br>Note: optimization takes ~30 s longer per book; worth it</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="prebake-reader-cache-checkbox" checked>
                 <span class="toggle-slider"></span>
               </label>
             </div>
@@ -1680,31 +1694,12 @@
                JPEG-decode each image at runtime, which fragments heap). -->
           <div class="advanced-setting-row">
             <div class="setting-label">
-              <div class="setting-title">🖼️ Generate .pxc image cache</div>
-              <div class="setting-desc">Pre-render each image for the device's screen — speeds up indexing on image-heavy chapters<br>Note: increases EPUB size; turn off if you never read with a Bluetooth remote</div>
+              <div class="setting-title">🖼️ Generate .pxc image cache (BT only, ignored if Pre-bake is on)</div>
+              <div class="setting-desc">Pre-renders each image into the EPUB for Bluetooth remote use. Pre-bake reader cache covers this same need and ships smaller artifacts in the cache zip instead, so this toggle has no effect when Pre-bake is on.<br>Note: increases EPUB size; useful only if you skip Pre-bake and still want BT image perf.</div>
             </div>
             <div class="setting-controls">
               <label class="toggle-switch">
                 <input type="checkbox" id="bake-pxc-checkbox" checked>
-                <span class="toggle-slider"></span>
-              </label>
-            </div>
-          </div>
-          <!-- CrumBLE: prebake the device's reader cache (book.bin + sections +
-               thumbs) right here in the browser so the first time the user opens
-               the book on-device it boots into chapter 1 in under a second. Runs
-               the same C++ pipeline the device uses on cold-open, but here it's
-               compiled to WASM and runs on the user's CPU + heap. When this is
-               on, the .pxc bake above is unnecessary -- prebake ships the same
-               artifacts in a separate cache zip instead of inflating the EPUB. -->
-          <div class="advanced-setting-row">
-            <div class="setting-label">
-              <div class="setting-title">⚡ Pre-bake reader cache (beta)</div>
-              <div class="setting-desc">Produces a separate cache zip that lands chapter 1 in &lt;1s on first open<br>Requires firmware with prebake support (this build); supersedes the .pxc bake above when enabled</div>
-            </div>
-            <div class="setting-controls">
-              <label class="toggle-switch">
-                <input type="checkbox" id="prebake-reader-cache-checkbox" checked>
                 <span class="toggle-slider"></span>
               </label>
             </div>
@@ -2165,6 +2160,11 @@
     if (btFriendlyOption) btFriendlyOption.style.display = 'none';
     const storeTextCb = document.getElementById('store-text-uncompressed-checkbox');
     if (storeTextCb) storeTextCb.checked = false;
+    // CrumBLE: Pre-bake reader cache defaults ON across modal opens.
+    // Match the same pattern as Optimize EPUB above -- users almost always
+    // benefit, so persisting checked is the right default.
+    const prebakeCb = document.getElementById('prebake-reader-cache-checkbox');
+    if (prebakeCb) prebakeCb.checked = true;
     // Clear image picker cache and reset layout
     epubImagesCache = [];
     imageStates = {};
