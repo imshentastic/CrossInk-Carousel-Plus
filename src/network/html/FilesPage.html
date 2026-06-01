@@ -2819,7 +2819,7 @@ function triggerCacheZipDownload(blob, bookName) {
 // dir (e.g. "/.crosspoint/Foo.crumble-cache.zip"). The device's /upload
 // handler treats ?path= as the destination directory and appends the
 // multipart file's filename, so we split here.
-function uploadFileHTTPToPath(file, devicePath) {
+function uploadFileHTTPToPath(file, devicePath, onProgress) {
   return new Promise((resolve, reject) => {
     const lastSlash = devicePath.lastIndexOf('/');
     const dirPath = lastSlash > 0 ? devicePath.substring(0, lastSlash) : '/';
@@ -2827,6 +2827,11 @@ function uploadFileHTTPToPath(file, devicePath) {
     formData.append('file', file);
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/upload?path=' + encodeURIComponent(dirPath), true);
+    if (typeof onProgress === 'function') {
+      xhr.upload.onprogress = function(e) {
+        if (e.lengthComputable) onProgress(e.loaded, e.total);
+      };
+    }
     xhr.onload = function() {
       if (xhr.status === 200) resolve();
       else reject(new Error(xhr.responseText || `Upload failed: HTTP ${xhr.status}`));
@@ -3177,6 +3182,15 @@ async function uploadFile() {
         const baseName = (cacheZipBookName || 'book').replace(/\.epub$/i, '');
         const cacheZipName = `${baseName}.crumble-cache.zip`;
         const cacheZipDevicePath = `/.crosspoint/${cacheZipName}`;
+        // Progress UX: the EPUB upload bar above hit 100% green, but we're
+        // not actually done -- prebake adds another 30-60 s of work the user
+        // shouldn't think is finished. Reset bar to 0% with an orange tint
+        // and a "Pre-baking..." label so it's visually obvious there's a
+        // phase 2 in progress. Earlier user feedback: "shows 100% but it's
+        // still going, the bar should reflect that."
+        progressFill.style.backgroundColor = '#e67e22';  // orange = prebake phase
+        progressFill.style.width = '0%';
+        progressText.textContent = `Pre-baking reader cache for ${file.name}...`;
         try {
           log(`Pre-bake: uploading cache zip (${formatBytes(cacheZipForUpload.size)}) to ${cacheZipDevicePath}...`,
               '', 'PRE');
@@ -3185,7 +3199,14 @@ async function uploadFile() {
           // Reuses the file manager's normal HTTP upload path -- multipart,
           // streamed to SD via the standard /upload handler, no custom
           // multi-MB body code on the receiving side.
-          await uploadFileHTTPToPath(cacheZipFile, cacheZipDevicePath);
+          await uploadFileHTTPToPath(cacheZipFile, cacheZipDevicePath, (loaded, total) => {
+            // Upload phase = 0-50% of the orange bar.
+            const pct = total > 0 ? Math.round((loaded / total) * 50) : 0;
+            progressFill.style.width = pct + '%';
+            progressText.textContent = `Pre-baking reader cache for ${file.name} — uploading ${Math.round((loaded / total) * 100)}%`;
+          });
+          progressFill.style.width = '55%';
+          progressText.textContent = `Pre-baking reader cache for ${file.name} — waiting for device heap...`;
           log(`Pre-bake: cache zip uploaded; waiting for device heap to recover...`, '', 'PRE');
 
           // Heap-recovery wait: after the EPUB upload + the cache-zip upload
@@ -3198,6 +3219,8 @@ async function uploadFile() {
           // the upload scope exits; the wait + retry loop below rides that
           // recovery window.
           await new Promise(resolve => setTimeout(resolve, 6000));
+          progressFill.style.width = '60%';
+          progressText.textContent = `Pre-baking reader cache for ${file.name} — extracting on device...`;
           log(`Pre-bake: triggering extraction...`, '', 'PRE');
 
           // Up to 3 attempts with 8-second waits between. The device-side
@@ -3207,6 +3230,9 @@ async function uploadFile() {
           let summary = null;
           let lastRawBody = null;
           for (let attempt = 1; attempt <= 3; attempt++) {
+            // Bar advances modestly per attempt so the user sees progress
+            // even on retries. 60 -> 70 -> 80 -> 90 across attempts.
+            progressFill.style.width = (50 + attempt * 10) + '%';
             extractResp = await fetch(
               '/api/extract-prebake-cache?path=' + encodeURIComponent(cacheZipDevicePath),
               { method: 'POST' });
@@ -3229,9 +3255,12 @@ async function uploadFile() {
                           (lastRawBody && lastRawBody.length > 0 ? `unparseable: "${lastRawBody.slice(0, 120)}"` : 'empty body');
               log(`Pre-bake: heap still tight (${why}), waiting 8s and retrying (${attempt}/3)...`,
                   'warning', 'PRE');
+              progressText.textContent = `Pre-baking reader cache for ${file.name} — retry ${attempt}/3 in 8s...`;
               await new Promise(resolve => setTimeout(resolve, 8000));
             }
           }
+          // Whatever the outcome, we're at the end of the prebake phase.
+          progressFill.style.width = '100%';
           // Log the final result from the retry loop above. summary and
           // extractResp are already populated from the last attempt; do NOT
           // call .json() again here (body's been consumed).
