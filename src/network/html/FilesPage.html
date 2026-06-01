@@ -3112,13 +3112,16 @@ async function uploadFile() {
       // fall back to a browser download so the artifact isn't lost.
       if (cacheZipForUpload) {
         try {
+          // Multipart upload: ESP32 WebServer can't buffer multi-MB raw bodies
+          // in heap, so we ride the same streamed-upload code path that the
+          // EPUB upload uses. The device-side handler accumulates chunks into
+          // a temp SD file and extracts on FILE_END.
+          const fd = new FormData();
+          const baseName = (cacheZipBookName || 'book').replace(/\.epub$/i, '');
+          fd.append('file', cacheZipForUpload, `${baseName}.crumble-cache.zip`);
           const resp = await fetch('/api/upload-prebake-cache', {
             method: 'POST',
-            headers: {
-              'Content-Type': 'application/zip',
-              'X-Crumble-Book-Name': encodeURIComponent(cacheZipBookName || ''),
-            },
-            body: cacheZipForUpload,
+            body: fd,
           });
           if (resp.ok) {
             log(`Pre-bake cache uploaded (${formatBytes(cacheZipForUpload.size)})`, 'success', 'PRE');

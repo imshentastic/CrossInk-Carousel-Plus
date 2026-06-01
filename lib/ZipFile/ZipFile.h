@@ -73,4 +73,13 @@ class ZipFile {
   // These functions will open and close the zip as needed
   uint8_t* readFileToMemory(const char* filename, size_t* size = nullptr, bool trailingNullByte = false);
   bool readFileToStream(const char* filename, Print& out, size_t chunkSize);
+
+  // CrumBLE: enumerate every entry's name + stats. Populated by
+  // loadAllFileStatSlims(); reading before that call yields an empty map.
+  // Const reference is fine to hand out -- the map's lifetime is tied to
+  // this ZipFile instance and callers are expected to drain it during the
+  // same scope. Used by the /api/upload-prebake-cache handler to walk the
+  // optimizer's cache zip and extract each entry to SD without having to
+  // know the entry names ahead of time.
+  const std::unordered_map<std::string, FileStatSlim>& getEntries() const { return fileStatSlimCache; }
 };

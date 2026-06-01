@@ -50,6 +50,27 @@ class CrossPointWebServer {
     UploadState() { buffer.resize(UPLOAD_BUFFER_SIZE); }
   } upload;
 
+  // CrumBLE: /api/upload-prebake-cache uses the same streamed-upload pattern
+  // as the /upload endpoint, but the destination is a fixed temp path and
+  // the FILE_END hook extracts the zip's contents to SD instead of leaving
+  // the upload as-is. Separate state from UploadState so a concurrent
+  // file-manager upload doesn't trample the prebake cache extract.
+  struct PrebakeCacheUploadState {
+    FsFile file;
+    String tmpPath = "/.crosspoint/_inflight_prebake_cache.zip";
+    size_t size = 0;
+    bool success = false;
+    String error = "";
+    int extractedCount = 0;
+    size_t extractedBytes = 0;
+
+    static constexpr size_t UPLOAD_BUFFER_SIZE = 4096;
+    std::vector<uint8_t> buffer;
+    size_t bufferPos = 0;
+
+    PrebakeCacheUploadState() { buffer.resize(UPLOAD_BUFFER_SIZE); }
+  } prebakeCacheUpload;
+
   CrossPointWebServer();
   ~CrossPointWebServer();
 
@@ -106,6 +127,15 @@ class CrossPointWebServer {
   // serves the raw PROGMEM bytes verbatim.
   void handleCrumblePrebakeJs() const;
   void handleCrumblePrebakeWasm() const;
+  // POST /api/upload-prebake-cache: optimizer.js ships a zip whose entries
+  // mirror the device's cache-dir layout (.crosspoint/epub_<hash>/book.bin,
+  // sections/*.bin, thumb_*.bmp). Streamed upload writes the zip to a temp
+  // SD file; the POST handler then walks the zip's central directory and
+  // extracts each entry to its zip-encoded path under SD root, then deletes
+  // the temp. Result: the device has a populated cache before the user
+  // opens the book for the first time -> sub-second cold open.
+  void handlePrebakeCacheUpload(PrebakeCacheUploadState& state);
+  void handlePrebakeCacheUploadPost(PrebakeCacheUploadState& state) const;
   void handleNotFound() const;
   void handleStatus() const;
   void handleFileList() const;

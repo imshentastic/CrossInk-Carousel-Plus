@@ -7,6 +7,7 @@
 #include <Epub.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
+#include <ZipFile.h>  // /api/upload-prebake-cache iterates the optimizer's zip
 #include <HalGPIO.h>
 #include <HalStorage.h>
 #include <Logging.h>
@@ -198,6 +199,9 @@ void CrossPointWebServer::begin() {
 
   // Upload endpoint with special handling for multipart form data
   server->on("/upload", HTTP_POST, [this] { handleUploadPost(upload); }, [this] { handleUpload(upload); });
+  server->on("/api/upload-prebake-cache", HTTP_POST,
+             [this] { handlePrebakeCacheUploadPost(prebakeCacheUpload); },
+             [this] { handlePrebakeCacheUpload(prebakeCacheUpload); });
 
   // Create folder endpoint
   server->on("/mkdir", HTTP_POST, [this] { handleCreateFolder(); });
@@ -853,6 +857,174 @@ void CrossPointWebServer::handleUploadPost(UploadState& state) const {
     const String error = state.error.isEmpty() ? "Unknown error during upload" : state.error;
     server->send(400, "text/plain", error);
   }
+}
+
+// CrumBLE: /api/upload-prebake-cache streamed upload handler. Same callback
+// shape as /upload but writes to a fixed temp path so an in-flight prebake
+// cache and a regular file upload can coexist without trampling each other.
+// The actual zip extraction happens in handlePrebakeCacheUploadPost after
+// the upload completes -- doing it inline in UPLOAD_FILE_END would block
+// the HTTP layer for seconds on a large cache and risk a watchdog reset.
+void CrossPointWebServer::handlePrebakeCacheUpload(PrebakeCacheUploadState& state) {
+  esp_task_wdt_reset();
+  if (!running || !server) return;
+  const HTTPUpload& upload = server->upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    esp_task_wdt_reset();
+    state.size = 0;
+    state.success = false;
+    state.error = "";
+    state.extractedCount = 0;
+    state.extractedBytes = 0;
+    state.bufferPos = 0;
+
+    // Ensure the /.crosspoint cache root exists; the inflight zip lives
+    // alongside the per-book cache dirs that the extraction will populate.
+    Storage.mkdir("/.crosspoint");
+    if (Storage.exists(state.tmpPath.c_str())) Storage.remove(state.tmpPath.c_str());
+
+    if (!Storage.openFileForWrite("WEB", state.tmpPath, state.file)) {
+      state.error = "Failed to open temp zip on SD";
+      LOG_ERR("WEB", "[PRE-UP] FAILED to create %s", state.tmpPath.c_str());
+      return;
+    }
+    LOG_INF("WEB", "[PRE-UP] START -> %s", state.tmpPath.c_str());
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!state.file || !state.error.isEmpty()) return;
+    const uint8_t* data = upload.buf;
+    size_t remaining = upload.currentSize;
+    while (remaining > 0) {
+      const size_t space = PrebakeCacheUploadState::UPLOAD_BUFFER_SIZE - state.bufferPos;
+      const size_t toCopy = remaining < space ? remaining : space;
+      memcpy(state.buffer.data() + state.bufferPos, data, toCopy);
+      state.bufferPos += toCopy;
+      data += toCopy;
+      remaining -= toCopy;
+      if (state.bufferPos >= PrebakeCacheUploadState::UPLOAD_BUFFER_SIZE) {
+        const size_t w = state.file.write(state.buffer.data(), state.bufferPos);
+        if (w != state.bufferPos) {
+          state.error = "Write to SD failed (disk full?)";
+          state.file.close();
+          return;
+        }
+        state.bufferPos = 0;
+        esp_task_wdt_reset();
+      }
+    }
+    state.size += upload.currentSize;
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (!state.file) return;
+    if (state.bufferPos > 0) {
+      const size_t w = state.file.write(state.buffer.data(), state.bufferPos);
+      if (w != state.bufferPos) state.error = "Final write to SD failed";
+      state.bufferPos = 0;
+    }
+    state.file.close();
+    if (state.error.isEmpty()) state.success = true;
+    LOG_INF("WEB", "[PRE-UP] received %u bytes", static_cast<unsigned>(state.size));
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (state.file) state.file.close();
+    Storage.remove(state.tmpPath.c_str());
+    state.error = "Upload aborted";
+    LOG_DBG("WEB", "[PRE-UP] aborted");
+  }
+}
+
+void CrossPointWebServer::handlePrebakeCacheUploadPost(PrebakeCacheUploadState& state) const {
+  if (!state.success) {
+    const String error = state.error.isEmpty() ? "Unknown error during prebake cache upload" : state.error;
+    server->send(400, "text/plain", error);
+    return;
+  }
+
+  // Walk the zip's central directory + extract each entry to its zip-encoded
+  // path under SD root. Path safety: reject any entry that's absolute,
+  // contains ".." segments, or escapes /.crosspoint/. Anything outside
+  // that root would let a malformed cache zip write over /Books or system
+  // files, so we fail closed on the first suspicious entry rather than
+  // partial-extract.
+  const std::string tmpStd(state.tmpPath.c_str());
+  ZipFile zip(tmpStd);
+  if (!zip.loadAllFileStatSlims()) {
+    Storage.remove(state.tmpPath.c_str());
+    server->send(400, "text/plain", "Failed to parse uploaded cache zip");
+    return;
+  }
+  const auto& entries = zip.getEntries();
+
+  int extracted = 0;
+  size_t totalBytes = 0;
+  String firstBadEntry;
+  for (const auto& kv : entries) {
+    esp_task_wdt_reset();
+    const std::string& entryName = kv.first;
+    if (entryName.empty() || entryName.back() == '/') continue;  // skip directories
+    // Anchor at the .crosspoint/ namespace. The optimizer always writes
+    // entries with that prefix; we reject anything else as malformed.
+    if (entryName.rfind(".crosspoint/", 0) != 0 ||
+        entryName.find("..") != std::string::npos ||
+        entryName[0] == '/') {
+      firstBadEntry = entryName.c_str();
+      break;
+    }
+    // Final SD destination = "/" + entry name.
+    String destPath = "/";
+    destPath += entryName.c_str();
+    // Ensure parent dirs exist. ESP32's FATFS mkdir is non-recursive, so we
+    // walk path segments and create each one.
+    {
+      int slash = destPath.indexOf('/', 1);
+      while (slash > 0) {
+        const String parent = destPath.substring(0, slash);
+        Storage.mkdir(parent.c_str());
+        slash = destPath.indexOf('/', slash + 1);
+      }
+    }
+    FsFile outFile;
+    if (Storage.exists(destPath.c_str())) Storage.remove(destPath.c_str());
+    if (!Storage.openFileForWrite("WEB", destPath, outFile)) {
+      LOG_ERR("WEB", "[PRE-EXT] open %s failed", destPath.c_str());
+      continue;
+    }
+    if (!zip.readFileToStream(entryName.c_str(), outFile, 4096)) {
+      LOG_ERR("WEB", "[PRE-EXT] inflate %s failed", entryName.c_str());
+      outFile.close();
+      Storage.remove(destPath.c_str());
+      continue;
+    }
+    const uint32_t sz = outFile.size();
+    outFile.close();
+    extracted++;
+    totalBytes += sz;
+  }
+
+  // Always remove the temp zip whether extraction fully succeeded or not --
+  // we never want a stale ~MB blob sitting in /.crosspoint forever.
+  Storage.remove(state.tmpPath.c_str());
+
+  state.extractedCount = extracted;
+  state.extractedBytes = totalBytes;
+
+  if (!firstBadEntry.isEmpty()) {
+    String body = "Refused cache zip: unsafe entry '";
+    body += firstBadEntry;
+    body += "' (must be under .crosspoint/ and free of '..' segments)";
+    server->send(400, "text/plain", body);
+    return;
+  }
+
+  // JSON summary so optimizer.js can log a precise success line.
+  String body = "{\"extracted\":";
+  body += String(extracted);
+  body += ",\"bytes\":";
+  body += String(static_cast<uint32_t>(totalBytes));
+  body += ",\"total_entries\":";
+  body += String(static_cast<uint32_t>(entries.size()));
+  body += "}";
+  server->send(200, "application/json", body);
+  LOG_INF("WEB", "[PRE-EXT] extracted %d/%u entries, %u bytes",
+          extracted, static_cast<unsigned>(entries.size()), static_cast<unsigned>(totalBytes));
 }
 
 void CrossPointWebServer::handleCreateFolder() const {
