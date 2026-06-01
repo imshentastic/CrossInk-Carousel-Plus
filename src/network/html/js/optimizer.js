@@ -2057,13 +2057,26 @@ async function convertEpubFile(file, progressCallback) {
   // to its .pxc pixel cache at the exact dimensions the device will use. The
   // optimizer is served by the device, so this returns the live viewport.
   //
-  // Two gates:
+  // Three gates:
   //   1. User toggle: "Bake images for Bluetooth". Default on. Lets users
   //      opt out of the bake (and the size growth) when they don't read with
   //      a BT remote.
-  //   2. Render-info fetch must succeed (fails when the optimizer runs
+  //   2. NOT mutually exclusive with the Pre-bake reader cache toggle. When
+  //      prebake is on, the WASM step downstream extracts the .pxc files into
+  //      the cache zip; baking them into the EPUB too means shipping the same
+  //      pixel data twice (once embedded in the EPUB, once in /.crosspoint/),
+  //      doubling SD storage and ballooning the cache zip to ~4 MB (which
+  //      crashes the device's upload handler). 2C.7 / Option B: prebake
+  //      supersedes the per-image bake.
+  //   3. Render-info fetch must succeed (fails when the optimizer runs
   //      standalone off-device).
-  const bakePxcEnabled = document.getElementById('bake-pxc-checkbox')?.checked !== false;
+  const prebakeReaderCacheEnabled = !!document.getElementById('prebake-reader-cache-checkbox')?.checked;
+  const bakePxcUserChoice = document.getElementById('bake-pxc-checkbox')?.checked !== false;
+  const bakePxcEnabled = bakePxcUserChoice && !prebakeReaderCacheEnabled;
+  if (prebakeReaderCacheEnabled && bakePxcUserChoice) {
+    log('Bluetooth image cache: skipped (superseded by Pre-bake reader cache; .pxc files ship in the cache zip instead of the EPUB)',
+        '', 'INFO');
+  }
   let renderInfo = null;
   if (bakePxcEnabled) {
     try {
