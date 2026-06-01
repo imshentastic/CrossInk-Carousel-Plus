@@ -592,9 +592,15 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
     Section section(epub, spineIdx, renderer);
     bool imagesWereSuppressed = false;
     bool layoutAbortedForLowMemory = false;
+    // EXPERIMENTAL (2C.8 workaround): force embeddedStyle=false to ChapterHtmlSlimParser
+    // so it produces ZERO-margin BlockStyle (matching device's rebuild behavior). The
+    // device's renderer evidently applies CSS margins at draw time using its own CssParser
+    // lookup, not from BlockStyle, so shipping BlockStyle margins double-applies them and
+    // breaks pagination. We patch the header byte AFTER the build to report the
+    // user's real embeddedStyle setting so device's settings-fingerprint check passes.
     const bool ok = section.createSectionFile(
         s.fontId, s.lineCompression, s.extraParagraphSpacing, s.forceParagraphIndents, s.paragraphAlignment,
-        s.viewportWidth, s.viewportHeight, s.hyphenationEnabled, s.embeddedStyle, s.imageRendering,
+        s.viewportWidth, s.viewportHeight, s.hyphenationEnabled, /*embeddedStyle=*/false, s.imageRendering,
         s.bionicReadingEnabled, s.guideReadingEnabled, /*popupFn=*/nullptr, &imagesWereSuppressed,
         &layoutAbortedForLowMemory);
     if (!ok) {
@@ -640,6 +646,13 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
         std::memcpy(content.data() + pos, deviceCacheDirOnSd.data(), deviceCacheDirOnSd.size());
         pos += deviceCacheDirOnSd.size();
       }
+    }
+    // 2C.8 workaround: patch the embeddedStyle byte (offset 21 in header) to
+    // match the user's real setting. We built with embeddedStyle=false so the
+    // parser produced zero-margin BlockStyle, but the header must report the
+    // user's real value so device's section-load fingerprint check passes.
+    if (content.size() > 21) {
+      content[21] = static_cast<char>(s.embeddedStyle ? 1 : 0);
     }
     std::ofstream out(dstPath, std::ios::binary | std::ios::trunc);
     if (!out) continue;
