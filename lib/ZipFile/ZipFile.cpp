@@ -101,11 +101,18 @@ int ZipFile::iterateEntries(const std::function<bool(const std::string&, const F
     file.seekCur(m + k);  // skip extra field + comment
     count++;
 
-    // Build a small std::string just for the callback signature. This
-    // is a transient heap allocation (~length of itemName + sizeof header)
-    // that gets freed as soon as the callback returns.
+    // Save cursor BEFORE calling the callback. The callback typically
+    // invokes readFileToStream / readFileToMemory, which both `file.seek`
+    // to the entry's local-header offset to read the actual file data --
+    // that trample the central-dir cursor we're walking. Restore it after
+    // the callback returns so the next `file.read(&sig, 4)` reads the
+    // NEXT central-dir record, not garbage at wherever readFileToStream
+    // left the head.
+    const uint32_t cursorBefore = file.position();
     const std::string nameStr(itemName, nameLen);
-    if (!callback(nameStr, fileStat)) break;
+    const bool cont = callback(nameStr, fileStat);
+    file.seek(cursorBefore);
+    if (!cont) break;
   }
 
   return count;
