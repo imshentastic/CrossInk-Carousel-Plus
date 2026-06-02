@@ -818,6 +818,47 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
     }
   }
   LOG_INF("PRE", "copied %d image files + %d pxc caches + css to real cache dir", copiedImages, copiedPxc);
+
+  // CrumBLE: write the 12-field fingerprint as a tiny JSON sidecar
+  // (prebake-manifest.json) so the device's switch-back prompt can detect
+  // the prebake's existence AFTER the section files have been overwritten
+  // by chapter rebuilds under mismatched settings. Without this, the moment
+  // the user changes a setting and reads through the book, Section.cpp's
+  // clearCache() deletes each section file and the prebake's fingerprint
+  // becomes unrecoverable -- they'd have to re-run the optimizer to get
+  // the prompt back, even after reverting their settings.
+  //
+  // The manifest is self-contained: doesn't depend on any section file
+  // existing, and survives chapter rebuilds because Section.cpp only
+  // touches per-section files. ~250 bytes of SD per book.
+  {
+    JsonDocument mdoc;
+    mdoc["v"] = 1;  // schema version; bump if fields are added
+    mdoc["fontId"] = s.fontId;
+    mdoc["lineCompression"] = s.lineCompression;
+    mdoc["extraParagraphSpacing"] = s.extraParagraphSpacing ? 1 : 0;
+    mdoc["forceParagraphIndents"] = s.forceParagraphIndents ? 1 : 0;
+    mdoc["paragraphAlignment"] = static_cast<int>(s.paragraphAlignment);
+    mdoc["viewportWidth"] = static_cast<int>(s.viewportWidth);
+    mdoc["viewportHeight"] = static_cast<int>(s.viewportHeight);
+    mdoc["hyphenationEnabled"] = s.hyphenationEnabled ? 1 : 0;
+    mdoc["embeddedStyle"] = s.embeddedStyle ? 1 : 0;
+    mdoc["imageRendering"] = static_cast<int>(s.imageRendering);
+    mdoc["bionicReadingEnabled"] = s.bionicReadingEnabled ? 1 : 0;
+    mdoc["guideReadingEnabled"] = s.guideReadingEnabled ? 1 : 0;
+    std::string mjson;
+    serializeJson(mdoc, mjson);
+    const std::string manifestPath = realCacheDir + "/prebake-manifest.json";
+    std::ofstream mfile(manifestPath, std::ios::binary | std::ios::trunc);
+    if (mfile) {
+      mfile.write(mjson.data(), static_cast<std::streamsize>(mjson.size()));
+      mfile.close();
+      LOG_INF("PRE", "wrote prebake-manifest.json (%zu bytes)", mjson.size());
+    } else {
+      LOG_ERR("PRE", "could not write prebake-manifest.json at %s", manifestPath.c_str());
+    }
+  }
+
   return failures;
 }
 

@@ -32,11 +32,15 @@ struct PrebakeManifest {
   bool guideReadingEnabled = false;
 };
 
-// Try to load the fingerprint from the cache's section 0. Returns true on
-// success. Reads only the first ~25 bytes of the file -- one SD seek + small
-// read, no full deserialize -- so this is cheap to call on every book open
-// even when the user has hundreds of cached books.
+// Try to load the fingerprint from the prebake CLI's JSON sidecar at
+// <cachePath>/prebake-manifest.json. Returns true on success. Reads a small
+// (~250 byte) JSON file and parses with ArduinoJson -- cheap to call on
+// every book open.
 //
-// cachePath is the per-book cache dir (i.e. /.crosspoint/epub_<hash>); the
-// function reads <cachePath>/sections/0.bin's header.
+// Important: the manifest is decoupled from the section files. After the
+// device's Section::clearCache + chapter rebuild has overwritten the
+// prebake'd section files (when current settings don't match), the manifest
+// JSON is still on disk and tryLoadPrebakeManifest still succeeds. That's
+// what lets the switch-back prompt keep firing on subsequent book opens --
+// until the user accepts the prompt OR manually deletes the manifest.
 bool tryLoadPrebakeManifest(const std::string& cachePath, PrebakeManifest& out);
