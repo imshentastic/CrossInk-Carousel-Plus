@@ -13,8 +13,6 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <MemoryBudget.h>
-#include <ZipFile.h>
-#include <esp_task_wdt.h>
 #include <esp_system.h>
 
 #include <algorithm>
@@ -357,7 +355,6 @@ void EpubReaderActivity::onEnter() {
   prebakeManifest_.reset();
   prebakeLastSnapshot_ = {};
   prebakePromptShowing_ = false;
-  lazyPrebakeExtractor_.reset();
   deferredOnEnterPending_ = true;
   firstRenderCompleted_ = false;
   // Reset BLE-link edge state on every book open: a fresh book may have a
@@ -558,15 +555,7 @@ void EpubReaderActivity::runDeferredOnEnter() {
   // user flips the toggle on. Cheap when it does run: one SD open + small
   // JSON parse. The result drives the switch-back prompt in tick() when
   // current SETTINGS would invalidate the cache.
-  //
-  // We also start the lazy extractor here -- it runs before the manifest
-  // check because, if there's a pending zip with a fresher manifest inside,
-  // we want to know about it after extraction completes. The extractor's
-  // tick loop re-loads the manifest when it finishes the prebake-manifest
-  // entry specifically, so the prompt fires correctly even when the
-  // manifest didn't exist at book-open time.
   if (SETTINGS.optimizeChapterIndexing) {
-    startLazyPrebakeExtractionIfPending();
     PrebakeManifest pm;
     if (tryLoadPrebakeManifest(epub->getCachePath(), pm)) {
       prebakeManifest_ = pm;
@@ -576,142 +565,6 @@ void EpubReaderActivity::runDeferredOnEnter() {
               pm.embeddedStyle);
     }
   }
-}
-
-void EpubReaderActivity::startLazyPrebakeExtractionIfPending() {
-  // Pending zip convention: <cachePath>/_pending_prebake.zip, with entry
-  // names RELATIVE to cachePath (e.g. "sections-prebake/0.bin",
-  // "prebake-manifest.json", "book.bin"). The JS-side optimizer or the
-  // user's file-manager drop is responsible for putting it here.
-  const std::string zipPath = epub->getCachePath() + "/_pending_prebake.zip";
-  if (!Storage.exists(zipPath.c_str())) return;
-
-  // Pre-scan once to collect entry names. iterateEntries holds at most
-  // one entry's worth of state in flight, so the only persistent heap
-  // cost is the std::vector<std::string> we accumulate (~5 KB for a
-  // typical 130-entry cache). Per-tick extraction then does
-  // open + central-dir-cursor-walk + extract + close per entry, with
-  // ZipFile's lastCentralDirPosValid cursor making sequential lookups
-  // amortized constant time.
-  ZipFile zip(zipPath);
-  LazyPrebakeExtractor extractor;
-  extractor.zipPath = zipPath;
-  zip.iterateEntries([&extractor](const std::string& name, const ZipFile::FileStatSlim&) -> bool {
-    if (name.empty() || name.back() == '/') return true;  // skip dirs
-    if (name.find("..") != std::string::npos || name[0] == '/') return true;  // skip unsafe
-    extractor.entryNames.push_back(name);
-    return true;
-  });
-
-  if (extractor.entryNames.empty()) {
-    // Empty or corrupt zip -- delete it so we don't keep retrying on
-    // every book open. The user can re-upload a valid one to restart.
-    LOG_ERR("ERA", "Pending prebake zip has zero usable entries; deleting %s", zipPath.c_str());
-    Storage.remove(zipPath.c_str());
-    return;
-  }
-
-  LOG_INF("ERA", "Lazy prebake extractor armed: %zu entries from %s",
-          extractor.entryNames.size(), zipPath.c_str());
-  lazyPrebakeExtractor_ = std::move(extractor);
-}
-
-void EpubReaderActivity::tickLazyPrebakeExtraction() {
-  if (!lazyPrebakeExtractor_.has_value()) return;
-  LazyPrebakeExtractor& ex = *lazyPrebakeExtractor_;
-
-  // Heap-floor check: skip this tick when memory is tight. Earlier
-  // designs (the now-removed device-side multipart extractor) blew up
-  // exactly when other reader work was competing for heap; the lazy
-  // extractor's whole point is to defer to those callers. Picks back
-  // up next tick when the pressure passes.
-  static constexpr uint32_t EXTRACT_HEAP_MIN = 6 * 1024;
-  if (ESP.getMaxAllocHeap() < EXTRACT_HEAP_MIN) return;
-
-  // Per-tick time budget. We batch multiple entries per tick (instead of
-  // strict one-per-tick) because at idle e-ink loop rates a single-entry
-  // pace meant ~2 minutes for a 130-entry cache, during which the user
-  // saw the "Indexing chapter..." screen instead of their book. 120 ms
-  // is the rough wall-clock budget that keeps the reader responsive
-  // while still completing extraction in ~10-15 s for typical books.
-  // Entries are tiny (~100 B-30 KB each), so one entry is roughly 5-15 ms
-  // wall on SD; we'll fit somewhere between 8 and 24 per tick.
-  static constexpr uint32_t TICK_BUDGET_MS = 120;
-  const uint32_t tickStart = millis();
-
-  while (true) {
-    if (ex.nextEntry >= ex.entryNames.size()) {
-      // Done. Delete the source zip and clear state.
-      Storage.remove(ex.zipPath.c_str());
-      LOG_INF("ERA", "Lazy prebake extract finished: ok=%u fail=%u bytes=%u; removed %s",
-              ex.extractedOk, ex.extractedFail, ex.totalBytes, ex.zipPath.c_str());
-      // If we just landed a prebake-manifest.json AND we didn't have a
-      // manifest in memory yet, re-load it now so the post-extract reader
-      // can pick up the switch-back prompt on its next render.
-      if (!prebakeManifest_.has_value() && SETTINGS.optimizeChapterIndexing) {
-        PrebakeManifest pm;
-        if (tryLoadPrebakeManifest(epub->getCachePath(), pm)) {
-          prebakeManifest_ = pm;
-          LOG_INF("ERA", "Loaded prebake manifest post-extract: fontId=%ld viewport=%ux%u",
-                  static_cast<long>(pm.fontId), static_cast<unsigned>(pm.viewportWidth),
-                  static_cast<unsigned>(pm.viewportHeight));
-        }
-      }
-      lazyPrebakeExtractor_.reset();
-      return;
-    }
-
-    esp_task_wdt_reset();
-    const std::string& entryName = ex.entryNames[ex.nextEntry];
-    ex.nextEntry++;
-
-    // Compose absolute destination under the book's cache dir.
-    std::string destPath = epub->getCachePath();
-    if (destPath.empty() || destPath.back() != '/') destPath += '/';
-    destPath += entryName;
-
-    // mkdir -p for any parent dirs in the entry name (e.g. "sections-prebake/").
-    {
-      size_t slash = destPath.find('/', 1);
-      while (slash != std::string::npos) {
-        const std::string parent = destPath.substr(0, slash);
-        Storage.mkdir(parent.c_str());
-        slash = destPath.find('/', slash + 1);
-      }
-    }
-
-    if (Storage.exists(destPath.c_str())) Storage.remove(destPath.c_str());
-    FsFile outFile;
-    if (!Storage.openFileForWrite("ERA", String(destPath.c_str()), outFile)) {
-      LOG_ERR("ERA", "Lazy extract: open %s for write failed", destPath.c_str());
-      ex.extractedFail++;
-    } else {
-      ZipFile zip(ex.zipPath);
-      if (!zip.readFileToStream(entryName.c_str(), outFile, 4096)) {
-        LOG_ERR("ERA", "Lazy extract: inflate %s failed", entryName.c_str());
-        outFile.close();
-        Storage.remove(destPath.c_str());
-        ex.extractedFail++;
-      } else {
-        const uint32_t sz = outFile.size();
-        outFile.close();
-        ex.extractedOk++;
-        ex.totalBytes += sz;
-      }
-    }
-
-    // Yield when the time budget is exhausted. Don't bail mid-loop on
-    // heap pressure though -- once we have the writer file handle we'd
-    // rather finish the entry than partially fail it.
-    if ((millis() - tickStart) >= TICK_BUDGET_MS) break;
-  }
-
-  // Single progress log per tick (the entry-by-entry log flooded serial
-  // and made it hard to see other reader activity). Show cumulative
-  // counts + heap so it's easy to spot if extraction stalls.
-  LOG_INF("ERA", "Lazy extract: %u/%zu ok (%u fail, %u B total), heap free=%u maxAlloc=%u",
-          ex.extractedOk, ex.entryNames.size(), ex.extractedFail, ex.totalBytes,
-          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 }
 
 bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
@@ -1034,11 +887,10 @@ void EpubReaderActivity::loop() {
   // complete). Tick() still calls it as a safety net.
   if (checkAndFirePrebakePromptIfNeeded()) return;
 
-  // CrumBLE: lazy prebake extractor. One entry per tick when there's a
-  // pending zip, no-op when there isn't. Spread across reader idle time
-  // so the user isn't blocked by extract work the way the v1 device-side
-  // multipart endpoint blocked the request thread.
-  tickLazyPrebakeExtraction();
+  // CrumBLE: prebake artifacts now arrive via the file manager's /upload
+  // endpoint, file-by-file, dropped straight into the final cache layout
+  // by the JS-side optimizer (or a curl loop). No reader-side extraction
+  // step needed -- Section's dual-path read picks them up automatically.
 
   // BT No Images Quick Connect auto-restore. The no-images flag exists only to
   // keep the contiguous heap free for NimBLE's ~58 KB, so restore images the

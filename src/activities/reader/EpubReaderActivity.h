@@ -212,40 +212,6 @@ class EpubReaderActivity final : public Activity {
   // prebakePromptShowing_ guard short-circuits subsequent invocations).
   bool checkAndFirePrebakePromptIfNeeded();
 
-  // CrumBLE: lazy background extractor for a prebake'd cache zip that the
-  // JS-side optimizer (or the user via the file manager) has dropped at
-  // <cachePath>/_pending_prebake.zip. We extract one entry per tick so
-  // the work spreads across the reader's idle time instead of blocking
-  // the request thread the way the v1 device-side multipart extractor
-  // did -- under heap pressure that was both a crash risk AND a UI
-  // hang. Trade-off: total extraction takes ~5-15 s wall-clock for a
-  // ~130-entry cache, but the reader stays interactive throughout.
-  //
-  // Entry names are RELATIVE paths under the book's cache dir, e.g.
-  // "sections-prebake/0.bin", "prebake-manifest.json", "book.bin". The
-  // JS-side upload step is responsible for using this naming convention.
-  struct LazyPrebakeExtractor {
-    std::string zipPath;
-    // Entry names collected once at extractor-init via iterateEntries().
-    // Heap cost: ~4-6 KB for a typical 130-entry cache. We pay this once
-    // up front so per-tick work is O(1) lookup + entry extract (the
-    // ZipFile's lastCentralDirPos cursor makes sequential-by-name lookups
-    // amortized constant time even without the full fileStatSlimCache).
-    std::vector<std::string> entryNames;
-    size_t nextEntry = 0;
-    uint32_t extractedOk = 0;
-    uint32_t extractedFail = 0;
-    uint32_t totalBytes = 0;
-  };
-  std::optional<LazyPrebakeExtractor> lazyPrebakeExtractor_;
-  // Called from runDeferredOnEnter when the toggle is on. Checks for a
-  // pending zip and initializes lazyPrebakeExtractor_ if found.
-  void startLazyPrebakeExtractionIfPending();
-  // Called once per tick. Extracts the next entry (if any) and updates
-  // state. When the last entry is done, deletes the source zip + clears
-  // the extractor state. Cheap when idle (nothing to do).
-  void tickLazyPrebakeExtraction();
-
   // CrumBLE Phase 1 fast-open: non-critical onEnter work (font buffer
   // pre-grow, reader-settings cache build, .pxc manifest parse) is
   // deferred to the first loop() tick AFTER the first render. Net
