@@ -2,6 +2,7 @@
 #include <HalStorage.h>
 
 #include <deque>
+#include <functional>
 #include <string>
 #include <unordered_map>
 
@@ -73,4 +74,28 @@ class ZipFile {
   // These functions will open and close the zip as needed
   uint8_t* readFileToMemory(const char* filename, size_t* size = nullptr, bool trailingNullByte = false);
   bool readFileToStream(const char* filename, Print& out, size_t chunkSize);
+
+  // CrumBLE: enumerate every entry's name + stats. Populated by
+  // loadAllFileStatSlims(); reading before that call yields an empty map.
+  // Const reference is fine to hand out -- the map's lifetime is tied to
+  // this ZipFile instance and callers are expected to drain it during the
+  // same scope. Used by the /api/upload-prebake-cache handler to walk the
+  // optimizer's cache zip and extract each entry to SD without having to
+  // know the entry names ahead of time.
+  const std::unordered_map<std::string, FileStatSlim>& getEntries() const { return fileStatSlimCache; }
+
+  // CrumBLE: streaming central-dir walk. Calls `callback(name, stat)` for
+  // each entry in zip order, allocating only ONE entry's worth of memory
+  // at a time (the local itemName[256] buffer + the FileStatSlim). Unlike
+  // loadAllFileStatSlims this never builds the ~13 KB unordered_map, which
+  // matters on ESP32 when extracting under heap pressure right after a
+  // large upload completes. Callback returns true to continue, false to
+  // stop walking. Returns total entries visited (or 0 on error).
+  //
+  // Trade-off vs. loadAllFileStatSlims: subsequent readFileToStream calls
+  // re-scan the central dir for each lookup (slower), but the memory
+  // ceiling drops from "size of cache zip" to a small constant. For the
+  // prebake-cache extract path this is the difference between "extracts
+  // nothing under pressure" and "extracts everything under pressure".
+  int iterateEntries(const std::function<bool(const std::string&, const FileStatSlim&)>& callback);
 };
