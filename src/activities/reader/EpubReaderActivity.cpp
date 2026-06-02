@@ -662,43 +662,78 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
           static_cast<unsigned>(pm.imageRendering),
           pm.bionicReadingEnabled, pm.guideReadingEnabled);
 
+  // .pxc-manifest-style prompt: confirm applies the prebake's prepared
+  // layout (restoring cache compatibility), cancel keeps current settings
+  // (book will rebuild chapter-by-chapter against the live cache). This
+  // is uniform across both the "you just changed a setting" and "you
+  // opened a book whose settings already don't match the prebake" cases
+  // -- both want the same choice between "use what was prepared" and
+  // "keep what I have."
   const std::string promptBody =
-      "Your reader setting change makes this book's prepared layout invalid. "
-      "Every chapter will rebuild from scratch -- slower opens and possible "
-      "memory errors on long chapters. Keep your change?";
+      "This book was prepared with different reader settings. Switch to the "
+      "prepared layout for faster reading, or keep your current settings and "
+      "let the device rebuild each chapter as you reach it?";
   prebakePromptShowing_ = true;
   startActivityForResult(
       std::make_unique<ConfirmationActivity>(
-          renderer, mappedInput, "Keep reader settings change?", promptBody,
+          renderer, mappedInput, "Use prepared layout?", promptBody,
           /*ignoreInitialConfirmRelease=*/true),
       [this](const ActivityResult& result) {
         prebakePromptShowing_ = false;
         if (result.isCancelled) {
-          LOG_INF("ERA", "Prebake prompt: user cancelled, reverting settings to prebake-compatible snapshot");
-          SETTINGS.orientation = prebakeLastSnapshot_.orientation;
-          SETTINGS.screenMargin = prebakeLastSnapshot_.screenMargin;
-          SETTINGS.imageRendering = prebakeLastSnapshot_.imageRendering;
-          SETTINGS.fontFamily = prebakeLastSnapshot_.fontFamily;
-          SETTINGS.fontSize = prebakeLastSnapshot_.fontSize;
-          SETTINGS.sdFontSizeRange = prebakeLastSnapshot_.sdFontSizeRange;
-          strncpy(SETTINGS.sdFontFamilyName, prebakeLastSnapshot_.sdFontFamilyName,
-                  sizeof(SETTINGS.sdFontFamilyName) - 1);
-          SETTINGS.sdFontFamilyName[sizeof(SETTINGS.sdFontFamilyName) - 1] = '\0';
-          SETTINGS.lineSpacing = prebakeLastSnapshot_.lineSpacing;
-          SETTINGS.paragraphAlignment = prebakeLastSnapshot_.paragraphAlignment;
-          SETTINGS.extraParagraphSpacing = prebakeLastSnapshot_.extraParagraphSpacing;
-          SETTINGS.forceParagraphIndents = prebakeLastSnapshot_.forceParagraphIndents;
-          SETTINGS.hyphenationEnabled = prebakeLastSnapshot_.hyphenationEnabled;
-          SETTINGS.embeddedStyle = prebakeLastSnapshot_.embeddedStyle;
-          SETTINGS.bionicReadingEnabled = prebakeLastSnapshot_.bionicReadingEnabled;
-          SETTINGS.guideReadingEnabled = prebakeLastSnapshot_.guideReadingEnabled;
-          SETTINGS.saveToFile();
-          ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
-          if (section) section.reset();
+          // User declined -- keep their current settings. Don't delete the
+          // prebake (Section.cpp's clearCache only ever touches sections/,
+          // never sections-prebake/), so if they later open the book again
+          // and revert their settings, the cache is still there. Update
+          // the snapshot to current SETTINGS so we don't keep firing the
+          // prompt on every render tick.
+          LOG_INF("ERA", "Prebake prompt: user declined, keeping current settings");
+          prebakeLastSnapshot_.orientation = SETTINGS.orientation;
+          prebakeLastSnapshot_.screenMargin = SETTINGS.screenMargin;
+          prebakeLastSnapshot_.imageRendering = SETTINGS.imageRendering;
+          prebakeLastSnapshot_.fontFamily = SETTINGS.fontFamily;
+          prebakeLastSnapshot_.fontSize = SETTINGS.fontSize;
+          prebakeLastSnapshot_.sdFontSizeRange = SETTINGS.sdFontSizeRange;
+          strncpy(prebakeLastSnapshot_.sdFontFamilyName, SETTINGS.sdFontFamilyName,
+                  sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1);
+          prebakeLastSnapshot_.sdFontFamilyName[sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1] = '\0';
+          prebakeLastSnapshot_.lineSpacing = SETTINGS.lineSpacing;
+          prebakeLastSnapshot_.paragraphAlignment = SETTINGS.paragraphAlignment;
+          prebakeLastSnapshot_.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
+          prebakeLastSnapshot_.forceParagraphIndents = SETTINGS.forceParagraphIndents;
+          prebakeLastSnapshot_.hyphenationEnabled = SETTINGS.hyphenationEnabled;
+          prebakeLastSnapshot_.embeddedStyle = SETTINGS.embeddedStyle;
+          prebakeLastSnapshot_.bionicReadingEnabled = SETTINGS.bionicReadingEnabled;
+          prebakeLastSnapshot_.guideReadingEnabled = SETTINGS.guideReadingEnabled;
           requestUpdate();
           return;
         }
-        LOG_INF("ERA", "Prebake prompt: user confirmed change, cache will rebuild");
+        // User confirmed -- apply the prebake's prepared layout. With the
+        // reversion fields in the manifest we can fully restore the raw
+        // SETTINGS the prebake was made against, so the next fingerprint
+        // check against sections-prebake/ matches exactly.
+        if (!prebakeManifest_.has_value()) return;
+        const PrebakeManifest& pm2 = *prebakeManifest_;
+        LOG_INF("ERA", "Prebake prompt: user accepted, restoring prepared layout");
+        SETTINGS.orientation = pm2.orientation;
+        SETTINGS.screenMargin = pm2.screenMargin;
+        SETTINGS.imageRendering = pm2.imageRendering;
+        SETTINGS.fontFamily = pm2.fontFamily;
+        SETTINGS.fontSize = pm2.fontSize;
+        SETTINGS.sdFontSizeRange = pm2.sdFontSizeRange;
+        strncpy(SETTINGS.sdFontFamilyName, pm2.sdFontFamilyName, sizeof(SETTINGS.sdFontFamilyName) - 1);
+        SETTINGS.sdFontFamilyName[sizeof(SETTINGS.sdFontFamilyName) - 1] = '\0';
+        SETTINGS.lineSpacing = pm2.lineSpacing;
+        SETTINGS.paragraphAlignment = pm2.paragraphAlignment;
+        SETTINGS.extraParagraphSpacing = pm2.extraParagraphSpacing;
+        SETTINGS.forceParagraphIndents = pm2.forceParagraphIndents;
+        SETTINGS.hyphenationEnabled = pm2.hyphenationEnabled;
+        SETTINGS.embeddedStyle = pm2.embeddedStyle;
+        SETTINGS.bionicReadingEnabled = pm2.bionicReadingEnabled;
+        SETTINGS.guideReadingEnabled = pm2.guideReadingEnabled;
+        SETTINGS.saveToFile();
+        ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
+        // Snapshot the now-reverted SETTINGS as the new baseline.
         prebakeLastSnapshot_.orientation = SETTINGS.orientation;
         prebakeLastSnapshot_.screenMargin = SETTINGS.screenMargin;
         prebakeLastSnapshot_.imageRendering = SETTINGS.imageRendering;

@@ -30,6 +30,20 @@ struct PrebakeManifest {
   uint8_t imageRendering = 0;
   bool bionicReadingEnabled = false;
   bool guideReadingEnabled = false;
+
+  // CrumBLE reversion fields. The 12 fingerprint values above lock the
+  // section header but include derived quantities (fontId is hash of
+  // family+size; viewport is screen minus margins; lineCompression is
+  // SETTINGS::getReaderLineCompression(lineSpacing)). The on-device "Use
+  // prepared layout?" prompt applies these RAW values on confirm so the
+  // post-revert fingerprint check actually matches the prebake'd cache.
+  uint8_t orientation = 0;
+  uint8_t screenMargin = 0;
+  uint8_t fontFamily = 0;
+  uint8_t fontSize = 0;
+  uint8_t sdFontSizeRange = 0;
+  char sdFontFamilyName[64] = "";
+  uint8_t lineSpacing = 0;
 };
 
 // Try to load the fingerprint from the prebake CLI's JSON sidecar at

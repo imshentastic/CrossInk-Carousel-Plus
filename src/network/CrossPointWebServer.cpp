@@ -1891,6 +1891,11 @@ void CrossPointWebServer::handleReaderRenderInfo() const {
   // against on first open. Any drift here invalidates the prebake'd
   // section cache and the device falls back to a fresh build.
   doc["lineCompression"] = SETTINGS.getReaderLineCompression();
+  // CrumBLE: raw lineSpacing enum (NORMAL / TIGHT / etc.) alongside the
+  // derived lineCompression float. The prebake manifest carries lineSpacing
+  // so the device-side switch-back prompt can reverse-apply (lineCompression
+  // is a one-way derivation that we can't cleanly invert without the enum).
+  doc["lineSpacing"] = static_cast<int>(SETTINGS.lineSpacing);
   doc["extraParagraphSpacing"] = static_cast<int>(SETTINGS.extraParagraphSpacing);
   doc["forceParagraphIndents"] = static_cast<int>(SETTINGS.forceParagraphIndents);
   doc["paragraphAlignment"] = static_cast<int>(SETTINGS.paragraphAlignment);

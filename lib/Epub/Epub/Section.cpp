@@ -98,7 +98,43 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
                               const uint16_t viewportWidth, const uint16_t viewportHeight,
                               const bool hyphenationEnabled, const bool embeddedStyle, const uint8_t imageRendering,
                               const bool bionicReadingEnabled, const bool guideReadingEnabled) {
-  if (!Storage.openFileForRead("SCT", filePath, file)) {
+  // Try the live cache (sections/) first. This is the path the device
+  // writes to when it rebuilds a chapter under current settings, so it's
+  // always going to fingerprint-match if the cache is still fresh.
+  if (tryLoadFromPath(filePath, fontId, lineCompression, extraParagraphSpacing, forceParagraphIndents,
+                      paragraphAlignment, viewportWidth, viewportHeight, hyphenationEnabled, embeddedStyle,
+                      imageRendering, bionicReadingEnabled, guideReadingEnabled)) {
+    return true;
+  }
+  // Fall through to the prebake fallback (sections-prebake/). If the user
+  // just reverted their reader settings back to the prebake'd layout via
+  // the switch-back prompt, the live cache was deleted by the previous
+  // mismatch's clearCache call BUT the prebake artifact is still on SD.
+  // Fingerprint check inside tryLoadFromPath enforces that this only
+  // succeeds when current settings actually match the prebake.
+  if (tryLoadFromPath(prebakeFilePath, fontId, lineCompression, extraParagraphSpacing, forceParagraphIndents,
+                      paragraphAlignment, viewportWidth, viewportHeight, hyphenationEnabled, embeddedStyle,
+                      imageRendering, bionicReadingEnabled, guideReadingEnabled)) {
+    LOG_INF("SCT", "Loaded section %d from prebake fallback (%s)", spineIndex, prebakeFilePath.c_str());
+    return true;
+  }
+  // Both failed. Clear the live cache so createSectionFile writes fresh
+  // bytes at filePath. NEVER clear the prebake artifact -- it has to
+  // outlive any number of live-cache rebuilds so the user can always
+  // switch back.
+  if (Storage.exists(filePath.c_str())) {
+    clearCache();
+  }
+  return false;
+}
+
+bool Section::tryLoadFromPath(const std::string& path, const int fontId, const float lineCompression,
+                              const bool extraParagraphSpacing, const bool forceParagraphIndents,
+                              const uint8_t paragraphAlignment, const uint16_t viewportWidth,
+                              const uint16_t viewportHeight, const bool hyphenationEnabled, const bool embeddedStyle,
+                              const uint8_t imageRendering, const bool bionicReadingEnabled,
+                              const bool guideReadingEnabled) {
+  if (!Storage.openFileForRead("SCT", path, file)) {
     return false;
   }
 
@@ -107,29 +143,25 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
     uint32_t magic;
     if (!serialization::tryReadPod(file, magic)) {
       file.close();
-      LOG_ERR("SCT", "Deserialization failed: could not read cache magic");
-      clearCache();
+      LOG_ERR("SCT", "Deserialization failed: could not read cache magic (%s)", path.c_str());
       return false;
     }
     if (magic != SECTION_CACHE_MAGIC) {
       file.close();
-      LOG_ERR("SCT", "Deserialization failed: cache magic mismatch");
-      clearCache();
+      LOG_ERR("SCT", "Deserialization failed: cache magic mismatch (%s)", path.c_str());
       return false;
     }
 
     uint8_t version;
     if (!serialization::tryReadPod(file, version)) {
       file.close();
-      LOG_ERR("SCT", "Deserialization failed: could not read version");
-      clearCache();
+      LOG_ERR("SCT", "Deserialization failed: could not read version (%s)", path.c_str());
       return false;
     }
     if (version != SECTION_FILE_VERSION) {
       // Explicit close() required: member variable persists beyond function scope
       file.close();
-      LOG_ERR("SCT", "Deserialization failed: Unknown version %u", version);
-      clearCache();
+      LOG_ERR("SCT", "Deserialization failed: Unknown version %u (%s)", version, path.c_str());
       return false;
     }
 
@@ -154,8 +186,7 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
         !serialization::tryReadPod(file, fileBionicReadingEnabled) ||
         !serialization::tryReadPod(file, fileGuideReadingEnabled)) {
       file.close();
-      LOG_ERR("SCT", "Deserialization failed: truncated section header");
-      clearCache();
+      LOG_ERR("SCT", "Deserialization failed: truncated section header (%s)", path.c_str());
       return false;
     }
 
@@ -185,7 +216,7 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
               "  imageRendering:        file=%u   device=%u   %s\n"
               "  bionicReadingEnabled:  file=%d   device=%d   %s\n"
               "  guideReadingEnabled:   file=%d   device=%d   %s",
-              filePath.c_str(),
+              path.c_str(),
               fileFontId, fontId, (fileFontId == fontId ? "OK" : "MISMATCH"),
               fileLineCompression, lineCompression, (fileLineCompression == lineCompression ? "OK" : "MISMATCH"),
               fileExtraParagraphSpacing, extraParagraphSpacing,
@@ -204,7 +235,6 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
               (fileBionicReadingEnabled == bionicReadingEnabled ? "OK" : "MISMATCH"),
               fileGuideReadingEnabled, guideReadingEnabled,
               (fileGuideReadingEnabled == guideReadingEnabled ? "OK" : "MISMATCH"));
-      clearCache();
       return false;
     }
   }
@@ -215,15 +245,13 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
   if (!serialization::tryReadPod(file, fileImagesSuppressed) ||
       !serialization::tryReadPod(file, fileBuildMaxAlloc)) {
     file.close();
-    LOG_ERR("SCT", "Deserialization failed: missing degraded-cache fields");
-    clearCache();
+    LOG_ERR("SCT", "Deserialization failed: missing degraded-cache fields (%s)", path.c_str());
     return false;
   }
 
   if (!serialization::tryReadPod(file, pageCount)) {
     file.close();
-    LOG_ERR("SCT", "Deserialization failed: missing page count");
-    clearCache();
+    LOG_ERR("SCT", "Deserialization failed: missing page count (%s)", path.c_str());
     return false;
   }
 

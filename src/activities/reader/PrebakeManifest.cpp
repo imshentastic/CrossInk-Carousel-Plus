@@ -2,6 +2,7 @@
 
 #include <ArduinoJson.h>
 #include <Logging.h>
+#include <cstring>
 
 // CrumBLE: read the JSON sidecar the prebake CLI writes alongside book.bin
 // at <cachePath>/prebake-manifest.json. The file is self-contained (no
@@ -50,5 +51,21 @@ bool tryLoadPrebakeManifest(const std::string& cachePath, PrebakeManifest& out) 
   out.imageRendering = static_cast<uint8_t>(doc["imageRendering"] | 0);
   out.bionicReadingEnabled = (doc["bionicReadingEnabled"] | 0) != 0;
   out.guideReadingEnabled = (doc["guideReadingEnabled"] | 0) != 0;
+  // CrumBLE reversion fields. Older manifests (written before these were
+  // added) leave them at zero; the on-device prompt's apply path treats
+  // zero as "don't override SETTINGS" for the font-name fields and
+  // tolerates zeros for the rest because they default-match a fresh
+  // SETTINGS state.
+  out.orientation = static_cast<uint8_t>(doc["orientation"] | 0);
+  out.screenMargin = static_cast<uint8_t>(doc["screenMargin"] | 0);
+  out.fontFamily = static_cast<uint8_t>(doc["fontFamily"] | 0);
+  out.fontSize = static_cast<uint8_t>(doc["fontSize"] | 0);
+  out.sdFontSizeRange = static_cast<uint8_t>(doc["sdFontSizeRange"] | 0);
+  if (doc["sdFontFamilyName"].is<const char*>()) {
+    const char* name = doc["sdFontFamilyName"].as<const char*>();
+    strncpy(out.sdFontFamilyName, name ? name : "", sizeof(out.sdFontFamilyName) - 1);
+    out.sdFontFamilyName[sizeof(out.sdFontFamilyName) - 1] = '\0';
+  }
+  out.lineSpacing = static_cast<uint8_t>(doc["lineSpacing"] | 0);
   return true;
 }

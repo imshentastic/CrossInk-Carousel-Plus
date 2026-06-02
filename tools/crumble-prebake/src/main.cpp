@@ -84,6 +84,21 @@ struct SectionSettings {
   // Device target ("X4" or "X3") detected from the render-info response.
   // Used by future per-device thumb-set logic; currently only logged.
   std::string device;
+  // CrumBLE reversion fields. The 12 fingerprint values above lock the
+  // section header, but they include derived quantities (fontId, viewport,
+  // lineCompression) that the on-device "Use prepared layout?" prompt can't
+  // reverse-apply without knowing the RAW SETTINGS that produced them.
+  // These mirror /api/reader-render-info v2's font-family/size + screen-
+  // margin/orientation + lineSpacing so the manifest stores enough state
+  // for the device to fully restore the prebake's reader settings on a
+  // single user confirm.
+  uint8_t orientation = 0;
+  uint8_t screenMargin = 0;
+  uint8_t fontFamily = 0;
+  uint8_t fontSize = 0;
+  uint8_t sdFontSizeRange = 0;
+  std::string sdFontFamilyName;
+  uint8_t lineSpacing = 0;
 };
 
 #ifndef CRUMBLE_PREBAKE_WASM
@@ -237,6 +252,16 @@ bool loadSettingsFromFile(const std::string& path, SectionSettings& out) {
     out.bionicReadingEnabled = doc["bionicReadingEnabled"].as<int>() != 0;
   if (doc["guideReadingEnabled"].is<int>())
     out.guideReadingEnabled = doc["guideReadingEnabled"].as<int>() != 0;
+  // CrumBLE reversion fields. Missing values default to 0 / "" which the
+  // manifest writer will still emit (so the device-side prompt knows whether
+  // a given field is reverse-applicable).
+  if (doc["orientation"].is<int>()) out.orientation = doc["orientation"].as<int>();
+  if (doc["screenMargin"].is<int>()) out.screenMargin = doc["screenMargin"].as<int>();
+  if (doc["fontFamily"].is<int>()) out.fontFamily = doc["fontFamily"].as<int>();
+  if (doc["fontSize"].is<int>()) out.fontSize = doc["fontSize"].as<int>();
+  if (doc["sdFontSizeRange"].is<int>()) out.sdFontSizeRange = doc["sdFontSizeRange"].as<int>();
+  if (doc["sdFontFamilyName"].is<const char*>()) out.sdFontFamilyName = doc["sdFontFamilyName"].as<const char*>();
+  if (doc["lineSpacing"].is<int>()) out.lineSpacing = doc["lineSpacing"].as<int>();
 
   LOG_INF("CFG",
           "device=%s settings (from file): fontId=%d viewport=%ux%u lineCompression=%.3f "
@@ -750,7 +775,14 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
   // shadowCacheDir's length to realCacheDir's), so file sizes and offset
   // tables stay intact.
   std::error_code ec2;
-  const std::string realSectionsDir = realCacheDir + "/sections";
+  // CrumBLE: write prebake sections to a SIDE path (sections-prebake/) so the
+  // device's Section::clearCache (which eats sections/<n>.bin on fingerprint
+  // mismatch when the user changes a reader setting) can never destroy the
+  // prebake artifact. Section::loadSectionFile tries sections/ first, then
+  // falls back to sections-prebake/ when fingerprints match -- enabling
+  // "revert your settings, the prebake cache is still there to pick back up
+  // where you left off" without forcing a re-run of the optimizer.
+  const std::string realSectionsDir = realCacheDir + "/sections-prebake";
   fs::create_directories(realSectionsDir, ec2);
   if (ec2) {
     LOG_ERR("PRE", "could not create real sections dir %s: %s", realSectionsDir.c_str(), ec2.message().c_str());
@@ -846,6 +878,16 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
     mdoc["imageRendering"] = static_cast<int>(s.imageRendering);
     mdoc["bionicReadingEnabled"] = s.bionicReadingEnabled ? 1 : 0;
     mdoc["guideReadingEnabled"] = s.guideReadingEnabled ? 1 : 0;
+    // CrumBLE reversion fields. The device-side "Use prepared layout?"
+    // prompt applies these RAW SETTINGS values on confirm so the fingerprint
+    // check then matches the prebake'd cache.
+    mdoc["orientation"] = static_cast<int>(s.orientation);
+    mdoc["screenMargin"] = static_cast<int>(s.screenMargin);
+    mdoc["fontFamily"] = static_cast<int>(s.fontFamily);
+    mdoc["fontSize"] = static_cast<int>(s.fontSize);
+    mdoc["sdFontSizeRange"] = static_cast<int>(s.sdFontSizeRange);
+    mdoc["sdFontFamilyName"] = s.sdFontFamilyName;
+    mdoc["lineSpacing"] = static_cast<int>(s.lineSpacing);
     std::string mjson;
     serializeJson(mdoc, mjson);
     const std::string manifestPath = realCacheDir + "/prebake-manifest.json";
