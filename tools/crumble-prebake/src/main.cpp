@@ -182,6 +182,22 @@ bool fetchDeviceSettings(const std::string& deviceUrl, SectionSettings& out) {
   if (doc["guideReadingEnabled"].is<int>())
     out.guideReadingEnabled = doc["guideReadingEnabled"].as<int>() != 0;
 
+  // Reversion fields. These are the RAW SETTINGS values used to produce
+  // the prebake; the device's switch-back prompt copies them back into
+  // SETTINGS on confirm. The 12 fingerprint fields above include DERIVED
+  // values (fontId is hash of family+size, lineCompression is derived
+  // from lineSpacing) that we can't cleanly invert, so we carry the raw
+  // values alongside. Without these, the manifest reverts to zeros and
+  // the switch-back prompt either misfires or restores factory defaults.
+  if (doc["orientation"].is<int>()) out.orientation = doc["orientation"].as<int>();
+  if (doc["screenMargin"].is<int>()) out.screenMargin = doc["screenMargin"].as<int>();
+  if (doc["fontFamily"].is<int>()) out.fontFamily = doc["fontFamily"].as<int>();
+  if (doc["fontSize"].is<int>()) out.fontSize = doc["fontSize"].as<int>();
+  if (doc["sdFontSizeRange"].is<int>()) out.sdFontSizeRange = doc["sdFontSizeRange"].as<int>();
+  if (doc["sdFontFamilyName"].is<const char*>())
+    out.sdFontFamilyName = doc["sdFontFamilyName"].as<const char*>();
+  if (doc["lineSpacing"].is<int>()) out.lineSpacing = doc["lineSpacing"].as<int>();
+
   LOG_INF("CFG",
           "device=%s settings: fontId=%d viewport=%ux%u lineCompression=%.3f extraPS=%d fpI=%d pA=%u "
           "hyph=%d embed=%d imgR=%u bionic=%d guide=%d",
@@ -303,6 +319,12 @@ void usage(const char* argv0) {
                "                         processing on systems without device network access;\n"
                "                         the resulting cache still saves ~3s of cold-open time\n"
                "                         from the OPF + thumb-gen skip.\n"
+               "  --skip-thumbs          Skip cover-thumb generation. The device's reader\n"
+               "                         generates the same thumbs on first cover render, so\n"
+               "                         they're optional for the prebake flow. Use this when\n"
+               "                         the cover is a progressive JPEG (the bundled JPEGDEC\n"
+               "                         decoder crashes on those) or for batches where you\n"
+               "                         don't want a single bad cover to halt the run.\n"
                "  --settings-file <path> Load render-info from a JSON file on disk instead\n"
                "                         of fetching it from a live device. The file must\n"
                "                         contain the same JSON schema as /api/reader-render-info\n"
@@ -335,6 +357,13 @@ struct Options {
   bool verbose = false;
   bool skipSections = false;  // skip section gen; book.bin + thumbs only.
                               // Removes the settings-source requirement.
+  bool skipThumbs = false;    // skip cover-thumb pipeline. The device's
+                              // reader generates the same thumbs on first
+                              // cover render anyway, so they're optional
+                              // for the prebake flow. Useful when the cover
+                              // is a progressive JPEG (JPEGDEC crashes on
+                              // those) or when batching books and you don't
+                              // want a single bad cover to halt the run.
 };
 
 bool parseArgs(int argc, char** argv, Options& out) {
@@ -357,6 +386,8 @@ bool parseArgs(int argc, char** argv, Options& out) {
       out.settingsFile = argv[++i];
     } else if (a == "--skip-sections") {
       out.skipSections = true;
+    } else if (a == "--skip-thumbs") {
+      out.skipThumbs = true;
     } else if (a == "--check") {
       out.check = true;
     } else if (a == "--verbose") {
@@ -1042,13 +1073,17 @@ int main(int argc, char** argv) {
     // code only counts book.bin failures since thumbs are recoverable
     // on-device (the reader will generate them itself on first cover
     // render).
-    const uint32_t t1 = millis();
-    const int thumbFails = prebakeAllThumbs(epubPath, cacheDir, bookMetadata.coverItemHref);
-    const uint32_t dtThumbs = millis() - t1;
-    if (thumbFails == 0) {
-      LOG_INF("CLI", "  thumbs OK (%u ms)", dtThumbs);
+    if (opts.skipThumbs) {
+      LOG_INF("CLI", "  thumbs SKIPPED (--skip-thumbs); device will generate on first cover render");
     } else {
-      LOG_INF("CLI", "  thumbs PARTIAL: %d of 3 failed (%u ms)", thumbFails, dtThumbs);
+      const uint32_t t1 = millis();
+      const int thumbFails = prebakeAllThumbs(epubPath, cacheDir, bookMetadata.coverItemHref);
+      const uint32_t dtThumbs = millis() - t1;
+      if (thumbFails == 0) {
+        LOG_INF("CLI", "  thumbs OK (%u ms)", dtThumbs);
+      } else {
+        LOG_INF("CLI", "  thumbs PARTIAL: %d of 3 failed (%u ms)", thumbFails, dtThumbs);
+      }
     }
 
     // Phase 2C: section files. Builds sections/<spineIdx>.bin per spine
