@@ -681,30 +681,49 @@ void EpubReaderActivity::loop() {
 
   // CrumBLE: prebake-cache mismatch prompt on book open.
   //
-  // Fires once per book-open session, after the first render has completed
-  // (so the user sees the page they tapped into before being prompted) and
-  // only when this book actually has a prebake'd cache to switch back to.
-  // Without the prompt, the user gets the SLOW path on every chapter -- the
-  // device's Section::loadSectionFile fingerprint check rejects the cached
-  // section and rebuilds from HTML, defeating the whole prebake speedup
-  // AND running the chapter parser under tight heap (the chip-tracked
-  // file-transfer-page heap-pressure failure mode the user has flagged
-  // separately).
-  if (prebakeManifest_.has_value() && firstRenderCompleted_ && !prebakePromptAnsweredThisSession_) {
+  // Fires once per book-open session, BEFORE the first render -- crucially
+  // ahead of any chapter rebuild attempt, because the rebuild path is the
+  // OOM-prone code the prebake exists to skip. User feedback: they hit "out
+  // of memory" when they changed screenMargin to 10 (which invalidates the
+  // cached viewport), and the prompt firing AFTER first render didn't help
+  // because the rebuild had already consumed the heap. Firing now lets them
+  // revert before any heavy work starts. Only fires when this book actually
+  // has a prebake'd cache to switch back to; books without prebake'd files
+  // get no prompt at all.
+  if (prebakeManifest_.has_value() && !prebakePromptAnsweredThisSession_) {
     const PrebakeManifest& pm = *prebakeManifest_;
     const int32_t curFontId = SETTINGS.getReaderFontId();
     const float curLineComp = SETTINGS.getReaderLineCompression();
-    // 10-field comparison. Viewport is excluded because it's derived from
-    // orientation + screenMargin, and the orientation change path already
-    // hits the .pxc-manifest prompt above for users who have that manifest.
-    // Keeping the prompt list flat (rather than chained with .pxc) avoids
-    // double-prompting users who have both artifacts.
+
+    // Compute current viewport the same way handleReaderRenderInfo + render()
+    // do: oriented viewable rect, plus screenMargin on each side, minus
+    // statusBar+padding on the bottom. The result drives the device's
+    // section-load fingerprint check (Section.cpp lines 162-167), so any
+    // drift here is what triggers the rebuild that just OOM'd the user.
+    int omt, omr, omb, oml;
+    renderer.getOrientedViewableTRBL(&omt, &omr, &omb, &oml);
+    omt += SETTINGS.screenMargin;
+    oml += SETTINGS.screenMargin;
+    omr += SETTINGS.screenMargin;
+    const uint8_t statusBarH = UITheme::getInstance().getStatusBarHeight();
+    constexpr uint8_t STATUS_BAR_TEXT_PADDING = 3;
+    omb += std::max<uint8_t>(SETTINGS.screenMargin, static_cast<uint8_t>(statusBarH + STATUS_BAR_TEXT_PADDING));
+    const uint16_t curViewportW = static_cast<uint16_t>(renderer.getScreenWidth() - oml - omr);
+    const uint16_t curViewportH = static_cast<uint16_t>(renderer.getScreenHeight() - omt - omb);
+
+    // 12-field comparison -- the same fields Section.cpp's fingerprint check
+    // gates section loads on. viewportWidth/Height ARE on this list because
+    // they're how screenMargin and orientation changes manifest in the
+    // header's bytes; the .pxc-manifest prompt above catches orientation
+    // separately for BLE users, but screenMargin changes show up here only.
     const bool mismatch =
         (pm.fontId != curFontId) ||
         (pm.lineCompression != curLineComp) ||
         (pm.extraParagraphSpacing != SETTINGS.extraParagraphSpacing) ||
         (pm.forceParagraphIndents != SETTINGS.forceParagraphIndents) ||
         (pm.paragraphAlignment != SETTINGS.paragraphAlignment) ||
+        (pm.viewportWidth != curViewportW) ||
+        (pm.viewportHeight != curViewportH) ||
         (pm.hyphenationEnabled != SETTINGS.hyphenationEnabled) ||
         (pm.embeddedStyle != SETTINGS.embeddedStyle) ||
         (pm.imageRendering != SETTINGS.imageRendering) ||
@@ -714,17 +733,21 @@ void EpubReaderActivity::loop() {
     if (mismatch) {
       LOG_INF("ERA",
               "Prebake fingerprint mismatch: cur fontId=%ld lineComp=%.3f ePS=%d fPI=%d pA=%u "
-              "hyph=%d embed=%d imgR=%u bionic=%d guide=%d vs prebake fontId=%ld lineComp=%.3f "
-              "ePS=%d fPI=%d pA=%u hyph=%d embed=%d imgR=%u bionic=%d guide=%d",
+              "vp=%ux%u hyph=%d embed=%d imgR=%u bionic=%d guide=%d vs prebake fontId=%ld "
+              "lineComp=%.3f ePS=%d fPI=%d pA=%u vp=%ux%u hyph=%d embed=%d imgR=%u bionic=%d guide=%d",
               static_cast<long>(curFontId), static_cast<double>(curLineComp),
               SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
-              static_cast<unsigned>(SETTINGS.paragraphAlignment), SETTINGS.hyphenationEnabled,
-              SETTINGS.embeddedStyle, static_cast<unsigned>(SETTINGS.imageRendering),
+              static_cast<unsigned>(SETTINGS.paragraphAlignment),
+              static_cast<unsigned>(curViewportW), static_cast<unsigned>(curViewportH),
+              SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+              static_cast<unsigned>(SETTINGS.imageRendering),
               SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled,
               static_cast<long>(pm.fontId), static_cast<double>(pm.lineCompression),
               pm.extraParagraphSpacing, pm.forceParagraphIndents,
-              static_cast<unsigned>(pm.paragraphAlignment), pm.hyphenationEnabled,
-              pm.embeddedStyle, static_cast<unsigned>(pm.imageRendering),
+              static_cast<unsigned>(pm.paragraphAlignment),
+              static_cast<unsigned>(pm.viewportWidth), static_cast<unsigned>(pm.viewportHeight),
+              pm.hyphenationEnabled, pm.embeddedStyle,
+              static_cast<unsigned>(pm.imageRendering),
               pm.bionicReadingEnabled, pm.guideReadingEnabled);
       // Plain-English body. Hardcoded English -- rare prompt, layman wording
       // matches the existing .pxc manifest prompt's style.
