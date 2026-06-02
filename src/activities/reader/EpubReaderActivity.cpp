@@ -696,11 +696,7 @@ void EpubReaderActivity::loop() {
     const int32_t curFontId = SETTINGS.getReaderFontId();
     const float curLineComp = SETTINGS.getReaderLineCompression();
 
-    // Compute current viewport the same way handleReaderRenderInfo + render()
-    // do: oriented viewable rect, plus screenMargin on each side, minus
-    // statusBar+padding on the bottom. The result drives the device's
-    // section-load fingerprint check (Section.cpp lines 162-167), so any
-    // drift here is what triggers the rebuild that just OOM'd the user.
+    // Compute current viewport (same logic as handleReaderRenderInfo / render).
     int omt, omr, omb, oml;
     renderer.getOrientedViewableTRBL(&omt, &omr, &omb, &oml);
     omt += SETTINGS.screenMargin;
@@ -712,58 +708,70 @@ void EpubReaderActivity::loop() {
     const uint16_t curViewportW = static_cast<uint16_t>(renderer.getScreenWidth() - oml - omr);
     const uint16_t curViewportH = static_cast<uint16_t>(renderer.getScreenHeight() - omt - omb);
 
-    // Detect settings changes since our last check by snapshotting the 12
-    // fields the comparison uses. When any value drifts -- whether from
-    // the drawer's quick toggles, the main settings menu, or a programmatic
-    // SETTINGS.saveToFile() somewhere -- the snapshot mismatch tells us to
-    // re-evaluate. The previous design used a one-shot per-session flag
-    // that latched on the first tick and silently swallowed every later
-    // user-driven settings change, so a hyphenation toggle (or any other)
-    // mid-book never triggered the prompt the second time.
+    // Initialise the snapshot on the first tick after book open. Whatever
+    // SETTINGS look like at this moment becomes the "baseline that's still
+    // valid" -- if it already mismatches the prebake manifest, the user
+    // hits the prompt immediately. After accept, snapshot advances to the
+    // new SETTINGS so the user can change other things without re-prompting
+    // until the next invalidating change.
+    auto snapshotCurrent = [&]() {
+      prebakeLastSnapshot_.orientation = SETTINGS.orientation;
+      prebakeLastSnapshot_.screenMargin = SETTINGS.screenMargin;
+      prebakeLastSnapshot_.imageRendering = SETTINGS.imageRendering;
+      prebakeLastSnapshot_.fontFamily = SETTINGS.fontFamily;
+      prebakeLastSnapshot_.fontSize = SETTINGS.fontSize;
+      prebakeLastSnapshot_.sdFontSizeRange = SETTINGS.sdFontSizeRange;
+      strncpy(prebakeLastSnapshot_.sdFontFamilyName, SETTINGS.sdFontFamilyName,
+              sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1);
+      prebakeLastSnapshot_.sdFontFamilyName[sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1] = '\0';
+      prebakeLastSnapshot_.lineSpacing = SETTINGS.lineSpacing;
+      prebakeLastSnapshot_.paragraphAlignment = SETTINGS.paragraphAlignment;
+      prebakeLastSnapshot_.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
+      prebakeLastSnapshot_.forceParagraphIndents = SETTINGS.forceParagraphIndents;
+      prebakeLastSnapshot_.hyphenationEnabled = SETTINGS.hyphenationEnabled;
+      prebakeLastSnapshot_.embeddedStyle = SETTINGS.embeddedStyle;
+      prebakeLastSnapshot_.bionicReadingEnabled = SETTINGS.bionicReadingEnabled;
+      prebakeLastSnapshot_.guideReadingEnabled = SETTINGS.guideReadingEnabled;
+      prebakeLastSnapshot_.initialised = true;
+    };
+
+    // Has any of the user-tracked settings drifted from the snapshot since
+    // we last evaluated? If not, nothing to check.
     const bool snapChanged = !prebakeLastSnapshot_.initialised ||
-        prebakeLastSnapshot_.fontId != curFontId ||
-        prebakeLastSnapshot_.lineCompression != curLineComp ||
+        prebakeLastSnapshot_.orientation != SETTINGS.orientation ||
+        prebakeLastSnapshot_.screenMargin != SETTINGS.screenMargin ||
+        prebakeLastSnapshot_.imageRendering != SETTINGS.imageRendering ||
+        prebakeLastSnapshot_.fontFamily != SETTINGS.fontFamily ||
+        prebakeLastSnapshot_.fontSize != SETTINGS.fontSize ||
+        prebakeLastSnapshot_.sdFontSizeRange != SETTINGS.sdFontSizeRange ||
+        strncmp(prebakeLastSnapshot_.sdFontFamilyName, SETTINGS.sdFontFamilyName,
+                sizeof(prebakeLastSnapshot_.sdFontFamilyName)) != 0 ||
+        prebakeLastSnapshot_.lineSpacing != SETTINGS.lineSpacing ||
+        prebakeLastSnapshot_.paragraphAlignment != SETTINGS.paragraphAlignment ||
         prebakeLastSnapshot_.extraParagraphSpacing != SETTINGS.extraParagraphSpacing ||
         prebakeLastSnapshot_.forceParagraphIndents != SETTINGS.forceParagraphIndents ||
-        prebakeLastSnapshot_.paragraphAlignment != SETTINGS.paragraphAlignment ||
-        prebakeLastSnapshot_.viewportWidth != curViewportW ||
-        prebakeLastSnapshot_.viewportHeight != curViewportH ||
         prebakeLastSnapshot_.hyphenationEnabled != SETTINGS.hyphenationEnabled ||
         prebakeLastSnapshot_.embeddedStyle != SETTINGS.embeddedStyle ||
-        prebakeLastSnapshot_.imageRendering != SETTINGS.imageRendering ||
         prebakeLastSnapshot_.bionicReadingEnabled != SETTINGS.bionicReadingEnabled ||
         prebakeLastSnapshot_.guideReadingEnabled != SETTINGS.guideReadingEnabled;
 
-    // Always refresh the snapshot so the next tick compares against the
-    // current state, not a stale one (in particular: if the user accepts
-    // the prompt and we revert SETTINGS, the snapshot moves with them and
-    // we don't re-fire on the post-accept tick).
-    prebakeLastSnapshot_.fontId = curFontId;
-    prebakeLastSnapshot_.lineCompression = curLineComp;
-    prebakeLastSnapshot_.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
-    prebakeLastSnapshot_.forceParagraphIndents = SETTINGS.forceParagraphIndents;
-    prebakeLastSnapshot_.paragraphAlignment = SETTINGS.paragraphAlignment;
-    prebakeLastSnapshot_.viewportWidth = curViewportW;
-    prebakeLastSnapshot_.viewportHeight = curViewportH;
-    prebakeLastSnapshot_.hyphenationEnabled = SETTINGS.hyphenationEnabled;
-    prebakeLastSnapshot_.embeddedStyle = SETTINGS.embeddedStyle;
-    prebakeLastSnapshot_.imageRendering = SETTINGS.imageRendering;
-    prebakeLastSnapshot_.bionicReadingEnabled = SETTINGS.bionicReadingEnabled;
-    prebakeLastSnapshot_.guideReadingEnabled = SETTINGS.guideReadingEnabled;
-    prebakeLastSnapshot_.initialised = true;
+    if (!prebakeLastSnapshot_.initialised) {
+      // First tick after book open -- seed the snapshot with current SETTINGS
+      // BEFORE evaluating, so that the prompt-cancel handler has something
+      // to restore to. If the book opened with already-mismatched SETTINGS,
+      // we still fire the prompt this tick (snapChanged was true via the
+      // !initialised path); cancel reverts to the snapshot we just took,
+      // which IS the current SETTINGS (no actual change happens -- but the
+      // user gets the option to either accept or not be re-prompted by
+      // re-seeding the baseline).
+      snapshotCurrent();
+    }
 
     if (!snapChanged) {
-      // No drift this tick; skip the comparison entirely. The mismatch
-      // status hasn't changed since our last evaluation, so re-prompting
-      // would just be noise.
-      // (fall through to the rest of tick())
+      // No drift since the last accepted baseline. Don't re-evaluate.
     } else {
 
-    // 12-field comparison -- the same fields Section.cpp's fingerprint check
-    // gates section loads on. viewportWidth/Height ARE on this list because
-    // they're how screenMargin and orientation changes manifest in the
-    // header's bytes; the .pxc-manifest prompt above catches orientation
-    // separately for BLE users, but screenMargin changes show up here only.
+    // 12-field comparison against the prebake manifest.
     const bool mismatch =
         (pm.fontId != curFontId) ||
         (pm.lineCompression != curLineComp) ||
@@ -777,6 +785,13 @@ void EpubReaderActivity::loop() {
         (pm.imageRendering != SETTINGS.imageRendering) ||
         (pm.bionicReadingEnabled != SETTINGS.bionicReadingEnabled) ||
         (pm.guideReadingEnabled != SETTINGS.guideReadingEnabled);
+
+    // No mismatch even though settings drifted? User changed something
+    // benign (or changed something that re-matches the manifest). Accept
+    // the new baseline silently and continue.
+    if (!mismatch) {
+      snapshotCurrent();
+    }
     if (mismatch) {
       LOG_INF("ERA",
               "Prebake fingerprint mismatch: cur fontId=%ld lineComp=%.3f ePS=%d fPI=%d pA=%u "
@@ -796,51 +811,86 @@ void EpubReaderActivity::loop() {
               pm.hyphenationEnabled, pm.embeddedStyle,
               static_cast<unsigned>(pm.imageRendering),
               pm.bionicReadingEnabled, pm.guideReadingEnabled);
-      // Plain-English body. Hardcoded English -- rare prompt, layman wording
-      // matches the existing .pxc manifest prompt's style.
+      // Two-option prompt. The user-friendly mental model:
+      //   - Cancel (back button) -> undo the change they just made. Safe
+      //     default; book keeps reading from the cache.
+      //   - Confirm (OK) -> keep the change and accept the rebuild cost.
+      // This inverts the polarity of the previous version, which on confirm
+      // applied prebake's values and lost the user's change -- per direct
+      // feedback ("If the user selects cancel, then it should be like they
+      // never changed hyphenation to on at all. If they choose confirm,
+      // then yes, it should index and build what's needed").
       const std::string promptBody =
-          "This book was prepared with different reader settings. Your current settings "
-          "would make every chapter rebuild from scratch -- slower opens and possible "
-          "memory errors. Switch to the prepared settings?";
+          "Your reader setting change makes this book's prepared layout invalid. "
+          "Every chapter will rebuild from scratch -- slower opens and possible "
+          "memory errors on long chapters. Keep your change?";
       prebakePromptShowing_ = true;
       startActivityForResult(
           std::make_unique<ConfirmationActivity>(
-              renderer, mappedInput, "Restore prepared layout?", promptBody,
+              renderer, mappedInput, "Keep reader settings change?", promptBody,
               /*ignoreInitialConfirmRelease=*/true),
           [this](const ActivityResult& result) {
             prebakePromptShowing_ = false;
             if (result.isCancelled) {
+              // User said no -- revert their just-made change by restoring
+              // SETTINGS from the snapshot taken before they entered the
+              // settings UI. Save + force a fresh layout so anything that
+              // already started under the new values gets re-laid-out
+              // under the restored values. The cache stays valid because
+              // SETTINGS now match the prebake manifest again.
+              LOG_INF("ERA", "Prebake prompt: user cancelled, reverting settings to prebake-compatible snapshot");
+              SETTINGS.orientation = prebakeLastSnapshot_.orientation;
+              SETTINGS.screenMargin = prebakeLastSnapshot_.screenMargin;
+              SETTINGS.imageRendering = prebakeLastSnapshot_.imageRendering;
+              SETTINGS.fontFamily = prebakeLastSnapshot_.fontFamily;
+              SETTINGS.fontSize = prebakeLastSnapshot_.fontSize;
+              SETTINGS.sdFontSizeRange = prebakeLastSnapshot_.sdFontSizeRange;
+              strncpy(SETTINGS.sdFontFamilyName, prebakeLastSnapshot_.sdFontFamilyName,
+                      sizeof(SETTINGS.sdFontFamilyName) - 1);
+              SETTINGS.sdFontFamilyName[sizeof(SETTINGS.sdFontFamilyName) - 1] = '\0';
+              SETTINGS.lineSpacing = prebakeLastSnapshot_.lineSpacing;
+              SETTINGS.paragraphAlignment = prebakeLastSnapshot_.paragraphAlignment;
+              SETTINGS.extraParagraphSpacing = prebakeLastSnapshot_.extraParagraphSpacing;
+              SETTINGS.forceParagraphIndents = prebakeLastSnapshot_.forceParagraphIndents;
+              SETTINGS.hyphenationEnabled = prebakeLastSnapshot_.hyphenationEnabled;
+              SETTINGS.embeddedStyle = prebakeLastSnapshot_.embeddedStyle;
+              SETTINGS.bionicReadingEnabled = prebakeLastSnapshot_.bionicReadingEnabled;
+              SETTINGS.guideReadingEnabled = prebakeLastSnapshot_.guideReadingEnabled;
+              SETTINGS.saveToFile();
+              ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
+              if (section) section.reset();
               requestUpdate();
               return;
             }
-            if (!prebakeManifest_.has_value()) return;
-            const PrebakeManifest& pm2 = *prebakeManifest_;
-            // Apply the 9 directly-settable fields. fontId is omitted because
-            // SETTINGS doesn't store it directly -- it's derived from
-            // fontFamily + fontSize, and reversing that on-device without the
-            // font registry isn't trivial. Same caveat the existing .pxc
-            // manifest path documents at line 749. User keeps current font;
-            // the other 9 fields update so margins / paragraph layout /
-            // hyphenation / etc. match the prebake. Most users who hit this
-            // prompt changed one or two settings, not the font itself.
-            SETTINGS.extraParagraphSpacing = pm2.extraParagraphSpacing;
-            SETTINGS.forceParagraphIndents = pm2.forceParagraphIndents;
-            SETTINGS.paragraphAlignment = pm2.paragraphAlignment;
-            SETTINGS.hyphenationEnabled = pm2.hyphenationEnabled;
-            SETTINGS.embeddedStyle = pm2.embeddedStyle;
-            SETTINGS.imageRendering = pm2.imageRendering;
-            SETTINGS.bionicReadingEnabled = pm2.bionicReadingEnabled;
-            SETTINGS.guideReadingEnabled = pm2.guideReadingEnabled;
-            // lineCompression maps to lineSpacing enum; without a reverse
-            // map, leave lineSpacing as-is and accept fingerprint mismatch
-            // on that field too. Follow-up: add reverse lookup or store
-            // lineSpacing alongside lineCompression in the manifest.
-            SETTINGS.saveToFile();
-            if (section) section.reset();  // force fresh layout next render
-            // Refresh the snapshot to the post-revert values so the next
-            // tick's snap-changed check sees the change came from US and
-            // doesn't re-fire the prompt immediately.
-            prebakeLastSnapshot_.initialised = false;
+            // User confirmed -- they want to keep their change. Update the
+            // snapshot to the new SETTINGS so they don't get re-prompted on
+            // every subsequent tick (or every further setting toggle that
+            // still mismatches the manifest, because mismatch is per-field
+            // independent). The cache will rebuild from HTML chapter by
+            // chapter; we don't touch any files here -- Section.cpp's
+            // existing load+rebuild flow handles it.
+            LOG_INF("ERA", "Prebake prompt: user confirmed change, cache will rebuild");
+            // Snapshot the current (just-confirmed) SETTINGS as the new
+            // baseline so the next user action is what triggers another
+            // evaluation, not the change they just confirmed.
+            prebakeLastSnapshot_.orientation = SETTINGS.orientation;
+            prebakeLastSnapshot_.screenMargin = SETTINGS.screenMargin;
+            prebakeLastSnapshot_.imageRendering = SETTINGS.imageRendering;
+            prebakeLastSnapshot_.fontFamily = SETTINGS.fontFamily;
+            prebakeLastSnapshot_.fontSize = SETTINGS.fontSize;
+            prebakeLastSnapshot_.sdFontSizeRange = SETTINGS.sdFontSizeRange;
+            strncpy(prebakeLastSnapshot_.sdFontFamilyName, SETTINGS.sdFontFamilyName,
+                    sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1);
+            prebakeLastSnapshot_.sdFontFamilyName[sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1] = '\0';
+            prebakeLastSnapshot_.lineSpacing = SETTINGS.lineSpacing;
+            prebakeLastSnapshot_.paragraphAlignment = SETTINGS.paragraphAlignment;
+            prebakeLastSnapshot_.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
+            prebakeLastSnapshot_.forceParagraphIndents = SETTINGS.forceParagraphIndents;
+            prebakeLastSnapshot_.hyphenationEnabled = SETTINGS.hyphenationEnabled;
+            prebakeLastSnapshot_.embeddedStyle = SETTINGS.embeddedStyle;
+            prebakeLastSnapshot_.bionicReadingEnabled = SETTINGS.bionicReadingEnabled;
+            prebakeLastSnapshot_.guideReadingEnabled = SETTINGS.guideReadingEnabled;
+            if (section) section.reset();
             requestUpdate();
           });
       return;

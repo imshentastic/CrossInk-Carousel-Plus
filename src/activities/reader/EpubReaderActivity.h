@@ -172,26 +172,32 @@ class EpubReaderActivity final : public Activity {
   // the user to switch back to the prebake'd layout so the cached sections
   // can actually load instead of being rebuilt from HTML on every chapter.
   std::optional<PrebakeManifest> prebakeManifest_;
-  // Snapshot of the SETTINGS fields the prebake check compares. When any of
-  // these change between ticks (e.g. user toggled hyphenation in the drawer
-  // or changed margin from the main menu), the snapshot mismatch tells us
-  // to re-evaluate the prebake prompt -- previous design used a one-shot
-  // flag that latched on book open and silently swallowed every subsequent
-  // settings change, so the user never saw the prompt after the first one.
-  // -1 / 0xFFFF in the snapshot means "uninitialised, run the check next tick".
+  // Snapshot of the DIRECT SETTINGS values when the user opened this book
+  // (or last accepted a settings change that invalidates the prebake cache).
+  // We hold the raw SETTINGS values rather than the derived fingerprint
+  // values because the prompt's "Cancel" path needs to copy these back into
+  // SETTINGS to ACTUALLY undo the user's just-made change -- previous
+  // designs left SETTINGS at the new value and just declined to revert to
+  // the prebake's value, which wasn't what the user wanted.
+  // Initialised on the first tick after book open; cancelling the prompt
+  // restores from this snapshot, confirming updates the snapshot to the
+  // current SETTINGS (taking the user's choice as the new baseline).
   struct PrebakeSettingsSnapshot {
-    int32_t fontId = -1;
-    float lineCompression = -1.0f;
-    bool extraParagraphSpacing = false;
-    bool forceParagraphIndents = false;
+    uint8_t orientation = 0;
+    uint8_t screenMargin = 0;
+    uint8_t imageRendering = 0;
+    uint8_t fontFamily = 0;
+    uint8_t fontSize = 0;
+    uint8_t sdFontSizeRange = 0;
+    char sdFontFamilyName[64] = "";
+    uint8_t lineSpacing = 0;
     uint8_t paragraphAlignment = 0;
-    uint16_t viewportWidth = 0xFFFF;
-    uint16_t viewportHeight = 0xFFFF;
-    bool hyphenationEnabled = false;
-    bool embeddedStyle = false;
-    uint8_t imageRendering = 0xFF;
-    bool bionicReadingEnabled = false;
-    bool guideReadingEnabled = false;
+    uint8_t extraParagraphSpacing = 0;
+    uint8_t forceParagraphIndents = 0;
+    uint8_t hyphenationEnabled = 0;
+    uint8_t embeddedStyle = 0;
+    uint8_t bionicReadingEnabled = 0;
+    uint8_t guideReadingEnabled = 0;
     bool initialised = false;
   } prebakeLastSnapshot_;
   bool prebakePromptShowing_ = false;  // suppress re-fire while dialog is open
