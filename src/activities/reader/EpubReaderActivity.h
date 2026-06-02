@@ -202,6 +202,15 @@ class EpubReaderActivity final : public Activity {
   } prebakeLastSnapshot_;
   bool prebakePromptShowing_ = false;  // suppress re-fire while dialog is open
 
+  // CrumBLE: evaluates the prebake-cache mismatch state and fires the
+  // settings-change prompt if needed. Returns true when a prompt has been
+  // pushed (caller should bail from the surrounding render/tick to avoid
+  // running any chapter-parse / heap-heavy work behind the user's back
+  // before they've decided whether to keep their change or revert it).
+  // Idempotent across multiple call sites in the same tick (the
+  // prebakePromptShowing_ guard short-circuits subsequent invocations).
+  bool checkAndFirePrebakePromptIfNeeded();
+
   // CrumBLE Phase 1 fast-open: non-critical onEnter work (font buffer
   // pre-grow, reader-settings cache build, .pxc manifest parse) is
   // deferred to the first loop() tick AFTER the first render. Net

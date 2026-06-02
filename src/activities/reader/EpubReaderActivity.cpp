@@ -564,6 +564,164 @@ void EpubReaderActivity::runDeferredOnEnter() {
   }
 }
 
+bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
+  if (!prebakeManifest_.has_value() || prebakePromptShowing_) return false;
+  const PrebakeManifest& pm = *prebakeManifest_;
+  const int32_t curFontId = SETTINGS.getReaderFontId();
+  const float curLineComp = SETTINGS.getReaderLineCompression();
+
+  // Compute current viewport (same logic as handleReaderRenderInfo / render).
+  int omt, omr, omb, oml;
+  renderer.getOrientedViewableTRBL(&omt, &omr, &omb, &oml);
+  omt += SETTINGS.screenMargin;
+  oml += SETTINGS.screenMargin;
+  omr += SETTINGS.screenMargin;
+  const uint8_t statusBarH = UITheme::getInstance().getStatusBarHeight();
+  constexpr uint8_t STATUS_BAR_TEXT_PADDING = 3;
+  omb += std::max<uint8_t>(SETTINGS.screenMargin, static_cast<uint8_t>(statusBarH + STATUS_BAR_TEXT_PADDING));
+  const uint16_t curViewportW = static_cast<uint16_t>(renderer.getScreenWidth() - oml - omr);
+  const uint16_t curViewportH = static_cast<uint16_t>(renderer.getScreenHeight() - omt - omb);
+
+  auto snapshotCurrent = [this]() {
+    prebakeLastSnapshot_.orientation = SETTINGS.orientation;
+    prebakeLastSnapshot_.screenMargin = SETTINGS.screenMargin;
+    prebakeLastSnapshot_.imageRendering = SETTINGS.imageRendering;
+    prebakeLastSnapshot_.fontFamily = SETTINGS.fontFamily;
+    prebakeLastSnapshot_.fontSize = SETTINGS.fontSize;
+    prebakeLastSnapshot_.sdFontSizeRange = SETTINGS.sdFontSizeRange;
+    strncpy(prebakeLastSnapshot_.sdFontFamilyName, SETTINGS.sdFontFamilyName,
+            sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1);
+    prebakeLastSnapshot_.sdFontFamilyName[sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1] = '\0';
+    prebakeLastSnapshot_.lineSpacing = SETTINGS.lineSpacing;
+    prebakeLastSnapshot_.paragraphAlignment = SETTINGS.paragraphAlignment;
+    prebakeLastSnapshot_.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
+    prebakeLastSnapshot_.forceParagraphIndents = SETTINGS.forceParagraphIndents;
+    prebakeLastSnapshot_.hyphenationEnabled = SETTINGS.hyphenationEnabled;
+    prebakeLastSnapshot_.embeddedStyle = SETTINGS.embeddedStyle;
+    prebakeLastSnapshot_.bionicReadingEnabled = SETTINGS.bionicReadingEnabled;
+    prebakeLastSnapshot_.guideReadingEnabled = SETTINGS.guideReadingEnabled;
+    prebakeLastSnapshot_.initialised = true;
+  };
+
+  const bool snapChanged = !prebakeLastSnapshot_.initialised ||
+      prebakeLastSnapshot_.orientation != SETTINGS.orientation ||
+      prebakeLastSnapshot_.screenMargin != SETTINGS.screenMargin ||
+      prebakeLastSnapshot_.imageRendering != SETTINGS.imageRendering ||
+      prebakeLastSnapshot_.fontFamily != SETTINGS.fontFamily ||
+      prebakeLastSnapshot_.fontSize != SETTINGS.fontSize ||
+      prebakeLastSnapshot_.sdFontSizeRange != SETTINGS.sdFontSizeRange ||
+      strncmp(prebakeLastSnapshot_.sdFontFamilyName, SETTINGS.sdFontFamilyName,
+              sizeof(prebakeLastSnapshot_.sdFontFamilyName)) != 0 ||
+      prebakeLastSnapshot_.lineSpacing != SETTINGS.lineSpacing ||
+      prebakeLastSnapshot_.paragraphAlignment != SETTINGS.paragraphAlignment ||
+      prebakeLastSnapshot_.extraParagraphSpacing != SETTINGS.extraParagraphSpacing ||
+      prebakeLastSnapshot_.forceParagraphIndents != SETTINGS.forceParagraphIndents ||
+      prebakeLastSnapshot_.hyphenationEnabled != SETTINGS.hyphenationEnabled ||
+      prebakeLastSnapshot_.embeddedStyle != SETTINGS.embeddedStyle ||
+      prebakeLastSnapshot_.bionicReadingEnabled != SETTINGS.bionicReadingEnabled ||
+      prebakeLastSnapshot_.guideReadingEnabled != SETTINGS.guideReadingEnabled;
+
+  if (!prebakeLastSnapshot_.initialised) snapshotCurrent();
+  if (!snapChanged) return false;
+
+  const bool mismatch =
+      (pm.fontId != curFontId) ||
+      (pm.lineCompression != curLineComp) ||
+      (pm.extraParagraphSpacing != SETTINGS.extraParagraphSpacing) ||
+      (pm.forceParagraphIndents != SETTINGS.forceParagraphIndents) ||
+      (pm.paragraphAlignment != SETTINGS.paragraphAlignment) ||
+      (pm.viewportWidth != curViewportW) ||
+      (pm.viewportHeight != curViewportH) ||
+      (pm.hyphenationEnabled != SETTINGS.hyphenationEnabled) ||
+      (pm.embeddedStyle != SETTINGS.embeddedStyle) ||
+      (pm.imageRendering != SETTINGS.imageRendering) ||
+      (pm.bionicReadingEnabled != SETTINGS.bionicReadingEnabled) ||
+      (pm.guideReadingEnabled != SETTINGS.guideReadingEnabled);
+
+  if (!mismatch) {
+    snapshotCurrent();  // user-driven drift but still valid; accept silently
+    return false;
+  }
+
+  LOG_INF("ERA",
+          "Prebake fingerprint mismatch: cur fontId=%ld lineComp=%.3f ePS=%d fPI=%d pA=%u "
+          "vp=%ux%u hyph=%d embed=%d imgR=%u bionic=%d guide=%d vs prebake fontId=%ld "
+          "lineComp=%.3f ePS=%d fPI=%d pA=%u vp=%ux%u hyph=%d embed=%d imgR=%u bionic=%d guide=%d",
+          static_cast<long>(curFontId), static_cast<double>(curLineComp),
+          SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
+          static_cast<unsigned>(SETTINGS.paragraphAlignment),
+          static_cast<unsigned>(curViewportW), static_cast<unsigned>(curViewportH),
+          SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+          static_cast<unsigned>(SETTINGS.imageRendering),
+          SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled,
+          static_cast<long>(pm.fontId), static_cast<double>(pm.lineCompression),
+          pm.extraParagraphSpacing, pm.forceParagraphIndents,
+          static_cast<unsigned>(pm.paragraphAlignment),
+          static_cast<unsigned>(pm.viewportWidth), static_cast<unsigned>(pm.viewportHeight),
+          pm.hyphenationEnabled, pm.embeddedStyle,
+          static_cast<unsigned>(pm.imageRendering),
+          pm.bionicReadingEnabled, pm.guideReadingEnabled);
+
+  const std::string promptBody =
+      "Your reader setting change makes this book's prepared layout invalid. "
+      "Every chapter will rebuild from scratch -- slower opens and possible "
+      "memory errors on long chapters. Keep your change?";
+  prebakePromptShowing_ = true;
+  startActivityForResult(
+      std::make_unique<ConfirmationActivity>(
+          renderer, mappedInput, "Keep reader settings change?", promptBody,
+          /*ignoreInitialConfirmRelease=*/true),
+      [this](const ActivityResult& result) {
+        prebakePromptShowing_ = false;
+        if (result.isCancelled) {
+          LOG_INF("ERA", "Prebake prompt: user cancelled, reverting settings to prebake-compatible snapshot");
+          SETTINGS.orientation = prebakeLastSnapshot_.orientation;
+          SETTINGS.screenMargin = prebakeLastSnapshot_.screenMargin;
+          SETTINGS.imageRendering = prebakeLastSnapshot_.imageRendering;
+          SETTINGS.fontFamily = prebakeLastSnapshot_.fontFamily;
+          SETTINGS.fontSize = prebakeLastSnapshot_.fontSize;
+          SETTINGS.sdFontSizeRange = prebakeLastSnapshot_.sdFontSizeRange;
+          strncpy(SETTINGS.sdFontFamilyName, prebakeLastSnapshot_.sdFontFamilyName,
+                  sizeof(SETTINGS.sdFontFamilyName) - 1);
+          SETTINGS.sdFontFamilyName[sizeof(SETTINGS.sdFontFamilyName) - 1] = '\0';
+          SETTINGS.lineSpacing = prebakeLastSnapshot_.lineSpacing;
+          SETTINGS.paragraphAlignment = prebakeLastSnapshot_.paragraphAlignment;
+          SETTINGS.extraParagraphSpacing = prebakeLastSnapshot_.extraParagraphSpacing;
+          SETTINGS.forceParagraphIndents = prebakeLastSnapshot_.forceParagraphIndents;
+          SETTINGS.hyphenationEnabled = prebakeLastSnapshot_.hyphenationEnabled;
+          SETTINGS.embeddedStyle = prebakeLastSnapshot_.embeddedStyle;
+          SETTINGS.bionicReadingEnabled = prebakeLastSnapshot_.bionicReadingEnabled;
+          SETTINGS.guideReadingEnabled = prebakeLastSnapshot_.guideReadingEnabled;
+          SETTINGS.saveToFile();
+          ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
+          if (section) section.reset();
+          requestUpdate();
+          return;
+        }
+        LOG_INF("ERA", "Prebake prompt: user confirmed change, cache will rebuild");
+        prebakeLastSnapshot_.orientation = SETTINGS.orientation;
+        prebakeLastSnapshot_.screenMargin = SETTINGS.screenMargin;
+        prebakeLastSnapshot_.imageRendering = SETTINGS.imageRendering;
+        prebakeLastSnapshot_.fontFamily = SETTINGS.fontFamily;
+        prebakeLastSnapshot_.fontSize = SETTINGS.fontSize;
+        prebakeLastSnapshot_.sdFontSizeRange = SETTINGS.sdFontSizeRange;
+        strncpy(prebakeLastSnapshot_.sdFontFamilyName, SETTINGS.sdFontFamilyName,
+                sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1);
+        prebakeLastSnapshot_.sdFontFamilyName[sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1] = '\0';
+        prebakeLastSnapshot_.lineSpacing = SETTINGS.lineSpacing;
+        prebakeLastSnapshot_.paragraphAlignment = SETTINGS.paragraphAlignment;
+        prebakeLastSnapshot_.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
+        prebakeLastSnapshot_.forceParagraphIndents = SETTINGS.forceParagraphIndents;
+        prebakeLastSnapshot_.hyphenationEnabled = SETTINGS.hyphenationEnabled;
+        prebakeLastSnapshot_.embeddedStyle = SETTINGS.embeddedStyle;
+        prebakeLastSnapshot_.bionicReadingEnabled = SETTINGS.bionicReadingEnabled;
+        prebakeLastSnapshot_.guideReadingEnabled = SETTINGS.guideReadingEnabled;
+        if (section) section.reset();
+        requestUpdate();
+      });
+  return true;
+}
+
 void EpubReaderActivity::onExit() {
   Activity::onExit();
 
@@ -680,223 +838,13 @@ void EpubReaderActivity::loop() {
     return;
   }
 
-  // CrumBLE: prebake-cache mismatch prompt on book open.
-  //
-  // Fires once per book-open session, BEFORE the first render -- crucially
-  // ahead of any chapter rebuild attempt, because the rebuild path is the
-  // OOM-prone code the prebake exists to skip. User feedback: they hit "out
-  // of memory" when they changed screenMargin to 10 (which invalidates the
-  // cached viewport), and the prompt firing AFTER first render didn't help
-  // because the rebuild had already consumed the heap. Firing now lets them
-  // revert before any heavy work starts. Only fires when this book actually
-  // has a prebake'd cache to switch back to; books without prebake'd files
-  // get no prompt at all.
-  if (prebakeManifest_.has_value() && !prebakePromptShowing_) {
-    const PrebakeManifest& pm = *prebakeManifest_;
-    const int32_t curFontId = SETTINGS.getReaderFontId();
-    const float curLineComp = SETTINGS.getReaderLineCompression();
-
-    // Compute current viewport (same logic as handleReaderRenderInfo / render).
-    int omt, omr, omb, oml;
-    renderer.getOrientedViewableTRBL(&omt, &omr, &omb, &oml);
-    omt += SETTINGS.screenMargin;
-    oml += SETTINGS.screenMargin;
-    omr += SETTINGS.screenMargin;
-    const uint8_t statusBarH = UITheme::getInstance().getStatusBarHeight();
-    constexpr uint8_t STATUS_BAR_TEXT_PADDING = 3;
-    omb += std::max<uint8_t>(SETTINGS.screenMargin, static_cast<uint8_t>(statusBarH + STATUS_BAR_TEXT_PADDING));
-    const uint16_t curViewportW = static_cast<uint16_t>(renderer.getScreenWidth() - oml - omr);
-    const uint16_t curViewportH = static_cast<uint16_t>(renderer.getScreenHeight() - omt - omb);
-
-    // Initialise the snapshot on the first tick after book open. Whatever
-    // SETTINGS look like at this moment becomes the "baseline that's still
-    // valid" -- if it already mismatches the prebake manifest, the user
-    // hits the prompt immediately. After accept, snapshot advances to the
-    // new SETTINGS so the user can change other things without re-prompting
-    // until the next invalidating change.
-    auto snapshotCurrent = [&]() {
-      prebakeLastSnapshot_.orientation = SETTINGS.orientation;
-      prebakeLastSnapshot_.screenMargin = SETTINGS.screenMargin;
-      prebakeLastSnapshot_.imageRendering = SETTINGS.imageRendering;
-      prebakeLastSnapshot_.fontFamily = SETTINGS.fontFamily;
-      prebakeLastSnapshot_.fontSize = SETTINGS.fontSize;
-      prebakeLastSnapshot_.sdFontSizeRange = SETTINGS.sdFontSizeRange;
-      strncpy(prebakeLastSnapshot_.sdFontFamilyName, SETTINGS.sdFontFamilyName,
-              sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1);
-      prebakeLastSnapshot_.sdFontFamilyName[sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1] = '\0';
-      prebakeLastSnapshot_.lineSpacing = SETTINGS.lineSpacing;
-      prebakeLastSnapshot_.paragraphAlignment = SETTINGS.paragraphAlignment;
-      prebakeLastSnapshot_.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
-      prebakeLastSnapshot_.forceParagraphIndents = SETTINGS.forceParagraphIndents;
-      prebakeLastSnapshot_.hyphenationEnabled = SETTINGS.hyphenationEnabled;
-      prebakeLastSnapshot_.embeddedStyle = SETTINGS.embeddedStyle;
-      prebakeLastSnapshot_.bionicReadingEnabled = SETTINGS.bionicReadingEnabled;
-      prebakeLastSnapshot_.guideReadingEnabled = SETTINGS.guideReadingEnabled;
-      prebakeLastSnapshot_.initialised = true;
-    };
-
-    // Has any of the user-tracked settings drifted from the snapshot since
-    // we last evaluated? If not, nothing to check.
-    const bool snapChanged = !prebakeLastSnapshot_.initialised ||
-        prebakeLastSnapshot_.orientation != SETTINGS.orientation ||
-        prebakeLastSnapshot_.screenMargin != SETTINGS.screenMargin ||
-        prebakeLastSnapshot_.imageRendering != SETTINGS.imageRendering ||
-        prebakeLastSnapshot_.fontFamily != SETTINGS.fontFamily ||
-        prebakeLastSnapshot_.fontSize != SETTINGS.fontSize ||
-        prebakeLastSnapshot_.sdFontSizeRange != SETTINGS.sdFontSizeRange ||
-        strncmp(prebakeLastSnapshot_.sdFontFamilyName, SETTINGS.sdFontFamilyName,
-                sizeof(prebakeLastSnapshot_.sdFontFamilyName)) != 0 ||
-        prebakeLastSnapshot_.lineSpacing != SETTINGS.lineSpacing ||
-        prebakeLastSnapshot_.paragraphAlignment != SETTINGS.paragraphAlignment ||
-        prebakeLastSnapshot_.extraParagraphSpacing != SETTINGS.extraParagraphSpacing ||
-        prebakeLastSnapshot_.forceParagraphIndents != SETTINGS.forceParagraphIndents ||
-        prebakeLastSnapshot_.hyphenationEnabled != SETTINGS.hyphenationEnabled ||
-        prebakeLastSnapshot_.embeddedStyle != SETTINGS.embeddedStyle ||
-        prebakeLastSnapshot_.bionicReadingEnabled != SETTINGS.bionicReadingEnabled ||
-        prebakeLastSnapshot_.guideReadingEnabled != SETTINGS.guideReadingEnabled;
-
-    if (!prebakeLastSnapshot_.initialised) {
-      // First tick after book open -- seed the snapshot with current SETTINGS
-      // BEFORE evaluating, so that the prompt-cancel handler has something
-      // to restore to. If the book opened with already-mismatched SETTINGS,
-      // we still fire the prompt this tick (snapChanged was true via the
-      // !initialised path); cancel reverts to the snapshot we just took,
-      // which IS the current SETTINGS (no actual change happens -- but the
-      // user gets the option to either accept or not be re-prompted by
-      // re-seeding the baseline).
-      snapshotCurrent();
-    }
-
-    if (!snapChanged) {
-      // No drift since the last accepted baseline. Don't re-evaluate.
-    } else {
-
-    // 12-field comparison against the prebake manifest.
-    const bool mismatch =
-        (pm.fontId != curFontId) ||
-        (pm.lineCompression != curLineComp) ||
-        (pm.extraParagraphSpacing != SETTINGS.extraParagraphSpacing) ||
-        (pm.forceParagraphIndents != SETTINGS.forceParagraphIndents) ||
-        (pm.paragraphAlignment != SETTINGS.paragraphAlignment) ||
-        (pm.viewportWidth != curViewportW) ||
-        (pm.viewportHeight != curViewportH) ||
-        (pm.hyphenationEnabled != SETTINGS.hyphenationEnabled) ||
-        (pm.embeddedStyle != SETTINGS.embeddedStyle) ||
-        (pm.imageRendering != SETTINGS.imageRendering) ||
-        (pm.bionicReadingEnabled != SETTINGS.bionicReadingEnabled) ||
-        (pm.guideReadingEnabled != SETTINGS.guideReadingEnabled);
-
-    // No mismatch even though settings drifted? User changed something
-    // benign (or changed something that re-matches the manifest). Accept
-    // the new baseline silently and continue.
-    if (!mismatch) {
-      snapshotCurrent();
-    }
-    if (mismatch) {
-      LOG_INF("ERA",
-              "Prebake fingerprint mismatch: cur fontId=%ld lineComp=%.3f ePS=%d fPI=%d pA=%u "
-              "vp=%ux%u hyph=%d embed=%d imgR=%u bionic=%d guide=%d vs prebake fontId=%ld "
-              "lineComp=%.3f ePS=%d fPI=%d pA=%u vp=%ux%u hyph=%d embed=%d imgR=%u bionic=%d guide=%d",
-              static_cast<long>(curFontId), static_cast<double>(curLineComp),
-              SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
-              static_cast<unsigned>(SETTINGS.paragraphAlignment),
-              static_cast<unsigned>(curViewportW), static_cast<unsigned>(curViewportH),
-              SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
-              static_cast<unsigned>(SETTINGS.imageRendering),
-              SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled,
-              static_cast<long>(pm.fontId), static_cast<double>(pm.lineCompression),
-              pm.extraParagraphSpacing, pm.forceParagraphIndents,
-              static_cast<unsigned>(pm.paragraphAlignment),
-              static_cast<unsigned>(pm.viewportWidth), static_cast<unsigned>(pm.viewportHeight),
-              pm.hyphenationEnabled, pm.embeddedStyle,
-              static_cast<unsigned>(pm.imageRendering),
-              pm.bionicReadingEnabled, pm.guideReadingEnabled);
-      // Two-option prompt. The user-friendly mental model:
-      //   - Cancel (back button) -> undo the change they just made. Safe
-      //     default; book keeps reading from the cache.
-      //   - Confirm (OK) -> keep the change and accept the rebuild cost.
-      // This inverts the polarity of the previous version, which on confirm
-      // applied prebake's values and lost the user's change -- per direct
-      // feedback ("If the user selects cancel, then it should be like they
-      // never changed hyphenation to on at all. If they choose confirm,
-      // then yes, it should index and build what's needed").
-      const std::string promptBody =
-          "Your reader setting change makes this book's prepared layout invalid. "
-          "Every chapter will rebuild from scratch -- slower opens and possible "
-          "memory errors on long chapters. Keep your change?";
-      prebakePromptShowing_ = true;
-      startActivityForResult(
-          std::make_unique<ConfirmationActivity>(
-              renderer, mappedInput, "Keep reader settings change?", promptBody,
-              /*ignoreInitialConfirmRelease=*/true),
-          [this](const ActivityResult& result) {
-            prebakePromptShowing_ = false;
-            if (result.isCancelled) {
-              // User said no -- revert their just-made change by restoring
-              // SETTINGS from the snapshot taken before they entered the
-              // settings UI. Save + force a fresh layout so anything that
-              // already started under the new values gets re-laid-out
-              // under the restored values. The cache stays valid because
-              // SETTINGS now match the prebake manifest again.
-              LOG_INF("ERA", "Prebake prompt: user cancelled, reverting settings to prebake-compatible snapshot");
-              SETTINGS.orientation = prebakeLastSnapshot_.orientation;
-              SETTINGS.screenMargin = prebakeLastSnapshot_.screenMargin;
-              SETTINGS.imageRendering = prebakeLastSnapshot_.imageRendering;
-              SETTINGS.fontFamily = prebakeLastSnapshot_.fontFamily;
-              SETTINGS.fontSize = prebakeLastSnapshot_.fontSize;
-              SETTINGS.sdFontSizeRange = prebakeLastSnapshot_.sdFontSizeRange;
-              strncpy(SETTINGS.sdFontFamilyName, prebakeLastSnapshot_.sdFontFamilyName,
-                      sizeof(SETTINGS.sdFontFamilyName) - 1);
-              SETTINGS.sdFontFamilyName[sizeof(SETTINGS.sdFontFamilyName) - 1] = '\0';
-              SETTINGS.lineSpacing = prebakeLastSnapshot_.lineSpacing;
-              SETTINGS.paragraphAlignment = prebakeLastSnapshot_.paragraphAlignment;
-              SETTINGS.extraParagraphSpacing = prebakeLastSnapshot_.extraParagraphSpacing;
-              SETTINGS.forceParagraphIndents = prebakeLastSnapshot_.forceParagraphIndents;
-              SETTINGS.hyphenationEnabled = prebakeLastSnapshot_.hyphenationEnabled;
-              SETTINGS.embeddedStyle = prebakeLastSnapshot_.embeddedStyle;
-              SETTINGS.bionicReadingEnabled = prebakeLastSnapshot_.bionicReadingEnabled;
-              SETTINGS.guideReadingEnabled = prebakeLastSnapshot_.guideReadingEnabled;
-              SETTINGS.saveToFile();
-              ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
-              if (section) section.reset();
-              requestUpdate();
-              return;
-            }
-            // User confirmed -- they want to keep their change. Update the
-            // snapshot to the new SETTINGS so they don't get re-prompted on
-            // every subsequent tick (or every further setting toggle that
-            // still mismatches the manifest, because mismatch is per-field
-            // independent). The cache will rebuild from HTML chapter by
-            // chapter; we don't touch any files here -- Section.cpp's
-            // existing load+rebuild flow handles it.
-            LOG_INF("ERA", "Prebake prompt: user confirmed change, cache will rebuild");
-            // Snapshot the current (just-confirmed) SETTINGS as the new
-            // baseline so the next user action is what triggers another
-            // evaluation, not the change they just confirmed.
-            prebakeLastSnapshot_.orientation = SETTINGS.orientation;
-            prebakeLastSnapshot_.screenMargin = SETTINGS.screenMargin;
-            prebakeLastSnapshot_.imageRendering = SETTINGS.imageRendering;
-            prebakeLastSnapshot_.fontFamily = SETTINGS.fontFamily;
-            prebakeLastSnapshot_.fontSize = SETTINGS.fontSize;
-            prebakeLastSnapshot_.sdFontSizeRange = SETTINGS.sdFontSizeRange;
-            strncpy(prebakeLastSnapshot_.sdFontFamilyName, SETTINGS.sdFontFamilyName,
-                    sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1);
-            prebakeLastSnapshot_.sdFontFamilyName[sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1] = '\0';
-            prebakeLastSnapshot_.lineSpacing = SETTINGS.lineSpacing;
-            prebakeLastSnapshot_.paragraphAlignment = SETTINGS.paragraphAlignment;
-            prebakeLastSnapshot_.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
-            prebakeLastSnapshot_.forceParagraphIndents = SETTINGS.forceParagraphIndents;
-            prebakeLastSnapshot_.hyphenationEnabled = SETTINGS.hyphenationEnabled;
-            prebakeLastSnapshot_.embeddedStyle = SETTINGS.embeddedStyle;
-            prebakeLastSnapshot_.bionicReadingEnabled = SETTINGS.bionicReadingEnabled;
-            prebakeLastSnapshot_.guideReadingEnabled = SETTINGS.guideReadingEnabled;
-            if (section) section.reset();
-            requestUpdate();
-          });
-      return;
-    }
-    }  // close: if (snapChanged)
-  }
+  // CrumBLE: prebake-cache mismatch prompt. Delegated to a helper so
+  // render() can call the same check at the top of its body -- catching
+  // the mismatch BEFORE any chapter parse runs (which is what was OOM-ing
+  // in the "switched to margin=10 then hit cancel" trace: the rebuild had
+  // already consumed enough heap that the post-cancel re-layout couldn't
+  // complete). Tick() still calls it as a safety net.
+  if (checkAndFirePrebakePromptIfNeeded()) return;
 
   // BT No Images Quick Connect auto-restore. The no-images flag exists only to
   // keep the contiguous heap free for NimBLE's ~58 KB, so restore images the
@@ -2272,6 +2220,17 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn) {
 // TODO: Failure handling
 void EpubReaderActivity::render(RenderLock&& lock) {
   if (!epub) {
+    return;
+  }
+
+  // CrumBLE: settings-drift check at the START of render -- before any
+  // section.load / chapter parse runs. Tick()'s call to the same helper
+  // already had a chance to fire; we double-check here because some entry
+  // paths into render (post-settings-drawer-close in particular) can run
+  // before tick() has had a chance to evaluate. If it fires, the prompt
+  // gets pushed on top of the reader and we bail; the next render() call
+  // (after the prompt closes) sees the reverted or accepted settings.
+  if (checkAndFirePrebakePromptIfNeeded()) {
     return;
   }
 
