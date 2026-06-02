@@ -1379,7 +1379,14 @@ void CrossPointWebServer::handleReaderRenderInfo() const {
   r.setOrientation(savedOrientation);  // restore; no panel push happened in between
 
   JsonDocument doc;
-  doc["fitVersion"] = 1;  // bump if the device image-fit math changes
+  // fitVersion 2: adds the 8 section-header layout fields (line compression,
+  // paragraph spacing/indents/alignment, hyphenation, embedded style, bionic
+  // reading, guide reading) consumed by the crumble-prebake CLI when
+  // generating sections/*.bin. The CLI hard-errors on fitVersion < 2 because
+  // those values are baked into the section file fingerprint -- skipping
+  // them would mean every prebake'd section gets rejected on first device
+  // open. v1 fields are unchanged so existing .pxc-only flows still work.
+  doc["fitVersion"] = 2;
   doc["device"] = "X4";
   doc["orientation"] = static_cast<int>(SETTINGS.orientation);
   doc["screenMargin"] = static_cast<int>(SETTINGS.screenMargin);
@@ -1400,6 +1407,25 @@ void CrossPointWebServer::handleReaderRenderInfo() const {
   doc["viewportWidth"] = viewportWidth;
   doc["viewportHeight"] = viewportHeight;
   doc["emSize"] = emSize;
+  // fitVersion 2 additions: the eight layout settings baked into the
+  // section file header by Section::writeSectionFileHeader. The crumble-
+  // prebake CLI passes these into Section::createSectionFile so the
+  // section header it writes matches what the device will fingerprint
+  // against on first open. Any drift here invalidates the prebake'd
+  // section cache and the device falls back to a fresh build.
+  doc["lineCompression"] = SETTINGS.getReaderLineCompression();
+  // Raw lineSpacing enum (NORMAL / TIGHT / WIDE) alongside the derived
+  // lineCompression float. The prebake manifest carries lineSpacing so
+  // the device-side switch-back prompt can reverse-apply (lineCompression
+  // is a one-way derivation we can't cleanly invert without the enum).
+  doc["lineSpacing"] = static_cast<int>(SETTINGS.lineSpacing);
+  doc["extraParagraphSpacing"] = static_cast<int>(SETTINGS.extraParagraphSpacing);
+  doc["forceParagraphIndents"] = static_cast<int>(SETTINGS.forceParagraphIndents);
+  doc["paragraphAlignment"] = static_cast<int>(SETTINGS.paragraphAlignment);
+  doc["hyphenationEnabled"] = static_cast<int>(SETTINGS.hyphenationEnabled);
+  doc["embeddedStyle"] = static_cast<int>(SETTINGS.embeddedStyle);
+  doc["bionicReadingEnabled"] = static_cast<int>(SETTINGS.bionicReadingEnabled);
+  doc["guideReadingEnabled"] = static_cast<int>(SETTINGS.guideReadingEnabled);
   String json;
   serializeJson(doc, json);
   server->send(200, "application/json", json);
