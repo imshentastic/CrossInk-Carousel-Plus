@@ -628,73 +628,90 @@ void EpubReaderActivity::tickLazyPrebakeExtraction() {
   static constexpr uint32_t EXTRACT_HEAP_MIN = 6 * 1024;
   if (ESP.getMaxAllocHeap() < EXTRACT_HEAP_MIN) return;
 
-  if (ex.nextEntry >= ex.entryNames.size()) {
-    // Done. Delete the source zip and clear state.
-    Storage.remove(ex.zipPath.c_str());
-    LOG_INF("ERA", "Lazy prebake extract finished: ok=%u fail=%u bytes=%u; removed %s",
-            ex.extractedOk, ex.extractedFail, ex.totalBytes, ex.zipPath.c_str());
-    // If we just landed a prebake-manifest.json AND we didn't have a
-    // manifest in memory yet, re-load it now so the post-extract reader
-    // can pick up the switch-back prompt on its next render.
-    if (!prebakeManifest_.has_value() && SETTINGS.optimizeChapterIndexing) {
-      PrebakeManifest pm;
-      if (tryLoadPrebakeManifest(epub->getCachePath(), pm)) {
-        prebakeManifest_ = pm;
-        LOG_INF("ERA", "Loaded prebake manifest post-extract: fontId=%ld viewport=%ux%u",
-                static_cast<long>(pm.fontId), static_cast<unsigned>(pm.viewportWidth),
-                static_cast<unsigned>(pm.viewportHeight));
+  // Per-tick time budget. We batch multiple entries per tick (instead of
+  // strict one-per-tick) because at idle e-ink loop rates a single-entry
+  // pace meant ~2 minutes for a 130-entry cache, during which the user
+  // saw the "Indexing chapter..." screen instead of their book. 120 ms
+  // is the rough wall-clock budget that keeps the reader responsive
+  // while still completing extraction in ~10-15 s for typical books.
+  // Entries are tiny (~100 B-30 KB each), so one entry is roughly 5-15 ms
+  // wall on SD; we'll fit somewhere between 8 and 24 per tick.
+  static constexpr uint32_t TICK_BUDGET_MS = 120;
+  const uint32_t tickStart = millis();
+
+  while (true) {
+    if (ex.nextEntry >= ex.entryNames.size()) {
+      // Done. Delete the source zip and clear state.
+      Storage.remove(ex.zipPath.c_str());
+      LOG_INF("ERA", "Lazy prebake extract finished: ok=%u fail=%u bytes=%u; removed %s",
+              ex.extractedOk, ex.extractedFail, ex.totalBytes, ex.zipPath.c_str());
+      // If we just landed a prebake-manifest.json AND we didn't have a
+      // manifest in memory yet, re-load it now so the post-extract reader
+      // can pick up the switch-back prompt on its next render.
+      if (!prebakeManifest_.has_value() && SETTINGS.optimizeChapterIndexing) {
+        PrebakeManifest pm;
+        if (tryLoadPrebakeManifest(epub->getCachePath(), pm)) {
+          prebakeManifest_ = pm;
+          LOG_INF("ERA", "Loaded prebake manifest post-extract: fontId=%ld viewport=%ux%u",
+                  static_cast<long>(pm.fontId), static_cast<unsigned>(pm.viewportWidth),
+                  static_cast<unsigned>(pm.viewportHeight));
+        }
+      }
+      lazyPrebakeExtractor_.reset();
+      return;
+    }
+
+    esp_task_wdt_reset();
+    const std::string& entryName = ex.entryNames[ex.nextEntry];
+    ex.nextEntry++;
+
+    // Compose absolute destination under the book's cache dir.
+    std::string destPath = epub->getCachePath();
+    if (destPath.empty() || destPath.back() != '/') destPath += '/';
+    destPath += entryName;
+
+    // mkdir -p for any parent dirs in the entry name (e.g. "sections-prebake/").
+    {
+      size_t slash = destPath.find('/', 1);
+      while (slash != std::string::npos) {
+        const std::string parent = destPath.substr(0, slash);
+        Storage.mkdir(parent.c_str());
+        slash = destPath.find('/', slash + 1);
       }
     }
-    lazyPrebakeExtractor_.reset();
-    return;
-  }
 
-  esp_task_wdt_reset();
-  const std::string& entryName = ex.entryNames[ex.nextEntry];
-  ex.nextEntry++;
-
-  // Compose absolute destination under the book's cache dir.
-  std::string destPath = epub->getCachePath();
-  if (destPath.empty() || destPath.back() != '/') destPath += '/';
-  destPath += entryName;
-
-  // mkdir -p for any parent dirs in the entry name (e.g. "sections-prebake/").
-  {
-    size_t slash = destPath.find('/', 1);
-    while (slash != std::string::npos) {
-      const std::string parent = destPath.substr(0, slash);
-      Storage.mkdir(parent.c_str());
-      slash = destPath.find('/', slash + 1);
+    if (Storage.exists(destPath.c_str())) Storage.remove(destPath.c_str());
+    FsFile outFile;
+    if (!Storage.openFileForWrite("ERA", String(destPath.c_str()), outFile)) {
+      LOG_ERR("ERA", "Lazy extract: open %s for write failed", destPath.c_str());
+      ex.extractedFail++;
+    } else {
+      ZipFile zip(ex.zipPath);
+      if (!zip.readFileToStream(entryName.c_str(), outFile, 4096)) {
+        LOG_ERR("ERA", "Lazy extract: inflate %s failed", entryName.c_str());
+        outFile.close();
+        Storage.remove(destPath.c_str());
+        ex.extractedFail++;
+      } else {
+        const uint32_t sz = outFile.size();
+        outFile.close();
+        ex.extractedOk++;
+        ex.totalBytes += sz;
+      }
     }
+
+    // Yield when the time budget is exhausted. Don't bail mid-loop on
+    // heap pressure though -- once we have the writer file handle we'd
+    // rather finish the entry than partially fail it.
+    if ((millis() - tickStart) >= TICK_BUDGET_MS) break;
   }
 
-  if (Storage.exists(destPath.c_str())) Storage.remove(destPath.c_str());
-  FsFile outFile;
-  if (!Storage.openFileForWrite("ERA", String(destPath.c_str()), outFile)) {
-    LOG_ERR("ERA", "Lazy extract: open %s for write failed", destPath.c_str());
-    ex.extractedFail++;
-    return;
-  }
-
-  ZipFile zip(ex.zipPath);
-  if (!zip.readFileToStream(entryName.c_str(), outFile, 4096)) {
-    LOG_ERR("ERA", "Lazy extract: inflate %s failed", entryName.c_str());
-    outFile.close();
-    Storage.remove(destPath.c_str());
-    ex.extractedFail++;
-    return;
-  }
-  const uint32_t sz = outFile.size();
-  outFile.close();
-  ex.extractedOk++;
-  ex.totalBytes += sz;
-
-  // Log every 8th entry so the serial log shows progress without flooding.
-  if ((ex.extractedOk & 0x07) == 0) {
-    LOG_INF("ERA", "Lazy extract progress: %u/%zu ok, last=%s (%u B), heap free=%u",
-            ex.extractedOk, ex.entryNames.size(), entryName.c_str(),
-            static_cast<unsigned>(sz), ESP.getFreeHeap());
-  }
+  // Single progress log per tick (the entry-by-entry log flooded serial
+  // and made it hard to see other reader activity). Show cumulative
+  // counts + heap so it's easy to spot if extraction stalls.
+  LOG_INF("ERA", "Lazy extract: %u/%zu ok (%u fail, %u B total), heap free=%u maxAlloc=%u",
+          ex.extractedOk, ex.entryNames.size(), ex.extractedFail, ex.totalBytes,
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 }
 
 bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
