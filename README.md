@@ -16,6 +16,12 @@ CrumBLE sits on top of CrossInk and CrossInk Carousel's feature set — see the 
 
 As of v3.0.0, CrumBLE is rebased onto **CrossInk 1.3** (a fresh upstream base rather than back-porting), so it also inherits 1.3's additions — SD-card font sizes, Quick Resume, the Minimal sleep screen, low-memory OPDS handling, and more.
 
+
+
+<p align="center">
+  <img width="440" height="591" alt="Screenshot 2026-05-31 at 11 45 56 PM" src="https://github.com/user-attachments/assets/855dbae2-8ce5-4d63-a6a9-15081ffbbb94" />
+</p>
+
 ### Collections
 
 Not a fan of always digging into file explorer to find your books? Want to group your books in a display on the home screen that makes sense? Fully customizable collection system that helps you access, organize, and display your books regardless of your file structure.
@@ -24,6 +30,10 @@ Not a fan of always digging into file explorer to find your books? Want to group
 - **User collections** Make your own and add any books of your choosing
 - **Per-collection sort** (A–Z / Z–A / Author A–Z / Author Z–A / Date Added), persisted in `collections.json`
 - Optional **series collapse** that folds same-series books into one spine glyph on the shelf; tapping the spine opens a mini-picker of the series members (in Beta)
+
+<p align="center">
+   <img src="https://github.com/imshentastic/CrumBLE/releases/download/readme-assets/04-add-remove-books.gif" alt="Add / Remove Books picker" width="280"/>
+</p>
 
 ### Bookshelf grid
 
@@ -35,9 +45,12 @@ Browse the active collection as a 3×3 grid of cover thumbnails instead of cycli
 - Cover thumbs are pre-cached at exact cell dimensions, so revisits don't flash a "Loading" popup looking for thumbs that already exist
 
 <p align="center">
-  <img src="./docs/images/crumble/03-collections-shelf.png" alt="Collections shelf with series collapse" width="280"/>
-  <img src="https://github.com/imshentastic/CrumBLE/releases/download/readme-assets/04-add-remove-books.gif" alt="Add / Remove Books picker" width="280"/>
+  <img width="281" height="378" alt="Screenshot 2026-05-31 at 11 46 30 PM" src="https://github.com/user-attachments/assets/680af84c-3f53-4f01-978c-b86ed9a1dbb9" />
+  <img width="281" height="378" alt="Screenshot 2026-05-31 at 11 46 37 PM" src="https://github.com/user-attachments/assets/b458be1b-ed94-46f8-965c-0dd0fd528019" />
+  <img width="281" height="457" alt="Screenshot 2026-05-31 at 11 49 10 PM" src="https://github.com/user-attachments/assets/de66eb4c-5e09-4110-b72e-ddad5afe5cd0" />
 </p>
+
+
 
 ### Bluetooth remote page-turner
 
@@ -50,7 +63,7 @@ Bluetooth will always be a challenge for this device, but I'm trying to bring th
 - **BT No Images Quick Connect**: Located about BT Quick Connect, this one-tap drawer action will temporarily suppress image decoding at render time (uses placeholder border) while BT is connected. It will automatically revert back once BT is disconnected, so just another option to have without any long-term commitment.
 
 <p align="center">
-  <img src="https://github.com/imshentastic/CrumBLE/releases/download/readme-assets/02-bt-pairing.gif" alt="Bluetooth pairing UI" width="280"/>
+  <img width="270" height="480" alt="IMG_9994" src="https://github.com/user-attachments/assets/6b0f1e34-2aae-4186-9229-6eb501cef5f1" />
 </p>
 Shout-out to [thedrunkpenguin](https://github.com/thedrunkpenguin/crosspoint-reader-ble/) for his BLE changes which I learned much from and added some memory changes to make it all fit.
 
