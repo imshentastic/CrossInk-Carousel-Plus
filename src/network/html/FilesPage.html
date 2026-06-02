@@ -3014,13 +3014,40 @@ async function uploadFile() {
     progressText.style.color = '';
     progressText.textContent = `${stageText} ${file.name} (${currentIndex + 1}/${files.length})${methodText}`;
 
+    // CrumBLE: single monotonic progress bar across all phases. The
+    // pre-prebake design ran conversion 0-50% green, EPUB upload 50-100%
+    // green, then RESET to 0% orange for the prebake phase -- user feedback:
+    // "currently does the original behavior to 99% (even bounces backwards
+    // once which isnt ideal), and then restarts with a second orange progress
+    // bar." Now the bar climbs in one continuous sweep:
+    //   no prebake: convert 0-50%, EPUB upload 50-100%
+    //   prebake:    convert 0-30%, EPUB upload 30-50%, cache upload 50-75%,
+    //               extract 75-100%
+    // Phase windows are scaled inside each callback so the bar never moves
+    // backwards. Caller asks "is prebake on" via document.getElementById so
+    // we don't have to thread state through every closure.
+    const prebakeOn = !!document.getElementById('prebake-reader-cache-checkbox')?.checked;
     const onProgress = (loaded, total) => {
-      const uploadPercent = Math.round((loaded / total) * 100);
-      // If conversion succeeded, display goes from 50-100%, otherwise 0-100%
-      const displayPercent = conversionSucceeded ? 50 + Math.round(uploadPercent / 2) : uploadPercent;
+      const uploadPercent = total > 0 ? Math.round((loaded / total) * 100) : 0;
+      // EPUB upload window depends on prebake: 50-100% if no prebake,
+      // 30-50% if prebake will follow. Conversion already filled the lead-in.
+      let displayPercent;
+      if (conversionSucceeded) {
+        if (prebakeOn) {
+          // Conversion took 0-30%; EPUB upload takes 30-50%.
+          displayPercent = 30 + Math.round(uploadPercent * 0.2);
+        } else {
+          // Conversion took 0-50%; EPUB upload takes 50-100%.
+          displayPercent = 50 + Math.round(uploadPercent / 2);
+        }
+      } else {
+        // No conversion this run -- upload owns the full bar (or 0-50%
+        // when prebake will follow).
+        displayPercent = prebakeOn ? Math.round(uploadPercent * 0.5) : uploadPercent;
+      }
       progressFill.style.width = displayPercent + '%';
       const prefix = conversionSucceeded ? 'Converting & uploading' : 'Uploading';
-      progressText.textContent = `${prefix} ${file.name} (${currentIndex + 1}/${files.length})${methodText} — ${uploadPercent}%`;
+      progressText.textContent = `${prefix} ${file.name} (${currentIndex + 1}/${files.length})${methodText} — ${displayPercent}%`;
     };
 
     const onComplete = () => {
@@ -3091,9 +3118,14 @@ async function uploadFile() {
         const origFileSize = file.size;
 
         try {
+          // Conversion window: 0-30% when prebake is on (leaves 30-50 for
+          // EPUB upload, 50-75 for cache zip upload, 75-100 for extract),
+          // 0-50% when prebake is off (same as the legacy split).
+          const prebakeOnForConvert = !!document.getElementById('prebake-reader-cache-checkbox')?.checked;
+          const convertScale = prebakeOnForConvert ? 0.30 : 0.50;
           const convertedBlob = await convertEpubFile(file, (percent) => {
-            // Pass current quality setting to converter
-            progressFill.style.width = (percent * 0.5) + '%'; // Conversion takes first 50%
+            progressFill.style.width = (percent * convertScale) + '%';
+            progressText.textContent = `Converting ${file.name} (${currentIndex + 1}/${files.length}) — ${Math.round(percent * convertScale)}%`;
           });
 
           // CrumBLE: pull the WASM-prebake cache zip OFF the converted blob
@@ -3182,31 +3214,30 @@ async function uploadFile() {
         const baseName = (cacheZipBookName || 'book').replace(/\.epub$/i, '');
         const cacheZipName = `${baseName}.crumble-cache.zip`;
         const cacheZipDevicePath = `/.crosspoint/${cacheZipName}`;
-        // Progress UX: the EPUB upload bar above hit 100% green, but we're
-        // not actually done -- prebake adds another 30-60 s of work the user
-        // shouldn't think is finished. Reset bar to 0% with an orange tint
-        // and a "Pre-baking..." label so it's visually obvious there's a
-        // phase 2 in progress. Earlier user feedback: "shows 100% but it's
-        // still going, the bar should reflect that."
-        progressFill.style.backgroundColor = '#e67e22';  // orange = prebake phase
-        progressFill.style.width = '0%';
-        progressText.textContent = `Pre-baking reader cache for ${file.name}...`;
+        // Progress UX (revised after user feedback): keep climbing on the
+        // same bar instead of resetting -- earlier the bar bounced from 100%
+        // green back to 0% orange when prebake kicked in, which read as
+        // "we just started over". Same green, no reset, just continued
+        // motion through the prebake phases:
+        //   50-75% = cache zip upload to device
+        //   75-100% = device-side extract (across up to 3 retries)
         try {
           log(`Pre-bake: uploading cache zip (${formatBytes(cacheZipForUpload.size)}) to ${cacheZipDevicePath}...`,
               '', 'PRE');
+          progressFill.style.width = '50%';
+          progressText.textContent = `Pre-baking ${file.name} — uploading cache (0%)`;
           const cacheZipFile = new File([cacheZipForUpload], cacheZipName,
                                          { type: 'application/zip' });
-          // Reuses the file manager's normal HTTP upload path -- multipart,
-          // streamed to SD via the standard /upload handler, no custom
-          // multi-MB body code on the receiving side.
           await uploadFileHTTPToPath(cacheZipFile, cacheZipDevicePath, (loaded, total) => {
-            // Upload phase = 0-50% of the orange bar.
-            const pct = total > 0 ? Math.round((loaded / total) * 50) : 0;
-            progressFill.style.width = pct + '%';
-            progressText.textContent = `Pre-baking reader cache for ${file.name} — uploading ${Math.round((loaded / total) * 100)}%`;
+            // Cache zip upload owns 50-75% of the bar.
+            const innerPct = total > 0 ? (loaded / total) : 0;
+            const displayPct = 50 + Math.round(innerPct * 25);
+            progressFill.style.width = displayPct + '%';
+            progressText.textContent =
+                `Pre-baking ${file.name} — uploading cache (${Math.round(innerPct * 100)}%) — ${displayPct}%`;
           });
-          progressFill.style.width = '55%';
-          progressText.textContent = `Pre-baking reader cache for ${file.name} — waiting for device heap...`;
+          progressFill.style.width = '76%';
+          progressText.textContent = `Pre-baking ${file.name} — waiting for device heap — 76%`;
           log(`Pre-bake: cache zip uploaded; waiting for device heap to recover...`, '', 'PRE');
 
           // Heap-recovery wait: after the EPUB upload + the cache-zip upload
@@ -3219,8 +3250,8 @@ async function uploadFile() {
           // the upload scope exits; the wait + retry loop below rides that
           // recovery window.
           await new Promise(resolve => setTimeout(resolve, 6000));
-          progressFill.style.width = '60%';
-          progressText.textContent = `Pre-baking reader cache for ${file.name} — extracting on device...`;
+          progressFill.style.width = '80%';
+          progressText.textContent = `Pre-baking ${file.name} — extracting on device — 80%`;
           log(`Pre-bake: triggering extraction...`, '', 'PRE');
 
           // Up to 3 attempts with 8-second waits between. The device-side
@@ -3230,9 +3261,11 @@ async function uploadFile() {
           let summary = null;
           let lastRawBody = null;
           for (let attempt = 1; attempt <= 3; attempt++) {
-            // Bar advances modestly per attempt so the user sees progress
-            // even on retries. 60 -> 70 -> 80 -> 90 across attempts.
-            progressFill.style.width = (50 + attempt * 10) + '%';
+            // Bar climbs through 75-100 across attempts: 80 -> 87 -> 93.
+            // Settled at 100% by the success log below.
+            const attemptPct = 75 + Math.round(attempt * (25 / 4));  // 81, 88, 94
+            progressFill.style.width = attemptPct + '%';
+            progressText.textContent = `Pre-baking ${file.name} — extracting (attempt ${attempt}/3) — ${attemptPct}%`;
             extractResp = await fetch(
               '/api/extract-prebake-cache?path=' + encodeURIComponent(cacheZipDevicePath),
               { method: 'POST' });
