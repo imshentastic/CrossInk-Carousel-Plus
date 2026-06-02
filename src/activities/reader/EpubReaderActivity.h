@@ -172,7 +172,29 @@ class EpubReaderActivity final : public Activity {
   // the user to switch back to the prebake'd layout so the cached sections
   // can actually load instead of being rebuilt from HTML on every chapter.
   std::optional<PrebakeManifest> prebakeManifest_;
-  bool prebakePromptAnsweredThisSession_ = false;  // one-shot per book open
+  // Snapshot of the SETTINGS fields the prebake check compares. When any of
+  // these change between ticks (e.g. user toggled hyphenation in the drawer
+  // or changed margin from the main menu), the snapshot mismatch tells us
+  // to re-evaluate the prebake prompt -- previous design used a one-shot
+  // flag that latched on book open and silently swallowed every subsequent
+  // settings change, so the user never saw the prompt after the first one.
+  // -1 / 0xFFFF in the snapshot means "uninitialised, run the check next tick".
+  struct PrebakeSettingsSnapshot {
+    int32_t fontId = -1;
+    float lineCompression = -1.0f;
+    bool extraParagraphSpacing = false;
+    bool forceParagraphIndents = false;
+    uint8_t paragraphAlignment = 0;
+    uint16_t viewportWidth = 0xFFFF;
+    uint16_t viewportHeight = 0xFFFF;
+    bool hyphenationEnabled = false;
+    bool embeddedStyle = false;
+    uint8_t imageRendering = 0xFF;
+    bool bionicReadingEnabled = false;
+    bool guideReadingEnabled = false;
+    bool initialised = false;
+  } prebakeLastSnapshot_;
+  bool prebakePromptShowing_ = false;  // suppress re-fire while dialog is open
 
   // CrumBLE Phase 1 fast-open: non-critical onEnter work (font buffer
   // pre-grow, reader-settings cache build, .pxc manifest parse) is

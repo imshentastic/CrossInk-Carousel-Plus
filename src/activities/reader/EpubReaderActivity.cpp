@@ -353,7 +353,8 @@ void EpubReaderActivity::onEnter() {
   readerSettingsCache_.clear();
   pxcManifest_.reset();
   prebakeManifest_.reset();
-  prebakePromptAnsweredThisSession_ = false;
+  prebakeLastSnapshot_ = {};
+  prebakePromptShowing_ = false;
   deferredOnEnterPending_ = true;
   firstRenderCompleted_ = false;
   // Reset BLE-link edge state on every book open: a fresh book may have a
@@ -690,7 +691,7 @@ void EpubReaderActivity::loop() {
   // revert before any heavy work starts. Only fires when this book actually
   // has a prebake'd cache to switch back to; books without prebake'd files
   // get no prompt at all.
-  if (prebakeManifest_.has_value() && !prebakePromptAnsweredThisSession_) {
+  if (prebakeManifest_.has_value() && !prebakePromptShowing_) {
     const PrebakeManifest& pm = *prebakeManifest_;
     const int32_t curFontId = SETTINGS.getReaderFontId();
     const float curLineComp = SETTINGS.getReaderLineCompression();
@@ -711,6 +712,53 @@ void EpubReaderActivity::loop() {
     const uint16_t curViewportW = static_cast<uint16_t>(renderer.getScreenWidth() - oml - omr);
     const uint16_t curViewportH = static_cast<uint16_t>(renderer.getScreenHeight() - omt - omb);
 
+    // Detect settings changes since our last check by snapshotting the 12
+    // fields the comparison uses. When any value drifts -- whether from
+    // the drawer's quick toggles, the main settings menu, or a programmatic
+    // SETTINGS.saveToFile() somewhere -- the snapshot mismatch tells us to
+    // re-evaluate. The previous design used a one-shot per-session flag
+    // that latched on the first tick and silently swallowed every later
+    // user-driven settings change, so a hyphenation toggle (or any other)
+    // mid-book never triggered the prompt the second time.
+    const bool snapChanged = !prebakeLastSnapshot_.initialised ||
+        prebakeLastSnapshot_.fontId != curFontId ||
+        prebakeLastSnapshot_.lineCompression != curLineComp ||
+        prebakeLastSnapshot_.extraParagraphSpacing != SETTINGS.extraParagraphSpacing ||
+        prebakeLastSnapshot_.forceParagraphIndents != SETTINGS.forceParagraphIndents ||
+        prebakeLastSnapshot_.paragraphAlignment != SETTINGS.paragraphAlignment ||
+        prebakeLastSnapshot_.viewportWidth != curViewportW ||
+        prebakeLastSnapshot_.viewportHeight != curViewportH ||
+        prebakeLastSnapshot_.hyphenationEnabled != SETTINGS.hyphenationEnabled ||
+        prebakeLastSnapshot_.embeddedStyle != SETTINGS.embeddedStyle ||
+        prebakeLastSnapshot_.imageRendering != SETTINGS.imageRendering ||
+        prebakeLastSnapshot_.bionicReadingEnabled != SETTINGS.bionicReadingEnabled ||
+        prebakeLastSnapshot_.guideReadingEnabled != SETTINGS.guideReadingEnabled;
+
+    // Always refresh the snapshot so the next tick compares against the
+    // current state, not a stale one (in particular: if the user accepts
+    // the prompt and we revert SETTINGS, the snapshot moves with them and
+    // we don't re-fire on the post-accept tick).
+    prebakeLastSnapshot_.fontId = curFontId;
+    prebakeLastSnapshot_.lineCompression = curLineComp;
+    prebakeLastSnapshot_.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
+    prebakeLastSnapshot_.forceParagraphIndents = SETTINGS.forceParagraphIndents;
+    prebakeLastSnapshot_.paragraphAlignment = SETTINGS.paragraphAlignment;
+    prebakeLastSnapshot_.viewportWidth = curViewportW;
+    prebakeLastSnapshot_.viewportHeight = curViewportH;
+    prebakeLastSnapshot_.hyphenationEnabled = SETTINGS.hyphenationEnabled;
+    prebakeLastSnapshot_.embeddedStyle = SETTINGS.embeddedStyle;
+    prebakeLastSnapshot_.imageRendering = SETTINGS.imageRendering;
+    prebakeLastSnapshot_.bionicReadingEnabled = SETTINGS.bionicReadingEnabled;
+    prebakeLastSnapshot_.guideReadingEnabled = SETTINGS.guideReadingEnabled;
+    prebakeLastSnapshot_.initialised = true;
+
+    if (!snapChanged) {
+      // No drift this tick; skip the comparison entirely. The mismatch
+      // status hasn't changed since our last evaluation, so re-prompting
+      // would just be noise.
+      // (fall through to the rest of tick())
+    } else {
+
     // 12-field comparison -- the same fields Section.cpp's fingerprint check
     // gates section loads on. viewportWidth/Height ARE on this list because
     // they're how screenMargin and orientation changes manifest in the
@@ -729,7 +777,6 @@ void EpubReaderActivity::loop() {
         (pm.imageRendering != SETTINGS.imageRendering) ||
         (pm.bionicReadingEnabled != SETTINGS.bionicReadingEnabled) ||
         (pm.guideReadingEnabled != SETTINGS.guideReadingEnabled);
-    prebakePromptAnsweredThisSession_ = true;  // one-shot per book regardless of branch
     if (mismatch) {
       LOG_INF("ERA",
               "Prebake fingerprint mismatch: cur fontId=%ld lineComp=%.3f ePS=%d fPI=%d pA=%u "
@@ -755,11 +802,13 @@ void EpubReaderActivity::loop() {
           "This book was prepared with different reader settings. Your current settings "
           "would make every chapter rebuild from scratch -- slower opens and possible "
           "memory errors. Switch to the prepared settings?";
+      prebakePromptShowing_ = true;
       startActivityForResult(
           std::make_unique<ConfirmationActivity>(
               renderer, mappedInput, "Restore prepared layout?", promptBody,
               /*ignoreInitialConfirmRelease=*/true),
           [this](const ActivityResult& result) {
+            prebakePromptShowing_ = false;
             if (result.isCancelled) {
               requestUpdate();
               return;
@@ -788,10 +837,15 @@ void EpubReaderActivity::loop() {
             // lineSpacing alongside lineCompression in the manifest.
             SETTINGS.saveToFile();
             if (section) section.reset();  // force fresh layout next render
+            // Refresh the snapshot to the post-revert values so the next
+            // tick's snap-changed check sees the change came from US and
+            // doesn't re-fire the prompt immediately.
+            prebakeLastSnapshot_.initialised = false;
             requestUpdate();
           });
       return;
     }
+    }  // close: if (snapChanged)
   }
 
   // BT No Images Quick Connect auto-restore. The no-images flag exists only to
