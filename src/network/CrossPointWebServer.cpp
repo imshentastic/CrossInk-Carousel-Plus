@@ -33,6 +33,8 @@
 #include "html/SettingsPageHtml.generated.h"
 #include "html/js/jszip_minJs.generated.h"
 #include "html/js/optimizerJs.generated.h"
+#include "html/wasm/crumblePrebakeJs.generated.h"
+#include "html/wasm/crumblePrebakeWasm.generated.h"
 #include "util/BookCacheUtils.h"
 #include "util/StringUtils.h"
 
@@ -183,6 +185,12 @@ void CrossPointWebServer::begin() {
   server->on("/files", HTTP_GET, [this] { handleFileList(); });
   server->on("/js/jszip.min.js", HTTP_GET, [this] { handleJszip(); });
   server->on("/js/optimizer.js", HTTP_GET, [this] { handleOptimizerJs(); });
+  // CrumBLE Phase 5a: PROGMEM-embedded prebake WASM module. ~870 KB total
+  // (gzipped). Lazy-loaded by the optimizer page when the user opts in to
+  // chapter-prebake; otherwise these handlers are never hit and the flash
+  // cost is the only impact.
+  server->on("/js/crumble-prebake.js", HTTP_GET, [this] { handleCrumblePrebakeJs(); });
+  server->on("/js/crumble-prebake.wasm", HTTP_GET, [this] { handleCrumblePrebakeWasm(); });
 
   server->on("/api/status", HTTP_GET, [this] { handleStatus(); });
   server->on("/api/files", HTTP_GET, [this] { handleFileListData(); });
@@ -428,6 +436,24 @@ void CrossPointWebServer::handleJszip() const {
 void CrossPointWebServer::handleOptimizerJs() const {
   sendBufferGzip(server.get(), "application/javascript", optimizerJs,
                  optimizerJsCompressedSize, "optimizer.js");
+}
+
+void CrossPointWebServer::handleCrumblePrebakeJs() const {
+  if (CrumblePrebakeJsCompressedSize == 0) {
+    server->send(404, "text/plain", "Prebake WASM not built into this firmware");
+    return;
+  }
+  sendBufferGzip(server.get(), "application/javascript", CrumblePrebakeJs,
+                 CrumblePrebakeJsCompressedSize, "crumble-prebake.js");
+}
+
+void CrossPointWebServer::handleCrumblePrebakeWasm() const {
+  if (CrumblePrebakeWasmCompressedSize == 0) {
+    server->send(404, "text/plain", "Prebake WASM not built into this firmware");
+    return;
+  }
+  sendBufferGzip(server.get(), "application/wasm", CrumblePrebakeWasm,
+                 CrumblePrebakeWasmCompressedSize, "crumble-prebake.wasm");
 }
 
 void CrossPointWebServer::handleNotFound() const {

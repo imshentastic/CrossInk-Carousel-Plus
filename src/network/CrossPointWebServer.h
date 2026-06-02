@@ -100,6 +100,13 @@ class CrossPointWebServer {
   void handleRoot() const;
   void handleJszip() const;
   void handleOptimizerJs() const;
+  // CrumBLE Phase 5a: serve PROGMEM-embedded prebake WASM module.
+  // Total ~870 KB gzipped; loaded on demand by the optimizer page when
+  // the user opts in to chapter-prebake. Headers return 404 if the WASM
+  // wasn't built (zero-length sentinel from embed_wasm.py) so the
+  // firmware still works without crumble-prebake.{js,wasm} on disk.
+  void handleCrumblePrebakeJs() const;
+  void handleCrumblePrebakeWasm() const;
   void handleNotFound() const;
   void handleStatus() const;
   void handleFileList() const;
