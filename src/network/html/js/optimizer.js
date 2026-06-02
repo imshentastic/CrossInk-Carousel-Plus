@@ -2079,7 +2079,7 @@ async function showOptimizerPreflightModal(renderInfo, fileName) {
       'justify-content:center;z-index:10000;font-family:-apple-system,system-ui,sans-serif;';
     const dialog = document.createElement('div');
     dialog.style.cssText =
-      'background:#fff;border-radius:12px;max-width:560px;width:90%;max-height:85vh;overflow-y:auto;' +
+      'background:#fff;color:#222;border-radius:12px;max-width:560px;width:90%;max-height:85vh;overflow-y:auto;' +
       'padding:24px;box-shadow:0 12px 32px rgba(0,0,0,0.2);';
     const header = document.createElement('div');
     header.innerHTML =
@@ -2109,7 +2109,7 @@ async function showOptimizerPreflightModal(renderInfo, fileName) {
       const sel = document.createElement('select');
       sel.dataset.key = key;
       sel.dataset.current = current;
-      sel.style.cssText = 'padding:6px 8px;border:1px solid #c2c2c2;border-radius:4px;font-size:14px;background:#fff';
+      sel.style.cssText = 'padding:6px 8px;border:1px solid #c2c2c2;border-radius:4px;font-size:14px;background:#fff;color:#222';
       for (const opt of options) {
         const o = document.createElement('option');
         o.value = opt.v;
@@ -2134,7 +2134,7 @@ async function showOptimizerPreflightModal(renderInfo, fileName) {
       inp.value = String(current);
       inp.dataset.key = key;
       inp.dataset.current = String(current);
-      inp.style.cssText = 'padding:6px 8px;border:1px solid #c2c2c2;border-radius:4px;font-size:14px;background:#fff';
+      inp.style.cssText = 'padding:6px 8px;border:1px solid #c2c2c2;border-radius:4px;font-size:14px;background:#fff;color:#222';
       wrap.appendChild(span);
       wrap.appendChild(inp);
       form.appendChild(wrap);

@@ -452,6 +452,15 @@
       gap: 12px;
       margin: 0;
     }
+    /* Visual separator between stacked primary toggles so the BT row and
+       the Pre-bake row read as two distinct settings rather than one
+       merged block (user feedback: the BT row looked "gone" because it
+       blended into the prebake row above/below it). */
+    .bt-friendly-row + .bt-friendly-row {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border-color);
+    }
     .bt-friendly-text {
       flex: 1;
       min-width: 0;
