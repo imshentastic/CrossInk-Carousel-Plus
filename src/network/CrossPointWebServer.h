@@ -153,6 +153,14 @@ class CrossPointWebServer {
   // path-safety and priority-order rules as handlePrebakeCacheUploadPost;
   // they share most of the implementation. No request body needed.
   void handleExtractPrebakeCache() const;
+  // POST /api/save-reader-settings  (Content-Type: application/json)
+  // Body: subset of /api/reader-render-info's payload (any field that's
+  // a writable SETTINGS member is accepted). Updates only the named fields
+  // -- omitted fields stay at their current SETTINGS values. SETTINGS.
+  // saveToFile() persists to flash on success. Used by the optimizer's
+  // preflight modal so the user can correct any setting that's wrong
+  // before locking it into the prebake's manifest.
+  void handleSaveReaderSettings() const;
   void handleNotFound() const;
   void handleStatus() const;
   void handleFileList() const;

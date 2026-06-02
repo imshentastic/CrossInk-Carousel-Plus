@@ -206,6 +206,7 @@ void CrossPointWebServer::begin() {
   // standard /upload endpoint; we just trigger the extract step against
   // ?path=. Avoids the multipart body that was crashing the older route.
   server->on("/api/extract-prebake-cache", HTTP_POST, [this] { handleExtractPrebakeCache(); });
+  server->on("/api/save-reader-settings", HTTP_POST, [this] { handleSaveReaderSettings(); });
 
   // Create folder endpoint
   server->on("/mkdir", HTTP_POST, [this] { handleCreateFolder(); });
@@ -1139,6 +1140,55 @@ void CrossPointWebServer::handlePrebakeCacheUploadPost(PrebakeCacheUploadState& 
           (status == 200 ? "FULL" : "PARTIAL"), extracted,
           static_cast<unsigned>(entries.size()), static_cast<unsigned>(totalBytes),
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+}
+
+// CrumBLE: optimizer preflight settings update. JSON body subset, applies
+// only the named fields, persists via SETTINGS.saveToFile(). All fields are
+// optional; omitted fields keep their current SETTINGS value. Validates
+// numeric ranges against the enums in CrossPointSettings.h so a malformed
+// POST can't push the device into an inconsistent settings state.
+void CrossPointWebServer::handleSaveReaderSettings() const {
+  if (!server->hasArg("plain")) {
+    server->send(400, "text/plain", "Missing JSON body");
+    return;
+  }
+  const String body = server->arg("plain");
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    server->send(400, "text/plain", String("JSON parse failed: ") + err.c_str());
+    return;
+  }
+  // Helper to clamp + apply an integer field. Skips when the key is absent
+  // so partial updates work.
+  auto applyU8 = [&doc](const char* key, uint8_t& field, uint8_t maxValue) {
+    if (!doc[key].is<int>()) return;
+    const int v = doc[key].as<int>();
+    if (v < 0 || v > maxValue) return;
+    field = static_cast<uint8_t>(v);
+  };
+  applyU8("orientation", SETTINGS.orientation, 3);
+  applyU8("screenMargin", SETTINGS.screenMargin, 50);
+  applyU8("imageRendering", SETTINGS.imageRendering, CrossPointSettings::IMAGE_RENDERING_COUNT - 1);
+  applyU8("fontFamily", SETTINGS.fontFamily, CrossPointSettings::FONT_FAMILY_COUNT - 1);
+  applyU8("fontSize", SETTINGS.fontSize, CrossPointSettings::FONT_SIZE_COUNT - 1);
+  applyU8("sdFontSizeRange", SETTINGS.sdFontSizeRange, CrossPointSettings::SD_FONT_SIZE_RANGE_COUNT - 1);
+  applyU8("lineSpacing", SETTINGS.lineSpacing, CrossPointSettings::LINE_COMPRESSION_COUNT - 1);
+  applyU8("paragraphAlignment", SETTINGS.paragraphAlignment, CrossPointSettings::PARAGRAPH_ALIGNMENT_COUNT - 1);
+  applyU8("extraParagraphSpacing", SETTINGS.extraParagraphSpacing, 1);
+  applyU8("forceParagraphIndents", SETTINGS.forceParagraphIndents, 1);
+  applyU8("hyphenationEnabled", SETTINGS.hyphenationEnabled, 1);
+  applyU8("embeddedStyle", SETTINGS.embeddedStyle, 1);
+  applyU8("bionicReadingEnabled", SETTINGS.bionicReadingEnabled, 1);
+  applyU8("guideReadingEnabled", SETTINGS.guideReadingEnabled, 1);
+  if (doc["sdFontFamilyName"].is<const char*>()) {
+    const char* name = doc["sdFontFamilyName"].as<const char*>();
+    strncpy(SETTINGS.sdFontFamilyName, name ? name : "", sizeof(SETTINGS.sdFontFamilyName) - 1);
+    SETTINGS.sdFontFamilyName[sizeof(SETTINGS.sdFontFamilyName) - 1] = '\0';
+  }
+  SETTINGS.saveToFile();
+  LOG_INF("WEB", "[CFG] reader settings updated via /api/save-reader-settings");
+  server->send(200, "application/json", "{\"ok\":true}");
 }
 
 // POST /api/extract-prebake-cache?path=/path/to/cache.zip
