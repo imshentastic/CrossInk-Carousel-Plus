@@ -277,7 +277,12 @@ bool Section::tryLoadFromPath(const std::string& path, const int fontId, const f
 
   // Explicit close() required: member variable persists beyond function scope
   file.close();
-  LOG_DBG("SCT", "Deserialization succeeded: %d pages", pageCount);
+  // CrumBLE: remember which slot we actually loaded from so subsequent
+  // reads (loadPageFromSectionFile etc.) re-open the right file. Without
+  // this, a section loaded from the prebake fallback could not read its
+  // own page bytes because reads went to the non-existent live filePath.
+  activeFilePath = path;
+  LOG_DBG("SCT", "Deserialization succeeded: %d pages (from %s)", pageCount, path.c_str());
   return true;
 }
 
@@ -523,6 +528,10 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
     }
     return false;
   }
+  // CrumBLE: a freshly built section lives at filePath; point activeFilePath
+  // at it so subsequent reads (loadPageFromSectionFile etc.) target the new
+  // live cache rather than whichever path was used by a stale prior load.
+  activeFilePath = filePath;
   if (cssParser) {
     cssParser->clear();
   }
@@ -532,7 +541,7 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
 }
 
 std::unique_ptr<Page> Section::loadPageFromSectionFile() {
-  if (!Storage.openFileForRead("SCT", filePath, file)) {
+  if (!Storage.openFileForRead("SCT", activeFilePath, file)) {
     return nullptr;
   }
 
@@ -559,7 +568,7 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
 
 std::optional<uint16_t> Section::getPageForAnchor(const std::string& anchor) const {
   FsFile f;
-  if (!Storage.openFileForRead("SCT", filePath, f)) {
+  if (!Storage.openFileForRead("SCT", activeFilePath, f)) {
     return std::nullopt;
   }
 
@@ -598,7 +607,7 @@ std::optional<uint16_t> Section::getPageForAnchor(const std::string& anchor) con
 
 std::optional<uint16_t> Section::getPageForParagraphIndex(const uint16_t pIndex) const {
   FsFile f;
-  if (!Storage.openFileForRead("SCT", filePath, f)) {
+  if (!Storage.openFileForRead("SCT", activeFilePath, f)) {
     return std::nullopt;
   }
 
@@ -647,7 +656,7 @@ std::optional<uint16_t> Section::getPageForParagraphIndex(const uint16_t pIndex)
 
 std::optional<uint16_t> Section::getParagraphIndexForPage(const uint16_t page) const {
   FsFile f;
-  if (!Storage.openFileForRead("SCT", filePath, f)) {
+  if (!Storage.openFileForRead("SCT", activeFilePath, f)) {
     return std::nullopt;
   }
 
@@ -691,7 +700,7 @@ std::optional<uint16_t> Section::getParagraphIndexForPage(const uint16_t page) c
 
 std::optional<uint16_t> Section::getPageForListItemIndex(const uint16_t liIndex) const {
   FsFile f;
-  if (!Storage.openFileForRead("SCT", filePath, f)) {
+  if (!Storage.openFileForRead("SCT", activeFilePath, f)) {
     return std::nullopt;
   }
 

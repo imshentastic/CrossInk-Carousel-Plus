@@ -25,6 +25,15 @@ class Section {
   // fall back to the prebake artifact instead of rebuilding the chapter
   // from HTML again.
   std::string prebakeFilePath;
+  // CrumBLE: which of filePath / prebakeFilePath actually contained the
+  // most recently loaded section. tryLoadFromPath updates this on success.
+  // All subsequent reads (loadPageFromSectionFile, getPageForAnchor,
+  // getPageForParagraphIndex, etc.) MUST use this rather than filePath --
+  // when a section was loaded from the prebake fallback, filePath
+  // (sections/<n>.bin) doesn't exist on SD and re-opens fail.
+  // Writes (clearCache, createSectionFile, rename) keep using filePath
+  // since they target the live cache slot, never the prebake artifact.
+  std::string activeFilePath;
   FsFile file;
 
   bool writeSectionFileHeader(int fontId, float lineCompression, bool extraParagraphSpacing, bool forceParagraphIndents,
@@ -52,7 +61,8 @@ class Section {
         spineIndex(spineIndex),
         renderer(renderer),
         filePath(epub->getCachePath() + "/sections/" + std::to_string(spineIndex) + ".bin"),
-        prebakeFilePath(epub->getCachePath() + "/sections-prebake/" + std::to_string(spineIndex) + ".bin") {}
+        prebakeFilePath(epub->getCachePath() + "/sections-prebake/" + std::to_string(spineIndex) + ".bin"),
+        activeFilePath(filePath) {}
   ~Section() = default;
   // CrumBLE: when prebakeFallbackEnabled is false, only the live sections/
   // file is consulted (matches stock 3.7.3 behaviour). When true, the live
