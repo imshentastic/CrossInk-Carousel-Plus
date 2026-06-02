@@ -1690,6 +1690,24 @@
               </label>
             </div>
           </div>
+          <!-- CrumBLE Phase 5b: chapter-indexing prebake. Runs after the EPUB
+               upload completes. Generates book.bin + sections-prebake/ +
+               manifest in the browser via the WASM-compiled prebake CLI, then
+               uploads each file directly to its final SD path via the
+               proven /upload endpoint. No bundling, no device-side extract;
+               every transfer is a single small file. -->
+          <div class="advanced-setting-row">
+            <div class="setting-label">
+              <div class="setting-title">⚡ Optimize chapter indexing</div>
+              <div class="setting-desc">After upload, build the chapter index for this book so chapters open instantly on first read<br>Adds ~15-30 s per book, uses live device reader settings, requires no extra steps</div>
+            </div>
+            <div class="setting-controls">
+              <label class="toggle-switch">
+                <input type="checkbox" id="prebake-chapters-checkbox">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
           </div><!-- advanced-settings-content -->
       </div><!-- end convert-options -->
       <!-- Image Picker Section - in picker-columns for two-column layout -->
@@ -3050,6 +3068,33 @@ async function uploadFile() {
       // Ensure progress bar shows 100% before moving to next file
       progressFill.style.width = '100%';
       progressText.textContent = `Upload complete: ${file.name}`;
+
+      // CrumBLE Phase 5b: chapter-indexing prebake. Runs against the EPUB
+      // we just uploaded (the converted blob if BT optimization succeeded,
+      // otherwise the original). Gated by the user-visible checkbox; only
+      // applies to .epub uploads. Failure is non-fatal -- we still report
+      // the upload as complete; only the chapter speed-up is missed.
+      const prebakeCheckbox = document.getElementById('prebake-chapters-checkbox');
+      const isEpubUpload = file && file.name && /\.epub$/i.test(file.name);
+      if (prebakeCheckbox && prebakeCheckbox.checked && isEpubUpload) {
+        try {
+          progressText.textContent = `Optimizing chapter indexing for ${file.name}...`;
+          progressFill.style.backgroundColor = '#3498db'; // Blue for prebake phase
+          await prebakeChapters(file, file.name, (percent) => {
+            progressFill.style.width = `${percent}%`;
+          });
+          progressFill.style.backgroundColor = '#27ae60'; // Back to green
+        } catch (preErr) {
+          console.error('Chapter prebake error:', preErr);
+          if (typeof logError === 'function') {
+            logError(`Chapter prebake failed: ${preErr.message}`);
+          }
+          // Non-fatal -- the EPUB is already uploaded, the user can read it
+          // without the chapter speed-up. Don't block the rest of the batch.
+          progressFill.style.backgroundColor = '#e67e22'; // Orange = partial
+        }
+      }
+
       onComplete();
     } catch (error) {
       if (operationCancelled) { if (uploadGeneration === myGeneration) restoreAfterCancel(); return; }

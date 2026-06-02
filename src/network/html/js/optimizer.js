@@ -1858,6 +1858,276 @@ async function bakePxc(jpegBytes, viewportW, viewportH) {
   }
 }
 
+// =============================================================================
+// CrumBLE Phase 5b: chapter-indexing prebake (WASM-backed)
+// =============================================================================
+//
+// The "Optimize chapter indexing" checkbox runs prebakeChapters() AFTER the
+// EPUB upload completes. It executes the prebake CLI (cross-compiled to WASM
+// in tools/crumble-prebake) inside the browser against the just-uploaded
+// EPUB. The WASM emits a per-book cache directory under MEMFS; we then
+// upload each file individually via the file manager's /upload endpoint.
+//
+// Why no zip / no extractor: tonight's debugging showed that a single big
+// upload-and-extract on the device blew its heap, and a "lazy" tick-paced
+// extractor competed badly with the reader for the SD bus. Individual
+// uploads through the proven /upload endpoint sidestep both problems --
+// each request is a ~5-30 KB write, sequential, no extraction.
+
+let crumblePrebakeModuleFactoryPromise = null;
+let crumblePrebakeModulePromise = null;
+
+// Lazily inject /js/crumble-prebake.js and grab the factory it exposes.
+// Cached: subsequent calls return the same factory.
+function loadCrumblePrebakeFactory() {
+  if (crumblePrebakeModuleFactoryPromise) return crumblePrebakeModuleFactoryPromise;
+  crumblePrebakeModuleFactoryPromise = new Promise((resolve, reject) => {
+    if (typeof window.CrumblePrebake === 'function') {
+      resolve(window.CrumblePrebake);
+      return;
+    }
+    const s = document.createElement('script');
+    s.src = '/js/crumble-prebake.js';
+    s.onload = () => {
+      if (typeof window.CrumblePrebake !== 'function') {
+        reject(new Error('crumble-prebake.js loaded but CrumblePrebake factory missing'));
+        return;
+      }
+      resolve(window.CrumblePrebake);
+    };
+    s.onerror = () => reject(new Error('Failed to load /js/crumble-prebake.js (firmware may not include the WASM module)'));
+    document.head.appendChild(s);
+  });
+  return crumblePrebakeModuleFactoryPromise;
+}
+
+// Get a ready Module instance. The factory is invoked once and the resulting
+// Module is reused across runs (EXIT_RUNTIME=0 keeps MEMFS + libc alive
+// between callMain invocations). This means we pay the ~850 KB WASM
+// download + instantiation cost once per session, not per book.
+async function loadCrumblePrebakeModule() {
+  if (crumblePrebakeModulePromise) return crumblePrebakeModulePromise;
+  crumblePrebakeModulePromise = (async () => {
+    const factory = await loadCrumblePrebakeFactory();
+    return await factory({
+      // Quiet the noisy emscripten stdout/stderr -- prebake CLI logs are
+      // useful but we route them through the optimizer log panel ourselves
+      // so the user can see what happened.
+      print: (msg) => { try { log(`[prebake] ${msg}`, '', 'PRE'); } catch (e) {} },
+      printErr: (msg) => { try { log(`[prebake-err] ${msg}`, 'warning', 'PRE-ERR'); } catch (e) {} },
+    });
+  })();
+  return crumblePrebakeModulePromise;
+}
+
+// Upload a single byte buffer to /upload?path=<destDir> with filename <name>.
+// Returns the HTTP status code; throws on network failure.
+async function uploadOneToDevice(destDir, name, bytes) {
+  const formData = new FormData();
+  // The handler infers the filename from the upload's part name; we set it
+  // explicitly so the destination basename matches what we generated.
+  formData.append('file', new Blob([bytes]), name);
+  const resp = await fetch(`/upload?path=${encodeURIComponent(destDir)}`, {
+    method: 'POST',
+    body: formData,
+  });
+  return resp;
+}
+
+// POST /mkdir?path=<parent>&name=<dir>. Returns 200 on create, 400 if
+// already exists (which is fine -- the caller treats both as success).
+async function ensureRemoteDir(parentPath, dirName) {
+  const url = `/mkdir?path=${encodeURIComponent(parentPath)}&name=${encodeURIComponent(dirName)}`;
+  try {
+    await fetch(url, { method: 'POST' });
+  } catch (e) {
+    // Network errors are surfaced by the subsequent upload; mkdir failures
+    // (including "already exists") are not fatal in themselves.
+  }
+}
+
+// Run the WASM prebake against `epubBlob` and stream the resulting cache
+// files to the device. `deviceFileName` is the basename of the EPUB as it
+// will exist on the device's SD card -- used to compute the cache hash so
+// the device finds the prebake at the right path on next book open.
+//
+// Calls progressCallback(donePct) with values 0..100 across the whole run
+// (download settings -> run WASM -> upload N files).
+//
+// Throws on any fatal error. Returns a summary object on success:
+//   { hashId, uploaded, failed, totalBytes, elapsedMs }
+async function prebakeChapters(epubBlob, deviceFileName, progressCallback) {
+  const startTime = Date.now();
+  const reportProgress = (pct) => {
+    if (progressCallback) {
+      try { progressCallback(Math.max(0, Math.min(100, pct))); } catch (e) {}
+    }
+  };
+  reportProgress(0);
+
+  // 1. Fetch live render-info from the device (same endpoint the BT optimizer
+  //    uses for .pxc baking). Required because the CLI hard-errors on
+  //    fitVersion < 2 -- the eight layout fields it adds are baked into
+  //    section file headers and must match the device's current state.
+  log('Chapter prebake: fetching device render settings...', '', 'PRE');
+  const riResp = await fetch('/api/reader-render-info');
+  if (!riResp.ok) {
+    throw new Error(`render-info fetch failed: HTTP ${riResp.status}`);
+  }
+  const renderInfo = await riResp.json();
+  if (!(renderInfo.fitVersion >= 2)) {
+    throw new Error(`device reports fitVersion=${renderInfo.fitVersion}; chapter prebake needs >=2 (update firmware)`);
+  }
+  reportProgress(5);
+
+  // 2. Boot the WASM module (downloads ~850 KB gz on first call).
+  log('Chapter prebake: loading WASM module...', '', 'PRE');
+  const Module = await loadCrumblePrebakeModule();
+  reportProgress(15);
+
+  // 3. Stage the EPUB + settings file into MEMFS so the CLI sees them as
+  //    regular files. The CLI's --device-path argument controls the cache
+  //    hash so we use the actual device-side path (e.g. "/foo.epub"),
+  //    matching what the device computed when it indexed this book.
+  log('Chapter prebake: staging input into WASM filesystem...', '', 'PRE');
+  const epubBytes = new Uint8Array(await epubBlob.arrayBuffer());
+  const inputPath = '/input.epub';
+  const settingsPath = '/settings.json';
+  const outDir = '/out';
+  try { Module.FS.unlink(inputPath); } catch (e) {}
+  try { Module.FS.unlink(settingsPath); } catch (e) {}
+  try { Module.FS.unlink(outDir); } catch (e) {}
+  Module.FS.writeFile(inputPath, epubBytes);
+  Module.FS.writeFile(settingsPath, JSON.stringify(renderInfo));
+  Module.FS.mkdir(outDir);
+
+  // 4. Run prebake. callMain returns the CLI's exit code. The CLI's
+  //    --device-path tells it which SD-card path to hash for the cache
+  //    directory name -- without this it'd hash "/input.epub" instead
+  //    of the real device-side path.
+  const devicePath = '/' + deviceFileName;
+  log(`Chapter prebake: running CLI (--device-path=${devicePath})...`, '', 'PRE');
+  const rc = Module.callMain([
+    '--settings-file', settingsPath,
+    '--output-dir', outDir,
+    '--device-path', devicePath,
+    '--skip-thumbs',
+    inputPath,
+  ]);
+  if (rc !== 0) {
+    throw new Error(`prebake CLI exited with code ${rc}`);
+  }
+  reportProgress(50);
+
+  // 5. Walk MEMFS to find the produced cache directory. Layout:
+  //    /out/.crosspoint/epub_<hash>/{book.bin,sections-prebake/*.bin,...}
+  const crosspointDir = `${outDir}/.crosspoint`;
+  const cacheRoots = Module.FS.readdir(crosspointDir).filter(
+    (n) => n.startsWith('epub_'),
+  );
+  if (cacheRoots.length !== 1) {
+    throw new Error(`expected exactly one epub_* cache dir, found ${cacheRoots.length}`);
+  }
+  const hashId = cacheRoots[0]; // "epub_<hash>"
+  const memCacheDir = `${crosspointDir}/${hashId}`;
+  const deviceCacheDir = `/.crosspoint/${hashId}`;
+
+  // 6. Make sure the destination dirs exist on device. mkdir for the cache
+  //    dir is idempotent-ish (400 if exists, fine). sections-prebake/
+  //    too. Without these, /upload's openFileForWrite would fail because
+  //    the handler doesn't auto-create parents.
+  await ensureRemoteDir('/.crosspoint', hashId);
+  await ensureRemoteDir(deviceCacheDir, 'sections-prebake');
+
+  // 7. Enumerate output files and upload each one. Order: top-level files
+  //    first (book.bin, manifest, css), then sections in numeric order.
+  //    This means the manifest lands quickly and the device's switch-back
+  //    prompt has something to check before all sections finish.
+  function* walkMemfs(dir, relPrefix) {
+    for (const entry of Module.FS.readdir(dir)) {
+      if (entry === '.' || entry === '..') continue;
+      const full = `${dir}/${entry}`;
+      const stat = Module.FS.stat(full);
+      const rel = relPrefix ? `${relPrefix}/${entry}` : entry;
+      if (Module.FS.isDir(stat.mode)) {
+        yield* walkMemfs(full, rel);
+      } else {
+        yield { memPath: full, relPath: rel };
+      }
+    }
+  }
+  const allFiles = Array.from(walkMemfs(memCacheDir, ''));
+  // Numeric-ish sort: top-level non-section files first, then sections by index.
+  allFiles.sort((a, b) => {
+    const aIsSection = a.relPath.startsWith('sections-prebake/');
+    const bIsSection = b.relPath.startsWith('sections-prebake/');
+    if (aIsSection !== bIsSection) return aIsSection ? 1 : -1;
+    if (aIsSection) {
+      const an = parseInt(a.relPath.match(/(\d+)\.bin$/)?.[1] ?? '0', 10);
+      const bn = parseInt(b.relPath.match(/(\d+)\.bin$/)?.[1] ?? '0', 10);
+      return an - bn;
+    }
+    return a.relPath.localeCompare(b.relPath);
+  });
+
+  log(`Chapter prebake: uploading ${allFiles.length} cache files...`, '', 'PRE');
+  let uploaded = 0;
+  let failed = 0;
+  let totalBytes = 0;
+  for (let i = 0; i < allFiles.length; i++) {
+    const { memPath, relPath } = allFiles[i];
+    const bytes = Module.FS.readFile(memPath);
+    totalBytes += bytes.length;
+    // Destination dir is deviceCacheDir + parent-of-relPath.
+    const slash = relPath.lastIndexOf('/');
+    const destSubdir = slash >= 0 ? relPath.substring(0, slash) : '';
+    const destDir = destSubdir ? `${deviceCacheDir}/${destSubdir}` : deviceCacheDir;
+    const fname = slash >= 0 ? relPath.substring(slash + 1) : relPath;
+    try {
+      const resp = await uploadOneToDevice(destDir, fname, bytes);
+      if (resp.ok) {
+        uploaded++;
+      } else {
+        failed++;
+        const errText = await resp.text().catch(() => '');
+        log(`Upload failed ${relPath}: HTTP ${resp.status} ${errText}`.trim(), 'warning', 'PRE-FAIL');
+      }
+    } catch (e) {
+      failed++;
+      log(`Upload error ${relPath}: ${e.message}`, 'warning', 'PRE-FAIL');
+    }
+    // 50% -> 95% across the upload phase.
+    reportProgress(50 + Math.floor(45 * (i + 1) / allFiles.length));
+  }
+
+  // 8. Clean MEMFS so the next book in a batch doesn't pile up entries.
+  //    EXIT_RUNTIME=0 keeps the Module alive, but we don't want to leak
+  //    ~MB of EPUB / cache bytes per book across batch runs.
+  function rmRf(path) {
+    try {
+      const stat = Module.FS.stat(path);
+      if (Module.FS.isDir(stat.mode)) {
+        for (const entry of Module.FS.readdir(path)) {
+          if (entry === '.' || entry === '..') continue;
+          rmRf(`${path}/${entry}`);
+        }
+        Module.FS.rmdir(path);
+      } else {
+        Module.FS.unlink(path);
+      }
+    } catch (e) {}
+  }
+  rmRf(inputPath);
+  rmRf(settingsPath);
+  rmRf(outDir);
+
+  const elapsedMs = Date.now() - startTime;
+  reportProgress(100);
+  log(`Chapter prebake done: ${uploaded}/${allFiles.length} files (${formatBytes(totalBytes)}) in ${(elapsedMs / 1000).toFixed(1)}s`,
+      failed === 0 ? '' : 'warning', 'PRE-OK');
+  return { hashId, uploaded, failed, totalBytes, elapsedMs };
+}
+
 async function convertEpubFile(file, progressCallback) {
   const startTime = Date.now();
   const originalSize = file.size;
