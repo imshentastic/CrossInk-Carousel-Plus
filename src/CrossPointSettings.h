@@ -462,6 +462,20 @@ class CrossPointSettings {
   // BLE address type (0 = public, 1 = random). Required by NimBLE on reconnect.
   uint8_t bleBondedDeviceAddrType = 0;
 
+  // CrumBLE prebake — master switch for the off-device chapter-index optimizer.
+  // When 0 (default), the device behaves exactly like stock 3.7.3: only
+  // sections/*.bin is consulted on cache load, and no prebake-manifest.json
+  // lookup runs at book open.
+  // When 1, the device also reads sections-prebake/*.bin as a fallback,
+  // checks the prebake JSON manifest fingerprint on book open, and
+  // prompts the user with "Use prepared layout?" when their current
+  // SETTINGS don't match the prepared cache. The lazy background
+  // extractor (which converts a pending zip drop into sections-prebake/
+  // entries) also only runs when this is on. Per-book opt-in: works
+  // alongside the existing /upload file manager flow so users who haven't
+  // run the optimizer on a particular book see no change in behavior.
+  uint8_t optimizeChapterIndexing = 0;
+
   ~CrossPointSettings() = default;
 
   // Get singleton instance
