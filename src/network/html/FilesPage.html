@@ -474,9 +474,15 @@
       min-width: 100px;
     }
     .setting-label {
-      flex-shrink: 0;
+      /* Long descriptions need to wrap so they don't push the toggle
+         column off the right edge of the 340px convert-options panel in
+         picker mode. min-width:0 is required for flex items to actually
+         shrink below their content's natural width. */
+      flex: 1;
+      min-width: 0;
     }
     .setting-controls {
+      flex-shrink: 0;
       display: flex;
       flex-direction: column;
       align-items: flex-end;
