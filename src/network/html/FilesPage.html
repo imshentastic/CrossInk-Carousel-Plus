@@ -1205,6 +1205,23 @@
     .delete-btn-cancel:hover {
       background-color: var(--label-color);
     }
+    /* End-of-batch / failed-batch states for the upload modal's "Close"
+       button. We swap the grey Cancel into a coloured action so the user
+       sees an obvious next step instead of having to guess. */
+    .delete-btn-cancel.done {
+      background-color: #27ae60;
+      font-weight: 600;
+    }
+    .delete-btn-cancel.done:hover {
+      background-color: #239753;
+    }
+    .delete-btn-cancel.done-failed {
+      background-color: #e74c3c;
+      font-weight: 600;
+    }
+    .delete-btn-cancel.done-failed:hover {
+      background-color: #c44034;
+    }
     .rename-btn-confirm {
       background-color: #3498db;
       color: white;
@@ -2116,12 +2133,12 @@
     document.getElementById('uploadBtn').disabled = false;
   }
 
-  // Set true when the upload batch finishes successfully. On the next
-  // closeUploadModal() call the page refreshes so the file list shows
-  // the newly-uploaded files. We don't refresh inline at finish-time
-  // anymore because that auto-dismissed the modal before the user could
-  // review the conversion log.
+  // Post-close actions set by uploadNextFile when the batch reaches
+  // its end. We don't auto-reload/show-banner inline anymore because
+  // that auto-dismissed the modal before the user could review the
+  // conversion log; both are deferred until the user clicks Close.
   let modalNeedsRefreshOnClose = false;
+  let modalNeedsBannerOnClose = false;
 
   function closeUploadModal() {
     // Prevent closing during upload/conversion
@@ -2133,6 +2150,12 @@
       window.location.reload();
       return;
     }
+    if (modalNeedsBannerOnClose) {
+      modalNeedsBannerOnClose = false;
+      document.getElementById('uploadModal').classList.remove('open');
+      showFailedUploadsBanner();
+      return;
+    }
     document.getElementById('uploadModal').classList.remove('open');
     const fileInput = document.getElementById('fileInput');
     fileInput.value = '';
@@ -2142,6 +2165,15 @@
     uploadBtn.style.display = 'block';
     uploadBtn.textContent = 'Upload';
     uploadBtn.classList.remove('optimize');
+    // Reset the Cancel/Close button back to neutral grey "Cancel" so the
+    // next upload opens to a fresh modal -- otherwise a previous batch's
+    // green/red "Close" treatment would persist.
+    const cancelBtnReset = document.querySelector('#uploadModal .delete-btn-cancel');
+    if (cancelBtnReset) {
+      cancelBtnReset.textContent = 'Cancel';
+      cancelBtnReset.classList.remove('done');
+      cancelBtnReset.classList.remove('done-failed');
+    }
     document.getElementById('startConversionBtn').style.display = 'none';
     document.getElementById('progress-container').style.display = 'none';
     document.getElementById('progress-fill').style.width = '0%';
@@ -2890,10 +2922,7 @@ async function uploadFile() {
       if (failedFiles.length === 0) {
         progressFill.style.backgroundColor = '#4caf50';
         progressFill.style.width = '100%';
-        const optimizedCount = files.filter(f => f.name.toLowerCase().endsWith('.epub')).length;
-        progressText.textContent = files.length === 1
-          ? `Uploaded ${files[0].name}${optimizedCount ? ' (optimized)' : ''}. Close when ready.`
-          : `Uploaded ${files.length} files${optimizedCount ? ` (${optimizedCount} optimized)` : ''}. Close when ready.`;
+        progressText.textContent = 'Finished, close when ready.';
 
         // Finalize batch log if in batch mode
         if (useBatchLog) finalizeBatchLog();
@@ -2905,13 +2934,23 @@ async function uploadFile() {
         // shows the freshly-uploaded files when they DO close.
         isUploadInProgress = false;
         document.getElementById('uploadModalClose').classList.remove('disabled');
-        const cancelBtn = document.querySelector('.delete-btn-cancel');
-        if (cancelBtn) cancelBtn.textContent = 'Close';
+        const cancelBtn = document.querySelector('#uploadModal .delete-btn-cancel');
+        if (cancelBtn) {
+          cancelBtn.textContent = 'Close';
+          // Make the Close button visually pop -- without this the user
+          // sees a sea of grey at the bottom and doesn't know which
+          // button to click to dismiss the modal. Green = "you're done,
+          // here's the way out."
+          cancelBtn.classList.add('done');
+        }
         modalNeedsRefreshOnClose = true;
       } else {
         progressFill.style.backgroundColor = '#e74c3c';
-        const failedList = failedFiles.map(f => f.name).join(', ');
-        progressText.textContent = `${files.length - failedFiles.length}/${files.length} uploaded. Failed: ${failedList}`;
+        progressFill.style.width = '100%';
+        const ok = files.length - failedFiles.length;
+        progressText.textContent = ok > 0
+          ? `Finished with errors. ${ok}/${files.length} uploaded.`
+          : 'Finished with errors. See log for details.';
 
         // Add upload errors to batch log
         if (useBatchLog) {
@@ -2921,17 +2960,27 @@ async function uploadFile() {
           finalizeBatchLog();
         }
 
-        // Only show banner if THIS upload session had failures
-        // Use local failedFiles, not the global shared variable
+        // Accumulate failed uploads to global retry list so the banner
+        // appears AFTER the user dismisses the modal -- gives them a
+        // chance to read the log before being shunted to the retry UI.
         if (failedFiles.length > 0) {
-          // Accumulate failed uploads to global (don't replace)
           failedUploadsGlobal = failedUploadsGlobal.concat(failedFiles);
-          // Clear flag and close modal, then show banner with retry options
-          isUploadInProgress = false;
-          document.getElementById('uploadModalClose').classList.remove('disabled');
-          closeUploadModal();
-          showFailedUploadsBanner();
         }
+
+        // Same treatment as the success path: leave the modal open with
+        // a coloured Close button so the user can read the conversion
+        // log before the retry banner appears. We DON'T set the refresh
+        // flag here -- reloading would wipe failedUploadsGlobal, which
+        // is plain JS state. Instead set the banner flag so close-click
+        // dismisses the modal and surfaces the retry UI in-page.
+        isUploadInProgress = false;
+        document.getElementById('uploadModalClose').classList.remove('disabled');
+        const cancelBtnFail = document.querySelector('#uploadModal .delete-btn-cancel');
+        if (cancelBtnFail) {
+          cancelBtnFail.textContent = 'Close';
+          cancelBtnFail.classList.add('done-failed');
+        }
+        modalNeedsBannerOnClose = true;
       }
       return;
     }
