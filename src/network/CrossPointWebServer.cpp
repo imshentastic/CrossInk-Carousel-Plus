@@ -566,7 +566,7 @@ void CrossPointWebServer::handleFileListData() const {
   bool seenFirst = false;
   JsonDocument doc;
 
-  scanFiles(currentPath.c_str(), [this, &output, &doc, seenFirst](const FileInfo& info) mutable {
+  scanFiles(currentPath.c_str(), [this, &output, &doc, &currentPath, seenFirst](const FileInfo& info) mutable {
     // Stop streaming if the client/link dropped, so we don't spin sending to a
     // dead socket (the send timeout above also bounds any single blocked write).
     if (!server->client().connected()) return;
@@ -575,6 +575,23 @@ void CrossPointWebServer::handleFileListData() const {
     doc["size"] = info.size;
     doc["isDirectory"] = info.isDirectory;
     doc["isEpub"] = info.isEpub;
+
+    // CrumBLE: when an EPUB has a prebake-manifest.json in its cache
+    // directory, mark it as pre-cached so the file-manager UI can show
+    // a "Pre-cached" badge. cachePathForFilePath hashes the SD-relative
+    // path the device uses to open the book -- same string the
+    // crumble-prebake CLI / optimizer wrote against when it created
+    // the cache dir. Cheap check: one Storage.exists per EPUB row.
+    if (info.isEpub && !info.isDirectory) {
+      std::string fullPath = currentPath.c_str();
+      if (fullPath.empty() || fullPath.back() != '/') fullPath += '/';
+      fullPath += info.name.c_str();
+      const std::string manifestPath =
+          Epub::cachePathForFilePath(fullPath, "/.crosspoint") + "/prebake-manifest.json";
+      doc["prebaked"] = Storage.exists(manifestPath.c_str());
+    } else {
+      doc["prebaked"] = false;
+    }
 
     const size_t written = serializeJson(doc, output, outputSize);
     if (written >= outputSize) {

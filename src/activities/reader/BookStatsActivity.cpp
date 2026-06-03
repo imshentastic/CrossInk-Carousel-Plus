@@ -48,14 +48,18 @@ void BookStatsActivity::buildNavList() {
   nav.clear();
   const auto& books = RECENT_BOOKS.getBooks();
   for (const auto& b : books) {
+    // CrumBLE: previously filtered to only books with sessionCount > 0,
+    // which meant any SD-state event that wiped stats (eg. a Disk
+    // Utility First Aid pass, a manual cache delete, a fresh upload of
+    // a previously-cached book) collapsed the carousel to a single
+    // entry and stripped the user's ability to scroll. Show every
+    // recent book instead -- books without stats yet render their
+    // numeric fields as zeroes, which is honest and matches the
+    // user's mental model of "show me my recent books." Still caches
+    // the loaded stats on the NavEntry so L/R presses don't re-open
+    // stats.bin from SD.
     const auto bookStats = BookReadingStats::load(statsCachePathFor(b.path));
-    if (bookStats.sessionCount > 0) {
-      // CrumBLE #125: store the freshly-loaded stats on the NavEntry so
-      // loadCurrent on every L/R press can read from RAM instead of
-      // re-opening stats.bin from SD. The filter already paid the SD
-      // cost; throwing the value away meant every press paid again.
-      nav.push_back({b.path, b.title, b.author, b.coverBmpPath, bookStats});
-    }
+    nav.push_back({b.path, b.title, b.author, b.coverBmpPath, bookStats});
   }
   bool found = false;
   for (size_t i = 0; i < nav.size(); ++i) {
