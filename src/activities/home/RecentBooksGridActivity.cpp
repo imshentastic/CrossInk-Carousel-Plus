@@ -691,7 +691,10 @@ void RecentBooksGridActivity::paintGridFocusUpdate(int prevFocusedIndex, int new
   const int gridSpacing = is3x3 ? 24 : kLyraGridSpacing;
   const int kProgressBarHeight = is2x2 ? 7 : 5;
   const int kProgressTopGap = 4;
-  const int rowSpacing = is2x2 ? 4 : (is3x3 ? (titleAtTop ? 14 : 18) : 5);
+  // CrumBLE: 2x2 + title-at-top adds inter-row spacing so the bottom
+  // row sits comfortably below the top row instead of feeling stacked.
+  // 2x2-bottom and other layouts keep their original spacing.
+  const int rowSpacing = is2x2 ? (titleAtTop ? 10 : 4) : (is3x3 ? (titleAtTop ? 14 : 18) : 5);
   const int totalGridWidth = gridColumns_ * coverWidth_ + (gridColumns_ - 1) * gridSpacing;
   const int startXOffset = (pageWidth - totalGridWidth) / 2;
   const int rowStride = coverHeight_ + kProgressTopGap + kProgressBarHeight + rowSpacing;
@@ -1257,7 +1260,10 @@ void RecentBooksGridActivity::render(RenderLock&&) {
   // top placement is geometrically tight (last row's progress bar sits
   // 1 px above the title strip already) so it keeps the smaller value.
   const int kProgressTopGap = 4;
-  const int rowSpacing = is2x2 ? 4 : (is3x3 ? (titleAtTop ? 14 : 18) : 5);
+  // CrumBLE: 2x2 + title-at-top adds inter-row spacing so the bottom
+  // row sits comfortably below the top row instead of feeling stacked.
+  // 2x2-bottom and other layouts keep their original spacing.
+  const int rowSpacing = is2x2 ? (titleAtTop ? 10 : 4) : (is3x3 ? (titleAtTop ? 14 : 18) : 5);
   const int totalGridWidth = gridColumns_ * coverWidth_ + (gridColumns_ - 1) * gridSpacing;
   const int startXOffset = (pageWidth - totalGridWidth) / 2;
   // CrumBLE #133 follow-up: Title Placement-aware Y. TOP sits just
