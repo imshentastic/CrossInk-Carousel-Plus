@@ -1679,11 +1679,13 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
 
       // Pre-flight heap check AFTER the BT teardown. Even with NimBLE gone,
       // a long session on a fragmented heap can still bottom out below
-      // the WordInfo reserve. In that case we bail with an actionable
-      // alert and re-enable BT immediately since we never got to use it.
-      // 25 KB threshold matches the worst case of the reserve plus the
-      // index scan's working set.
-      constexpr uint32_t LOOKUP_MIN_MAX_ALLOC = 25000;
+      // the WordInfo reserve. User report: second Lookup attempt in a
+      // single session crashed -- BT cycle leaves the heap slightly more
+      // fragmented than before. Bump threshold from 25 KB to 32 KB so
+      // the alert catches that second-attempt case before extractWords
+      // bad_allocs. Cost: a few more "low memory" alerts in edge cases,
+      // each of which is correct (better than a reboot).
+      constexpr uint32_t LOOKUP_MIN_MAX_ALLOC = 32000;
       if (ESP.getMaxAllocHeap() < LOOKUP_MIN_MAX_ALLOC) {
         LOG_INF("ERS", "Lookup pre-flight: maxAlloc=%u below %u even after BT off, raising alert",
                 ESP.getMaxAllocHeap(), LOOKUP_MIN_MAX_ALLOC);
@@ -1839,6 +1841,24 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       if (bleWasOnForHistory) {
         LOG_INF("ERS", "LookedUpWords: disabling BT (re-enabling on exit)");
         btMgr.disable();
+        LOG_INF("ERS", "LookedUpWords: heap after BT disable: free=%u maxAlloc=%u",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      }
+      // Pre-flight heap check: tapping an entry will eventually call
+      // Dictionary::lookup and (if the user opens word select later from
+      // there) hit the same WordInfo allocation pressure as LOOKUP. Same
+      // 32 KB threshold + same alert path.
+      constexpr uint32_t LOOKED_UP_MIN_MAX_ALLOC = 32000;
+      if (ESP.getMaxAllocHeap() < LOOKED_UP_MIN_MAX_ALLOC) {
+        LOG_INF("ERS", "LookedUpWords pre-flight: maxAlloc=%u below %u, raising alert",
+                ESP.getMaxAllocHeap(), LOOKED_UP_MIN_MAX_ALLOC);
+        if (bleWasOnForHistory) btMgr.requestEnableLater();
+        strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_LOOKUP_TITLE),
+                sizeof(APP_STATE.pendingAlertTitle) - 1);
+        strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_LOOKUP_BODY),
+                sizeof(APP_STATE.pendingAlertBody) - 1);
+        APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
+        break;
       }
       startActivityForResult(std::make_unique<LookedUpWordsActivity>(renderer, mappedInput, epub->getCachePath()),
                              [this, bleWasOnForHistory](const ActivityResult& result) {

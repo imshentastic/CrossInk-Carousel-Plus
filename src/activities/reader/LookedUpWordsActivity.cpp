@@ -182,7 +182,13 @@ void LookedUpWordsActivity::render(RenderLock&&) {
     const auto labels = mappedInput.mapLabels(tr(STR_NO), tr(STR_YES), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   } else {
-    const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_LOOKUP), "", tr(STR_DELETE));
+    // CrumBLE: drop the "Delete" tag from the next/right slot. User
+    // reports the front-facing left/right buttons don't do anything in
+    // this view (in their button mapping), so labeling them misleads.
+    // Delete still works via the side rocker's Button::Right press
+    // (handled in loop()); users who want it discover it the same way
+    // they discover the side rocker's other roles.
+    const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_LOOKUP), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   }
 

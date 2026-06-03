@@ -297,7 +297,12 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
     }
   }
 
-  const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), tr(STR_LOOKUP), tr(STR_UP_DOWN), tr(STR_PREV_NEXT));
+  // CrumBLE: drop the STR_UP_DOWN tag -- up/down navigation is obvious
+  // from the physical arrow buttons (or side rocker), and labeling the
+  // logical "previous" slot with "Up/Down" is redundant. STR_PREV_NEXT
+  // still tags the right/left slot, which is the non-obvious bit
+  // (jumping word-by-word vs. line-by-line).
+  const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), tr(STR_LOOKUP), "", tr(STR_PREV_NEXT));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 }
