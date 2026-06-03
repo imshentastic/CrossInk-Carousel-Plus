@@ -580,9 +580,16 @@ bool handleGlobalPowerButtonAction(const CrossPointSettings::SHORT_PWRBTN action
 namespace {
 constexpr uint16_t POST_SLEEP_SCREEN_SETTLE_MS = 500;
 // In cycle mode, a press shorter than this is a tap (cycle); longer is a wake.
-// Set equal to the wake-duration threshold so there is no dead zone between
-// "tap" and "wake" — anything below cycles, anything above wakes.
-constexpr unsigned long SCREENSAVER_TAP_MAX_MS = CrossPointSettings::POWER_BUTTON_LONG_PRESS_MS;
+// Originally set equal to the wake-duration threshold (400 ms) so there was no
+// dead zone, but user reports showed that releases in the 200-400 ms range --
+// which usually mean "I tried to hold to wake but didn't quite make it" --
+// were getting interpreted as taps and cycling the screensaver instead.
+// Dropping to 200 ms keeps genuine deliberate taps (<150 ms) snappy while
+// leaving anything 200 ms+ to fall through into the wake path. The dead zone
+// between 200 ms and POWER_BUTTON_LONG_PRESS_MS (400 ms) is intentional:
+// presses in that range are likely accidental, and waking is the less
+// surprising outcome than cycling a screen the user wasn't asking for.
+constexpr unsigned long SCREENSAVER_TAP_MAX_MS = 200;
 
 constexpr uint8_t TILT_SLEEP_MAX_ATTEMPTS = 3;
 constexpr uint16_t TILT_SLEEP_RETRY_DELAY_MS = 10;

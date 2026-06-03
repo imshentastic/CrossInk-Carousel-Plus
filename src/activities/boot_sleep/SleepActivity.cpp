@@ -345,7 +345,7 @@ bool renderPngToSleepScreen(GfxRenderer& renderer, const std::string& filename) 
   return true;
 }
 
-void renderBitmapToSleepScreen(GfxRenderer& renderer, const Bitmap& bitmap) {
+void renderBitmapToSleepScreen(GfxRenderer& renderer, const Bitmap& bitmap, bool skipGreyscalePass = false) {
   int x, y;
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
@@ -400,7 +400,7 @@ void renderBitmapToSleepScreen(GfxRenderer& renderer, const Bitmap& bitmap) {
   // buffer here, before the optional grayscale passes overwrite it below.
   writeFramebufferCache(SLEEP_FB_CACHE_PATH);
 
-  if (hasGreyscale) {
+  if (hasGreyscale && !skipGreyscalePass) {
     bitmap.rewindToData();
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
@@ -851,7 +851,13 @@ void SleepActivity::cycleScreensaverFromDeepSleep(GfxRenderer& renderer) {
     return;
   }
 
-  renderBitmapToSleepScreen(renderer, bitmap);
+  // Skip the grayscale LSB/MSB double-pass while cycling: each pass triggers
+  // an additional ~1-2 s e-ink sweep, and a user rapidly tapping through
+  // images doesn't need pristine grayscale on every frame -- they need the
+  // device to be responsive. The B/W single-sweep gives them snappy
+  // feedback; the grayscale settle would only be visible briefly before
+  // they tap to the next one anyway.
+  renderBitmapToSleepScreen(renderer, bitmap, /*skipGreyscalePass=*/true);
 }
 
 void SleepActivity::renderCoverSleepScreen() const {
