@@ -298,6 +298,22 @@
       vertical-align: middle;
       letter-spacing: 0.02em;
     }
+    /* "Highly Recommended" pill that sits inline with the toggle title.
+       Smaller + colour-emphasised so it telegraphs "you almost certainly
+       want this on" without screaming. */
+    .recommended-pill {
+      display: inline-block;
+      padding: 1px 7px;
+      background-color: #27ae60;
+      color: #ffffff;
+      border-radius: 8px;
+      font-size: 0.65em;
+      font-weight: 600;
+      margin-left: 6px;
+      vertical-align: middle;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
     .file-icon {
       margin-right: 8px;
     }
@@ -1633,7 +1649,7 @@
           <div class="bt-friendly-option" id="btFriendlyOption">
             <div class="bt-friendly-row">
               <div class="bt-friendly-text">
-                <div class="setting-title">Pre-cache chapter indexing / images</div>
+                <div class="setting-title">Pre-Cache for fast chapter turns <span class="recommended-pill">Highly Recommended</span></div>
                 <div class="setting-desc">Optimizes for instant chapter turns and accelerated book opening. Adds ~40 s to upload time per book in exchange for zero-delay reading!</div>
               </div>
               <label class="toggle-switch">
