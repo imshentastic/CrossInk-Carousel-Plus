@@ -16,6 +16,7 @@
 #include "CrossPointState.h"
 #include "CollectionsStore.h"
 #include "FileBrowserActionActivity.h"
+#include "LibraryIndex.h"
 #include "MappedInputManager.h"
 #include "activities/util/ConfirmationActivity.h"
 #include "components/UITheme.h"
@@ -364,11 +365,84 @@ void FileBrowserActivity::showFileActionMenu(const std::string& entry, bool igno
           case FileBrowserAction::CreateNewCollectionFromHeader:
           case FileBrowserAction::AddBooksToActiveCollection:
           case FileBrowserAction::RemoveFromRecents:  // CrossInk 1.3 (recent-books views only)
+          case FileBrowserAction::MakeCollectionFromFolder:  // folder menu only
             // Not exposed in the file browser's action menu — only the
-            // home shelf / recent-books paths add these items.
+            // home shelf / recent-books / folder paths add these items.
             return;
         }
       });
+}
+
+void FileBrowserActivity::showFolderActionMenu(const std::string& entry, bool ignoreInitialConfirmRelease) {
+  const std::string fullPath = buildFullPath(basepath, entry);
+  std::vector<FileBrowserActionActivity::MenuItem> items;
+  items.push_back({FileBrowserAction::MakeCollectionFromFolder, StrId::STR_MAKE_COLLECTION_FROM_FOLDER});
+  items.push_back({FileBrowserAction::Delete, StrId::STR_DELETE});
+
+  startActivityForResult(
+      std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, getFileName(entry), std::move(items),
+                                                  ignoreInitialConfirmRelease),
+      [this, fullPath, entry](const ActivityResult& result) {
+        longPressConfirmHandled = false;
+        if (result.isCancelled) return;
+
+        const auto action = static_cast<FileBrowserAction>(std::get<FileBrowserActionResult>(result.data).action);
+        switch (action) {
+          case FileBrowserAction::Delete:
+            promptDeleteDirectory(fullPath, entry);
+            return;
+          case FileBrowserAction::MakeCollectionFromFolder:
+            makeCollectionFromFolder(fullPath, entry);
+            return;
+          default:
+            // Other actions live on file / shelf menus; folder menu ignores them.
+            return;
+        }
+      });
+}
+
+void FileBrowserActivity::makeCollectionFromFolder(const std::string& fullPath, const std::string& entry) {
+  // The walk can take a noticeable amount of time on a large nested folder.
+  // Surface a popup so the user knows the device is working rather than frozen.
+  GUI.drawPopup(renderer, tr(STR_SCANNING_FOLDER));
+  const auto books = LibraryIndex::collectBookPaths(fullPath);
+
+  if (books.empty()) {
+    BookActions::drawToast(renderer, tr(STR_NO_BOOKS_IN_FOLDER));
+    delay(1500);
+    requestUpdate(true);
+    return;
+  }
+
+  // Folder basename = default collection name. Strip a trailing slash (the file
+  // list marks directories with one) and fall back to a generic label for the
+  // pathological case of the SD root or a blank entry.
+  std::string folderName = entry;
+  if (!folderName.empty() && folderName.back() == '/') folderName.pop_back();
+  if (folderName.empty()) folderName = "Books";
+
+  // createCollection() runs the name through disambiguateName() internally so
+  // we don't shadow a virtual ("All Books") or an existing user collection.
+  const std::string newId = CollectionsStore::getInstance().createCollection(folderName);
+  if (newId.empty()) {
+    BookActions::drawToast(renderer, tr(STR_CREATE_COLLECTION_FAILED));
+    delay(1500);
+    requestUpdate(true);
+    return;
+  }
+
+  const int added = CollectionsStore::getInstance().addBooksToCollection(newId, books);
+  CollectionsStore::getInstance().setActiveId(newId);
+  LOG_INF("FileBrowser", "Made collection '%s' from folder %s: added=%d found=%zu", folderName.c_str(),
+          fullPath.c_str(), added, books.size());
+
+  char msg[64];
+  snprintf(msg, sizeof(msg), tr(STR_COLLECTION_CREATED_N_BOOKS), added);
+  BookActions::drawToast(renderer, msg);
+  delay(1500);
+
+  // Land on Home so the new collection is immediately visible and active.
+  onGoHome();
 }
 
 void FileBrowserActivity::toggleHiddenFiles() {
@@ -436,7 +510,7 @@ void FileBrowserActivity::loop() {
         mappedInput.getHeldTime() >= GO_HOME_MS) {
       longPressConfirmHandled = true;
       if (isDirectory) {
-        promptDeleteDirectory(buildFullPath(basepath, entry), entry, true);
+        showFolderActionMenu(entry, true);
       } else {
         showFileActionMenu(entry, true);
       }

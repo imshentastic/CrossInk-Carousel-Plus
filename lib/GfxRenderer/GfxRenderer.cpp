@@ -2046,6 +2046,78 @@ void GfxRenderer::drawPerspectiveBitmap(CachedBitmap* handle, const int x, const
   }
 }
 
+void GfxRenderer::renderPerspectiveBitmapToPacked1bpp(CachedBitmap* handle, const int w, const int hL, const int hR,
+                                                      uint8_t* dst) const {
+  if (handle == nullptr || !handle->pixels || dst == nullptr) return;
+  if (w <= 0 || hL <= 0 || hR <= 0) return;
+
+  const int srcW = handle->width;
+  const int srcH = handle->height;
+  if (srcW <= 0 || srcH <= 0) return;
+
+  const int hMax = std::max(hL, hR);
+  const bool topDown = handle->topDown;
+
+  // Source 2bpp packed; dest 1bpp packed MSB-first per byte. Mirrors the
+  // cached drawPerspectiveBitmap geometry pixel-for-pixel so a tile baked
+  // here renders identically when blitted at the same (w, hL, hR).
+  const int srcStride = (srcW + 3) / 4;
+  const int dstStride = (w + 7) / 8;
+
+  for (int srcY = 0; srcY < srcH; srcY++) {
+    const int srcRowIndex = topDown ? srcY : (srcH - 1 - srcY);
+    const uint8_t* srcRow = handle->pixels.get() + srcY * srcStride;
+
+    for (int dx = 0; dx < w; dx++) {
+      const int colH = (w == 1) ? hL : (hL + (hR - hL) * dx / (w - 1));
+      if (colH <= 0) continue;
+      const int colTop = (hMax - colH) / 2;
+
+      const int srcX = (dx * srcW) / w;
+      const uint8_t val = (srcRow[srcX / 4] >> (6 - ((srcX * 2) % 8))) & 0x3;
+      // BW threshold: 3 = pure white, skip. Lower values become a set bit
+      // in the tile. Independent of renderMode -- tiles are always BW.
+      if (val >= 3) continue;
+
+      const int dstYStart = (srcRowIndex * colH) / srcH;
+      const int dstYEnd = ((srcRowIndex + 1) * colH) / srcH;
+      for (int dy = dstYStart; dy < dstYEnd; ++dy) {
+        const int outY = colTop + dy;
+        if (outY < 0 || outY >= hMax) continue;
+        dst[outY * dstStride + (dx >> 3)] |= static_cast<uint8_t>(0x80u >> (dx & 7));
+      }
+    }
+  }
+}
+
+void GfxRenderer::drawPacked1bpp(const uint8_t* src, const int srcStride, const int x, const int y, const int w,
+                                 const int h, const bool state) const {
+  if (src == nullptr || w <= 0 || h <= 0 || srcStride <= 0) return;
+  const int screenW = getScreenWidth();
+  const int screenH = getScreenHeight();
+  for (int row = 0; row < h; ++row) {
+    const int dstY = y + row;
+    if (dstY < 0 || dstY >= screenH) continue;
+    const uint8_t* srcRow = src + row * srcStride;
+    // Two inner loops merged into one: iterate columns, test the bit, draw
+    // if set. Hot-path optimization (e.g. byte-aligned runs) could be
+    // added later; for the 5 carousel side covers @ 66 px wide this is
+    // already orders of magnitude faster than the perspective walk it
+    // replaces.
+    for (int col = 0; col < w; ++col) {
+      const int dstX = x + col;
+      if (dstX < 0 || dstX >= screenW) continue;
+      const uint8_t bit = srcRow[col >> 3] & static_cast<uint8_t>(0x80u >> (col & 7));
+      if (!bit) continue;
+      if (state) {
+        drawPixel(dstX, dstY);
+      } else {
+        drawPixel(dstX, dstY, false);
+      }
+    }
+  }
+}
+
 void GfxRenderer::fillPolygon(const int* xPoints, const int* yPoints, int numPoints, bool state) const {
   if (numPoints < 3) return;
 

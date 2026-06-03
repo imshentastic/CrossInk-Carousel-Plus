@@ -243,7 +243,10 @@ void ActivityManager::goHome(HomeMenuItem initialMenuItem) {
     const auto& activityName = currentActivity->name;
     if (activityName == "FileBrowser") {
       initialMenuItem = HomeMenuItem::FILE_BROWSER;
-    } else if (activityName == "RecentBooks") {
+    } else if (activityName == "RecentBooks" || activityName == "RecentBooksGrid") {
+      // RecentBooksGrid (#81 Bookshelf) shares the icon-bar entry with the
+      // legacy RecentBooks list view, so returning from either lands on
+      // the same Bookshelf icon.
       initialMenuItem = HomeMenuItem::RECENTS;
     } else if (activityName == "OpdsBookBrowser") {
       initialMenuItem = HomeMenuItem::OPDS_BROWSER;

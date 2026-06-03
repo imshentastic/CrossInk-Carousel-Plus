@@ -21,8 +21,22 @@ class HomeActivity final : public Activity {
   // Keep one rendered carousel frame in RAM. Additional frames remain available
   // through the SD snapshot cache and are paged in on demand.
   static constexpr int kCarouselFrameCount = 1;
-  // Must be >= LyraCarouselMetrics::values.homeRecentBooksCount (asserted in .cpp)
-  static constexpr int kMaxCachedBooks = 3;
+  // Must be >= max(homeRecentBooksCount) across themes — asserted in .cpp.
+  // Bumped from 3 to 5 (CrumBLE #124) so Flow's 5-slot carousel can also hit
+  // the BookReadingStats / progress cache. Cost is ~32 extra bytes total
+  // (BookReadingStats ~12 B + float 4 B per slot); the win is eliminating
+  // ~2 SD reads on every carousel L/R press for the 2 books that previously
+  // fell outside the cap.
+  static constexpr int kMaxCachedBooks = 5;
+
+  // CrumBLE #120: forget any saved cursor position so the next Home visit
+  // falls through to APP_STATE.openEpubPath (just-read book promotion) or
+  // the default cold-boot landing. Called by ReaderActivity::onEnter so
+  // that reader -> Home highlights the book the user just exited, even
+  // when the user navigated through Home before opening the reader (which
+  // would otherwise have left a stale saved cursor pointing at some icon
+  // or shelf book).
+  static void clearSavedCursor();
 
  private:
   ButtonNavigator buttonNavigator;
@@ -132,13 +146,21 @@ class HomeActivity final : public Activity {
   // the "just-read book is highlighted" affordance still wins for that
   // specific path. The map deep-copies (small; one entry per visited
   // collection).
-  bool hasSavedCursor_ = false;
-  int savedSelectorIndex_ = 0;
-  int savedLastCarouselBookIndex_ = 0;
-  int savedLastShelfBookIndex_ = 0;
-  int savedLastMenuIndex_ = 0;
-  bool savedShelfHeaderFocused_ = false;
-  std::unordered_map<std::string, ShelfPos> savedShelfPosByCollection_;
+  // CrumBLE #120: STATIC so the saved cursor survives the activity
+  // recreation that happens on every home <-> other-activity transition
+  // (ActivityManager::replaceActivity destroys the current activity).
+  // Instance-field versions of these used to reset to default before the
+  // restoring onEnter could read them, so cursor recall only "worked"
+  // for transitions whose return path passed goHome() an initialMenuItem
+  // for the specific icon. The static promotion makes full carousel /
+  // shelf / menu position recall work across every entry path.
+  static bool hasSavedCursor_;
+  static int savedSelectorIndex_;
+  static int savedLastCarouselBookIndex_;
+  static int savedLastShelfBookIndex_;
+  static int savedLastMenuIndex_;
+  static bool savedShelfHeaderFocused_;
+  static std::unordered_map<std::string, ShelfPos> savedShelfPosByCollection_;
   // Set true during a Flow render whenever a progress popup (shelf cover
   // loading or "Detecting series...") was drawn over the framebuffer before
   // the end-of-render snapshot. The popup sits over the carousel, which the
@@ -270,7 +292,12 @@ class HomeActivity final : public Activity {
   // bookshelf). getFocusedBookPath returns the file path of the book under
   // the cursor when the user is on either a carousel slot or a shelf slot.
   // Empty string => not on a book (e.g. cursor is on the menu icon bar).
-  std::string getFocusedBookPath() const;
+  // CrumBLE #124: non-const because the impl now reuses cachedShelfPaths()
+  // (which lazily populates the shelf-entries cache). Without that, every
+  // loop tick was recomputing the full collection's path list via
+  // resolveBookPaths -- O(N log N) over LibraryIndex for a 50-book
+  // virtual collection, perceived as L/R/U/D lag on large libraries.
+  std::string getFocusedBookPath();
   // Opens the FileBrowserActionActivity picker for `bookPath` with a menu
   // tailored to the home screen (delete, delete cache, mark finished /
   // unfinished, add/remove favorites, remove from recent books). Result

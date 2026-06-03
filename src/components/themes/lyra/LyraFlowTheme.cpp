@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -139,9 +141,33 @@ void LyraFlowTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const 
     const int drawX = isLeft ? (isFar ? 24 : 74) : (isFar ? 390 : 340);
     const int drawY = centerY + (centerCoverHeight / 2) - (hMax / 2);
 
-    const std::string coverPath = UITheme::getCoverThumbPath(recentBooks[idx].coverBmpPath, centerCoverHeight);
+    // CrumBLE #125: tile-cache fast path. The 4 side covers in the Flow
+    // carousel share only 2 unique perspective shapes per book (left and
+    // right; near/far on the same side use the same shape, only drawX
+    // differs). prerenderCarouselSideTiles() bakes both shapes once at
+    // home entry, so every carousel L/R press here is a pure 1bpp blit
+    // instead of a ~70k-source-pixel perspective walk per cover. Falls
+    // through to the perspective-render path below when the tile cache
+    // is cold (first frame before prerender completes) or the book's
+    // tile failed to allocate (low heap during prerender).
     bool drawn = false;
-    if (!coverPath.empty()) {
+    const std::string& tileKey = recentBooks[idx].path;
+    auto tileIt = sideTileCache_.find(tileKey);
+    if (tileIt != sideTileCache_.end()) {
+      const PerspectiveTile& tile = isLeft ? tileIt->second.left : tileIt->second.right;
+      if (tile.pixels && tile.width > 0 && tile.height > 0) {
+        // OR-style blit: pre-clear the bbox to opaque white so any
+        // previous side cover that was here doesn't bleed through.
+        renderer.fillRect(drawX, drawY, sideCoverWidth, hMax, false);
+        const int dstStride = (tile.width + 7) / 8;
+        renderer.drawPacked1bpp(tile.pixels.get(), dstStride, drawX, drawY, tile.width, tile.height);
+        drawn = true;
+      }
+    }
+
+    const std::string coverPath =
+        drawn ? std::string{} : UITheme::getCoverThumbPath(recentBooks[idx].coverBmpPath, centerCoverHeight);
+    if (!drawn && !coverPath.empty()) {
       // CrumBLE Phase A perf: try the in-RAM cache first. The Cached
       // overload reads 2bpp packed pixels directly out of the cache
       // entry, no SD I/O. Cache miss / budget-rejected -> fall back to
@@ -225,7 +251,17 @@ void LyraFlowTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const 
   const std::string cp = UITheme::getCoverThumbPath(recentBooks[curIdx].coverBmpPath, centerCoverHeight);
   int centerSrcW = 0, centerSrcH = 0;
   bool centerParsed = false;
-  if (!cp.empty()) {
+  // CrumBLE #124: cached header dims short-circuit the SD probe when the
+  // center book is unchanged across renders -- previously every carousel
+  // L/R press paid a Storage.openFileForRead + Bitmap::parseHeaders even
+  // though both side covers and the center are byte-identical to the last
+  // frame. Footer width still recomputes identically because we feed it
+  // the same centerSrcW/H values from the cache.
+  if (!cp.empty() && cp == lastCenterCoverPath_ && lastCenterCoverSrcW_ > 0 && lastCenterCoverSrcH_ > 0) {
+    centerSrcW = lastCenterCoverSrcW_;
+    centerSrcH = lastCenterCoverSrcH_;
+    centerParsed = true;
+  } else if (!cp.empty()) {
     FsFile probeFile;
     if (Storage.openFileForRead("HOME", cp, probeFile)) {
       Bitmap probe(probeFile);
@@ -233,6 +269,9 @@ void LyraFlowTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const 
         centerSrcW = probe.getWidth();
         centerSrcH = probe.getHeight();
         centerParsed = true;
+        lastCenterCoverPath_ = cp;
+        lastCenterCoverSrcW_ = centerSrcW;
+        lastCenterCoverSrcH_ = centerSrcH;
       }
       probeFile.close();
     }
@@ -353,16 +392,64 @@ void LyraFlowTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const 
     // focused book. Dropping the always-on stroke eliminates the
     // last visible source of corner-hook artifacts.
 
-    if (hasSelection) {
-      // CrumBLE: rounded-corner selection border (radius 5, stroke 2)
-      // sitting 2 px outside the cover -- floats inside the 7 px
-      // white frame around the center cover. Tighter radius than the
-      // previous 7 px keeps the corner arcs crisp at panel resolution
-      // without the bracket-hook artifact the larger radius produced.
-      renderer.drawRoundedRect(cX - 2, actualY - 2, actualCoverWidth + 4, actualCoverHeight + 4, 2, 5, true);
-    }
-
   }  // end of if (!skipCarouselCoverLoads)
+
+  // CrumBLE #125: reconcile the selection border AFTER the cover-block
+  // guard. Previously this draw lived inside `if (!skipCarouselCoverLoads)`
+  // which meant any focus-only change (e.g. Down from carousel to shelf
+  // header — same center book, just hasSelection flipping from true to
+  // false) cache-missed the carousel-skip path because the only way to
+  // remove the border was a full repaint. Now the border is its own
+  // toggle:
+  //   - Full repaint (!skipCarouselCoverLoads): the cover-clear block
+  //     above just wiped the frame to white, so we always need to
+  //     repaint the border on top if hasSelection is true.
+  //   - Skip-covers fast path (skipCarouselCoverLoads): the framebuffer
+  //     restore brought back the previous frame's border state. If
+  //     hasSelection still matches what we drew, nothing to do. If it
+  //     differs, draw the border in black (appearing) or in white
+  //     (erasing — works because the 7 px frame around the cover is
+  //     white substrate from the prior frame's cover-clear).
+  // Tracked in lastDrawnSelectionBorder_ on the theme; HomeActivity's
+  // canSkipCovers gate only checks center book identity, leaving the
+  // border concern fully to the theme.
+  // CrumBLE: double-ring selection mirrors RecentBooksGridActivity's
+  // cell focus ring (inner 3 px ring at +4 outset, outer 1 px ring at
+  // +6 outset, 2 px gap between). Gives the same "layered 3D" look the
+  // user sees on Bookshelf cells. Fits inside the 7 px white frame
+  // already cleared around the center cover. Corner radius bumped by
+  // each outset so the rings stay concentric with the cover's
+  // bookCornerRadius=6.
+  constexpr int kSelectionPadding = 4;
+  constexpr int kSelectionGap = 2;
+  constexpr int kSelectionOuterInset = kSelectionPadding + kSelectionGap;
+  const int innerX = cX - kSelectionPadding;
+  const int innerY = actualY - kSelectionPadding;
+  const int innerW = actualCoverWidth + 2 * kSelectionPadding;
+  const int innerH = actualCoverHeight + 2 * kSelectionPadding;
+  const int outerX = cX - kSelectionOuterInset;
+  const int outerY = actualY - kSelectionOuterInset;
+  const int outerW = actualCoverWidth + 2 * kSelectionOuterInset;
+  const int outerH = actualCoverHeight + 2 * kSelectionOuterInset;
+  auto drawSelectionRings = [&](bool inkBlack) {
+    renderer.drawRoundedRect(innerX, innerY, innerW, innerH, 3, bookCornerRadius + kSelectionPadding, inkBlack);
+    renderer.drawRoundedRect(outerX, outerY, outerW, outerH, 1, bookCornerRadius + kSelectionOuterInset, inkBlack);
+  };
+  const int currentBorder = hasSelection ? 1 : 0;
+  if (!skipCarouselCoverLoads) {
+    // Full repaint path: the cover-clear block above wiped the ring
+    // pixels to white. Re-draw the rings iff they should be present.
+    if (hasSelection) {
+      drawSelectionRings(true);
+    }
+  } else if (currentBorder != lastDrawnSelectionBorder_) {
+    // Fast path with focus change: toggle BOTH rings by redrawing with
+    // the appropriate ink. state=true paints black (draw); state=false
+    // paints white (erase, since the surrounding frame is white from
+    // the prior frame's cover-clear).
+    drawSelectionRings(hasSelection);
+  }
+  lastDrawnSelectionBorder_ = currentBorder;
 
   // One-shot reset so the next render starts from a known default.
   skipCarouselCoverLoads = false;
@@ -536,7 +623,7 @@ void LyraFlowTheme::drawBookshelfStrip(GfxRenderer& renderer, Rect rect, const c
                                        int scrollOffset, bool headerFocused, bool hasMultipleCollections,
                                        const char* focusedBookTitle,
                                        const std::vector<int>* seriesMemberCounts, const char* focusedBookAuthor,
-                                       int rowCount) const {
+                                       int rowCount, const std::vector<std::string>* cellTitles) const {
   // Vertical layout (top → bottom):
   //   [focused book title]  — drawn ABOVE rect.y so the rest of the layout
   //                           doesn't shift when focused vs unfocused
@@ -629,10 +716,16 @@ void LyraFlowTheme::drawBookshelfStrip(GfxRenderer& renderer, Rect rect, const c
   const int shelfRowY = tabY + kTabHeight + kTabBottomGap;
   // Total visible book slots this paint = min(perPage, remaining in collection).
   const int actualDrawn = std::min(visiblePerPage, bookCount - scrollOffset);
-  // Row width is fixed at cellsPerRow cells when at least one full row is
-  // drawn; the final (partial) bottom row uses fewer cells but still
-  // anchors against the same rowStartX so columns line up across rows.
-  const int rowDrawW = cellsPerRow * kCellWidth + (cellsPerRow - 1) * kCellGap;
+  // CrumBLE: when the row is partial (fewer books than cellsPerRow),
+  // center the actual cell run inside the strip instead of anchoring
+  // as if the row were full. Mirrors RecentBooksGridActivity's
+  // partial-row centering for visual consistency between Bookshelf
+  // grid and Collections shelf. Flow shelf is hard-pinned to 1-row so
+  // we don't need to worry about per-row offsets in a 2-row layout.
+  const int actualRowCells = std::min(cellsPerRow, std::max(0, actualDrawn));
+  const int rowDrawW = (actualRowCells > 0)
+                           ? actualRowCells * kCellWidth + (actualRowCells - 1) * kCellGap
+                           : (cellsPerRow * kCellWidth + (cellsPerRow - 1) * kCellGap);
   const int rowStartX = rect.x + (rect.width - rowDrawW) / 2;
   // The bottom-edge scroll-arrow Y anchors to the centre of the LAST row
   // (so the arrow sits visually beside the cells regardless of 1- vs 2-row).
@@ -733,12 +826,45 @@ void LyraFlowTheme::drawBookshelfStrip(GfxRenderer& renderer, Rect rect, const c
       }
     }
     if (!drewThumb) {
-      // Placeholder cell: thin outline + small book icon centered.
+      // CrumBLE: placeholder shows the centered, wrapped book title --
+      // mirrors RecentBooksGridActivity's placeholder + the carousel
+      // fallback. Reads as an intentional card with the book name
+      // showing through, instead of a generic icon. Falls back to the
+      // CoverIcon when no title was passed (cellTitles == nullptr) or
+      // the entry is empty (series cell, missing metadata).
       renderer.drawRoundedRect(x, y, kCellWidth, kCellHeight, 1, 3, true);
-      constexpr int kIconSize = 24;
-      const int iconX = x + (kCellWidth - kIconSize) / 2;
-      const int iconY = y + (kCellHeight - kIconSize) / 2;
-      renderer.drawIcon(CoverIcon, iconX, iconY, kIconSize, kIconSize);
+      const std::string* cellTitle =
+          (cellTitles != nullptr && spineIdx < static_cast<int>(cellTitles->size()) && !(*cellTitles)[spineIdx].empty())
+              ? &(*cellTitles)[spineIdx]
+              : nullptr;
+      if (cellTitle != nullptr) {
+        constexpr int kPlaceholderPadX = 4;
+        // Cap title wrapping so a long boxed-set title (e.g. "George R. R.
+        // Martin's A Game of Thrones 5-Book Boxed Set") doesn't fill the
+        // entire placeholder cell with wrapped text. 4 lines matches the
+        // MinimalTheme placeholder convention and leaves visual room for
+        // the cell to read as "missing cover, here's a hint of the title"
+        // rather than a wall of small bold text. wrappedText auto-
+        // ellipsizes on the last line when the title overflows the cap.
+        constexpr int kPlaceholderMaxLines = 4;
+        const auto titleLines = renderer.wrappedText(SMALL_FONT_ID, cellTitle->c_str(),
+                                                      kCellWidth - 2 * kPlaceholderPadX, kPlaceholderMaxLines,
+                                                      EpdFontFamily::BOLD);
+        const int lineH = renderer.getLineHeight(SMALL_FONT_ID);
+        const int blockH = static_cast<int>(titleLines.size()) * lineH;
+        int textY = y + (kCellHeight - blockH) / 2;
+        for (const auto& line : titleLines) {
+          const int lineW = renderer.getTextWidth(SMALL_FONT_ID, line.c_str(), EpdFontFamily::BOLD);
+          renderer.drawText(SMALL_FONT_ID, x + (kCellWidth - lineW) / 2, textY, line.c_str(), true,
+                            EpdFontFamily::BOLD);
+          textY += lineH;
+        }
+      } else {
+        constexpr int kIconSize = 24;
+        const int iconX = x + (kCellWidth - kIconSize) / 2;
+        const int iconY = y + (kCellHeight - kIconSize) / 2;
+        renderer.drawIcon(CoverIcon, iconX, iconY, kIconSize, kIconSize);
+      }
     }
 
     if (spineIdx == selectedSpineIndex) {
@@ -794,6 +920,199 @@ void LyraFlowTheme::drawBookshelfStrip(GfxRenderer& renderer, Rect rect, const c
   }
   (void)focusedBookAuthor;  // intentionally unused; consumed by drawButtonMenu via focusedBookAuthorForLabel
 }
+
+void LyraFlowTheme::drawBookshelfStripFocusUpdate(GfxRenderer& renderer, Rect rect, int prevFocusedSpine,
+                                                  int newFocusedSpine, int scrollOffset, int bookCount,
+                                                  const char* focusedBookTitle,
+                                                  const std::vector<int>* seriesMemberCounts, int rowCount) const {
+  // CrumBLE #125: layout constants MUST match drawBookshelfStrip exactly --
+  // we're patching pixels into a framebuffer that was painted by it. Any
+  // drift here would leave the focus ring offset from the cells. If
+  // drawBookshelfStrip is restructured, update both in lockstep (or
+  // factor a shared layout helper).
+  const ShelfLayout layout = shelfLayoutFor(rowCount);
+  const int kCellWidth = layout.cellWidth;
+  const int kCellHeight = layout.cellHeight;
+  const int kCellGap = layout.cellGap;
+  const int kRowGap = layout.rowGap;
+  const bool drawShadows = layout.drawShadows;
+  constexpr int kSidePad = 16;
+  constexpr int kTabHeight = 18;
+  constexpr int kTabBottomGap = 12;
+  constexpr int kShadowDepth = 6;
+  constexpr int kShadowInset = 3;
+  constexpr int kSeriesSpineWidth = 6;
+  constexpr int kRingOutset = 3;  // ring sits 3 px outside the cell
+  constexpr int kRingStroke = 2;
+  constexpr int kRingRadius = 5;
+
+  const int cellsPerRow = layout.cellsPerRow;
+  const int rows = layout.rowCount;
+  const int visiblePerPage = cellsPerRow * rows;
+  const int cellTotalW = kCellWidth + kCellGap;
+  const int tabY = rect.y;
+  const int shelfRowY = tabY + kTabHeight + kTabBottomGap;
+  // CrumBLE: match drawBookshelfStrip's partial-row centering so the
+  // focus-only path puts the ring on the SAME pixels the full paint
+  // used. Without this, focus updates on a < cellsPerRow collection
+  // would draw the ring offset from the cell it visually frames.
+  const int actualDrawn = std::min(visiblePerPage, std::max(0, bookCount - scrollOffset));
+  const int actualRowCells = std::min(cellsPerRow, std::max(0, actualDrawn));
+  const int rowDrawW = (actualRowCells > 0)
+                           ? actualRowCells * kCellWidth + (actualRowCells - 1) * kCellGap
+                           : (cellsPerRow * kCellWidth + (cellsPerRow - 1) * kCellGap);
+  const int rowStartX = rect.x + (rect.width - rowDrawW) / 2;
+
+  auto cellOriginForSpine = [&](int spineIdx, int& outX, int& outY) -> bool {
+    const int i = spineIdx - scrollOffset;
+    if (i < 0 || i >= visiblePerPage) return false;
+    const int row = i / cellsPerRow;
+    const int col = i % cellsPerRow;
+    outX = rowStartX + col * cellTotalW;
+    outY = shelfRowY + row * (kCellHeight + kRowGap);
+    return true;
+  };
+
+  // --- Erase the OLD focus ring (if it was visible). The ring strokes
+  //     sit in a 3 px frame around the cell with a 2 px stroke width.
+  //     The TOP and LEFT strokes are on the page-white substrate (no
+  //     shadow there) -- white fillRects erase cleanly. The RIGHT and
+  //     BOTTOM strokes overlap with the dithered shadow strips; we
+  //     re-paint those shadow strips (which overwrites the affected
+  //     ring stroke pixels with the correct dither) instead of trying
+  //     to white-fill them. Series cells additionally have a solid
+  //     black spine at x-7..x-1; the LEFT ring stroke at x-3..x-1
+  //     would have overdrawn its right 3 px, so restore the spine
+  //     after erasing the ring.
+  if (prevFocusedSpine >= 0) {
+    int x = 0, y = 0;
+    if (cellOriginForSpine(prevFocusedSpine, x, y)) {
+      // TOP stroke (entirely on white substrate)
+      renderer.fillRect(x - kRingOutset, y - kRingOutset, kCellWidth + 2 * kRingOutset, kRingStroke, false);
+      // LEFT stroke (on white substrate; may clip a series spine -- restored below)
+      renderer.fillRect(x - kRingOutset, y - kRingOutset, kRingStroke, kCellHeight + 2 * kRingOutset, false);
+
+      const bool prevIsSeries = seriesMemberCounts != nullptr &&
+                                prevFocusedSpine < static_cast<int>(seriesMemberCounts->size()) &&
+                                (*seriesMemberCounts)[prevFocusedSpine] >= 2;
+
+      if (drawShadows) {
+        // Re-dither the shadow strips. These cover the right + bottom
+        // ring strokes (which overlap with the inner edge of the shadow
+        // at the inset). Same calls as the full-strip draw.
+        renderer.fillRectDither(x + kCellWidth, y + kShadowInset, kShadowDepth, kCellHeight - kShadowInset,
+                                Color::LightGray);
+        renderer.fillRectDither(x + kShadowInset, y + kCellHeight, kCellWidth - kShadowInset, kShadowDepth,
+                                Color::LightGray);
+        renderer.fillRectDither(x + kCellWidth, y + kCellHeight, kShadowDepth, kShadowDepth, Color::LightGray);
+        // The shadow's inner inset (top kShadowInset px on the right
+        // strip, left kShadowInset px on the bottom strip) doesn't have
+        // dither -- it sits on the page-white substrate. White-fill
+        // those small slivers to wipe the corresponding ring stroke
+        // pixels.
+        renderer.fillRect(x + kCellWidth + 1, y - kRingOutset, kRingStroke, kShadowInset + kRingOutset, false);
+        renderer.fillRect(x - kRingOutset, y + kCellHeight + 1, kShadowInset + kRingOutset, kRingStroke, false);
+      } else {
+        // No shadow this layout -- just white-fill the right + bottom strokes.
+        renderer.fillRect(x + kCellWidth + 1, y - kRingOutset, kRingStroke, kCellHeight + 2 * kRingOutset, false);
+        renderer.fillRect(x - kRingOutset, y + kCellHeight + 1, kCellWidth + 2 * kRingOutset, kRingStroke, false);
+      }
+
+      if (prevIsSeries) {
+        renderer.fillRect(x - kSeriesSpineWidth - 1, y, kSeriesSpineWidth, kCellHeight, true);
+      }
+    }
+  }
+
+  // --- Draw the NEW focus ring (if a cell is newly focused). Same call
+  //     the full-strip draw uses, so geometry matches pixel-perfectly.
+  if (newFocusedSpine >= 0) {
+    int x = 0, y = 0;
+    if (cellOriginForSpine(newFocusedSpine, x, y)) {
+      renderer.drawRoundedRect(x - kRingOutset, y - kRingOutset, kCellWidth + 2 * kRingOutset,
+                               kCellHeight + 2 * kRingOutset, kRingStroke, kRingRadius, true);
+    }
+  }
+
+  // --- Re-render the focused-book title strip below the cells. The
+  //     framebuffer-restored pixels carry the OLD title text; if the
+  //     new title is shorter, leftover characters would show through.
+  //     Clear a generous band and redraw centered.
+  constexpr int kTitleFontId = UI_10_FONT_ID;
+  constexpr int kTitleTopGap = 0;
+  const int lastRowBottomY = shelfRowY + (rows - 1) * (kCellHeight + kRowGap) + kCellHeight;
+  const int titleY = lastRowBottomY + kShadowDepth + kTitleTopGap;
+  // Clear the full strip width across the title's vertical band (line
+  // height + a few px of safety for ascenders/descenders).
+  const int titleLineH = renderer.getLineHeight(kTitleFontId);
+  renderer.fillRect(rect.x, titleY - 2, rect.width, titleLineH + 4, false);
+  if (newFocusedSpine >= 0 && focusedBookTitle != nullptr && *focusedBookTitle != '\0') {
+    const auto truncated = renderer.truncatedText(kTitleFontId, focusedBookTitle, rect.width - 2 * kSidePad);
+    const int tw = renderer.getTextWidth(kTitleFontId, truncated.c_str(), EpdFontFamily::REGULAR);
+    renderer.drawText(kTitleFontId, rect.x + (rect.width - tw) / 2, titleY, truncated.c_str(), true,
+                      EpdFontFamily::REGULAR);
+  }
+  (void)bookCount;  // future-proof for visiblePerPage / scroll-arrow logic
+}
+
+void LyraFlowTheme::prerenderCarouselSideTiles(GfxRenderer& renderer,
+                                                const std::vector<RecentBook>& recentBooks) const {
+  // Always rebuild from scratch -- the recentBooks vector may have
+  // reordered (just-read book promotion) or shrunk (delete). Tiles are
+  // keyed by book PATH so the table is stable across reorderings, but
+  // we drop stale entries here for tidiness.
+  sideTileCache_.clear();
+
+  // Same hL/hR convention drawStackedCover uses. Left side: taller on
+  // left edge, shorter on right edge. Right side is the mirror. Tiles
+  // are rendered at the natural hMax (288) so they cover the trapezoidal
+  // bounding box; positions inside the box with colH < hMax are simply
+  // unset bits in the tile.
+  const int hL_left = sideInnerHeight;
+  const int hR_left = sideOuterHeight;
+  const int hL_right = sideOuterHeight;
+  const int hR_right = sideInnerHeight;
+  const int hMax = std::max(sideInnerHeight, sideOuterHeight);
+  const int dstStride = (sideCoverWidth + 7) / 8;
+  const size_t tileBytes = static_cast<size_t>(dstStride) * static_cast<size_t>(hMax);
+
+  for (const auto& book : recentBooks) {
+    if (book.path.empty()) continue;
+    const std::string coverPath = UITheme::getCoverThumbPath(book.coverBmpPath, centerCoverHeight);
+    if (coverPath.empty()) continue;
+    // Triggers SD load + cache populate if not already resident. Same
+    // call drawStackedCover would do on first render anyway -- we just
+    // do it up front so the per-press path stays pure RAM.
+    GfxRenderer::CachedBitmap* handle = renderer.lookupCachedBitmap(coverPath);
+    int srcW = 0, srcH = 0;
+    if (!renderer.getCachedBitmapDimensions(handle, &srcW, &srcH) || srcW <= 0 || srcH <= 0) {
+      continue;  // skip; drawStackedCover will fall through to perspective-render
+    }
+
+    BookSideTiles& tiles = sideTileCache_[book.path];
+
+    // Left-perspective tile (used for both left-near and left-far drawX).
+    tiles.left.pixels.reset(new (std::nothrow) uint8_t[tileBytes]);
+    if (tiles.left.pixels) {
+      std::memset(tiles.left.pixels.get(), 0, tileBytes);
+      renderer.renderPerspectiveBitmapToPacked1bpp(handle, sideCoverWidth, hL_left, hR_left, tiles.left.pixels.get());
+      tiles.left.width = sideCoverWidth;
+      tiles.left.height = hMax;
+    }
+
+    // Right-perspective tile (mirror of left).
+    tiles.right.pixels.reset(new (std::nothrow) uint8_t[tileBytes]);
+    if (tiles.right.pixels) {
+      std::memset(tiles.right.pixels.get(), 0, tileBytes);
+      renderer.renderPerspectiveBitmapToPacked1bpp(handle, sideCoverWidth, hL_right, hR_right,
+                                                    tiles.right.pixels.get());
+      tiles.right.width = sideCoverWidth;
+      tiles.right.height = hMax;
+    }
+  }
+}
+
+void LyraFlowTheme::clearCarouselSideTiles() const { sideTileCache_.clear(); }
 
 void LyraFlowTheme::drawButtonMenu(GfxRenderer& renderer, Rect /*rect*/, int buttonCount, int selectedIndex,
                                    const std::function<std::string(int index)>& buttonLabel,

@@ -152,6 +152,14 @@ class CollectionsStore {
   // had to be modified — informational only.
   int removeBookFromAllCollections(const std::string& bookPath);
 
+  // Bulk-add: append every path in `bookPaths` to the given user collection,
+  // skipping paths already present. Saves once at the end instead of once
+  // per book — keeps SD writes bounded when populating from a folder. Refuses
+  // virtual collections (their book lists are derived, not stored). Returns
+  // the number of books actually added (0 if all were duplicates / no
+  // collection found / virtual).
+  int addBooksToCollection(const std::string& collectionId, const std::vector<std::string>& bookPaths);
+
   // Read-only accessors.
   bool isBookInCollection(const std::string& collectionId, const std::string& bookPath) const;
   const Collection* findCollection(const std::string& collectionId) const;
@@ -177,6 +185,16 @@ class CollectionsStore {
   // building the full vector. Still triggers a walk for virtuals on
   // first access. Use sparingly — pulls fresh data each call.
   int countBooksInCollection(const std::string& collectionId) const;
+
+  // Returns `name` unchanged if no other collection currently uses it,
+  // otherwise returns "name (N)" with the smallest unused N starting at 1.
+  // Comparison is case-sensitive — "Sci-Fi" and "sci-fi" are treated as
+  // distinct. The optional `ignoreId` excludes one collection from the
+  // duplicate set (used by renameCollection so renaming to the same name
+  // is a no-op instead of bumping to "Name (1)"). Virtual collection names
+  // (Favorites / All Books / Recently Added / Finished / Unopened) are
+  // included in the duplicate scan so user collections can't shadow them.
+  std::string disambiguateName(const std::string& name, const std::string& ignoreId = {}) const;
 
   // CrumBLE: invalidate the in-memory cache of the Finished / New virtual
   // collections. Call this whenever a book's completion state or

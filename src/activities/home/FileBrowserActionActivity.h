@@ -87,6 +87,13 @@ enum class FileBrowserAction : int {
   // layout shows ~12 smaller covers per page; one-row shows 4. Persisted
   // on collections.json for user collections; virtuals reseed each begin.
   ToggleTwoRowShelf = 22,
+  // CrumBLE: surfaces on the file browser's long-press menu when the
+  // selected entry is a folder. Walks the folder recursively for book
+  // files, creates a new user collection named after the folder
+  // (deduped via CollectionsStore::disambiguateName), bulk-adds every
+  // discovered book, and makes the collection active before returning
+  // to Home. Skipped (with a toast) if the folder contains no books.
+  MakeCollectionFromFolder = 23,
 };
 
 class FileBrowserActionActivity final : public Activity {

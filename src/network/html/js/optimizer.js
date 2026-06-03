@@ -1858,6 +1858,533 @@ async function bakePxc(jpegBytes, viewportW, viewportH) {
   }
 }
 
+// CrumBLE optimizer preflight modal. Before BT-bake or prebake locks the
+// book's layout to a specific reader-settings snapshot, surface that
+// snapshot to the user so they can verify (and edit) the values that will
+// be embedded in the manifest -- and, on edit, push the corrected SETTINGS
+// back to the device so the first cold open finds the prebake's
+// fingerprint matching reality.
+//
+// Returns a Promise that resolves with the final renderInfo to use for the
+// bake (potentially edited and re-fetched from the device after a save),
+// or rejects with an Error('Cancelled by user') if the user backs out.
+async function showOptimizerPreflightModal(renderInfo, fileName) {
+  // Enum tables. Indexes match the CrossPointSettings.h enums byte-for-byte
+  // -- the device validates the same ranges in handleSaveReaderSettings, so
+  // any drift here would be caught server-side. Keep in sync with that file.
+  const FONT_FAMILY = [
+    { v: 0, label: 'Lexend Deca' },
+    { v: 1, label: 'Bitter' },
+    { v: 2, label: 'CharE-Ink' },
+  ];
+  const FONT_SIZE = [
+    { v: 0, label: 'Tiny (8pt)' },
+    { v: 1, label: 'Small (10pt)' },
+    { v: 2, label: 'Medium (12pt)' },
+    { v: 3, label: 'Large (14pt)' },
+    { v: 4, label: 'Extra Large (16pt)' },
+    { v: 5, label: 'Teensy (6pt)' },
+    { v: 6, label: 'Huge (20pt)' },
+  ];
+  const ORIENTATION = [
+    { v: 0, label: 'Portrait' },
+    { v: 1, label: 'Landscape (CW)' },
+    { v: 3, label: 'Landscape (CCW)' },
+  ];
+  const LINE_SPACING = [
+    { v: 0, label: 'Tight' },
+    { v: 1, label: 'Normal' },
+    { v: 2, label: 'Wide' },
+  ];
+  const PARAGRAPH_ALIGNMENT = [
+    { v: 0, label: 'Justified' },
+    { v: 1, label: 'Left' },
+    { v: 2, label: 'Center' },
+    { v: 3, label: 'Right' },
+  ];
+  const IMAGE_RENDERING = [
+    { v: 0, label: 'Show images' },
+    { v: 1, label: 'Placeholder' },
+    { v: 2, label: 'Suppress' },
+  ];
+
+  return new Promise((resolve, reject) => {
+    const overlay = document.createElement('div');
+    overlay.style.cssText =
+      'position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;' +
+      'justify-content:center;z-index:10000;font-family:-apple-system,system-ui,sans-serif;';
+    const dialog = document.createElement('div');
+    dialog.style.cssText =
+      'background:#fff;color:#222;border-radius:12px;max-width:560px;width:90%;max-height:85vh;overflow-y:auto;' +
+      'padding:24px;box-shadow:0 12px 32px rgba(0,0,0,0.2);';
+    const header = document.createElement('div');
+    header.innerHTML =
+      '<h2 style="margin:0 0 6px;font-size:20px;color:#222">Lock in reader settings?</h2>' +
+      '<p style="margin:0 0 16px;color:#555;font-size:14px;line-height:1.5">' +
+      'Optimizing this book takes up to a few minutes (depending on length and images) ' +
+      'and locks the prepared layout to specific reader settings. Verify these are the ' +
+      'settings you read with. Anything you change here updates the device too.</p>';
+    dialog.appendChild(header);
+
+    const settingNote = document.createElement('p');
+    settingNote.style.cssText = 'margin:0 0 10px;font-size:13px;color:#777';
+    settingNote.textContent = `Book: ${fileName}`;
+    dialog.appendChild(settingNote);
+
+    const form = document.createElement('div');
+    form.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:10px 14px;margin:8px 0 16px;';
+
+    const makeSelect = (label, key, options, current) => {
+      const wrap = document.createElement('label');
+      wrap.style.cssText = 'display:flex;flex-direction:column;font-size:13px;color:#444';
+      const span = document.createElement('span');
+      span.style.cssText = 'margin-bottom:3px;font-weight:500';
+      span.textContent = label;
+      const sel = document.createElement('select');
+      sel.dataset.key = key;
+      sel.dataset.current = current;
+      sel.style.cssText = 'padding:6px 8px;border:1px solid #c2c2c2;border-radius:4px;font-size:14px;background:#fff;color:#222';
+      for (const opt of options) {
+        const o = document.createElement('option');
+        o.value = opt.v;
+        o.textContent = opt.label;
+        if (opt.v === current) o.selected = true;
+        sel.appendChild(o);
+      }
+      wrap.appendChild(span);
+      wrap.appendChild(sel);
+      form.appendChild(wrap);
+    };
+    const makeNumber = (label, key, current, min, max) => {
+      const wrap = document.createElement('label');
+      wrap.style.cssText = 'display:flex;flex-direction:column;font-size:13px;color:#444';
+      const span = document.createElement('span');
+      span.style.cssText = 'margin-bottom:3px;font-weight:500';
+      span.textContent = label;
+      const inp = document.createElement('input');
+      inp.type = 'number';
+      inp.min = String(min);
+      inp.max = String(max);
+      inp.value = String(current);
+      inp.dataset.key = key;
+      inp.dataset.current = String(current);
+      inp.style.cssText = 'padding:6px 8px;border:1px solid #c2c2c2;border-radius:4px;font-size:14px;background:#fff;color:#222';
+      wrap.appendChild(span);
+      wrap.appendChild(inp);
+      form.appendChild(wrap);
+    };
+    const makeBool = (label, key, current) => {
+      const wrap = document.createElement('label');
+      wrap.style.cssText =
+        'display:flex;align-items:center;gap:8px;font-size:13px;color:#444;cursor:pointer';
+      const inp = document.createElement('input');
+      inp.type = 'checkbox';
+      inp.dataset.key = key;
+      inp.dataset.current = String(current ? 1 : 0);
+      inp.checked = !!current;
+      inp.style.cssText = 'width:18px;height:18px;cursor:pointer';
+      const span = document.createElement('span');
+      span.textContent = label;
+      wrap.appendChild(inp);
+      wrap.appendChild(span);
+      form.appendChild(wrap);
+    };
+
+    makeSelect('Font family', 'fontFamily', FONT_FAMILY, renderInfo.fontFamily | 0);
+    makeSelect('Font size', 'fontSize', FONT_SIZE, renderInfo.fontSize | 0);
+    makeSelect('Orientation', 'orientation', ORIENTATION, renderInfo.orientation | 0);
+    makeNumber('Screen margin (px)', 'screenMargin', renderInfo.screenMargin | 0, 0, 50);
+    makeSelect('Line spacing', 'lineSpacing', LINE_SPACING, renderInfo.lineSpacing | 0);
+    makeSelect('Paragraph alignment', 'paragraphAlignment', PARAGRAPH_ALIGNMENT, renderInfo.paragraphAlignment | 0);
+    makeSelect('Image rendering', 'imageRendering', IMAGE_RENDERING, renderInfo.imageRendering | 0);
+    makeBool('Extra paragraph spacing', 'extraParagraphSpacing', renderInfo.extraParagraphSpacing | 0);
+    makeBool('Force paragraph indents', 'forceParagraphIndents', renderInfo.forceParagraphIndents | 0);
+    makeBool('Hyphenation', 'hyphenationEnabled', renderInfo.hyphenationEnabled | 0);
+    makeBool('Embedded CSS', 'embeddedStyle', renderInfo.embeddedStyle | 0);
+    makeBool('Bionic reading', 'bionicReadingEnabled', renderInfo.bionicReadingEnabled | 0);
+    makeBool('Guide reading', 'guideReadingEnabled', renderInfo.guideReadingEnabled | 0);
+    dialog.appendChild(form);
+
+    const buttons = document.createElement('div');
+    buttons.style.cssText = 'display:flex;gap:10px;justify-content:flex-end;margin-top:8px';
+    const cancel = document.createElement('button');
+    cancel.textContent = 'Cancel';
+    cancel.style.cssText =
+      'padding:9px 18px;border:1px solid #c2c2c2;background:#fafafa;border-radius:6px;' +
+      'font-size:14px;cursor:pointer;color:#444';
+    const confirm = document.createElement('button');
+    confirm.textContent = 'Looks good, optimize';
+    confirm.style.cssText =
+      'padding:9px 18px;border:1px solid #2c7a3f;background:#2c7a3f;color:#fff;border-radius:6px;' +
+      'font-size:14px;cursor:pointer;font-weight:600';
+    buttons.appendChild(cancel);
+    buttons.appendChild(confirm);
+    dialog.appendChild(buttons);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    const close = () => { try { document.body.removeChild(overlay); } catch (e) { /* gone already */ } };
+    cancel.onclick = () => { close(); reject(new Error('Cancelled by user')); };
+    overlay.onclick = (e) => { if (e.target === overlay) { close(); reject(new Error('Cancelled by user')); } };
+
+    confirm.onclick = async () => {
+      const updates = {};
+      const dirtyKeys = [];
+      form.querySelectorAll('[data-key]').forEach(el => {
+        const key = el.dataset.key;
+        const cur = el.dataset.current;
+        const val = (el.type === 'checkbox') ? (el.checked ? '1' : '0') : el.value;
+        if (val !== cur) {
+          dirtyKeys.push(key);
+          if (el.type === 'checkbox') updates[key] = el.checked ? 1 : 0;
+          else updates[key] = Number(val);
+        }
+      });
+      if (dirtyKeys.length === 0) {
+        close();
+        resolve(renderInfo);
+        return;
+      }
+      confirm.disabled = true;
+      confirm.textContent = 'Saving settings...';
+      try {
+        const resp = await fetch('/api/save-reader-settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updates),
+        });
+        if (!resp.ok) {
+          const errText = await resp.text();
+          throw new Error('Save failed: ' + errText);
+        }
+        const fresh = await fetch('/api/reader-render-info').then(r => r.json());
+        close();
+        resolve(fresh);
+      } catch (e) {
+        confirm.disabled = false;
+        confirm.textContent = 'Looks good, optimize';
+        alert('Could not save settings: ' + (e.message || e));
+      }
+    };
+  });
+}
+
+// =============================================================================
+// CrumBLE Phase 5b: chapter-indexing prebake (WASM-backed)
+// =============================================================================
+//
+// The "Optimize chapter indexing" checkbox runs prebakeChapters() AFTER the
+// EPUB upload completes. It executes the prebake CLI (cross-compiled to WASM
+// in tools/crumble-prebake) inside the browser against the just-uploaded
+// EPUB. The WASM emits a per-book cache directory under MEMFS; we then
+// upload each file individually via the file manager's /upload endpoint.
+//
+// Why no zip / no extractor: tonight's debugging showed that a single big
+// upload-and-extract on the device blew its heap, and a "lazy" tick-paced
+// extractor competed badly with the reader for the SD bus. Individual
+// uploads through the proven /upload endpoint sidestep both problems --
+// each request is a ~5-30 KB write, sequential, no extraction.
+
+let crumblePrebakeModuleFactoryPromise = null;
+let crumblePrebakeModulePromise = null;
+
+// Lazily inject /js/crumble-prebake.js and grab the factory it exposes.
+// Cached: subsequent calls return the same factory.
+function loadCrumblePrebakeFactory() {
+  if (crumblePrebakeModuleFactoryPromise) return crumblePrebakeModuleFactoryPromise;
+  crumblePrebakeModuleFactoryPromise = new Promise((resolve, reject) => {
+    if (typeof window.CrumblePrebake === 'function') {
+      resolve(window.CrumblePrebake);
+      return;
+    }
+    const s = document.createElement('script');
+    s.src = '/js/crumble-prebake.js';
+    s.onload = () => {
+      if (typeof window.CrumblePrebake !== 'function') {
+        reject(new Error('crumble-prebake.js loaded but CrumblePrebake factory missing'));
+        return;
+      }
+      resolve(window.CrumblePrebake);
+    };
+    s.onerror = () => reject(new Error('Failed to load /js/crumble-prebake.js (firmware may not include the WASM module)'));
+    document.head.appendChild(s);
+  });
+  return crumblePrebakeModuleFactoryPromise;
+}
+
+// Buffer for capturing the CLI's print/printErr output across a single
+// callMain. Cleared before each run; on non-zero exit we include the
+// captured contents in the thrown error so the user sees WHAT the CLI
+// rejected instead of just an opaque "exit code N".
+const crumblePrebakeOutputBuf = [];
+
+// Get a ready Module instance. The factory is invoked once and the resulting
+// Module is reused across runs (EXIT_RUNTIME=0 keeps MEMFS + libc alive
+// between callMain invocations). This means we pay the ~850 KB WASM
+// download + instantiation cost once per session, not per book.
+async function loadCrumblePrebakeModule() {
+  if (crumblePrebakeModulePromise) return crumblePrebakeModulePromise;
+  crumblePrebakeModulePromise = (async () => {
+    const factory = await loadCrumblePrebakeFactory();
+    return await factory({
+      // Route emscripten stdout/stderr through three places:
+      //   1. The optimizer log panel (per-line, prefixed by [prebake] /
+      //      [prebake-err]) -- visible while the modal is open.
+      //   2. console.log / console.error -- persists across page reloads
+      //      when DevTools "Preserve log" is on.
+      //   3. crumblePrebakeOutputBuf -- the running buffer we attach to
+      //      a thrown error when callMain returns non-zero, so the user
+      //      sees the CLI's own failure message even after the log
+      //      panel scrolls or the modal closes.
+      print: (msg) => {
+        crumblePrebakeOutputBuf.push(msg);
+        try { console.log('[prebake]', msg); } catch (e) {}
+        try { log(`[prebake] ${msg}`, '', 'PRE'); } catch (e) {}
+      },
+      printErr: (msg) => {
+        crumblePrebakeOutputBuf.push(msg);
+        try { console.error('[prebake-err]', msg); } catch (e) {}
+        try { log(`[prebake-err] ${msg}`, 'warning', 'PRE-ERR'); } catch (e) {}
+      },
+    });
+  })();
+  return crumblePrebakeModulePromise;
+}
+
+// Upload a single byte buffer to /upload?path=<destDir> with filename <name>.
+// Returns the HTTP status code; throws on network failure.
+async function uploadOneToDevice(destDir, name, bytes) {
+  const formData = new FormData();
+  // The handler infers the filename from the upload's part name; we set it
+  // explicitly so the destination basename matches what we generated.
+  formData.append('file', new Blob([bytes]), name);
+  const resp = await fetch(`/upload?path=${encodeURIComponent(destDir)}`, {
+    method: 'POST',
+    body: formData,
+  });
+  return resp;
+}
+
+// POST /mkdir?path=<parent>&name=<dir>. Returns 200 on create, 400 if
+// already exists (which is fine -- the caller treats both as success).
+async function ensureRemoteDir(parentPath, dirName) {
+  const url = `/mkdir?path=${encodeURIComponent(parentPath)}&name=${encodeURIComponent(dirName)}`;
+  try {
+    await fetch(url, { method: 'POST' });
+  } catch (e) {
+    // Network errors are surfaced by the subsequent upload; mkdir failures
+    // (including "already exists") are not fatal in themselves.
+  }
+}
+
+// Run the WASM prebake against `epubBlob` and stream the resulting cache
+// files to the device. `deviceFilePath` is the FULL absolute SD-card path
+// of the EPUB (e.g. "/Books/MyBook.epub"), NOT just the basename --
+// Epub::cachePathForFilePath on the device hashes the whole path string,
+// so if we only pass "/MyBook.epub" while the device sees "/Books/
+// MyBook.epub", the hashes differ and the prebake files land in a cache
+// dir the device doesn't look at. Caller is responsible for joining the
+// upload's currentPath with the filename.
+//
+// Calls progressCallback(donePct) with values 0..100 across the whole run
+// (download settings -> run WASM -> upload N files).
+//
+// Throws on any fatal error. Returns a summary object on success:
+//   { hashId, uploaded, failed, totalBytes, elapsedMs }
+async function prebakeChapters(epubBlob, deviceFilePath, progressCallback) {
+  const startTime = Date.now();
+  // progressCallback signature: (percent, optionalStatusText). The caller
+  // updates the progress bar with `percent` and the caption with the
+  // status text when present. Wraps in try/catch because the caller can
+  // also throw inside the callback (e.g. on cancellation paths) and we
+  // don't want a UI error to abort the prebake.
+  const reportProgress = (pct, status) => {
+    if (progressCallback) {
+      try { progressCallback(Math.max(0, Math.min(100, pct)), status); } catch (e) {}
+    }
+  };
+  reportProgress(0, 'starting prebake...');
+
+  // 1. Fetch live render-info from the device (same endpoint the BT optimizer
+  //    uses for .pxc baking). Required because the CLI hard-errors on
+  //    fitVersion < 2 -- the eight layout fields it adds are baked into
+  //    section file headers and must match the device's current state.
+  log('Chapter prebake: fetching device render settings...', '', 'PRE');
+  const riResp = await fetch('/api/reader-render-info');
+  if (!riResp.ok) {
+    throw new Error(`render-info fetch failed: HTTP ${riResp.status}`);
+  }
+  const renderInfo = await riResp.json();
+  if (!(renderInfo.fitVersion >= 2)) {
+    throw new Error(`device reports fitVersion=${renderInfo.fitVersion}; chapter prebake needs >=2 (update firmware)`);
+  }
+  reportProgress(5, 'loading WASM module...');
+
+  // 2. Boot the WASM module (downloads ~850 KB gz on first call).
+  log('Chapter prebake: loading WASM module...', '', 'PRE');
+  const Module = await loadCrumblePrebakeModule();
+  reportProgress(15, 'building chapter index...');
+
+  // 3. Stage the EPUB + settings file into MEMFS so the CLI sees them as
+  //    regular files. The CLI's --device-path argument controls the cache
+  //    hash so we use the actual device-side path (e.g. "/foo.epub"),
+  //    matching what the device computed when it indexed this book.
+  log('Chapter prebake: staging input into WASM filesystem...', '', 'PRE');
+  const epubBytes = new Uint8Array(await epubBlob.arrayBuffer());
+  const inputPath = '/input.epub';
+  const settingsPath = '/settings.json';
+  const outDir = '/out';
+  try { Module.FS.unlink(inputPath); } catch (e) {}
+  try { Module.FS.unlink(settingsPath); } catch (e) {}
+  try { Module.FS.unlink(outDir); } catch (e) {}
+  Module.FS.writeFile(inputPath, epubBytes);
+  Module.FS.writeFile(settingsPath, JSON.stringify(renderInfo));
+  Module.FS.mkdir(outDir);
+
+  // 4. Run prebake. callMain returns the CLI's exit code. The CLI's
+  //    --device-path tells it which SD-card path to hash for the cache
+  //    directory name -- without this it'd hash "/input.epub" instead
+  //    of the real device-side path.
+  // deviceFilePath comes in already absolute from the caller; verify and
+  // fall back defensively so we don't quietly hash a relative path.
+  let devicePath = deviceFilePath || '';
+  if (!devicePath.startsWith('/')) devicePath = '/' + devicePath;
+  const cliArgs = [
+    '--settings-file', settingsPath,
+    '--output-dir', outDir,
+    '--device-path', devicePath,
+    '--skip-thumbs',
+    inputPath,
+  ];
+  log(`Chapter prebake: callMain(${JSON.stringify(cliArgs)})`, '', 'PRE');
+  // Clear the print/printErr capture buffer right before we run so any
+  // earlier session output doesn't pollute this run's diagnostics.
+  crumblePrebakeOutputBuf.length = 0;
+  const rc = Module.callMain(cliArgs);
+  if (rc !== 0) {
+    // Surface whatever the CLI actually said on its way out. Without this
+    // the thrown error is just "exit code N" with no clue what was wrong.
+    const captured = crumblePrebakeOutputBuf.slice(-12).join('\n');
+    const detail = captured ? `\n--- CLI output ---\n${captured}` : '';
+    throw new Error(`prebake CLI exited with code ${rc}${detail}`);
+  }
+  reportProgress(50, 'uploading cache files...');
+
+  // 5. Walk MEMFS to find the produced cache directory. Layout:
+  //    /out/.crosspoint/epub_<hash>/{book.bin,sections-prebake/*.bin,...}
+  const crosspointDir = `${outDir}/.crosspoint`;
+  const cacheRoots = Module.FS.readdir(crosspointDir).filter(
+    (n) => n.startsWith('epub_'),
+  );
+  if (cacheRoots.length !== 1) {
+    throw new Error(`expected exactly one epub_* cache dir, found ${cacheRoots.length}`);
+  }
+  const hashId = cacheRoots[0]; // "epub_<hash>"
+  const memCacheDir = `${crosspointDir}/${hashId}`;
+  const deviceCacheDir = `/.crosspoint/${hashId}`;
+
+  // 6. Make sure the destination dirs exist on device. mkdir for the cache
+  //    dir is idempotent-ish (400 if exists, fine). sections-prebake/
+  //    too. Without these, /upload's openFileForWrite would fail because
+  //    the handler doesn't auto-create parents.
+  await ensureRemoteDir('/.crosspoint', hashId);
+  await ensureRemoteDir(deviceCacheDir, 'sections-prebake');
+
+  // 7. Enumerate output files and upload each one. Order: top-level files
+  //    first (book.bin, manifest, css), then sections in numeric order.
+  //    This means the manifest lands quickly and the device's switch-back
+  //    prompt has something to check before all sections finish.
+  function* walkMemfs(dir, relPrefix) {
+    for (const entry of Module.FS.readdir(dir)) {
+      if (entry === '.' || entry === '..') continue;
+      const full = `${dir}/${entry}`;
+      const stat = Module.FS.stat(full);
+      const rel = relPrefix ? `${relPrefix}/${entry}` : entry;
+      if (Module.FS.isDir(stat.mode)) {
+        yield* walkMemfs(full, rel);
+      } else {
+        yield { memPath: full, relPath: rel };
+      }
+    }
+  }
+  const allFiles = Array.from(walkMemfs(memCacheDir, ''));
+  // Numeric-ish sort: top-level non-section files first, then sections by index.
+  allFiles.sort((a, b) => {
+    const aIsSection = a.relPath.startsWith('sections-prebake/');
+    const bIsSection = b.relPath.startsWith('sections-prebake/');
+    if (aIsSection !== bIsSection) return aIsSection ? 1 : -1;
+    if (aIsSection) {
+      const an = parseInt(a.relPath.match(/(\d+)\.bin$/)?.[1] ?? '0', 10);
+      const bn = parseInt(b.relPath.match(/(\d+)\.bin$/)?.[1] ?? '0', 10);
+      return an - bn;
+    }
+    return a.relPath.localeCompare(b.relPath);
+  });
+
+  log(`Chapter prebake: uploading ${allFiles.length} cache files...`, '', 'PRE');
+  let uploaded = 0;
+  let failed = 0;
+  let totalBytes = 0;
+  for (let i = 0; i < allFiles.length; i++) {
+    const { memPath, relPath } = allFiles[i];
+    const bytes = Module.FS.readFile(memPath);
+    totalBytes += bytes.length;
+    // Destination dir is deviceCacheDir + parent-of-relPath.
+    const slash = relPath.lastIndexOf('/');
+    const destSubdir = slash >= 0 ? relPath.substring(0, slash) : '';
+    const destDir = destSubdir ? `${deviceCacheDir}/${destSubdir}` : deviceCacheDir;
+    const fname = slash >= 0 ? relPath.substring(slash + 1) : relPath;
+    try {
+      const resp = await uploadOneToDevice(destDir, fname, bytes);
+      if (resp.ok) {
+        uploaded++;
+      } else {
+        failed++;
+        const errText = await resp.text().catch(() => '');
+        log(`Upload failed ${relPath}: HTTP ${resp.status} ${errText}`.trim(), 'warning', 'PRE-FAIL');
+      }
+    } catch (e) {
+      failed++;
+      log(`Upload error ${relPath}: ${e.message}`, 'warning', 'PRE-FAIL');
+    }
+    // 50% -> 95% across the upload phase. Include the running file
+    // count in the status text so the user can see SOMETHING moves even
+    // when each upload nudges the bar by only a fraction of a percent
+    // (~0.25% per file for the typical ~180-file cache).
+    reportProgress(
+      50 + Math.floor(45 * (i + 1) / allFiles.length),
+      `uploading cache file ${i + 1}/${allFiles.length}`,
+    );
+  }
+
+  // 8. Clean MEMFS so the next book in a batch doesn't pile up entries.
+  //    EXIT_RUNTIME=0 keeps the Module alive, but we don't want to leak
+  //    ~MB of EPUB / cache bytes per book across batch runs.
+  function rmRf(path) {
+    try {
+      const stat = Module.FS.stat(path);
+      if (Module.FS.isDir(stat.mode)) {
+        for (const entry of Module.FS.readdir(path)) {
+          if (entry === '.' || entry === '..') continue;
+          rmRf(`${path}/${entry}`);
+        }
+        Module.FS.rmdir(path);
+      } else {
+        Module.FS.unlink(path);
+      }
+    } catch (e) {}
+  }
+  rmRf(inputPath);
+  rmRf(settingsPath);
+  rmRf(outDir);
+
+  const elapsedMs = Date.now() - startTime;
+  reportProgress(100);
+  log(`Chapter prebake done: ${uploaded}/${allFiles.length} files (${formatBytes(totalBytes)}) in ${(elapsedMs / 1000).toFixed(1)}s`,
+      failed === 0 ? '' : 'warning', 'PRE-OK');
+  return { hashId, uploaded, failed, totalBytes, elapsedMs };
+}
+
 async function convertEpubFile(file, progressCallback) {
   const startTime = Date.now();
   const originalSize = file.size;
@@ -1881,16 +2408,15 @@ async function convertEpubFile(file, progressCallback) {
   });
 
   const out = new JSZip();
-  // CrumBLE: "Bluetooth-friendly chapters" stores chapter XHTML uncompressed so
-  // the device needs no DEFLATE inflate window to cold-load a chapter -- chapter
-  // boundaries / Select / jumps / font changes then work even with a remote
-  // connected (which fragments the heap so a 32 KB contiguous block is
-  // unavailable). Small entries (CSS/OPF/NCX) are left DEFLATE; the device's
-  // window-sizing handles those. Only the large XHTML needs storing.
-  const bluetoothTextMode = !!document.getElementById('store-text-uncompressed-checkbox')?.checked;
-  const xhtmlFileOpts = bluetoothTextMode
-    ? { compression: 'STORE', createFolders: false }
-    : { compression: 'DEFLATE', compressionOptions: { level: 8 }, createFolders: false };
+  // Phase 5: chapter-prebake mode (the single "Pre-optimize for instant
+  // reading" toggle in the modal) supersedes the old "Bluetooth-friendly
+  // chapters" / store-XHTML-uncompressed toggle. When chapter prebake is
+  // on the device loads sections from sections-prebake/*.bin and never
+  // needs to inflate a DEFLATE chapter, so the 32 KB inflate window
+  // bypass that the old toggle achieved is delivered for free. We always
+  // DEFLATE chapter XHTML now -- smaller EPUB, no downside under the
+  // prebake flow.
+  const xhtmlFileOpts = { compression: 'DEFLATE', compressionOptions: { level: 8 }, createFolders: false };
   // CrumBLE: fetch the device's reader render-info so we can pre-render each image
   // to its .pxc pixel cache at the exact dimensions the device will use. The
   // optimizer is served by the device, so this returns the live viewport.
@@ -1901,9 +2427,18 @@ async function convertEpubFile(file, progressCallback) {
   //      a BT remote.
   //   2. Render-info fetch must succeed (fails when the optimizer runs
   //      standalone off-device).
-  const bakePxcEnabled = document.getElementById('bake-pxc-checkbox')?.checked !== false;
+  // Same checkbox now drives BT-pass .pxc baking AND the chapter prebake
+  // pass (read separately in FilesPage.html's upload step). One toggle,
+  // both off-device optimisations, single user mental model.
+  const bakePxcEnabled = document.getElementById('optimize-for-device-checkbox')?.checked !== false;
   let renderInfo = null;
   if (bakePxcEnabled) {
+    // FilesPage.html runs the preflight modal BEFORE calling
+    // convertEpubFile so the user only sees it once even when both the
+    // BT pass and the chapter prebake pass need the same locked-in
+    // settings. By the time we get here, SETTINGS on the device already
+    // reflects the user's edits (the modal POSTed them) -- we just need
+    // a fresh render-info snapshot to drive the .pxc bake.
     try {
       const resp = await fetch('/api/reader-render-info');
       if (resp.ok) renderInfo = await resp.json();

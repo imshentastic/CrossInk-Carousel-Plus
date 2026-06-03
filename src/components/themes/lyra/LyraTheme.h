@@ -8,11 +8,19 @@ class GfxRenderer;
 
 // Lyra theme metrics (zero runtime cost)
 namespace LyraMetrics {
+// CrumBLE: header compacted to match RecentBooksGridActivity's
+// kHeaderTopPadding=8 / kHeaderHeight=52 so Settings, Stats, File Browser,
+// the long-press book action menu, and the in-book menu all share the
+// same title-bar geometry as Bookshelf. Was topPadding=5 / headerHeight=84
+// (29 px taller). Net effect: every shared-header screen raises its
+// content area by ~29 px. The home screen uses metrics.topPadding +
+// metrics.homeTopPadding (not headerHeight) for its own header so only
+// shifts down by 3 px (the topPadding delta) -- absorbed.
 constexpr ThemeMetrics values = {.batteryWidth = 16,
                                  .batteryHeight = 12,
-                                 .topPadding = 5,
+                                 .topPadding = 8,
                                  .batteryBarHeight = 40,
-                                 .headerHeight = 84,
+                                 .headerHeight = 52,
                                  .verticalSpacing = 16,
                                  .contentSidePadding = 20,
                                  .listRowHeight = 36,

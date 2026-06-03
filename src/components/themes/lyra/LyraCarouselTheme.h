@@ -8,11 +8,14 @@ class GfxRenderer;
 
 // Lyra Carousel theme metrics (zero runtime cost)
 namespace LyraCarouselMetrics {
+// CrumBLE: header compacted to match Bookshelf -- see LyraTheme.h for
+// the full rationale. Mirrors topPadding=8 / headerHeight=52 across the
+// Lyra theme family.
 constexpr ThemeMetrics values = {.batteryWidth = 16,
                                  .batteryHeight = 12,
-                                 .topPadding = 5,
+                                 .topPadding = 8,
                                  .batteryBarHeight = 40,
-                                 .headerHeight = 84,
+                                 .headerHeight = 52,
                                  .verticalSpacing = 16,
                                  .contentSidePadding = 20,
                                  .listRowHeight = 35,

@@ -114,6 +114,14 @@ void LyraTheme::fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t
 }
 
 void LyraTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* title, const char* subtitle) const {
+  // CrumBLE: header internal layout matches RecentBooksGridActivity's
+  // drawGridHeader so every shared-header screen (Settings, Stats,
+  // FileBrowser, the long-press book action menu, the reader's in-book
+  // menu) has identical title/divider positioning to Bookshelf.
+  // Battery sits 2 px down from the rect top, title baseline 6 px below
+  // the battery icon, 2-px divider line at the rect bottom. With the
+  // matching LyraMetrics::values.headerHeight=52 / topPadding=8, the
+  // overall geometry is identical to Bookshelf.
   renderer.fillRect(rect.x, rect.y, rect.width, rect.height, false);
 
   const bool showBatteryPercentage =
@@ -121,7 +129,7 @@ void LyraTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* t
   // Position icon at right edge, drawBatteryRight will place text to the left
   const int batteryX = rect.x + rect.width - 12 - LyraMetrics::values.batteryWidth;
   drawBatteryRight(renderer,
-                   Rect{batteryX, rect.y + 5, LyraMetrics::values.batteryWidth, LyraMetrics::values.batteryHeight},
+                   Rect{batteryX, rect.y + 2, LyraMetrics::values.batteryWidth, LyraMetrics::values.batteryHeight},
                    showBatteryPercentage);
 
   int maxTitleWidth = title != nullptr ? renderer.getTextWidth(UI_12_FONT_ID, title, EpdFontFamily::BOLD) : 0;
@@ -146,20 +154,29 @@ void LyraTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* t
     }
   }
 
+  // Title sits just below the battery icon (rect.y + batteryHeight + 6),
+  // matching RecentBooksGridActivity's drawGridHeader. The 2-px divider
+  // line floats at the rect bottom. Always draw the divider so headers
+  // without a title (e.g. action-menu popups passing "") still get the
+  // visual separator above their content.
+  const int titleY = rect.y + LyraMetrics::values.batteryHeight + 6;
   if (title) {
     auto truncatedTitle = renderer.truncatedText(UI_12_FONT_ID, title, maxTitleWidth, EpdFontFamily::BOLD);
-    renderer.drawText(UI_12_FONT_ID, rect.x + LyraMetrics::values.contentSidePadding,
-                      rect.y + LyraMetrics::values.batteryBarHeight + 3, truncatedTitle.c_str(), true,
-                      EpdFontFamily::BOLD);
-    renderer.drawLine(rect.x, rect.y + rect.height - 3, rect.x + rect.width - 1, rect.y + rect.height - 3, 3, true);
+    renderer.drawText(UI_12_FONT_ID, rect.x + LyraMetrics::values.contentSidePadding, titleY,
+                      truncatedTitle.c_str(), true, EpdFontFamily::BOLD);
   }
+  renderer.drawLine(rect.x, rect.y + rect.height - 2, rect.x + rect.width - 1, rect.y + rect.height - 2, 2, true);
 
   if (subtitle) {
+    // Subtitle right-aligned on the SAME baseline as the title. Previous
+    // position (rect.y + 50) was tuned for the 84-px-tall header and
+    // would now collide with the divider line in the compact 52-px
+    // layout.
     auto truncatedSubtitle = renderer.truncatedText(SMALL_FONT_ID, subtitle, maxSubtitleWidth, EpdFontFamily::REGULAR);
     int truncatedSubtitleWidth = renderer.getTextWidth(SMALL_FONT_ID, truncatedSubtitle.c_str());
     renderer.drawText(SMALL_FONT_ID,
                       rect.x + rect.width - LyraMetrics::values.contentSidePadding - truncatedSubtitleWidth,
-                      rect.y + 50, truncatedSubtitle.c_str(), true);
+                      titleY, truncatedSubtitle.c_str(), true);
   }
 }
 

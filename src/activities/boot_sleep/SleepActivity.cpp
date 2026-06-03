@@ -580,6 +580,77 @@ bool selectRandomSleepImage(SleepImageMode /*mode*/, SleepImageSelection& select
   return true;
 }
 
+// Cycle through /.sleep/ in alphabetical order, picking by the persisted cursor
+// in SETTINGS.sleepScreenCycleIndex and advancing it. Returns false if the
+// directory is absent or empty so the caller falls through to pinned/random.
+bool selectCycleSleepImage(SleepImageSelection& selection) {
+  FsFile dir;
+  const char* sleepDir = nullptr;
+  if (!openPreferredSleepDirectory(dir, sleepDir)) {
+    LOG_INF("SLP", "Cycle: no sleep directory found");
+    return false;
+  }
+
+  std::vector<std::string> files;
+  files.reserve(16);
+  char name[500];
+  for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
+    if (file.isDirectory()) {
+      file.close();
+      continue;
+    }
+
+    file.getName(name, sizeof(name));
+    std::string filename(name);
+    if (filename.empty() || filename[0] == '.') {
+      file.close();
+      continue;
+    }
+
+    const bool isBmp = FsHelpers::hasBmpExtension(filename);
+    const bool isPng = FsHelpers::hasPngExtension(filename);
+    if (!isBmp && !isPng) {
+      file.close();
+      continue;
+    }
+
+    if (isBmp) {
+      Bitmap bitmap(file);
+      const BmpReaderError parseResult = bitmap.parseHeaders();
+      if (parseResult != BmpReaderError::Ok) {
+        LOG_ERR("SLP", "Skipping invalid BMP sleep image %s/%s: %s", sleepDir, filename.c_str(),
+                Bitmap::errorToString(parseResult));
+        file.close();
+        continue;
+      }
+    }
+
+    files.emplace_back(std::move(filename));
+    file.close();
+  }
+  dir.close();
+
+  if (files.empty()) {
+    LOG_INF("SLP", "Cycle: %s is empty (after BMP/PNG filter)", sleepDir);
+    return false;
+  }
+
+  std::sort(files.begin(), files.end());
+
+  const uint16_t fileCount = static_cast<uint16_t>(std::min(files.size(), static_cast<size_t>(UINT16_MAX)));
+  const uint16_t storedIndex = SETTINGS.sleepScreenCycleIndex;
+  const uint16_t idx = static_cast<uint16_t>(storedIndex % fileCount);
+  selection.path = std::string(sleepDir) + "/" + files[idx];
+  selection.isPng = FsHelpers::hasPngExtension(selection.path);
+
+  const uint16_t nextIndex = static_cast<uint16_t>((idx + 1) % fileCount);
+  SETTINGS.sleepScreenCycleIndex = nextIndex;
+  const bool saveOk = SETTINGS.saveToFile();
+  LOG_INF("SLP", "Cycle: count=%u stored=%u picked=%u next=%u save=%s file=%s", fileCount, storedIndex, idx, nextIndex,
+          saveOk ? "ok" : "DEFERRED", selection.path.c_str());
+  return true;
+}
+
 }  // namespace
 
 void SleepActivity::onEnter() {
@@ -642,8 +713,13 @@ void SleepActivity::onEnter() {
 
 void SleepActivity::renderCustomSleepScreen() const {
   SleepImageSelection selection;
-  if (selectPinnedSleepImage(SleepImageMode::Custom, selection) ||
-      selectRandomSleepImage(SleepImageMode::Custom, selection)) {
+  const bool alphabetical =
+      SETTINGS.sleepScreenOrder == CrossPointSettings::SLEEP_ORDER_ALPHABETICAL;
+  auto trySelectFallback = [&]() -> bool {
+    return alphabetical ? selectCycleSleepImage(selection)
+                        : selectRandomSleepImage(SleepImageMode::Custom, selection);
+  };
+  if (selectPinnedSleepImage(SleepImageMode::Custom, selection) || trySelectFallback()) {
     LOG_INF("SLP", "Loading custom sleep image: %s", selection.path.c_str());
     delay(100);
     if (selection.isPng) {
@@ -732,7 +808,11 @@ void SleepActivity::snapshotFramebufferForCycle() {
 
 void SleepActivity::cycleScreensaverFromDeepSleep(GfxRenderer& renderer) {
   SleepImageSelection selection;
-  if (!selectRandomSleepImage(SleepImageMode::Custom, selection)) {
+  const bool alphabetical =
+      SETTINGS.sleepScreenOrder == CrossPointSettings::SLEEP_ORDER_ALPHABETICAL;
+  const bool selected = alphabetical ? selectCycleSleepImage(selection)
+                                     : selectRandomSleepImage(SleepImageMode::Custom, selection);
+  if (!selected) {
     LOG_INF("SLP", "Cycle skipped: no sleep image available");
     return;
   }
@@ -888,17 +968,29 @@ void SleepActivity::composePngOverReaderPage(const std::string& pngPath) const {
 
   if (overlayPageBufferTrusted) {
     renderer.restoreBwBuffer();
-  } else if (canSnapshotOverlayBackground && restoreFramebufferFromCycleCache()) {
-    // Heap-light background: reuse the clean reader-page snapshot captured in
-    // onEnter() instead of re-rendering the page through the section cache. The
-    // re-render rebuilds the section cache on every sleep ("SCT: parameters do
-    // not match") and, on a long reading session, can exhaust the heap — which
-    // then left no room for the PNG decoder and froze the "Going to sleep"
-    // popup on screen. The snapshot is the exact page that was on screen, and
-    // is only written when we slept from a book (so sleeping from the home
-    // carousel still falls through to the clean white background below).
+  } else if (restoreFramebufferFromCycleCache()) {
+    // Reuse the persistent reader-page snapshot from
+    // /.crosspoint/last_reader_page.bin. The file is written both when we
+    // sleep from a reader (SleepActivity::onEnter) and when we exit a reader
+    // to Home (Activity::exitToHomeWithPopup), so a transparent PNG sleep
+    // image composes over the user's last book page even when they sleep
+    // from Home/Settings — not just when they sleep directly from the reader.
+    //
+    // History: 9f970dec gated this on canSnapshotOverlayBackground to avoid a
+    // "zoomed-in home screen" effect from the old renderSavedReaderPage()
+    // re-render path, which could pull stale content via APP_STATE.openEpubPath.
+    // The cache-based approach (introduced in f43693d6 alongside that gating
+    // "out of caution") has no such risk: the snapshot file is *only* written
+    // from reader contexts, never from Home/Settings, so its bytes are always
+    // a book page. Dropping the gate lets non-reader sleeps benefit from the
+    // last-known reader page as a backdrop.
+    //
+    // Heap-light: avoids the section-cache re-render that "SCT: parameters do
+    // not match" warned about on long reading sessions, which could leave no
+    // room for the PNG decoder and freeze the "Going to sleep" popup.
   } else {
-    // Not sleeping from a book (or no snapshot available): blank background.
+    // No snapshot ever written (e.g. fresh boot, no reader opened yet):
+    // blank background.
     renderer.clearScreen();
   }
 

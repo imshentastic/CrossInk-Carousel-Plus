@@ -487,6 +487,31 @@ CarouselCache gCarouselCache;
 static_assert(HomeActivity::kMaxCachedBooks >= LyraCarouselMetrics::values.homeRecentBooksCount,
               "kMaxCachedBooks must cover all carousel slots");
 
+// CrumBLE #120: cursor-recall state lives in static storage so it
+// outlives the per-transition HomeActivity instance (replaceActivity
+// destroys + recreates the activity on every home <-> other-activity
+// jump). See HomeActivity.h for the rationale.
+bool HomeActivity::hasSavedCursor_ = false;
+int HomeActivity::savedSelectorIndex_ = 0;
+int HomeActivity::savedLastCarouselBookIndex_ = 0;
+int HomeActivity::savedLastShelfBookIndex_ = 0;
+int HomeActivity::savedLastMenuIndex_ = 0;
+bool HomeActivity::savedShelfHeaderFocused_ = false;
+std::unordered_map<std::string, HomeActivity::ShelfPos> HomeActivity::savedShelfPosByCollection_;
+
+void HomeActivity::clearSavedCursor() {
+  // CrumBLE #120: hard reset, not just the flag, so a stale snapshot
+  // can't leak into a later restore if the flag ever gets flipped back
+  // on independently.
+  hasSavedCursor_ = false;
+  savedSelectorIndex_ = 0;
+  savedLastCarouselBookIndex_ = 0;
+  savedLastShelfBookIndex_ = 0;
+  savedLastMenuIndex_ = 0;
+  savedShelfHeaderFocused_ = false;
+  savedShelfPosByCollection_.clear();
+}
+
 int HomeActivity::getMenuItemCount() const {
   const auto& metrics = UITheme::getInstance().getMetrics();
   int count = 4;  // File Browser, Recents, File transfer, Settings
@@ -587,7 +612,8 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
     // been cleared at the time of failure (recent.json persisted "")
     // but, defense in depth: also short-circuit here so a re-derivation
     // anywhere upstream can't reanimate the retry loop.
-    if (CoverThumbStatus::isMarkedFailed(book.path)) {
+    if (CoverThumbStatus::isMarkedFailed(book.path, LyraCarouselTheme::kCenterThumbW,
+                                         LyraCarouselTheme::kCenterThumbH)) {
       progress++;
       continue;
     }
@@ -634,10 +660,20 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
                       ESP.getFreeHeap(), ESP.getMaxAllocHeap());
               updateRecentBookCoverPath(book, "");
               book.coverBmpPath = "";
-              CoverThumbStatus::markFailed(book.path);
+              if (centerMissing)
+                CoverThumbStatus::markFailed(book.path, LyraCarouselTheme::kCenterThumbW,
+                                             LyraCarouselTheme::kCenterThumbH);
+              if (sideMissing)
+                CoverThumbStatus::markFailed(book.path, LyraCarouselTheme::kSideCoverW,
+                                             LyraCarouselTheme::kSideCoverH);
             } else {
               bookUpdated[bookIdx] = true;
-              CoverThumbStatus::clearFailed(book.path);
+              if (centerMissing)
+                CoverThumbStatus::clearFailed(book.path, LyraCarouselTheme::kCenterThumbW,
+                                              LyraCarouselTheme::kCenterThumbH);
+              if (sideMissing)
+                CoverThumbStatus::clearFailed(book.path, LyraCarouselTheme::kSideCoverW,
+                                              LyraCarouselTheme::kSideCoverH);
             }
             coverRendered = false;
             requestUpdate();
@@ -659,10 +695,20 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
               if (!success) {
                 updateRecentBookCoverPath(book, "");
                 book.coverBmpPath = "";
-                CoverThumbStatus::markFailed(book.path);
+                if (centerMissing)
+                  CoverThumbStatus::markFailed(book.path, LyraCarouselTheme::kCenterThumbW,
+                                               LyraCarouselTheme::kCenterThumbH);
+                if (sideMissing)
+                  CoverThumbStatus::markFailed(book.path, LyraCarouselTheme::kSideCoverW,
+                                               LyraCarouselTheme::kSideCoverH);
               } else {
                 bookUpdated[bookIdx] = true;
-                CoverThumbStatus::clearFailed(book.path);
+                if (centerMissing)
+                  CoverThumbStatus::clearFailed(book.path, LyraCarouselTheme::kCenterThumbW,
+                                                LyraCarouselTheme::kCenterThumbH);
+                if (sideMissing)
+                  CoverThumbStatus::clearFailed(book.path, LyraCarouselTheme::kSideCoverW,
+                                                LyraCarouselTheme::kSideCoverH);
               }
               coverRendered = false;
               requestUpdate();
@@ -683,6 +729,13 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
               popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
             }
             GUI.fillPopupProgress(renderer, popupRect, 10 + progress * progressIncrement);
+            // W,H the gen attempt below will resolve to -- mirrored here so the
+            // per-size CoverThumbStatus marker matches the dims of the actual
+            // generateThumbBmp*() call (otherwise the marker is silently ignored).
+            const int thumbW = useMinimalThumb
+                                   ? minimalHomeCoverWidth(coverHeight)
+                                   : static_cast<int>((static_cast<int64_t>(coverHeight) * 3 + 2) / 5);
+            const int thumbH = useMinimalThumb ? minimalHomeCoverHeight(coverHeight) : coverHeight;
             bool success;
             if (useMinimalThumb) {
               // Minimal uses an ADAPTIVE thumbnail (contain unusual ratios),
@@ -697,7 +750,7 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
                 // a Loading popup + a second of SD I/O per visit. If a
                 // future build improves cache load, the user can clear
                 // /.crosspoint/<hash>/thumb_failed.marker manually.
-                CoverThumbStatus::markFailed(book.path);
+                CoverThumbStatus::markFailed(book.path, thumbW, thumbH);
                 coverRendered = false;
                 requestUpdate();
                 progress++;
@@ -717,10 +770,10 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
                       ESP.getFreeHeap(), ESP.getMaxAllocHeap());
               updateRecentBookCoverPath(book, "");
               book.coverBmpPath = "";
-              CoverThumbStatus::markFailed(book.path);
+              CoverThumbStatus::markFailed(book.path, thumbW, thumbH);
             } else {
               bookUpdated[bookIdx] = true;  // non-carousel path reuses same tracking
-              CoverThumbStatus::clearFailed(book.path);
+              CoverThumbStatus::clearFailed(book.path, thumbW, thumbH);
             }
             coverRendered = false;
             requestUpdate();
@@ -732,6 +785,11 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
                 popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
               }
               GUI.fillPopupProgress(renderer, popupRect, 10 + progress * progressIncrement);
+              // Mirror the W,H the gen attempt resolves to: Xtc::generateThumbBmp(h)
+              // derives width as static_cast<uint16_t>(h * 0.6).
+              const int thumbW = useMinimalThumb ? minimalHomeCoverWidth(coverHeight)
+                                                 : static_cast<int>(static_cast<uint16_t>(coverHeight * 0.6));
+              const int thumbH = useMinimalThumb ? minimalHomeCoverHeight(coverHeight) : coverHeight;
               const bool success =
                   useMinimalThumb ? xtc.generateThumbBmp(static_cast<uint16_t>(minimalHomeCoverWidth(coverHeight)),
                                                          static_cast<uint16_t>(minimalHomeCoverHeight(coverHeight)))
@@ -739,10 +797,10 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
               if (!success) {
                 updateRecentBookCoverPath(book, "");
                 book.coverBmpPath = "";
-                CoverThumbStatus::markFailed(book.path);
+                CoverThumbStatus::markFailed(book.path, thumbW, thumbH);
               } else {
                 bookUpdated[bookIdx] = true;
-                CoverThumbStatus::clearFailed(book.path);
+                CoverThumbStatus::clearFailed(book.path, thumbW, thumbH);
               }
               coverRendered = false;
               requestUpdate();
@@ -795,6 +853,82 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
         }
       }
       requestUpdate();
+    }
+  }
+
+  // CrumBLE #125: Flow path -- if any recent's BMP was just generated
+  // (the carousel branch above is LYRA_CAROUSEL-only; Flow lands here
+  // via the generic path at line ~738), re-bake the side-tile cache
+  // so the perspective fast-path picks up the new covers instead of
+  // staying on the slow drawPerspectiveBitmap fallback. Bounded to one
+  // tile-bake pass per loadRecentCovers invocation.
+  if (!isCarouselTheme &&
+      static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) == CrossPointSettings::UI_THEME::LYRA_FLOW) {
+    bool anyFlowUpdated = false;
+    for (size_t i = 0; i < bookUpdated.size(); ++i) {
+      if (bookUpdated[i]) {
+        anyFlowUpdated = true;
+        break;
+      }
+    }
+    if (anyFlowUpdated) {
+      static_cast<const LyraFlowTheme&>(GUI).prerenderCarouselSideTiles(renderer, recentBooks);
+      requestUpdate();
+    }
+  }
+
+  // CrumBLE #125: Reading Stats covers. The carousel/flow loop above only
+  // generates covers for the top homeRecentBooksCount books (Home's
+  // displayed range). But the Stats screen's L/R nav cycles through
+  // every book in RECENT_BOOKS (up to MAX_RECENT_BOOKS = 18 with
+  // sessionCount > 0) at the same dimensions Home uses (220x320 on
+  // Flow). Without this pass, books beyond the Home window render as
+  // blank-cover entries in Stats. Generate the missing thumbs here so
+  // Stats always has a cover -- bounded one-time cost per book (~100-
+  // 500 ms each on first hit). Subsequent home entries: pure
+  // Storage.exists() checks, near-instant. Failed books are tracked
+  // via CoverThumbStatus so we don't retry forever on undecodable
+  // covers.
+  if (!isMinimal) {
+    // Mirrors UITheme::getCoverThumbPath(coverBmpPath, coverHeight) and
+    // Epub::generateThumbBmpNoIndex(0, coverHeight) -- both derive W from H
+    // via (H*3+2)/5. For XTC we resolve the marker per-call below since
+    // generateThumbBmp(h) derives W via static_cast<uint16_t>(h*0.6) and
+    // can round to a different value at certain heights.
+    const int statsThumbWEpub = static_cast<int>((static_cast<int64_t>(coverHeight) * 3 + 2) / 5);
+    const auto& allRecents = RECENT_BOOKS.getBooks();
+    for (const RecentBook& sb : allRecents) {
+      if (sb.coverBmpPath.empty()) continue;
+      if (CoverThumbStatus::isMarkedFailed(sb.path, statsThumbWEpub, coverHeight)) continue;
+      const std::string thumbPath = UITheme::getCoverThumbPath(sb.coverBmpPath, coverHeight);
+      if (thumbPath.empty() || Storage.exists(thumbPath.c_str())) continue;
+      if (!Storage.exists(sb.path.c_str())) continue;  // book deleted from SD
+      // Memory guard before opening the EPUB/XTC -- generation is
+      // heap-heavy (decoder + zlib window).
+      if (!MemoryBudget::hasHeapForSeriesScan()) {
+        LOG_DBG("HOME", "Stats cover gen deferred: low heap (free=%u)", ESP.getFreeHeap());
+        break;
+      }
+      if (!showingLoading) {
+        showingLoading = true;
+        popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+      }
+      bool success = false;
+      int attemptedW = statsThumbWEpub;
+      if (FsHelpers::hasEpubExtension(sb.path)) {
+        Epub epub(sb.path, "/.crosspoint");
+        success = epub.generateThumbBmpNoIndex(0, coverHeight);
+      } else if (FsHelpers::hasXtcExtension(sb.path)) {
+        Xtc xtc(sb.path, "/.crosspoint");
+        attemptedW = static_cast<int>(static_cast<uint16_t>(coverHeight * 0.6));
+        if (xtc.load()) {
+          success = xtc.generateThumbBmp(coverHeight);
+        }
+      }
+      if (!success) {
+        LOG_DBG("HOME", "Stats cover gen failed: %s (free=%u)", sb.path.c_str(), ESP.getFreeHeap());
+        CoverThumbStatus::markFailed(sb.path, attemptedW, coverHeight);
+      }
     }
   }
 }
@@ -945,7 +1079,7 @@ void HomeActivity::loadShelfCovers(int cellWidth, int cellHeight, int scrollOffs
     // home visit to allow a single transient-failure retry). If gen has
     // been marked permanently failed for this book, render the
     // placeholder and don't even pay the existence-check below.
-    if (CoverThumbStatus::isMarkedFailed(bookPath)) {
+    if (CoverThumbStatus::isMarkedFailed(bookPath, cellWidth, cellHeight)) {
       processed++;
       continue;
     }
@@ -1036,13 +1170,13 @@ void HomeActivity::loadShelfCovers(int cellWidth, int cellHeight, int scrollOffs
       failedShelfCovers.push_back(bookPath);
       // Persist across boots so the next session's home doesn't repeat
       // the same Loading-popup flash for this book.
-      CoverThumbStatus::markFailed(bookPath);
+      CoverThumbStatus::markFailed(bookPath, cellWidth, cellHeight);
       LOG_ERR("HOME", "shelf: thumb generation failed for %s; rendering blank (won't retry)",
               bookPath.c_str());
     } else if (genSucceeded) {
       // Wipe the persistent marker on the rare cross-build "fixed cover"
       // case (decoder improved or user replaced the book file).
-      CoverThumbStatus::clearFailed(bookPath);
+      CoverThumbStatus::clearFailed(bookPath, cellWidth, cellHeight);
     }
     // Count this generation attempt toward the first-index cap (only enforced
     // while wasFreshFirstBoot(); harmless to increment otherwise).
@@ -1097,7 +1231,7 @@ const std::vector<std::string>& HomeActivity::cachedShelfPaths() {
   return shelfPathsCache;
 }
 
-std::string HomeActivity::getFocusedBookPath() const {
+std::string HomeActivity::getFocusedBookPath() {
   // Header focus is a separate row that isn't a "book" — long-press there
   // should NOT open an action menu (there's no book to act on).
   if (shelfHeaderFocused) {
@@ -1108,16 +1242,14 @@ std::string HomeActivity::getFocusedBookPath() const {
     return recentBooks[selectorIndex].path;
   }
   // Shelf range: only meaningful on the Flow theme. Indices sit between
-  // the carousel and the menu icon bar.
-  // BUG-FIX: previously used `active->bookPaths` directly, which is
-  // empty for virtual collections (Recently Added / All Books). Their
-  // book lists come from LibraryIndex via resolveBookPaths. Use that
-  // here so long-press on a shelf book works for ALL collections, not
-  // just user-managed ones.
+  // the carousel and the menu icon bar. Resolve via cachedShelfPaths()
+  // -- previous impl called CollectionsStore::resolveBookPaths each tick
+  // which re-sorted the full collection over LibraryIndex every press,
+  // showing as L/R/U/D lag on a 50-book All Books (#124).
   if (static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) == CrossPointSettings::UI_THEME::LYRA_FLOW) {
     const std::string& activeId = CollectionsStore::getInstance().getActiveId();
     if (!activeId.empty()) {
-      const std::vector<std::string> paths = CollectionsStore::getInstance().resolveBookPaths(activeId);
+      const std::vector<std::string>& paths = cachedShelfPaths();
       const int shelfStart = static_cast<int>(recentBooks.size());
       const int shelfCount = static_cast<int>(paths.size());
       if (static_cast<int>(selectorIndex) >= shelfStart &&
@@ -1224,6 +1356,20 @@ void HomeActivity::showHomeBookActionMenu(const std::string& bookPath) {
                   // Recents shrank — reload from the store so the
                   // carousel/shelf indices stay valid.
                   loadRecentBooks(UITheme::getInstance().getMetrics().homeRecentBooksCount);
+                  // CrumBLE #124: re-prime the per-book stats/progress cache
+                  // because the recentBooks vector just shifted -- otherwise
+                  // bookStatsCached[i] would reference stats from the OLD
+                  // book that used to occupy slot i.
+                  loadAllBookStats();
+                  // CrumBLE #125: same reason -- tile cache is keyed by
+                  // book path so the existing entries are still valid,
+                  // but the deleted/removed book's entry is now stale
+                  // (its file may be gone). Rebuild to match the new
+                  // recentBooks vector.
+                  if (static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) ==
+                      CrossPointSettings::UI_THEME::LYRA_FLOW) {
+                    static_cast<const LyraFlowTheme&>(GUI).prerenderCarouselSideTiles(renderer, recentBooks);
+                  }
                   if (selectorIndex >= recentBooks.size() + 1) {
                     selectorIndex = recentBooks.empty() ? 0 : static_cast<int>(recentBooks.size()) - 1;
                   }
@@ -1300,6 +1446,17 @@ void HomeActivity::showHomeBookActionMenu(const std::string& bookPath) {
               drawHomeToast(renderer, tr(STR_REMOVED_FROM_RECENT_BOOKS));
               delay(800);
               loadRecentBooks(UITheme::getInstance().getMetrics().homeRecentBooksCount);
+              // CrumBLE #124: re-prime the per-book stats/progress cache so
+              // the post-remove vector doesn't read stale stats out of slots
+              // that used to hold the removed book / its neighbors.
+              loadAllBookStats();
+              // CrumBLE #125: rebake the Flow side-tile cache. Removed
+              // book's entry would still render if cached, but a fresh
+              // build keeps the table tidy.
+              if (static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) ==
+                  CrossPointSettings::UI_THEME::LYRA_FLOW) {
+                static_cast<const LyraFlowTheme&>(GUI).prerenderCarouselSideTiles(renderer, recentBooks);
+              }
               if (selectorIndex >= recentBooks.size() + 1) {
                 selectorIndex = recentBooks.empty() ? 0 : static_cast<int>(recentBooks.size()) - 1;
               }
@@ -1335,8 +1492,9 @@ void HomeActivity::showHomeBookActionMenu(const std::string& bookPath) {
           case FileBrowserAction::DeleteCollection:
           case FileBrowserAction::CreateNewCollectionFromHeader:
           case FileBrowserAction::AddBooksToActiveCollection:
+          case FileBrowserAction::MakeCollectionFromFolder:
             // Not exposed in the home book menu — sleep-image / shelf-
-            // header-only actions.
+            // header / file-browser-folder-only actions.
             return;
         }
       });
@@ -1842,21 +2000,15 @@ void HomeActivity::onEnter() {
   const auto& metrics = UITheme::getInstance().getMetrics();
   loadRecentBooks(metrics.homeRecentBooksCount);
 
-  if (!APP_STATE.openEpubPath.empty()) {
-    for (int i = 0; i < static_cast<int>(recentBooks.size()); ++i) {
-      if (recentBooks[i].path == APP_STATE.openEpubPath) {
-        selectorIndex = i;
-        lastCarouselBookIndex = i;
-        break;
-      }
-    }
-  } else if (hasSavedCursor_) {
-    // Returning from a non-reader activity (settings, file browser,
-    // bookshelf grid, etc.) — restore where the cursor was. The shelf
-    // map is restored ahead of the index so the clamp / theme-specific
-    // bounds below see the correct collection state. Hard clamp the
-    // restored index against the current row sizes in case
-    // recentBooks/shelf membership shifted while we were elsewhere.
+  // CrumBLE #120: always restore "other row" memory from the saved
+  // cursor when we have one, regardless of which branch below sets
+  // selectorIndex. lastCarouselBookIndex / lastShelfBookIndex /
+  // lastMenuIndex / shelfPosByCollection / shelfHeaderFocused control
+  // where each ROW lands when the user navigates back into it — they
+  // should track the user's last position even when the activity
+  // explicitly drops the cursor on a specific icon (initialMenuItem)
+  // or on the just-read book (openEpubPath).
+  if (hasSavedCursor_) {
     shelfPosByCollection = savedShelfPosByCollection_;
     lastCarouselBookIndex = std::clamp(
         savedLastCarouselBookIndex_, 0,
@@ -1864,26 +2016,77 @@ void HomeActivity::onEnter() {
     lastShelfBookIndex = std::max(0, savedLastShelfBookIndex_);
     lastMenuIndex = std::max(0, savedLastMenuIndex_);
     shelfHeaderFocused = savedShelfHeaderFocused_;
-    // selectorIndex bounds are theme-dependent and finalised below the
-    // initialMenuItem block; use the saved value here and let the
-    // standard render-prep clamp it on the first render.
-    selectorIndex = std::max(0, savedSelectorIndex_);
   }
 
   globalStats = GlobalReadingStats::load();
-  if (isCarouselTheme) {
-    loadAllBookStats();
+  // CrumBLE #124: pre-load stats/progress for ALL themes that show recent
+  // books in any focusable row, not just Carousel. Flow's carousel pulls
+  // from the same `recentBooks` vector but used to skip this pre-load —
+  // meaning every L/R press on the Flow carousel did 2 SD reads inside
+  // updateHighlightedBookContext (loadRecentBookStats + RecentBookProgress::
+  // loadPercent), perceived as input latency. Doing it once at onEnter is
+  // a few-ms one-time cost; per-press goes from 2 SD reads to a cache hit.
+  // No-op on themes whose recentBooks is empty (e.g. minimal theme).
+  loadAllBookStats();
+  // CrumBLE #125: pre-bake the 4 perspective side-cover tiles for the
+  // Flow carousel. ~24 KB tile cache; one-time SD load + perspective
+  // walk per book per side AT entry, so the per-press carousel L/R
+  // path becomes a pure 1bpp blit. No-op on non-Flow themes.
+  if (static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) == CrossPointSettings::UI_THEME::LYRA_FLOW) {
+    static_cast<const LyraFlowTheme&>(GUI).prerenderCarouselSideTiles(renderer, recentBooks);
   }
   updateHighlightedBookContext();
 
+  // CrumBLE #120: pick selectorIndex by priority:
+  //   (1) initialMenuItem — caller (e.g. ActivityManager::goHome from a
+  //       known menu activity like Bookshelf / Settings / FileBrowser)
+  //       explicitly wants us on a specific icon. Highest priority.
+  //   (2) hasSavedCursor_ — returning from an activity that didn't pass
+  //       an initialMenuItem (popped overlays etc.). ReaderActivity::
+  //       onEnter clears the saved cursor explicitly so reader -> Home
+  //       falls through to (3) and the just-read book gets highlighted.
+  //   (3) APP_STATE.openEpubPath — just-exited reader (cleared cursor
+  //       above) or cold boot; land on the open book in the carousel.
+  //   (4) Default selectorIndex = 0 from the row above.
+  //
+  // Before this restructure, the openEpubPath branch ran first and
+  // always-wins-when-set was the bug — openEpubPath persists across
+  // home visits once a book has been read, so every return from
+  // Bookshelf landed on the prior-read book instead of the Bookshelf
+  // icon. See clearSavedCursor() for the matching reader-side hook.
   if (initialMenuItem != HomeMenuItem::NONE) {
     const bool includeContinueReading = metrics.homeContinueReadingInMenu && !recentBooks.empty();
     const auto menuItems =
         buildSelectableHomeMenuItems(hasOpdsServers, hasReadingStats, hasBookmarks, includeContinueReading);
     const int menuIndex = findMenuActionIndex(menuItems, homeActionForInitialMenuItem(initialMenuItem));
     if (menuIndex >= 0) {
-      selectorIndex = getHomeMenuSelectionOffset(recentBooks) + menuIndex;
+      // CrumBLE #120: on Flow theme the menu icons sit AFTER both the
+      // carousel AND the shelf (selectorIndex = bookCount + shelfCount
+      // + menuIdx). getHomeMenuSelectionOffset only contributes the
+      // bookCount portion — we have to add shelfBookCount here too or
+      // the cursor lands on a shelf book at index `menuIdx`.
+      int shelfBookCount = 0;
+      if (static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) == CrossPointSettings::UI_THEME::LYRA_FLOW) {
+        if (CollectionsStore::getInstance().getActiveCollection() != nullptr) {
+          shelfBookCount = static_cast<int>(cachedShelfPaths().size());
+        }
+      }
+      selectorIndex = getHomeMenuSelectionOffset(recentBooks) + shelfBookCount + menuIndex;
       updateHighlightedBookContext();
+    }
+  } else if (hasSavedCursor_) {
+    // selectorIndex bounds are theme-dependent; use the saved value and
+    // let the standard render-prep clamp it on the first render.
+    selectorIndex = std::max(0, savedSelectorIndex_);
+    updateHighlightedBookContext();
+  } else if (!APP_STATE.openEpubPath.empty()) {
+    for (int i = 0; i < static_cast<int>(recentBooks.size()); ++i) {
+      if (recentBooks[i].path == APP_STATE.openEpubPath) {
+        selectorIndex = i;
+        lastCarouselBookIndex = i;
+        updateHighlightedBookContext();
+        break;
+      }
     }
   }
 
@@ -1952,15 +2155,25 @@ void HomeActivity::onExit() {
   freeCarouselFrames();
   carouselWarmupPending = false;
 
-  // CrumBLE Phase A perf: the in-RAM cover-bitmap cache only reconciles
-  // its budget on cache misses, so leaving Home → Reader → Menu →
-  // Bluetooth (zero cache lookups) can leave ~50 KB of cover bitmaps
-  // pinned indefinitely. NimBLE then can't claim its ~58 KB block at
-  // BT enable, the first text-page render starves the FontDecompressor
-  // (3-4 KB page-buffer alloc fails), supervision-timeout disconnects
-  // fire. Drop the cache here so heap is restored before any heavier
-  // activity loads. Cache is rebuilt cheaply on the next Home visit.
-  renderer.clearImageCache();
+  // CrumBLE #125: drop the pre-baked Flow carousel side-cover tiles
+  // (~24 KB) so the reader's heap envelope isn't squeezed by carousel
+  // state we're done with. Rebuilt on next home onEnter.
+  if (static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) == CrossPointSettings::UI_THEME::LYRA_FLOW) {
+    static_cast<const LyraFlowTheme&>(GUI).clearCarouselSideTiles();
+  }
+
+  // CrumBLE #131: pre-shrink the in-RAM cover-bitmap cache only IF
+  // heap is currently under pressure. Was renderer.clearImageCache()
+  // which dumped every cached cover unconditionally -- that made
+  // Home → Bookshelf transitions slow (~300 ms cold) because the grid
+  // had to re-read all 9 thumb BMPs from SD when the home carousel had
+  // just had them in RAM. Reconcile shrinks the cache only when free
+  // heap demands it (e.g. NimBLE has eaten ~58 KB), so the common
+  // non-BLE transitions keep the cache warm. The BLE concern the
+  // original clear was added for is handled by the natural eviction-
+  // on-insert path: when reader-side allocations trigger
+  // lookupCachedBitmap, reconcile runs and evicts if heap is tight.
+  renderer.reconcileImageCacheBudgetExt();
 }
 
 bool HomeActivity::storeCoverBuffer() {
@@ -3032,16 +3245,31 @@ void HomeActivity::updateFocusedBookMeta(const std::string& path) {
   const std::string fname = (slash != std::string::npos) ? path.substr(slash + 1) : path;
   // Read the cached metadata only (buildIfMissing=false): cheap, and leaves the
   // title blank for un-indexed books so the caller falls back to the filename.
+  // Strip trailing ";"/whitespace from author -- some EPUBs leave a
+  // separator without a value, which without this trim renders as a
+  // dangling ";" on the carousel/shelf. Local helper inline to avoid
+  // pulling RecentBooksGridActivity's namespace.
+  const auto trimAuthor = [](std::string s) -> std::string {
+    while (!s.empty()) {
+      const char c = s.back();
+      if (c == ' ' || c == '\t' || c == ';' || c == ',' || c == '\r' || c == '\n') s.pop_back();
+      else break;
+    }
+    size_t i = 0;
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == ';' || s[i] == '\r' || s[i] == '\n')) ++i;
+    if (i > 0) s.erase(0, i);
+    return s;
+  };
   if (FsHelpers::hasEpubExtension(fname)) {
     Epub epub(path, "/.crosspoint");
     epub.load(/*buildIfMissing=*/false, /*skipLoadingCss=*/true);
     focusedMetaTitle = epub.getTitle();
-    focusedMetaAuthor = epub.getAuthor();
+    focusedMetaAuthor = trimAuthor(epub.getAuthor());
   } else if (FsHelpers::hasXtcExtension(fname)) {
     Xtc xtc(path, "/.crosspoint");
     if (xtc.load()) {
       focusedMetaTitle = xtc.getTitle();
-      focusedMetaAuthor = xtc.getAuthor();
+      focusedMetaAuthor = trimAuthor(xtc.getAuthor());
     }
   }
   // .txt / .md have no embedded metadata — leave title empty (filename fallback).
@@ -3201,14 +3429,30 @@ void HomeActivity::render(RenderLock&&) {
                           : std::function<bool()>(std::bind(&HomeActivity::storeCoverBuffer, this));
 
   // Carousel cover-load skip fast-path. When the buffer restore brought
-  // back the previous frame's carousel pixels AND the current carousel
-  // center hint matches the one that was painted into the buffer, the
-  // theme can skip its 5 BMP loads. Saves ~80% of drawRecentBookCover's
-  // cost on every "L/R within shelf/menu" type input — those don't
-  // change the carousel but currently force it to repaint anyway.
+  // back the previous frame's carousel pixels AND the actual center book
+  // matches the one that was painted into the buffer, the theme can skip
+  // its 5 BMP loads. Saves ~80% of drawRecentBookCover's cost on every
+  // "L/R within shelf/menu" type input — those don't change the carousel
+  // but currently force it to repaint anyway.
+  //
+  // CrumBLE #125: previously this compared the ENCODED coverSelectorIndex
+  // — which flips between `selectorIndex` and `(bookCount + lastCarousel
+  // BookIndex)` when focus enters/leaves the carousel (flowCarouselHold).
+  // That made the Down-from-carousel transition a guaranteed cache miss
+  // even though the center book didn't actually change, forcing a full
+  // 5-cover repaint just to remove the selection border. Decode here so
+  // the comparison sees the real center idx; the theme now reconciles
+  // the selection border separately within its skip path.
   if (isLyraFlowForRender) {
+    int effectiveCenterIdx = 0;
+    if (flowCarouselHold) {
+      effectiveCenterIdx =
+          (lastCarouselBookIndex >= 0 && lastCarouselBookIndex < bookCountForRender) ? lastCarouselBookIndex : 0;
+    } else if (selectorIndex >= 0 && selectorIndex < bookCountForRender) {
+      effectiveCenterIdx = selectorIndex;
+    }
     const bool canSkipCovers =
-        bufferRestored && lastRenderedCoverSelectorValid && coverSelectorIndex == lastRenderedCoverSelectorIdx;
+        bufferRestored && lastRenderedCoverSelectorValid && effectiveCenterIdx == lastRenderedCoverSelectorIdx;
     // skipCarouselCoverLoads is declared `mutable` precisely to allow
     // a single-flight assignment through the const theme reference.
     static_cast<const LyraFlowTheme&>(GUI).skipCarouselCoverLoads = canSkipCovers;
@@ -3226,8 +3470,19 @@ void HomeActivity::render(RenderLock&&) {
                           storer,
                           hasAnyBookStats(currentBookStats) ? &currentBookStats : nullptr, currentBookProgressPercent);
   // Remember what we just painted so the next render can short-circuit.
+  // CrumBLE #125: store the DECODED center idx (not the encoded
+  // coverSelectorIndex) so the next render's comparison correctly hits
+  // across the flowCarouselHold transition. Mirrors the decode block
+  // that computes `effectiveCenterIdx` for canSkipCovers above.
   if (isLyraFlowForRender) {
-    lastRenderedCoverSelectorIdx = coverSelectorIndex;
+    int effectiveCenterIdx = 0;
+    if (flowCarouselHold) {
+      effectiveCenterIdx =
+          (lastCarouselBookIndex >= 0 && lastCarouselBookIndex < bookCountForRender) ? lastCarouselBookIndex : 0;
+    } else if (selectorIndex >= 0 && selectorIndex < bookCountForRender) {
+      effectiveCenterIdx = selectorIndex;
+    }
+    lastRenderedCoverSelectorIdx = effectiveCenterIdx;
     lastRenderedCoverSelectorValid = true;
   }
 
@@ -3317,6 +3572,18 @@ void HomeActivity::render(RenderLock&&) {
         shelfScrollOffset == shelfSnapshotScrollOffset && shelfSelectedSpine == shelfSnapshotFocusedSpine &&
         shelfHeaderFocused == shelfSnapshotHeaderFocused;
 
+    // CrumBLE #125: focus-only diff -- same shelf state except the
+    // focused-cell index changed. This is the dominant case for shelf
+    // L/R navigation within a single page. We can take the partial-
+    // repaint fast path (erase prev ring + redraw shadow it overlapped,
+    // draw new ring, refresh title text strip) instead of the full
+    // 4-cell repaint.
+    const bool shelfFocusOnlyDiff = !shelfStateMatchesSnapshot && bufferRestored && shelfSnapshotValid &&
+                                    currentShelfActiveId == shelfSnapshotActiveId &&
+                                    shelfScrollOffset == shelfSnapshotScrollOffset &&
+                                    shelfHeaderFocused == shelfSnapshotHeaderFocused &&
+                                    shelfSelectedSpine != shelfSnapshotFocusedSpine;
+
     // Position the strip slightly below the geometric midpoint of the empty
     // band between cover tile bottom (~y=401) and icon-bar label top (~y=686).
     // Re-tuned in iter 5 to make room for the focused-book title under the
@@ -3378,8 +3645,11 @@ void HomeActivity::render(RenderLock&&) {
     // Build the parallel per-cell series-member-count vector so the
     // theme knows which cells deserve the spine glyph. One int per
     // ShelfEntry; 1 = single book, ≥2 = series group.
+    // CrumBLE #125: also needed on the focus-only path so the partial
+    // repaint knows whether to restore the dark series spine that the
+    // erased ring stroke overlapped with on the previously focused cell.
     std::vector<int> seriesMemberCounts;
-    if (activeCollection2 != nullptr && !shelfStateMatchesSnapshot) {
+    if (activeCollection2 != nullptr && (!shelfStateMatchesSnapshot || shelfFocusOnlyDiff)) {
       const std::vector<ShelfEntry>& entries = cachedShelfEntries();
       seriesMemberCounts.reserve(entries.size());
       for (const auto& e : entries) seriesMemberCounts.push_back(static_cast<int>(e.memberPaths.size()));
@@ -3392,32 +3662,86 @@ void HomeActivity::render(RenderLock&&) {
     // placeholders. Books whose thumb wasn't generated (or whose generation
     // failed in loadShelfCovers) get an empty string so the renderer draws
     // the placeholder card instead of trying to open a non-existent file.
+    //
+    // CrumBLE #124: only resolve cover paths for the VISIBLE window.
+    // drawBookshelfStrip only reads indices [scrollOffset, scrollOffset +
+    // actualDrawn) — a 4-book window for the 1-row layout — but this loop
+    // used to walk every entry in the collection. With "All Books" active
+    // (100+ entries), that was 100 Epub/Xtc constructions + 100
+    // Storage.exists() SD-stat calls per render, on a hot path that fires
+    // on every shelf-row L/R press. Now it scales with the on-screen cell
+    // count instead of the collection size. The full-sized vector with
+    // empty slots outside the window keeps the theme's `coverPaths[spineIdx]`
+    // indexing valid (empty string => placeholder card, but those cells
+    // are off-screen anyway so the theme never draws them).
+    // CrumBLE #125: on the focus-only fast path we don't need cover
+    // paths -- the cells (including their cover bitmaps) are already on
+    // screen from the framebuffer restore. Skip the resolution loop
+    // entirely. Same for the full-snapshot-match case.
     std::vector<std::string> shelfCoverPaths;
-    if (activeCollection2 != nullptr && !shelfStateMatchesSnapshot) {
+    // CrumBLE: per-cell titles for the theme's placeholder fallback.
+    // Filled with the series name for series cells, otherwise the
+    // filename (no metadata lookup -- the focused-cell branch above
+    // is the only place we pay for metadata resolution). Empty entries
+    // outside the visible window leave the theme on its CoverIcon
+    // fallback for those cells (which never render anyway since the
+    // theme loops only over the visible page).
+    std::vector<std::string> shelfCellTitles;
+    if (activeCollection2 != nullptr && !shelfStateMatchesSnapshot && !shelfFocusOnlyDiff) {
       const std::vector<std::string>& renderPaths = cachedShelfPaths();
-      shelfCoverPaths.reserve(renderPaths.size());
-      for (const auto& path : renderPaths) {
+      const std::vector<ShelfEntry>& entries = cachedShelfEntries();
+      const int total = static_cast<int>(renderPaths.size());
+      shelfCoverPaths.assign(total, std::string{});
+      shelfCellTitles.assign(total, std::string{});
+      const int winStart = std::clamp(shelfScrollOffset, 0, total);
+      const int winEnd = std::min(winStart + shelfVisibleCells, total);
+      for (int i = winStart; i < winEnd; ++i) {
+        const std::string& path = renderPaths[i];
         std::string templatePath;
         if (FsHelpers::hasEpubExtension(path)) {
           templatePath = Epub(path, "/.crosspoint").getThumbBmpPath();
         } else if (FsHelpers::hasXtcExtension(path)) {
           templatePath = Xtc(path, "/.crosspoint").getThumbBmpPath();
         }
-        std::string resolved;
         if (!templatePath.empty()) {
-          resolved = UITheme::getCoverThumbPath(templatePath, kShelfCellWidth, kShelfCellHeight);
-          if (!resolved.empty() && !Storage.exists(resolved.c_str())) {
-            resolved.clear();
+          std::string resolved = UITheme::getCoverThumbPath(templatePath, kShelfCellWidth, kShelfCellHeight);
+          if (!resolved.empty() && Storage.exists(resolved.c_str())) {
+            shelfCoverPaths[i] = std::move(resolved);
           }
         }
-        shelfCoverPaths.push_back(std::move(resolved));
+        // Title fallback: series name for series cells, else filename.
+        if (i < static_cast<int>(entries.size())) {
+          const ShelfEntry& e = entries[i];
+          if (!e.seriesName.empty() && e.memberPaths.size() >= 2) {
+            shelfCellTitles[i] = e.seriesName;
+          } else {
+            const size_t slash = path.find_last_of('/');
+            std::string fname = (slash != std::string::npos) ? path.substr(slash + 1) : path;
+            const size_t dot = fname.find_last_of('.');
+            if (dot != std::string::npos && dot > 0) fname = fname.substr(0, dot);
+            shelfCellTitles[i] = std::move(fname);
+          }
+        }
       }
     }
-    if (!shelfStateMatchesSnapshot) {
+    if (shelfFocusOnlyDiff) {
+      // CrumBLE #125: focus moved within the same page. Patch the two
+      // affected cells' ring + title band; skip the full cell-by-cell
+      // repaint loop in drawBookshelfStrip.
+      const int bookCountForFocus =
+          (activeCollection2 != nullptr) ? static_cast<int>(cachedShelfEntries().size()) : 0;
+      static_cast<const LyraFlowTheme&>(GUI).drawBookshelfStripFocusUpdate(
+          renderer, shelfRect, shelfSnapshotFocusedSpine, shelfSelectedSpine, shelfScrollOffset, bookCountForFocus,
+          focusedTitle, &seriesMemberCounts, shelfRowCount);
+      // Only the focused-spine slot of the snapshot needs to advance;
+      // everything else (activeId, scroll, header focus) is unchanged
+      // by the focus diff.
+      shelfSnapshotFocusedSpine = shelfSelectedSpine;
+    } else if (!shelfStateMatchesSnapshot) {
       static_cast<const LyraFlowTheme&>(GUI).drawBookshelfStrip(
           renderer, shelfRect, collectionName, shelfCoverPaths, shelfSelectedSpine, shelfScrollOffset,
           shelfHeaderFocused, hasMultipleCollections, focusedTitle, &seriesMemberCounts, focusedAuthor,
-          shelfRowCount);
+          shelfRowCount, &shelfCellTitles);
       // Remember the state of the shelf we just painted so the next
       // render can short-circuit if nothing about it has changed.
       shelfSnapshotActiveId = currentShelfActiveId;

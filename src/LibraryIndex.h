@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // CrumBLE — persistent index of every book file the device has seen on
@@ -11,11 +12,24 @@
 // walk only needs to happen once (initial discovery) plus on explicit
 // rescan; subsequent boots load the cached index in milliseconds.
 //
-// Memory shape: ~80 bytes per entry (path string + uint64). 500-book
-// library ≈ 40 KB — well within budget on the ESP32-C3.
+// Memory shape: paths are pooled into a single contiguous std::vector<char>
+// (null-terminated, back-to-back) and each LibraryEntry holds an offset
+// into it. Two reasons over the original "std::string per entry":
+//   1. N separate small heap allocs scatter the heap; the freed slots
+//      don't always coalesce into a contiguous block. File-transfer's
+//      WiFi stack needs 8-16 KB contiguous chunks and stalls when the
+//      heap is fragmented even though total free is healthy.
+//   2. releaseMemory() on a pool returns ONE large hole, not N scattered
+//      holes. Reclaim is clean.
+// 500-book library at ~120 chars/path ≈ 60 KB pool + 16 KB entry vector,
+// still within budget on the ESP32-C3.
 
 struct LibraryEntry {
-  std::string path;
+  // Offset into LibraryIndex::pathPool of this entry's null-terminated path.
+  // The pool's contents are stable for the lifetime of one rescan/load;
+  // rescan rebuilds it atomically. Use LibraryIndex::pathOf() to
+  // dereference -- never index the pool directly from outside the class.
+  uint32_t pathOffset = 0;
   // Sort key for "Recently Added" / "Date Added" (DESC = newest first). Despite
   // the legacy name, this is a persistent monotonic "first seen by the device"
   // counter, NOT a wall-clock time: millis() resets each boot, and file
@@ -31,6 +45,11 @@ struct LibraryEntry {
 class LibraryIndex {
   static LibraryIndex instance;
   std::vector<LibraryEntry> entries;
+  // Single contiguous backing buffer for every entry's path. Paths are
+  // appended back-to-back, each null-terminated. Indexed via
+  // entries[i].pathOffset. Stable for the lifetime of one load/rescan;
+  // mutating operations rebuild the pool wholesale.
+  std::vector<char> pathPool;
   bool jsonLoaded = false;  // /.crosspoint/library_index.json has been read
   bool walkPerformed = false;  // an SD walk has run this session (refresh or initial)
   bool freshFirstBoot = false;  // begin() ran with no index file on SD — used to gate welcome UI
@@ -68,15 +87,17 @@ class LibraryIndex {
   // next virtual-collection access) so onExit stays snappy.
   void markStale() { walkPerformed = false; }
 
-  // CrumBLE: free the in-RAM entry vector to reclaim heap. The index can be
-  // tens of KB for a large library (~80 bytes/entry), which is dead weight
-  // while the WiFi web server runs — file transfer is desperately heap-bound
-  // (~25 KB free), so releasing it here roughly doubles available headroom.
-  // The next ensureWalked()/begin() repopulates it from the on-disk JSON plus
-  // an SD walk; web-server exit paths already markStale() so the rebuild is
+  // CrumBLE: free both the entry vector AND the path pool to reclaim heap.
+  // The path pool is the persistent state; releasing it returns one large
+  // contiguous hole (instead of N scattered std::string holes the original
+  // implementation produced). The pool-shape change is what made
+  // file-transfer + WiFi reliably get its 8-16 KB contiguous allocs.
+  // Next ensureWalked()/begin() repopulates from the on-disk JSON plus an
+  // SD walk; web-server exit paths already markStale() so the rebuild is
   // automatic. Only call when nothing is actively reading the index.
   void releaseMemory() {
-    std::vector<LibraryEntry>().swap(entries);  // free capacity, not just size
+    std::vector<LibraryEntry>().swap(entries);
+    std::vector<char>().swap(pathPool);
     jsonLoaded = false;
     walkPerformed = false;
   }
@@ -99,6 +120,15 @@ class LibraryIndex {
   // refresh callers can drop the entry directly.
   void forgetPath(const std::string& path);
 
+  // Static helper: collect every book-file path under `dirPath` using the
+  // same recursive walker and extension filter as the library scan
+  // (.epub / .xtc / .txt / .md / .markdown, max 8 levels deep, skips
+  // dot-prefixed entries and the XTcache folder). Does NOT modify the
+  // index — pure read. Used by the file browser's "Make collection from
+  // folder" action so callers can act on a subtree without rescanning
+  // the whole SD.
+  static std::vector<std::string> collectBookPaths(const std::string& dirPath);
+
  private:
   bool loadFromFile();
   bool saveToFile() const;
@@ -111,4 +141,13 @@ class LibraryIndex {
   // True if the file extension marks it as one of our supported book
   // formats (.epub / .xtc / .txt / .md / .markdown).
   static bool isBookPath(const std::string& path);
+
+  // Internal helpers for working with the pooled paths.
+  const char* pathOf(const LibraryEntry& e) const { return pathPool.data() + e.pathOffset; }
+  std::string_view pathViewOf(const LibraryEntry& e) const { return std::string_view{pathOf(e)}; }
+  // Append `path` (no null terminator required) into pathPool with a
+  // trailing '\0'. Returns the offset where the path's first byte landed.
+  // The pool may reallocate; callers must not hold raw c_str() / pathOf()
+  // pointers across calls to appendPath().
+  uint32_t appendPath(std::string_view path);
 };

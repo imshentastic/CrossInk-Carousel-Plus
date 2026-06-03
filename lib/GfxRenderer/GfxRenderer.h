@@ -371,6 +371,12 @@ class GfxRenderer {
   // active book / library has changed enough that the cache contents are
   // stale, or as a low-heap escape hatch.
   void clearImageCache() const;
+  // CrumBLE #131: expose budget reconciliation publicly so HomeActivity
+  // (and other activities) can pre-shrink the cache on transition
+  // without nuking it. The cache is normally reconciled only on insert
+  // (lookupCachedBitmap path); explicit reconciliation lets activities
+  // that anticipate heap pressure shrink the cache proactively.
+  void reconcileImageCacheBudgetExt() const { reconcileImageCacheBudget(); }
   // Returns the current budget (post-reconciliation if you've called
   // anything that triggers it). Diagnostic; not for sizing decisions.
   size_t getImageCacheBudget() const { return imageCacheBudget_; }
@@ -385,6 +391,28 @@ class GfxRenderer {
   // no readNextRow). Used by Flow's carousel side covers so L/R
   // navigation hits RAM for previously-seen books.
   void drawPerspectiveBitmap(CachedBitmap* handle, int x, int y, int w, int hL, int hR) const;
+
+  // CrumBLE #125: render the perspective-warped bitmap into a user-supplied
+  // 1bpp packed buffer instead of the framebuffer. Mirrors the cached
+  // overload's geometry exactly so a tile baked here renders identically
+  // when blitted back via drawPacked1bpp at the same (w, hL, hR). Used by
+  // LyraFlowTheme to pre-bake the 4 side covers of the Flow carousel
+  // once at home-entry — every subsequent carousel L/R press then blits
+  // those 1bpp tiles instead of re-walking ~70k source pixels per cover.
+  //
+  // `dst` must be at least ((w + 7) / 8) * max(hL, hR) bytes. The buffer
+  // is NOT pre-cleared by this function (only set-bits are written via
+  // OR), so the caller must zero-fill before the first render of a tile.
+  // Output is always BW: any source pixel value < 3 (non-pure-white) sets
+  // the corresponding bit. Independent of the renderer's renderMode.
+  void renderPerspectiveBitmapToPacked1bpp(CachedBitmap* handle, int w, int hL, int hR, uint8_t* dst) const;
+
+  // CrumBLE #125: blit a 1bpp packed buffer (MSB-first per byte) to the
+  // framebuffer. `srcStride` is the byte count per source row. Each set
+  // bit becomes a drawPixel write at the offset (x + col, y + row); 0
+  // bits are skipped (transparent overlay). Used together with
+  // renderPerspectiveBitmapToPacked1bpp to consume the tile cache.
+  void drawPacked1bpp(const uint8_t* src, int srcStride, int x, int y, int w, int h, bool state = true) const;
   void fillPolygon(const int* xPoints, const int* yPoints, int numPoints, bool state = true) const;
 
   // Text

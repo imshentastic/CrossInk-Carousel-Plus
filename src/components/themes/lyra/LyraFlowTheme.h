@@ -1,8 +1,12 @@
 #pragma once
 
+#include <memory>
+#include <unordered_map>
+
 #include "components/themes/lyra/LyraTheme.h"
 
 class GfxRenderer;
+struct RecentBook;
 
 // Flow ("iPod-style") carousel theme. Inherits LyraTheme wholesale and only
 // overrides the home-screen recent-book carousel. Ported from the Lua-fork
@@ -86,7 +90,34 @@ class LyraFlowTheme : public LyraTheme {
                           // (default), 2 = two rows of 6 smaller covers (12 per page).
                           // HomeActivity picks per the active collection's
                           // twoRowShelf flag.
-                          int rowCount = 1) const;
+                          int rowCount = 1,
+                          // CrumBLE: per-cell titles used as placeholder content
+                          // when the cover bitmap is missing or fails to load.
+                          // Same length as coverPaths -- nullptr or empty entries
+                          // fall back to the small cover icon. Mirrors the
+                          // Bookshelf grid and carousel placeholder styles so
+                          // un-thumbnailed books read as intentional cards with
+                          // the title showing.
+                          const std::vector<std::string>* cellTitles = nullptr) const;
+
+  // CrumBLE #125: focus-only partial repaint for the shelf strip. When
+  // the only state change between renders is the focused cell index
+  // (same active collection, same scroll offset, same header focus),
+  // HomeActivity calls this instead of drawBookshelfStrip to skip the
+  // full per-cell repaint loop. Touches only the strokes of two focus
+  // rings (erase on previously focused cell, draw on newly focused
+  // cell) + repaints the shadow chunks the old ring overlapped + the
+  // focused-book title strip below the cells. Cost: a handful of small
+  // fill calls vs. ~4 cell blits + the title strip — observable
+  // navigation feel parity with the icon bar.
+  //
+  // `seriesMemberCounts` is needed only to detect whether the
+  // previously-focused cell was a series cell (so the dark series
+  // spine that the left ring stroke overlapped is restored). Pass the
+  // same vector that was passed to the prior drawBookshelfStrip call.
+  void drawBookshelfStripFocusUpdate(GfxRenderer& renderer, Rect rect, int prevFocusedSpine, int newFocusedSpine,
+                                     int scrollOffset, int bookCount, const char* focusedBookTitle,
+                                     const std::vector<int>* seriesMemberCounts, int rowCount = 1) const;
 
   // CrumBLE: layout constants exposed for HomeActivity's path-window /
   // scroll math. Pass rowCount=1 for the legacy 4x1 layout, =2 for 5x2.
@@ -106,6 +137,24 @@ class LyraFlowTheme : public LyraTheme {
     bool drawShadows;
   };
   static ShelfLayout shelfLayoutFor(int rowCount);
+
+  // CrumBLE #125: pre-bake the 4 perspective side-cover tiles for every
+  // book in `recentBooks` once at home-entry. drawStackedCover then blits
+  // the matching tile per book/side instead of re-walking ~70k source
+  // pixels per cover. Each book contributes 2 unique tile shapes (left
+  // perspective and right perspective — near and far positions on the
+  // same side share the shape, only drawX differs). Caches per-book by
+  // path so the table survives recentBooks reordering (e.g. just-read
+  // book promotion). HomeActivity invokes this after loadRecentCovers
+  // populates the in-RAM cover cache; if a source cover is not in the
+  // cache, that book's tile is skipped and drawStackedCover falls back
+  // to the original perspective-render path.
+  void prerenderCarouselSideTiles(GfxRenderer& renderer, const std::vector<RecentBook>& recentBooks) const;
+
+  // Drop all baked tiles (~24 KB). Called from HomeActivity::onExit so
+  // the cache doesn't stay resident while the user is in the reader (the
+  // reader's heap envelope is tight, especially under BLE).
+  void clearCarouselSideTiles() const;
 
  public:
   // Set by HomeActivity right before invoking drawRecentBookCover. When
@@ -140,4 +189,43 @@ class LyraFlowTheme : public LyraTheme {
   // a UX hint; resets itself whenever the cursor lands unambiguously
   // inside page 1's exclusive zone.
   mutable bool stickyMenuPage2 = false;
+
+  // CrumBLE #124: per-render center-cover header probe used to run on
+  // EVERY drawRecentBookCover even on the skipCarouselCoverLoads fast
+  // path -- the comment at the probe site noted it was deliberately kept
+  // to keep the footer width stable across renders. But the probe is a
+  // BMP file-open + header parse on SD, so every carousel L/R press paid
+  // for it. Cache the parsed dimensions keyed on the cover path so the
+  // SD probe only runs when the center book actually changes. Sentinel
+  // emptyPath / -1 dims = "no probe done yet"; mismatch on path triggers
+  // a fresh probe.
+  mutable std::string lastCenterCoverPath_;
+  mutable int lastCenterCoverSrcW_ = -1;
+  mutable int lastCenterCoverSrcH_ = -1;
+
+  // CrumBLE #125: track the selection-border state that was actually
+  // drawn last frame so the skipCarouselCoverLoads fast path can
+  // toggle JUST the border (draw or erase) when the user moves focus
+  // into / out of the carousel without changing the center book.
+  // Previously the border was drawn inside the `!skipCarouselCoverLoads`
+  // guard, so any focus-only change had to repaint 5 covers + chrome
+  // just to flip the border. -1 sentinel = "no border state recorded
+  // yet" (first render after onEnter; treat as full repaint).
+  mutable int lastDrawnSelectionBorder_ = -1;  // -1 = unknown, 0 = absent, 1 = present
+
+  // CrumBLE #125: pre-baked perspective side-cover tile cache. See
+  // prerenderCarouselSideTiles() / clearCarouselSideTiles() docstrings.
+  // Tile pixels are 1bpp packed MSB-first, sized (sideCoverWidth + 7) / 8
+  // bytes per row * sideInnerHeight rows ~= 2.4 KB. Two tiles per book
+  // (left/right perspective) -> ~24 KB for the 5-book carousel.
+  struct PerspectiveTile {
+    std::unique_ptr<uint8_t[]> pixels;
+    int width = 0;
+    int height = 0;
+  };
+  struct BookSideTiles {
+    PerspectiveTile left;   // hL = sideInnerHeight, hR = sideOuterHeight
+    PerspectiveTile right;  // hL = sideOuterHeight, hR = sideInnerHeight
+  };
+  mutable std::unordered_map<std::string, BookSideTiles> sideTileCache_;
 };

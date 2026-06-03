@@ -23,6 +23,12 @@ class FileBrowserActivity final : public Activity {
   void unpinSleepFavorite();
   bool isPinnedSleepFavorite(const std::string& fullPath) const;
   void showFileActionMenu(const std::string& entry, bool ignoreInitialConfirmRelease = false);
+  void showFolderActionMenu(const std::string& entry, bool ignoreInitialConfirmRelease = false);
+  // Walks `fullPath` for book files, creates a user collection named after
+  // `entry` (auto-deduped), bulk-adds every book, makes the collection
+  // active, then returns to Home. Toasts an error if the folder contains
+  // no books or collection creation fails.
+  void makeCollectionFromFolder(const std::string& fullPath, const std::string& entry);
 
   ButtonNavigator buttonNavigator;
 

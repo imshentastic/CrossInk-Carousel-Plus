@@ -18,6 +18,13 @@ class BookStatsActivity final : public Activity {
     std::string title;
     std::string author;
     std::string coverBmpPath;
+    // CrumBLE #125: stats are loaded once by buildNavList() to filter
+    // entries to books with sessionCount > 0. Cache them here so
+    // loadCurrent doesn't re-read stats.bin on every L/R press --
+    // 1 SD open per press eliminated. Initial-book override (which
+    // carries the reader's live in-progress session time) still wins
+    // when useInitialStats is true.
+    BookReadingStats stats;
   };
 
   // Constructor inputs.

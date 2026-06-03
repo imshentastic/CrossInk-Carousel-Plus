@@ -37,6 +37,15 @@ class CrossPointSettings {
     INVERTED_BLACK_AND_WHITE = 2,
     SLEEP_SCREEN_COVER_FILTER_COUNT
   };
+  // Selection order shared by both the on-enter Custom-mode fallback and the
+  // deep-sleep tap-to-cycle path. RANDOM = 0 preserves the long-standing
+  // tap-to-cycle default for upgrading users; ALPHABETICAL walks /.sleep/
+  // in sorted order using a persisted cursor (sleepScreenCycleIndex).
+  enum SLEEP_SCREEN_ORDER : uint8_t {
+    SLEEP_ORDER_RANDOM = 0,
+    SLEEP_ORDER_ALPHABETICAL = 1,
+    SLEEP_SCREEN_ORDER_COUNT
+  };
 
   // Status bar enum - legacy
   enum STATUS_BAR_MODE {
@@ -217,6 +226,23 @@ class CrossPointSettings {
   };
   enum RECENT_BOOKS_VIEW { RECENT_BOOKS_LIST = 0, RECENT_BOOKS_GRID = 1, RECENT_BOOKS_VIEW_COUNT };
 
+  // CrumBLE #133: Bookshelf grid layout choice. 4x4 (default) shares
+  // the 100x150 cover thumbs with the Flow shelf; 3x3 uses the legacy
+  // 123x180 cells from before the Flow-shelf unification (the user
+  // preferred that look at 9-cell density); 2x2 uses 220x320 (carousel
+  // center cover size) for max cache reuse with carousel + Reading
+  // Stats. Toggleable from the BookshelfPicker.
+  enum BOOKSHELF_LAYOUT { BOOKSHELF_LAYOUT_3X3 = 0, BOOKSHELF_LAYOUT_4X4 = 1, BOOKSHELF_LAYOUT_2X2 = 2,
+                          BOOKSHELF_LAYOUT_COUNT };
+
+  // CrumBLE #133 follow-up: where the selected-book label strip
+  // (title / author / read+remaining times) sits relative to the grid.
+  // BOTTOM puts it below the books with page dots just above it;
+  // TOP swaps it above the books and moves the page dots to the
+  // screen bottom. Toggleable from the BookshelfPicker.
+  enum BOOKSHELF_TITLE_PLACEMENT { BOOKSHELF_TITLE_PLACEMENT_BOTTOM = 0, BOOKSHELF_TITLE_PLACEMENT_TOP = 1,
+                                   BOOKSHELF_TITLE_PLACEMENT_COUNT };
+
   // Image rendering in EPUB reader
   enum IMAGE_RENDERING { IMAGES_DISPLAY = 0, IMAGES_PLACEHOLDER = 1, IMAGES_SUPPRESS = 2, IMAGE_RENDERING_COUNT };
 
@@ -267,6 +293,14 @@ class CrossPointSettings {
   // and the battery cost (one boot + e-ink half-refresh per cycle) is
   // small enough that opt-out is the right default for new users.
   uint8_t cycleScreensaverOnTap = 1;
+  // Persisted cursor for the SLEEP_ORDER_ALPHABETICAL fallback. Advances on
+  // each cycle and is taken modulo the current image count, so adds/removes
+  // degrade gracefully without needing a reset. Unused when order=Random.
+  uint16_t sleepScreenCycleIndex = 0;
+  // Selection order applied when the Custom sleep mode falls back to the
+  // /.sleep/ rotation (no pinned image, or pinned image missing) and to the
+  // deep-sleep tap-to-cycle path. Default RANDOM preserves prior behavior.
+  uint8_t sleepScreenOrder = SLEEP_ORDER_RANDOM;
   // Status bar settings (statusBar retained for migration only)
   uint8_t statusBar = FULL;
   uint8_t statusBarChapterPageCount = 1;
@@ -355,6 +389,15 @@ class CrossPointSettings {
   uint8_t uiTheme = LYRA_FLOW;
   // Recent Books screen layout
   uint8_t recentBooksView = RECENT_BOOKS_LIST;
+  // CrumBLE #133: Bookshelf grid layout choice. Toggled from the
+  // BookshelfPicker's "Layout" row. 4x4 is the default -- it shows the
+  // most books per page (16) and uses the same 100x150 cell size as
+  // the Flow shelf, so the four shelf books are immediate cache hits
+  // when the user transitions Home -> Bookshelf.
+  uint8_t bookshelfLayout = BOOKSHELF_LAYOUT_4X4;
+  // CrumBLE #133 follow-up: selected-book label strip placement (top
+  // / bottom of the grid). Bottom is the historical layout.
+  uint8_t bookshelfTitlePlacement = BOOKSHELF_TITLE_PLACEMENT_BOTTOM;
   // CrumBLE: the index-backed virtual collections (Recently Added / All Books)
   // are opt-in so a fresh device never runs the whole-SD walk at boot. 0 =
   // hidden from Home. Existing users (who already have a library index) are
@@ -418,6 +461,20 @@ class CrossPointSettings {
   char bleBondedDeviceName[32] = "";
   // BLE address type (0 = public, 1 = random). Required by NimBLE on reconnect.
   uint8_t bleBondedDeviceAddrType = 0;
+
+  // CrumBLE prebake — master switch for the off-device chapter-index optimizer.
+  // When 0 (default), the device behaves exactly like stock 3.7.3: only
+  // sections/*.bin is consulted on cache load, and no prebake-manifest.json
+  // lookup runs at book open.
+  // When 1, the device also reads sections-prebake/*.bin as a fallback,
+  // checks the prebake JSON manifest fingerprint on book open, and
+  // prompts the user with "Use prepared layout?" when their current
+  // SETTINGS don't match the prepared cache. The lazy background
+  // extractor (which converts a pending zip drop into sections-prebake/
+  // entries) also only runs when this is on. Per-book opt-in: works
+  // alongside the existing /upload file manager flow so users who haven't
+  // run the optimizer on a particular book see no change in behavior.
+  uint8_t optimizeChapterIndexing = 0;
 
   ~CrossPointSettings() = default;
 

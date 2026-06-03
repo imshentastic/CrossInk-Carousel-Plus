@@ -350,10 +350,67 @@ bool CollectionsStore::toggleBookInCollection(const std::string& collectionId, c
   return false;
 }
 
+int CollectionsStore::addBooksToCollection(const std::string& collectionId, const std::vector<std::string>& bookPaths) {
+  for (auto& c : collections) {
+    if (c.id != collectionId) continue;
+    if (c.isVirtual) {
+      LOG_ERR("CLN", "Refusing bulk-add on virtual collection: %s", collectionId.c_str());
+      return 0;
+    }
+    // Build a set of existing paths once so the membership test is O(1) per
+    // candidate instead of O(n) — folders with hundreds of books otherwise
+    // make this quadratic.
+    std::unordered_set<std::string> existing(c.bookPaths.begin(), c.bookPaths.end());
+    c.bookPaths.reserve(c.bookPaths.size() + bookPaths.size());
+    int added = 0;
+    for (const auto& path : bookPaths) {
+      if (path.empty()) continue;
+      if (existing.find(path) != existing.end()) continue;
+      c.bookPaths.push_back(path);
+      existing.insert(path);
+      ++added;
+    }
+    if (added > 0) {
+      saveToFile();
+      LOG_INF("CLN", "Bulk-added %d books to collection %s (now %zu)", added, collectionId.c_str(),
+              c.bookPaths.size());
+    }
+    return added;
+  }
+  LOG_ERR("CLN", "addBooksToCollection: unknown collection %s", collectionId.c_str());
+  return 0;
+}
+
+std::string CollectionsStore::disambiguateName(const std::string& name, const std::string& ignoreId) const {
+  if (name.empty()) return name;
+  auto isTaken = [&](const std::string& candidate) {
+    for (const auto& c : collections) {
+      if (!ignoreId.empty() && c.id == ignoreId) continue;
+      if (c.name == candidate) return true;
+    }
+    return false;
+  };
+  if (!isTaken(name)) return name;
+  // Append " (N)" with the smallest unused N >= 1. Bound the loop generously
+  // so a corrupted collections.json with thousands of dupes still terminates;
+  // realistically no user will breach single digits.
+  for (int n = 1; n < 1000; ++n) {
+    std::string candidate = name + " (" + std::to_string(n) + ")";
+    if (!isTaken(candidate)) return candidate;
+  }
+  // Pathological fallback: append a millis tag. Still unique vs. existing
+  // names, just ugly. Better than returning a known duplicate.
+  return name + " (" + std::to_string(millis()) + ")";
+}
+
 std::string CollectionsStore::createCollection(const std::string& name) {
   if (name.empty()) {
     LOG_ERR("CLN", "createCollection refused: empty name");
     return {};
+  }
+  const std::string uniqueName = disambiguateName(name);
+  if (uniqueName != name) {
+    LOG_INF("CLN", "createCollection: '%s' already taken, using '%s'", name.c_str(), uniqueName.c_str());
   }
   // ID derived from millis() — guaranteed unique on any human-paced
   // create cadence, and avoids needing a stable hash of the (possibly
@@ -367,10 +424,10 @@ std::string CollectionsStore::createCollection(const std::string& name) {
   }
   Collection c;
   c.id = id;
-  c.name = name;
+  c.name = uniqueName;
   collections.push_back(std::move(c));
   saveToFile();
-  LOG_INF("CLN", "Created collection: %s (id=%s)", name.c_str(), id.c_str());
+  LOG_INF("CLN", "Created collection: %s (id=%s)", uniqueName.c_str(), id.c_str());
   return id;
 }
 
@@ -385,9 +442,13 @@ bool CollectionsStore::renameCollection(const std::string& collectionId, const s
       LOG_ERR("CLN", "Refusing rename on virtual collection: %s", collectionId.c_str());
       return false;
     }
-    if (c.name == newName) return true;  // no-op, treat as success.
-    LOG_INF("CLN", "Renaming collection %s: '%s' -> '%s'", collectionId.c_str(), c.name.c_str(), newName.c_str());
-    c.name = newName;
+    // Dedupe against every other collection (incl. virtuals) but ignore ourselves —
+    // renaming "Foo" to "Foo" must remain a no-op rather than bumping to "Foo (1)".
+    const std::string uniqueName = disambiguateName(newName, collectionId);
+    if (c.name == uniqueName) return true;  // no-op, treat as success.
+    LOG_INF("CLN", "Renaming collection %s: '%s' -> '%s'%s", collectionId.c_str(), c.name.c_str(), uniqueName.c_str(),
+            uniqueName != newName ? " (deduped)" : "");
+    c.name = uniqueName;
     saveToFile();
     return true;
   }
@@ -520,16 +581,19 @@ std::vector<ShelfEntry> CollectionsStore::resolveShelfEntries(const std::string&
   std::vector<ShelfEntry> out;
   out.reserve(paths.size());
   auto& seriesIdx = SeriesIndex::getInstance();
+  auto nameStr = [&](const SeriesEntry* se) { return se ? std::string{seriesIdx.nameOf(*se)} : std::string{}; };
+  auto indexStr = [&](const SeriesEntry* se) { return se ? std::string{seriesIdx.indexOf(*se)} : std::string{}; };
   for (const auto& p : paths) {
     const SeriesEntry* se = seriesIdx.find(p);
-    if (se == nullptr || se->name.empty()) {
+    const std::string seName = nameStr(se);
+    if (se == nullptr || seName.empty()) {
       ShelfEntry e;
       e.firstPath = p;
       e.memberPaths.push_back(p);
       out.push_back(std::move(e));
       continue;
     }
-    const std::string key = SeriesIndex::seriesKey(se->name);
+    const std::string key = SeriesIndex::seriesKey(seName);
     if (seenKeys.count(key)) continue;  // grouped already; subsequent members suppressed.
     seenKeys.insert(key);
 
@@ -537,7 +601,8 @@ std::vector<ShelfEntry> CollectionsStore::resolveShelfEntries(const std::string&
     std::vector<std::string> members;
     for (const auto& q : paths) {
       const SeriesEntry* qse = seriesIdx.find(q);
-      if (qse != nullptr && !qse->name.empty() && SeriesIndex::seriesKey(qse->name) == key) {
+      const std::string qName = nameStr(qse);
+      if (qse != nullptr && !qName.empty() && SeriesIndex::seriesKey(qName) == key) {
         members.push_back(q);
       }
     }
@@ -554,11 +619,11 @@ std::vector<ShelfEntry> CollectionsStore::resolveShelfEntries(const std::string&
     std::sort(members.begin(), members.end(), [&](const std::string& a, const std::string& b) {
       const SeriesEntry* ea = seriesIdx.find(a);
       const SeriesEntry* eb = seriesIdx.find(b);
-      return SeriesIndex::indexLess(ea ? ea->index : "", eb ? eb->index : "");
+      return SeriesIndex::indexLess(indexStr(ea), indexStr(eb));
     });
     ShelfEntry e;
     e.firstPath = members.front();
-    e.seriesName = se->name;
+    e.seriesName = seName;
     e.memberPaths = std::move(members);
     out.push_back(std::move(e));
   }

@@ -352,6 +352,9 @@ void EpubReaderActivity::onEnter() {
   // where it's invisible.
   readerSettingsCache_.clear();
   pxcManifest_.reset();
+  prebakeManifest_.reset();
+  prebakeLastSnapshot_ = {};
+  prebakePromptShowing_ = false;
   deferredOnEnterPending_ = true;
   firstRenderCompleted_ = false;
   // Reset BLE-link edge state on every book open: a fresh book may have a
@@ -545,6 +548,219 @@ void EpubReaderActivity::runDeferredOnEnter() {
       }
     }
   }
+
+  // CrumBLE: parse the prebake'd manifest if the user has opted in and the
+  // cache exists. Gated by SETTINGS.optimizeChapterIndexing so this branch
+  // is dead code (and the helper-fired prompt below stays silent) until the
+  // user flips the toggle on. Cheap when it does run: one SD open + small
+  // JSON parse. The result drives the switch-back prompt in tick() when
+  // current SETTINGS would invalidate the cache.
+  if (SETTINGS.optimizeChapterIndexing) {
+    PrebakeManifest pm;
+    if (tryLoadPrebakeManifest(epub->getCachePath(), pm)) {
+      prebakeManifest_ = pm;
+      LOG_INF("ERA", "Loaded prebake manifest: fontId=%ld viewport=%ux%u lineComp=%.3f embed=%d",
+              static_cast<long>(pm.fontId), static_cast<unsigned>(pm.viewportWidth),
+              static_cast<unsigned>(pm.viewportHeight), static_cast<double>(pm.lineCompression),
+              pm.embeddedStyle);
+    }
+  }
+}
+
+bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
+  // SETTINGS gate first so flipping the toggle off mid-session quiets the
+  // prompt path even though the manifest is still parsed in memory.
+  if (!SETTINGS.optimizeChapterIndexing) return false;
+  if (!prebakeManifest_.has_value() || prebakePromptShowing_) return false;
+  const PrebakeManifest& pm = *prebakeManifest_;
+  const int32_t curFontId = SETTINGS.getReaderFontId();
+  const float curLineComp = SETTINGS.getReaderLineCompression();
+
+  // Compute current viewport (same logic as handleReaderRenderInfo / render).
+  int omt, omr, omb, oml;
+  renderer.getOrientedViewableTRBL(&omt, &omr, &omb, &oml);
+  omt += SETTINGS.screenMargin;
+  oml += SETTINGS.screenMargin;
+  omr += SETTINGS.screenMargin;
+  const uint8_t statusBarH = UITheme::getInstance().getStatusBarHeight();
+  constexpr uint8_t STATUS_BAR_TEXT_PADDING = 3;
+  omb += std::max<uint8_t>(SETTINGS.screenMargin, static_cast<uint8_t>(statusBarH + STATUS_BAR_TEXT_PADDING));
+  const uint16_t curViewportW = static_cast<uint16_t>(renderer.getScreenWidth() - oml - omr);
+  const uint16_t curViewportH = static_cast<uint16_t>(renderer.getScreenHeight() - omt - omb);
+
+  auto snapshotCurrent = [this]() {
+    prebakeLastSnapshot_.orientation = SETTINGS.orientation;
+    prebakeLastSnapshot_.screenMargin = SETTINGS.screenMargin;
+    prebakeLastSnapshot_.imageRendering = SETTINGS.imageRendering;
+    prebakeLastSnapshot_.fontFamily = SETTINGS.fontFamily;
+    prebakeLastSnapshot_.fontSize = SETTINGS.fontSize;
+    prebakeLastSnapshot_.sdFontSizeRange = SETTINGS.sdFontSizeRange;
+    strncpy(prebakeLastSnapshot_.sdFontFamilyName, SETTINGS.sdFontFamilyName,
+            sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1);
+    prebakeLastSnapshot_.sdFontFamilyName[sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1] = '\0';
+    prebakeLastSnapshot_.lineSpacing = SETTINGS.lineSpacing;
+    prebakeLastSnapshot_.paragraphAlignment = SETTINGS.paragraphAlignment;
+    prebakeLastSnapshot_.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
+    prebakeLastSnapshot_.forceParagraphIndents = SETTINGS.forceParagraphIndents;
+    prebakeLastSnapshot_.hyphenationEnabled = SETTINGS.hyphenationEnabled;
+    prebakeLastSnapshot_.embeddedStyle = SETTINGS.embeddedStyle;
+    prebakeLastSnapshot_.bionicReadingEnabled = SETTINGS.bionicReadingEnabled;
+    prebakeLastSnapshot_.guideReadingEnabled = SETTINGS.guideReadingEnabled;
+    prebakeLastSnapshot_.initialised = true;
+  };
+
+  const bool snapChanged = !prebakeLastSnapshot_.initialised ||
+      prebakeLastSnapshot_.orientation != SETTINGS.orientation ||
+      prebakeLastSnapshot_.screenMargin != SETTINGS.screenMargin ||
+      prebakeLastSnapshot_.imageRendering != SETTINGS.imageRendering ||
+      prebakeLastSnapshot_.fontFamily != SETTINGS.fontFamily ||
+      prebakeLastSnapshot_.fontSize != SETTINGS.fontSize ||
+      prebakeLastSnapshot_.sdFontSizeRange != SETTINGS.sdFontSizeRange ||
+      strncmp(prebakeLastSnapshot_.sdFontFamilyName, SETTINGS.sdFontFamilyName,
+              sizeof(prebakeLastSnapshot_.sdFontFamilyName)) != 0 ||
+      prebakeLastSnapshot_.lineSpacing != SETTINGS.lineSpacing ||
+      prebakeLastSnapshot_.paragraphAlignment != SETTINGS.paragraphAlignment ||
+      prebakeLastSnapshot_.extraParagraphSpacing != SETTINGS.extraParagraphSpacing ||
+      prebakeLastSnapshot_.forceParagraphIndents != SETTINGS.forceParagraphIndents ||
+      prebakeLastSnapshot_.hyphenationEnabled != SETTINGS.hyphenationEnabled ||
+      prebakeLastSnapshot_.embeddedStyle != SETTINGS.embeddedStyle ||
+      prebakeLastSnapshot_.bionicReadingEnabled != SETTINGS.bionicReadingEnabled ||
+      prebakeLastSnapshot_.guideReadingEnabled != SETTINGS.guideReadingEnabled;
+
+  if (!prebakeLastSnapshot_.initialised) snapshotCurrent();
+  if (!snapChanged) return false;
+
+  const bool mismatch =
+      (pm.fontId != curFontId) ||
+      (pm.lineCompression != curLineComp) ||
+      (pm.extraParagraphSpacing != SETTINGS.extraParagraphSpacing) ||
+      (pm.forceParagraphIndents != SETTINGS.forceParagraphIndents) ||
+      (pm.paragraphAlignment != SETTINGS.paragraphAlignment) ||
+      (pm.viewportWidth != curViewportW) ||
+      (pm.viewportHeight != curViewportH) ||
+      (pm.hyphenationEnabled != SETTINGS.hyphenationEnabled) ||
+      (pm.embeddedStyle != SETTINGS.embeddedStyle) ||
+      (pm.imageRendering != SETTINGS.imageRendering) ||
+      (pm.bionicReadingEnabled != SETTINGS.bionicReadingEnabled) ||
+      (pm.guideReadingEnabled != SETTINGS.guideReadingEnabled);
+
+  if (!mismatch) {
+    snapshotCurrent();  // user-driven drift but still valid; accept silently
+    return false;
+  }
+
+  LOG_INF("ERA",
+          "Prebake fingerprint mismatch: cur fontId=%ld lineComp=%.3f ePS=%d fPI=%d pA=%u "
+          "vp=%ux%u hyph=%d embed=%d imgR=%u bionic=%d guide=%d vs prebake fontId=%ld "
+          "lineComp=%.3f ePS=%d fPI=%d pA=%u vp=%ux%u hyph=%d embed=%d imgR=%u bionic=%d guide=%d",
+          static_cast<long>(curFontId), static_cast<double>(curLineComp),
+          SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
+          static_cast<unsigned>(SETTINGS.paragraphAlignment),
+          static_cast<unsigned>(curViewportW), static_cast<unsigned>(curViewportH),
+          SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+          static_cast<unsigned>(SETTINGS.imageRendering),
+          SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled,
+          static_cast<long>(pm.fontId), static_cast<double>(pm.lineCompression),
+          pm.extraParagraphSpacing, pm.forceParagraphIndents,
+          static_cast<unsigned>(pm.paragraphAlignment),
+          static_cast<unsigned>(pm.viewportWidth), static_cast<unsigned>(pm.viewportHeight),
+          pm.hyphenationEnabled, pm.embeddedStyle,
+          static_cast<unsigned>(pm.imageRendering),
+          pm.bionicReadingEnabled, pm.guideReadingEnabled);
+
+  // .pxc-manifest-style prompt: confirm applies the prebake's prepared
+  // layout (restoring cache compatibility), cancel keeps current settings
+  // (book will rebuild chapter-by-chapter against the live cache). This
+  // is uniform across both the "you just changed a setting" and "you
+  // opened a book whose settings already don't match the prebake" cases
+  // -- both want the same choice between "use what was prepared" and
+  // "keep what I have."
+  const std::string promptBody =
+      "This book was prepared with different reader settings. Switch to the "
+      "prepared layout for faster reading, or keep your current settings and "
+      "let the device rebuild each chapter as you reach it?";
+  prebakePromptShowing_ = true;
+  startActivityForResult(
+      std::make_unique<ConfirmationActivity>(
+          renderer, mappedInput, "Use prepared layout?", promptBody,
+          /*ignoreInitialConfirmRelease=*/true),
+      [this](const ActivityResult& result) {
+        prebakePromptShowing_ = false;
+        if (result.isCancelled) {
+          // User declined -- keep their current settings. Don't delete the
+          // prebake (Section.cpp's clearCache only ever touches sections/,
+          // never sections-prebake/), so if they later open the book again
+          // and revert their settings, the cache is still there. Update
+          // the snapshot to current SETTINGS so we don't keep firing the
+          // prompt on every render tick.
+          LOG_INF("ERA", "Prebake prompt: user declined, keeping current settings");
+          prebakeLastSnapshot_.orientation = SETTINGS.orientation;
+          prebakeLastSnapshot_.screenMargin = SETTINGS.screenMargin;
+          prebakeLastSnapshot_.imageRendering = SETTINGS.imageRendering;
+          prebakeLastSnapshot_.fontFamily = SETTINGS.fontFamily;
+          prebakeLastSnapshot_.fontSize = SETTINGS.fontSize;
+          prebakeLastSnapshot_.sdFontSizeRange = SETTINGS.sdFontSizeRange;
+          strncpy(prebakeLastSnapshot_.sdFontFamilyName, SETTINGS.sdFontFamilyName,
+                  sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1);
+          prebakeLastSnapshot_.sdFontFamilyName[sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1] = '\0';
+          prebakeLastSnapshot_.lineSpacing = SETTINGS.lineSpacing;
+          prebakeLastSnapshot_.paragraphAlignment = SETTINGS.paragraphAlignment;
+          prebakeLastSnapshot_.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
+          prebakeLastSnapshot_.forceParagraphIndents = SETTINGS.forceParagraphIndents;
+          prebakeLastSnapshot_.hyphenationEnabled = SETTINGS.hyphenationEnabled;
+          prebakeLastSnapshot_.embeddedStyle = SETTINGS.embeddedStyle;
+          prebakeLastSnapshot_.bionicReadingEnabled = SETTINGS.bionicReadingEnabled;
+          prebakeLastSnapshot_.guideReadingEnabled = SETTINGS.guideReadingEnabled;
+          requestUpdate();
+          return;
+        }
+        // User confirmed -- apply the prebake's prepared layout. With the
+        // reversion fields in the manifest we can fully restore the raw
+        // SETTINGS the prebake was made against, so the next fingerprint
+        // check against sections-prebake/ matches exactly.
+        if (!prebakeManifest_.has_value()) return;
+        const PrebakeManifest& pm2 = *prebakeManifest_;
+        LOG_INF("ERA", "Prebake prompt: user accepted, restoring prepared layout");
+        SETTINGS.orientation = pm2.orientation;
+        SETTINGS.screenMargin = pm2.screenMargin;
+        SETTINGS.imageRendering = pm2.imageRendering;
+        SETTINGS.fontFamily = pm2.fontFamily;
+        SETTINGS.fontSize = pm2.fontSize;
+        SETTINGS.sdFontSizeRange = pm2.sdFontSizeRange;
+        strncpy(SETTINGS.sdFontFamilyName, pm2.sdFontFamilyName, sizeof(SETTINGS.sdFontFamilyName) - 1);
+        SETTINGS.sdFontFamilyName[sizeof(SETTINGS.sdFontFamilyName) - 1] = '\0';
+        SETTINGS.lineSpacing = pm2.lineSpacing;
+        SETTINGS.paragraphAlignment = pm2.paragraphAlignment;
+        SETTINGS.extraParagraphSpacing = pm2.extraParagraphSpacing;
+        SETTINGS.forceParagraphIndents = pm2.forceParagraphIndents;
+        SETTINGS.hyphenationEnabled = pm2.hyphenationEnabled;
+        SETTINGS.embeddedStyle = pm2.embeddedStyle;
+        SETTINGS.bionicReadingEnabled = pm2.bionicReadingEnabled;
+        SETTINGS.guideReadingEnabled = pm2.guideReadingEnabled;
+        SETTINGS.saveToFile();
+        ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
+        // Snapshot the now-reverted SETTINGS as the new baseline.
+        prebakeLastSnapshot_.orientation = SETTINGS.orientation;
+        prebakeLastSnapshot_.screenMargin = SETTINGS.screenMargin;
+        prebakeLastSnapshot_.imageRendering = SETTINGS.imageRendering;
+        prebakeLastSnapshot_.fontFamily = SETTINGS.fontFamily;
+        prebakeLastSnapshot_.fontSize = SETTINGS.fontSize;
+        prebakeLastSnapshot_.sdFontSizeRange = SETTINGS.sdFontSizeRange;
+        strncpy(prebakeLastSnapshot_.sdFontFamilyName, SETTINGS.sdFontFamilyName,
+                sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1);
+        prebakeLastSnapshot_.sdFontFamilyName[sizeof(prebakeLastSnapshot_.sdFontFamilyName) - 1] = '\0';
+        prebakeLastSnapshot_.lineSpacing = SETTINGS.lineSpacing;
+        prebakeLastSnapshot_.paragraphAlignment = SETTINGS.paragraphAlignment;
+        prebakeLastSnapshot_.extraParagraphSpacing = SETTINGS.extraParagraphSpacing;
+        prebakeLastSnapshot_.forceParagraphIndents = SETTINGS.forceParagraphIndents;
+        prebakeLastSnapshot_.hyphenationEnabled = SETTINGS.hyphenationEnabled;
+        prebakeLastSnapshot_.embeddedStyle = SETTINGS.embeddedStyle;
+        prebakeLastSnapshot_.bionicReadingEnabled = SETTINGS.bionicReadingEnabled;
+        prebakeLastSnapshot_.guideReadingEnabled = SETTINGS.guideReadingEnabled;
+        if (section) section.reset();
+        requestUpdate();
+      });
+  return true;
 }
 
 void EpubReaderActivity::onExit() {
@@ -662,6 +878,19 @@ void EpubReaderActivity::loop() {
     requestUpdate();
     return;
   }
+
+  // CrumBLE: prebake-cache mismatch prompt. Delegated to a helper so
+  // render() can call the same check at the top of its body -- catching
+  // the mismatch BEFORE any chapter parse runs (which is what was OOM-ing
+  // in the "switched to margin=10 then hit cancel" trace: the rebuild had
+  // already consumed enough heap that the post-cancel re-layout couldn't
+  // complete). Tick() still calls it as a safety net.
+  if (checkAndFirePrebakePromptIfNeeded()) return;
+
+  // CrumBLE: prebake artifacts now arrive via the file manager's /upload
+  // endpoint, file-by-file, dropped straight into the final cache layout
+  // by the JS-side optimizer (or a curl loop). No reader-side extraction
+  // step needed -- Section's dual-path read picks them up automatically.
 
   // BT No Images Quick Connect auto-restore. The no-images flag exists only to
   // keep the contiguous heap free for NimBLE's ~58 KB, so restore images the
@@ -2040,6 +2269,17 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     return;
   }
 
+  // CrumBLE: settings-drift check at the START of render -- before any
+  // section.load / chapter parse runs. Tick()'s call to the same helper
+  // already had a chance to fire; we double-check here because some entry
+  // paths into render (post-settings-drawer-close in particular) can run
+  // before tick() has had a chance to evaluate. If it fires, the prompt
+  // gets pushed on top of the reader and we bail; the next render() call
+  // (after the prompt closes) sees the reverted or accepted settings.
+  if (checkAndFirePrebakePromptIfNeeded()) {
+    return;
+  }
+
   const auto showPendingSyncSaveError = [this]() {
     if (!pendingSyncSaveError) return;
     pendingSyncSaveError = false;
@@ -2111,7 +2351,8 @@ void EpubReaderActivity::render(RenderLock&& lock) {
                                   SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
                                   SETTINGS.paragraphAlignment, viewportWidth, viewportHeight,
                                   SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle, SETTINGS.imageRendering,
-                                  SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled)) {
+                                  SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled,
+                                  SETTINGS.optimizeChapterIndexing != 0)) {
       // Cache miss with BLE up: NimBLE's ~58 KB share has historically
       // made the parser either return layoutAbortedForLowMemory (good —
       // the reactive retry path below handles it) or simply hang
@@ -2458,7 +2699,8 @@ void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportW
                                   SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
                                   SETTINGS.paragraphAlignment, viewportWidth, viewportHeight,
                                   SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle, SETTINGS.imageRendering,
-                                  SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled)) {
+                                  SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled,
+                                  SETTINGS.optimizeChapterIndexing != 0)) {
     return;
   }
 
@@ -2929,7 +3171,7 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
                                 SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
                                 SETTINGS.paragraphAlignment, viewportWidth, viewportHeight, SETTINGS.hyphenationEnabled,
                                 SETTINGS.embeddedStyle, SETTINGS.imageRendering, SETTINGS.bionicReadingEnabled,
-                                SETTINGS.guideReadingEnabled)) {
+                                SETTINGS.guideReadingEnabled, SETTINGS.optimizeChapterIndexing != 0)) {
     if (!MemoryBudget::hasHeapForOptionalEpubRebuild("SLP", "EPUB sleep-page cache rebuild", spineIndex)) {
       return false;
     }

@@ -12,6 +12,7 @@
 #include "TxtReaderActivity.h"
 #include "Xtc.h"
 #include "XtcReaderActivity.h"
+#include "activities/home/HomeActivity.h"
 #include "activities/util/BmpViewerActivity.h"
 #include "activities/util/FullScreenMessageActivity.h"
 #include "components/UITheme.h"
@@ -109,6 +110,16 @@ void ReaderActivity::onEnter() {
     goToLibrary();  // Start from root when entering via Browse
     return;
   }
+
+  // CrumBLE #120: drop any saved Home cursor so the reader -> Home
+  // transition falls through to the openEpubPath promotion (highlight
+  // the just-read book) instead of restoring a stale icon / shelf-book
+  // selection from before the reader was launched. HomeActivity's
+  // saved cursor is meant for "Home -> non-reader activity -> back to
+  // Home" round trips, not for reader returns where the user expects
+  // to see their book front-and-center on the carousel. Cheap no-op
+  // for cold-boot / silent-restart entries (no saved cursor yet).
+  HomeActivity::clearSavedCursor();
 
   // Immediate tap feedback. The work below -- SD font load, EPUB/XTC/TXT parse,
   // then the first chapter build (which for a full-page cover also decodes the

@@ -33,6 +33,8 @@
 #include "html/SettingsPageHtml.generated.h"
 #include "html/js/jszip_minJs.generated.h"
 #include "html/js/optimizerJs.generated.h"
+#include "html/wasm/crumblePrebakeJs.generated.h"
+#include "html/wasm/crumblePrebakeWasm.generated.h"
 #include "util/BookCacheUtils.h"
 #include "util/StringUtils.h"
 
@@ -183,6 +185,12 @@ void CrossPointWebServer::begin() {
   server->on("/files", HTTP_GET, [this] { handleFileList(); });
   server->on("/js/jszip.min.js", HTTP_GET, [this] { handleJszip(); });
   server->on("/js/optimizer.js", HTTP_GET, [this] { handleOptimizerJs(); });
+  // CrumBLE Phase 5a: PROGMEM-embedded prebake WASM module. ~870 KB total
+  // (gzipped). Lazy-loaded by the optimizer page when the user opts in to
+  // chapter-prebake; otherwise these handlers are never hit and the flash
+  // cost is the only impact.
+  server->on("/js/crumble-prebake.js", HTTP_GET, [this] { handleCrumblePrebakeJs(); });
+  server->on("/js/crumble-prebake.wasm", HTTP_GET, [this] { handleCrumblePrebakeWasm(); });
 
   server->on("/api/status", HTTP_GET, [this] { handleStatus(); });
   server->on("/api/files", HTTP_GET, [this] { handleFileListData(); });
@@ -208,6 +216,7 @@ void CrossPointWebServer::begin() {
   server->on("/api/settings", HTTP_GET, [this] { handleGetSettings(); });
   server->on("/api/settings", HTTP_POST, [this] { handlePostSettings(); });
   server->on("/api/reader-render-info", HTTP_GET, [this] { handleReaderRenderInfo(); });
+  server->on("/api/save-reader-settings", HTTP_POST, [this] { handleSaveReaderSettings(); });
 
   // Font management endpoints
   server->on("/fonts", HTTP_GET, [this] { handleFontsPage(); });
@@ -428,6 +437,24 @@ void CrossPointWebServer::handleJszip() const {
 void CrossPointWebServer::handleOptimizerJs() const {
   sendBufferGzip(server.get(), "application/javascript", optimizerJs,
                  optimizerJsCompressedSize, "optimizer.js");
+}
+
+void CrossPointWebServer::handleCrumblePrebakeJs() const {
+  if (CrumblePrebakeJsCompressedSize == 0) {
+    server->send(404, "text/plain", "Prebake WASM not built into this firmware");
+    return;
+  }
+  sendBufferGzip(server.get(), "application/javascript", CrumblePrebakeJs,
+                 CrumblePrebakeJsCompressedSize, "crumble-prebake.js");
+}
+
+void CrossPointWebServer::handleCrumblePrebakeWasm() const {
+  if (CrumblePrebakeWasmCompressedSize == 0) {
+    server->send(404, "text/plain", "Prebake WASM not built into this firmware");
+    return;
+  }
+  sendBufferGzip(server.get(), "application/wasm", CrumblePrebakeWasm,
+                 CrumblePrebakeWasmCompressedSize, "crumble-prebake.wasm");
 }
 
 void CrossPointWebServer::handleNotFound() const {
@@ -1379,7 +1406,14 @@ void CrossPointWebServer::handleReaderRenderInfo() const {
   r.setOrientation(savedOrientation);  // restore; no panel push happened in between
 
   JsonDocument doc;
-  doc["fitVersion"] = 1;  // bump if the device image-fit math changes
+  // fitVersion 2: adds the 8 section-header layout fields (line compression,
+  // paragraph spacing/indents/alignment, hyphenation, embedded style, bionic
+  // reading, guide reading) consumed by the crumble-prebake CLI when
+  // generating sections/*.bin. The CLI hard-errors on fitVersion < 2 because
+  // those values are baked into the section file fingerprint -- skipping
+  // them would mean every prebake'd section gets rejected on first device
+  // open. v1 fields are unchanged so existing .pxc-only flows still work.
+  doc["fitVersion"] = 2;
   doc["device"] = "X4";
   doc["orientation"] = static_cast<int>(SETTINGS.orientation);
   doc["screenMargin"] = static_cast<int>(SETTINGS.screenMargin);
@@ -1400,9 +1434,73 @@ void CrossPointWebServer::handleReaderRenderInfo() const {
   doc["viewportWidth"] = viewportWidth;
   doc["viewportHeight"] = viewportHeight;
   doc["emSize"] = emSize;
+  // fitVersion 2 additions: the eight layout settings baked into the
+  // section file header by Section::writeSectionFileHeader. The crumble-
+  // prebake CLI passes these into Section::createSectionFile so the
+  // section header it writes matches what the device will fingerprint
+  // against on first open. Any drift here invalidates the prebake'd
+  // section cache and the device falls back to a fresh build.
+  doc["lineCompression"] = SETTINGS.getReaderLineCompression();
+  // Raw lineSpacing enum (NORMAL / TIGHT / WIDE) alongside the derived
+  // lineCompression float. The prebake manifest carries lineSpacing so
+  // the device-side switch-back prompt can reverse-apply (lineCompression
+  // is a one-way derivation we can't cleanly invert without the enum).
+  doc["lineSpacing"] = static_cast<int>(SETTINGS.lineSpacing);
+  doc["extraParagraphSpacing"] = static_cast<int>(SETTINGS.extraParagraphSpacing);
+  doc["forceParagraphIndents"] = static_cast<int>(SETTINGS.forceParagraphIndents);
+  doc["paragraphAlignment"] = static_cast<int>(SETTINGS.paragraphAlignment);
+  doc["hyphenationEnabled"] = static_cast<int>(SETTINGS.hyphenationEnabled);
+  doc["embeddedStyle"] = static_cast<int>(SETTINGS.embeddedStyle);
+  doc["bionicReadingEnabled"] = static_cast<int>(SETTINGS.bionicReadingEnabled);
+  doc["guideReadingEnabled"] = static_cast<int>(SETTINGS.guideReadingEnabled);
   String json;
   serializeJson(doc, json);
   server->send(200, "application/json", json);
+}
+
+void CrossPointWebServer::handleSaveReaderSettings() const {
+  if (!server->hasArg("plain")) {
+    server->send(400, "text/plain", "Missing JSON body");
+    return;
+  }
+  const String body = server->arg("plain");
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    server->send(400, "text/plain", String("JSON parse failed: ") + err.c_str());
+    return;
+  }
+  // Helper to clamp + apply an integer field. Skips when the key is absent
+  // so partial updates work -- the preflight modal only PUTs back fields
+  // the user actually edited.
+  auto applyU8 = [&doc](const char* key, uint8_t& field, uint8_t maxValue) {
+    if (!doc[key].is<int>()) return;
+    const int v = doc[key].as<int>();
+    if (v < 0 || v > maxValue) return;
+    field = static_cast<uint8_t>(v);
+  };
+  applyU8("orientation", SETTINGS.orientation, 3);
+  applyU8("screenMargin", SETTINGS.screenMargin, 50);
+  applyU8("imageRendering", SETTINGS.imageRendering, CrossPointSettings::IMAGE_RENDERING_COUNT - 1);
+  applyU8("fontFamily", SETTINGS.fontFamily, CrossPointSettings::FONT_FAMILY_COUNT - 1);
+  applyU8("fontSize", SETTINGS.fontSize, CrossPointSettings::FONT_SIZE_COUNT - 1);
+  applyU8("sdFontSizeRange", SETTINGS.sdFontSizeRange, CrossPointSettings::SD_FONT_SIZE_RANGE_COUNT - 1);
+  applyU8("lineSpacing", SETTINGS.lineSpacing, CrossPointSettings::LINE_COMPRESSION_COUNT - 1);
+  applyU8("paragraphAlignment", SETTINGS.paragraphAlignment, CrossPointSettings::PARAGRAPH_ALIGNMENT_COUNT - 1);
+  applyU8("extraParagraphSpacing", SETTINGS.extraParagraphSpacing, 1);
+  applyU8("forceParagraphIndents", SETTINGS.forceParagraphIndents, 1);
+  applyU8("hyphenationEnabled", SETTINGS.hyphenationEnabled, 1);
+  applyU8("embeddedStyle", SETTINGS.embeddedStyle, 1);
+  applyU8("bionicReadingEnabled", SETTINGS.bionicReadingEnabled, 1);
+  applyU8("guideReadingEnabled", SETTINGS.guideReadingEnabled, 1);
+  if (doc["sdFontFamilyName"].is<const char*>()) {
+    const char* name = doc["sdFontFamilyName"].as<const char*>();
+    strncpy(SETTINGS.sdFontFamilyName, name ? name : "", sizeof(SETTINGS.sdFontFamilyName) - 1);
+    SETTINGS.sdFontFamilyName[sizeof(SETTINGS.sdFontFamilyName) - 1] = '\0';
+  }
+  SETTINGS.saveToFile();
+  LOG_INF("WEB", "[CFG] reader settings updated via /api/save-reader-settings");
+  server->send(200, "application/json", "{\"ok\":true}");
 }
 
 // ---- OPDS Server API ----

@@ -1,5 +1,49 @@
 # Changelog
 
+## [crumble-v3.7.3] - 2026-05-31
+
+### Fixed
+- **File Transfer no longer freezes mid-session on libraries past ~30 books.** A handful of users hit a wedge where tapping into File Transfer worked, the web UI rendered, and then the back tap stopped responding — only a forced reboot recovered. Root cause was heap **fragmentation**, not raw exhaustion: total free heap looked healthy (~14 KB) but the largest contiguous block dropped to ~6 KB, well below the 8-16 KB chunks WiFi + AsyncWebServer + the activity-back-redraw allocator want. The per-book metadata stores (`LibraryIndex`, `SeriesIndex`) held their fields as individual `std::string`s, so an N-book library produced N (or N×3) small heap allocations scattered across the heap; `releaseMemory()` freed them but the slots stayed scattered between other longer-lived allocations and the allocator couldn't coalesce them back into a single large hole. Both stores now pool their strings into a single contiguous `std::vector<char>` (each entry holds a `uint32_t` offset). One big allocation instead of N small ones; releaseMemory returns ONE large hole. Measured impact on the same 32-book library that was freezing: post-HTML-page-served max-contiguous-alloc went from 6 KB → 23 KB, and **Min Free over the whole File Transfer session went from ~1-2 KB (on the OOM cliff) to ~14.7 KB** — a 7-10x safety margin. Safe library size for File Transfer should now be roughly 90-150 books before hitting the same threshold the old layout hit at 32.
+- Cover for boxed-set books (e.g. Game of Thrones 5-Book Boxed Set) sometimes loaded fine in the Home carousel but rendered the text placeholder in Collections. The thumb-failed marker was global per book — one transient memory-pressure failure during a multi-book Collections grid load (e.g. 9 covers in flight at 3x3) permanently poisoned the book against ALL future thumb-gen attempts at any size, even though Carousel-sized thumbs had been cached earlier and worked fine. Markers are now size-scoped (`thumb_failed_v3_<W>x<H>.marker`); failing at one cell size doesn't block regeneration at another. The v2 → v3 suffix bump also invalidates every existing global marker, giving every book a fresh chance to thumbnail at current cell sizes.
+- Long boxed-set titles overflowed the cover-placeholder cell with wrapped small-bold text instead of reading as a clean "missing cover" hint. Capped at 4 lines, matching the existing MinimalTheme convention.
+- In a 2x2 / 3x3 / 4x4 Bookshelf with a partial last row (e.g. 3 books in 2x2, 5 in 3x3), pressing DOWN from the top-right cell did nothing — the same-column slot in the next row had no book, so the navigator skipped the move and fell through to next-page wrap. Now snaps to the rightmost cell of the partial row, so DOWN feels like a real move every time.
+
+## [crumble-v3.7.2] - 2026-05-30
+
+### Added
+- **Make collection from folder**: long-press a folder in the file browser to open a menu with "Make collection from folder" (next to the existing "Delete"). Walks the folder recursively for `.epub` / `.xtc` / `.txt` / `.md` / `.markdown` files (same rules as the library scan, 8 levels deep, skips `XTcache` and dot-prefixed entries), creates a user collection named after the folder, bulk-adds every book in one save, makes the collection active, and returns to Home. Fast path for turning curated SD subdirectories into shelves without long-pressing each book.
+
+### Changed
+- Collection names are now disambiguated on create / rename. Picking "Sci-Fi" when "Sci-Fi" already exists (whether as a user collection or a virtual one — Favorites / All Books / Recently Added / Finished / Unopened) auto-suffixes the new name with the smallest unused " (N)" instead of silently allowing two indistinguishable entries on the shelf header. Case-sensitive — "Sci-Fi" and "sci-fi" remain treated as distinct.
+
+## [crumble-v3.7.1] - 2026-05-30
+
+### Added
+- **Sleep Screen Order**: new Display setting (Random / Alphabetical) shared by both the Custom-mode fallback (no pinned image) and the deep-sleep tap-to-cycle path. Random (default) preserves prior behavior — anti-recent-repeat random pick from `/.sleep/`. Alphabetical walks `/.sleep/` in sorted order using a persisted cursor that survives reboot, so curated collections rotate in deterministic order.
+
+### Fixed
+- Transparent PNG sleep images now compose over the last reader page even when sleeping from Home/Settings, not only when sleeping from inside a reader. The `/.crosspoint/last_reader_page.bin` snapshot is already written on reader-to-home exit, but `composePngOverReaderPage` was gating its use on the current activity being a reader, so non-reader sleep entries dropped the cached page and showed the PNG over a blank background. Cache restoration now relies on the snapshot file's own existence check — safe because the file is only ever written from reader contexts, never from Home/Settings, so it can't surface a stale non-book background.
+
+## [crumble-v3.7.0] - 2026-05-30
+
+### Added
+- **Bookshelf grid Layout option**: 3x3, 4x4 (default), or 2x2. Toggle from the "Layout" row at the bottom of the Bookshelf collection picker (hold Back inside the grid to open). The setting persists across reboots. 4x4 shares its 100x150 cell size with the Flow shelf so transitioning Home -> Bookshelf hits a warm thumbnail cache. 3x3 uses bigger 130x190 cells with generous spacing; 2x2 uses 220x320 (shares the cache with the carousel center cover + Reading Stats).
+- **Title Placement option**: the focused-book label strip (title / author / read+remaining times) can now sit above the books OR below them. Pairs with the page-dot indicator: above-mode anchors the dots to the screen bottom; below-mode stacks dots just above the strip. Toggle from "Title Placement" in the Bookshelf collection picker, below the Layout row.
+- Bookshelf grid cover loading is much more resilient on cold collections. Generation uses the same fast `epub.generateThumbBmpNoIndex` path the Flow shelf uses (content.opf-only parse, no spine/TOC index build) with a heavy `epub.load + generateThumbBmp` fallback for stubborn books. The 48 KB framebuffer snapshot and the in-RAM image cache are freed before gen so the JPG/PNG decoder + scaled-BMP write buffer has up to 112 KB more contiguous heap — what used to leave half a 16-cell page on placeholder now renders fully.
+
+### Fixed
+- Books stuck on placeholder covers from prior builds. The "thumb_failed" marker filename was bumped (suffix `_v2`) so markers set by older builds — which sometimes mis-fired on transient heap-OOM gen failures during 16-book sequential gens at 4x4 / 220x320 at 2x2 — are silently ignored. Combined with the new heap-pressure-relief before `loadPageCovers` (snapshot + image cache freed) and the NoIndex + heavy fallback gen pair, transient failures are rare and only permanent failures (no cover image / unsupported cover format) get marked.
+- Bookshelf page-dot indicator clipping the bottom row's progress bar in 2x2 mode. The 2x2 inter-row geometry now leaves a clean gap; the dot size shrinks from 8 px to 6 px in 2x2 to keep the bar clear without changing the dot Y position.
+- Carousel left/right navigation rebuilt the perspective side covers from scratch every press. Side tiles are now pre-rendered to a packed 1bpp cache and blitted on subsequent presses, eliminating ~70k per-side pixel walks per navigation.
+- Returning to Home from the reader sometimes left the cursor on the wrong icon-bar entry. Cursor recall order is now: caller-set entry > saved cursor from the previous visit > opened-book highlight > default; the reader clears the saved cursor on entry so a re-open uses the freshly-opened book as the recall target.
+
+### Changed
+- 4x4 is now the default Bookshelf layout (was 3x3). Existing users keep whatever layout they had set; new installs land on 4x4.
+- Bookshelf cells use a unified double-stroke selection ring (3 px inner + 1 px outer with a gap) that matches the carousel center cover and the Reading Stats main cover. 2x2 gets a slightly tighter ring (4 px outer extent vs 6 px) so it clears the inter-row gap on the wider covers.
+- LyraTheme header is more compact (52 px tall vs 84 px) which gives Bookshelf and Reading Stats more vertical room for cells / cover.
+- Reading Stats cover sized to 220x320 to match the carousel center cover. Opening Stats from a focused carousel book is now an immediate cache hit instead of a re-decode. Stats are cached per book during the All Books navigation filter pass so cycling through the list doesn't re-read `stats.bin` for every step.
+- Bookshelf and Flow shelf both detect "same page, focused-cell changed only" state on a press and restore a framebuffer snapshot + repaint just the selection ring + title strip, instead of a full clearScreen + redraw. Per-press cost is O(1) in steady state.
+
 ## [crumble-v3.6.0] - 2026-05-29
 
 ### Added

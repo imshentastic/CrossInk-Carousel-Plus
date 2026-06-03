@@ -274,6 +274,9 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                           "sleepScreenCoverFilter", StrId::STR_CAT_DISPLAY));
     add(SettingInfo::Toggle(StrId::STR_CYCLE_SCREENSAVER_ON_TAP, &CrossPointSettings::cycleScreensaverOnTap,
                             "cycleScreensaverOnTap", StrId::STR_CAT_DISPLAY));
+    add(SettingInfo::Enum(StrId::STR_SLEEP_SCREEN_ORDER, &CrossPointSettings::sleepScreenOrder,
+                          {StrId::STR_SLEEP_ORDER_RANDOM, StrId::STR_SLEEP_ORDER_ALPHABETICAL}, "sleepScreenOrder",
+                          StrId::STR_CAT_DISPLAY));
     add(SettingInfo::Enum(StrId::STR_QUICK_RESUME_TIMEOUT, &CrossPointSettings::quickResumeSleepScreen,
                           {StrId::STR_STATE_OFF, StrId::STR_STATE_ON}, "quickResumeSleepScreen",
                           StrId::STR_CAT_DISPLAY));
@@ -303,6 +306,17 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
             }));
     add(SettingInfo::Enum(StrId::STR_RECENT_BOOKS_VIEW, &CrossPointSettings::recentBooksView,
                           {StrId::STR_LIST_VIEW, StrId::STR_GRID_VIEW}, "recentBooksView", StrId::STR_CAT_DISPLAY));
+    // CrumBLE #133: persistence-only registration. Category left as
+    // STR_NONE_OPT so SettingsActivity skips it (line ~140 filters those
+    // out); the user-facing toggle lives in BookshelfPickerActivity's
+    // "Layout" row instead. JsonSettingsIO still picks it up because it
+    // iterates the registered list regardless of category.
+    add(SettingInfo::Enum(StrId::STR_BOOKSHELF_LAYOUT, &CrossPointSettings::bookshelfLayout,
+                          {StrId::STR_LAYOUT_3X3, StrId::STR_LAYOUT_4X4, StrId::STR_LAYOUT_2X2}, "bookshelfLayout"));
+    // CrumBLE #133 follow-up: also persistence-only. Toggle lives in
+    // the BookshelfPicker's "Title Placement" row, not in Settings UI.
+    add(SettingInfo::Enum(StrId::STR_BOOKSHELF_TITLE_PLACEMENT, &CrossPointSettings::bookshelfTitlePlacement,
+                          {StrId::STR_PLACEMENT_BOTTOM, StrId::STR_PLACEMENT_TOP}, "bookshelfTitlePlacement"));
     add(SettingInfo::Toggle(StrId::STR_SUNLIGHT_FADING_FIX, &CrossPointSettings::fadingFix, "fadingFix",
                             StrId::STR_CAT_DISPLAY));
 
@@ -403,6 +417,18 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
     // Calibre / EPUB-3 series metadata anyway.
     add(SettingInfo::Toggle(StrId::STR_SERIES_DETECTION, &CrossPointSettings::seriesDetectionEnabled,
                             "seriesDetectionEnabled", StrId::STR_CAT_SYSTEM));
+    // CrumBLE prebake: master switch for the off-device chapter-index
+    // optimizer. Off by default so the device behaves exactly like stock
+    // 3.7.3 until the user opts in. When on:
+    //   - Section.cpp tries sections-prebake/<n>.bin as a read-only fallback
+    //     (the prebake CLI / web optimizer puts its output there)
+    //   - EpubReaderActivity loads prebake-manifest.json on book open and
+    //     fires the "Use prepared layout?" prompt when current SETTINGS
+    //     don't match the cache's recorded fingerprint
+    //   - The reader's lazy background extractor processes any pending
+    //     <book-hash>.zip dropped via the file manager into sections-prebake/
+    add(SettingInfo::Toggle(StrId::STR_OPTIMIZE_CHAPTER_INDEXING, &CrossPointSettings::optimizeChapterIndexing,
+                            "optimizeChapterIndexing", StrId::STR_CAT_SYSTEM));
 
     // --- KOReader Sync (web-only, uses KOReaderCredentialStore) ---
     add(SettingInfo::DynamicString(
