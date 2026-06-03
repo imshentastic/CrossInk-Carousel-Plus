@@ -140,8 +140,20 @@ void DictionaryWordSelectActivity::extractWords() {
   }
 
   if (!words.empty()) {
+    // CrumBLE: rows are pushed per Y-line, but wordIndices only gets
+    // entries for lookup-able tokens. A row of pure punctuation /
+    // styled glyphs leaves wordIndices empty, and starting at row 0
+    // with an empty wordIndices vector faults the first render --
+    // rows[0].wordIndices[0] derefs OOB on an empty vector. Skip
+    // forward to the first row that actually has selectable words.
     currentRow = 0;
     currentWordInRow = 0;
+    for (size_t r = 0; r < rows.size(); ++r) {
+      if (!rows[r].wordIndices.empty()) {
+        currentRow = static_cast<int>(r);
+        break;
+      }
+    }
   }
 }
 
@@ -239,7 +251,12 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
   renderer.clearScreen();
   page->render(renderer, fontId, marginLeft, marginTop);
 
-  if (!rows.empty()) {
+  // CrumBLE: belt and suspenders -- extractWords now skips empty rows,
+  // but if currentRow lands on one anyway (defensive) or words is empty
+  // entirely, skip the highlight pass instead of dereferencing OOB.
+  if (!rows.empty() && currentRow >= 0 && currentRow < static_cast<int>(rows.size()) &&
+      !rows[currentRow].wordIndices.empty() && currentWordInRow >= 0 &&
+      currentWordInRow < static_cast<int>(rows[currentRow].wordIndices.size())) {
     int selectedWordIdx = rows[currentRow].wordIndices[currentWordInRow];
     const int lineHeight = renderer.getLineHeight(fontId);
 
