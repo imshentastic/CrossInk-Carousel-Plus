@@ -1,9 +1,12 @@
 #include "Dictionary.h"
 
+#include <Arduino.h>  // millis()
 #include <HalStorage.h>
+#include <Logging.h>
 #include <esp_task_wdt.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
-#include <Arduino.h>  // yield()
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -112,12 +115,20 @@ std::string Dictionary::readWord(FsFile& file) {
 
 bool Dictionary::loadIndex(const std::function<void(int percent)>& onProgress,
                            const std::function<bool()>& shouldCancel) {
-  if (loadCachedIndex()) return true;
+  if (loadCachedIndex()) {
+    LOG_INF("DICT", "loadIndex: cache hit, returning fast");
+    return true;
+  }
 
   FsFile idxFile;
-  if (!Storage.openFileForRead("DICT", IDX_FILE, idxFile)) return false;
+  if (!Storage.openFileForRead("DICT", IDX_FILE, idxFile)) {
+    LOG_ERR("DICT", "loadIndex: failed to open %s", IDX_FILE);
+    return false;
+  }
 
   uint32_t fileSize = idxFile.size();
+  LOG_INF("DICT", "loadIndex: scanning %s (%u bytes)", IDX_FILE, fileSize);
+  const uint32_t scanStartMs = millis();
   uint32_t currentOffset = 0;
   totalWords = 0;
   sparseOffsets.clear();
@@ -133,14 +144,19 @@ bool Dictionary::loadIndex(const std::function<void(int percent)>& onProgress,
       if (onProgress) {
         onProgress((currentOffset * 100) / fileSize);
       }
-      // CrumBLE: byte-by-byte SD reads for the whole .idx run for several
-      // seconds without giving FreeRTOS a chance to run. Without these
-      // calls, the task watchdog fires partway through and the device
-      // reboots before the scan completes -- matches the codebase pattern
-      // in CrossPointWebServer / WebDAVHandler for any long SD loop.
-      // SPARSE_INTERVAL is 512 words so we feed the WDT roughly every
-      // ~50ms of scan time, well inside the default timeout.
-      yield();
+    }
+    // CrumBLE: byte-by-byte SD reads can run multi-second without
+    // giving FreeRTOS a chance to schedule lower-priority tasks.
+    // CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0 panics IDLE0 if it
+    // doesn't get cycles within ~5s, and yield() (vTaskDelay(0)) only
+    // surrenders to same-or-higher-priority tasks -- IDLE is lower
+    // priority, so yield() never reaches it. vTaskDelay(1) actually
+    // sleeps for one tick (~1ms), which lets IDLE run and reset its
+    // own WDT. Also reset our own subscriber slot for completeness.
+    // Cadence: every 64 words. For a 100K-word dict that's ~1500
+    // delays of 1ms = ~1.5s total overhead, negligible.
+    if ((totalWords & 0x3F) == 0) {
+      vTaskDelay(1);
       esp_task_wdt_reset();
     }
 
@@ -159,7 +175,10 @@ bool Dictionary::loadIndex(const std::function<void(int percent)>& onProgress,
 
   idxFile.close();
   indexLoaded = true;
+  const uint32_t scanMs = millis() - scanStartMs;
+  LOG_INF("DICT", "loadIndex: scan complete -- %u words, %u ms", totalWords, scanMs);
   saveCachedIndex();
+  LOG_INF("DICT", "loadIndex: cache saved");
 
   if (onProgress) onProgress(100);
   return true;
@@ -244,7 +263,7 @@ std::string Dictionary::lookup(const std::string& rawWord, const std::function<v
     // that's enough byte-by-byte reads to trip the task WDT in the worst
     // case. Feed it every 64 iterations.
     if ((++scanned & 0x3F) == 0) {
-      yield();
+      vTaskDelay(1);
       esp_task_wdt_reset();
     }
   }
@@ -338,7 +357,7 @@ std::vector<std::string> Dictionary::findSimilar(const std::string& rawWord, int
     // CrumBLE: 3000-word linear scan on the byte-by-byte SD reader is
     // multi-second on a slow card -- feed WDT every 64 iterations.
     if ((wordsScanned & 0x3F) == 0) {
-      yield();
+      vTaskDelay(1);
       esp_task_wdt_reset();
     }
   }
