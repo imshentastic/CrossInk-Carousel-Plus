@@ -2478,6 +2478,12 @@
     const hasEpub = Array.from(files).some(f => f.name.toLowerCase().endsWith('.epub'));
     if (files.length > 0 && hasEpub) {
       convertOptions.style.display = 'block';
+      // Sync sub-option visibility (btFriendlyOption + the Pre-cache row
+      // inside it) to the master toggle's CURRENT state. Without this
+      // call the sub-options stay display:none on first pick because the
+      // master's checked state was set declaratively and never fired a
+      // change event for toggleConvertOptions to react to.
+      toggleConvertOptions();
     } else {
       convertOptions.style.display = 'none';
       // Clear stale checkbox state so the "Optimize & Upload" button doesn't linger
@@ -2941,6 +2947,7 @@ async function uploadFile() {
     // budget is based on whether the prebake toggle is checked AND the
     // file is an EPUB. The phase-end snaps are tracked below so a phase
     // that bails early hands off to the next one without rewinding.
+    const isEpubUpload = file && file.name && /\.epub$/i.test(file.name);
     const willPrebake = isEpubUpload && !!document.getElementById('optimize-for-device-checkbox')?.checked;
     const convertEnd = needsConversion ? (willPrebake ? 25 : 50) : 0;
     const uploadEnd = willPrebake ? 80 : 100;
@@ -3110,7 +3117,6 @@ async function uploadFile() {
       // .epub uploads. Failure is non-fatal -- we still report the upload
       // as complete; only the chapter speed-up is missed.
       const prebakeCheckbox = document.getElementById('optimize-for-device-checkbox');
-      const isEpubUpload = file && file.name && /\.epub$/i.test(file.name);
       if (prebakeCheckbox && prebakeCheckbox.checked && isEpubUpload) {
         try {
           progressText.textContent = `Optimizing chapter indexing for ${file.name}...`;
