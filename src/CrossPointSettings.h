@@ -462,6 +462,18 @@ class CrossPointSettings {
   // BLE address type (0 = public, 1 = random). Required by NimBLE on reconnect.
   uint8_t bleBondedDeviceAddrType = 0;
 
+  // CrumBLE: skip the grayscale LSB/MSB double-pass when cycling through the
+  // sleep screensaver. Each grayscale pass triggers an extra ~1-2 s e-ink
+  // sweep, so a single BMP with grayscale data takes ~3-4 sweeps to land.
+  // For users who tap-cycle rapidly to find a specific image, the BW
+  // single-sweep (~500 ms) feels much snappier. Trade-off: the cycled
+  // image is rendered in 1-bit BW instead of 4-level grayscale until the
+  // user stops cycling and the device deep-sleeps. Default 0 (grayscale
+  // pass stays on, matching v3.7.3 behaviour). Only affects the cycle
+  // path -- cover sleep, custom sleep, and end-of-book sleep keep the
+  // grayscale pass either way.
+  uint8_t sleepCycleSkipGrayscale = 0;
+
   // CrumBLE prebake — master switch for the off-device chapter-index optimizer.
   // When 0 (default), the device behaves exactly like stock 3.7.3: only
   // sections/*.bin is consulted on cache load, and no prebake-manifest.json

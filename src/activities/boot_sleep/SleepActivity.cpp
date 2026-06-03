@@ -851,13 +851,12 @@ void SleepActivity::cycleScreensaverFromDeepSleep(GfxRenderer& renderer) {
     return;
   }
 
-  // Skip the grayscale LSB/MSB double-pass while cycling: each pass triggers
-  // an additional ~1-2 s e-ink sweep, and a user rapidly tapping through
-  // images doesn't need pristine grayscale on every frame -- they need the
-  // device to be responsive. The B/W single-sweep gives them snappy
-  // feedback; the grayscale settle would only be visible briefly before
-  // they tap to the next one anyway.
-  renderBitmapToSleepScreen(renderer, bitmap, /*skipGreyscalePass=*/true);
+  // sleepCycleSkipGrayscale: optional opt-in for users who tap-cycle fast
+  // and would rather see a snappy BW frame than wait for the grayscale
+  // LSB/MSB double-pass. Default off so behaviour matches v3.7.3 unless
+  // the user explicitly turns it on in Display settings.
+  const bool skipGrayscale = SETTINGS.sleepCycleSkipGrayscale != 0;
+  renderBitmapToSleepScreen(renderer, bitmap, skipGrayscale);
 }
 
 void SleepActivity::renderCoverSleepScreen() const {
