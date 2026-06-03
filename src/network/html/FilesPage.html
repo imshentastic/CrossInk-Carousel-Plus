@@ -1205,22 +1205,27 @@
     .delete-btn-cancel:hover {
       background-color: var(--label-color);
     }
-    /* End-of-batch / failed-batch states for the upload modal's "Close"
-       button. We swap the grey Cancel into a coloured action so the user
-       sees an obvious next step instead of having to guess. */
+    /* Three-state Cancel/Close button for the upload modal. The colour
+       tells the user what's happening:
+         grey  (default)        : idle, nothing in flight
+         red   (.in-progress)   : upload/optimization running, closing now
+                                  interrupts work in progress
+         green (.done)          : finished, safe to close
+       Failure-with-some-success uses .done too because the work is over
+       either way -- the retry banner appears AFTER the user dismisses. */
+    .delete-btn-cancel.in-progress {
+      background-color: #e74c3c;
+      font-weight: 600;
+    }
+    .delete-btn-cancel.in-progress:hover {
+      background-color: #c44034;
+    }
     .delete-btn-cancel.done {
       background-color: #27ae60;
       font-weight: 600;
     }
     .delete-btn-cancel.done:hover {
       background-color: #239753;
-    }
-    .delete-btn-cancel.done-failed {
-      background-color: #e74c3c;
-      font-weight: 600;
-    }
-    .delete-btn-cancel.done-failed:hover {
-      background-color: #c44034;
     }
     .rename-btn-confirm {
       background-color: #3498db;
@@ -2165,14 +2170,15 @@
     uploadBtn.style.display = 'block';
     uploadBtn.textContent = 'Upload';
     uploadBtn.classList.remove('optimize');
-    // Reset the Cancel/Close button back to neutral grey "Cancel" so the
-    // next upload opens to a fresh modal -- otherwise a previous batch's
-    // green/red "Close" treatment would persist.
+    // Reset the Cancel/Close button to neutral grey "Cancel" so the next
+    // upload opens to a fresh modal -- otherwise the previous batch's
+    // red (in-progress) or green (done) paint would persist and lie about
+    // the new modal's state.
     const cancelBtnReset = document.querySelector('#uploadModal .delete-btn-cancel');
     if (cancelBtnReset) {
       cancelBtnReset.textContent = 'Cancel';
+      cancelBtnReset.classList.remove('in-progress');
       cancelBtnReset.classList.remove('done');
-      cancelBtnReset.classList.remove('done-failed');
     }
     document.getElementById('startConversionBtn').style.display = 'none';
     document.getElementById('progress-container').style.display = 'none';
@@ -2888,6 +2894,11 @@ async function uploadFile() {
   uploadGeneration++;
   const myGeneration = uploadGeneration;
   document.getElementById('uploadModalClose').classList.add('disabled');
+  // Three-state Cancel/Close button: paint it red while the batch is
+  // in flight. Visually telegraphs "don't bail mid-upload"; cleared back
+  // to green at terminal state (see the success/failure paths below).
+  const cancelBtnInProg = document.querySelector('#uploadModal .delete-btn-cancel');
+  if (cancelBtnInProg) cancelBtnInProg.classList.add('in-progress');
 
   const progressContainer = document.getElementById('progress-container');
   const progressFill = document.getElementById('progress-fill');
@@ -2937,10 +2948,10 @@ async function uploadFile() {
         const cancelBtn = document.querySelector('#uploadModal .delete-btn-cancel');
         if (cancelBtn) {
           cancelBtn.textContent = 'Close';
-          // Make the Close button visually pop -- without this the user
-          // sees a sea of grey at the bottom and doesn't know which
-          // button to click to dismiss the modal. Green = "you're done,
-          // here's the way out."
+          // Three-state Close button reaching its terminal state: drop
+          // the red in-progress paint and swap to green so the user sees
+          // "all good, here's the way out."
+          cancelBtn.classList.remove('in-progress');
           cancelBtn.classList.add('done');
         }
         modalNeedsRefreshOnClose = true;
@@ -2978,7 +2989,14 @@ async function uploadFile() {
         const cancelBtnFail = document.querySelector('#uploadModal .delete-btn-cancel');
         if (cancelBtnFail) {
           cancelBtnFail.textContent = 'Close';
-          cancelBtnFail.classList.add('done-failed');
+          // Per the user's three-state spec: the END of work means the
+          // button is safe-to-click whether or not every file succeeded.
+          // We swap to green even on partial failure -- the retry banner
+          // (which surfaces failed files) appears AFTER the user
+          // dismisses, so we don't need to paint the button red as a
+          // separate failure signal.
+          cancelBtnFail.classList.remove('in-progress');
+          cancelBtnFail.classList.add('done');
         }
         modalNeedsBannerOnClose = true;
       }
