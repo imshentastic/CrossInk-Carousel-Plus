@@ -1,7 +1,9 @@
 #include "Dictionary.h"
 
 #include <HalStorage.h>
+#include <esp_task_wdt.h>
 
+#include <Arduino.h>  // yield()
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -131,6 +133,15 @@ bool Dictionary::loadIndex(const std::function<void(int percent)>& onProgress,
       if (onProgress) {
         onProgress((currentOffset * 100) / fileSize);
       }
+      // CrumBLE: byte-by-byte SD reads for the whole .idx run for several
+      // seconds without giving FreeRTOS a chance to run. Without these
+      // calls, the task watchdog fires partway through and the device
+      // reboots before the scan completes -- matches the codebase pattern
+      // in CrossPointWebServer / WebDAVHandler for any long SD loop.
+      // SPARSE_INTERVAL is 512 words so we feed the WDT roughly every
+      // ~50ms of scan time, well inside the default timeout.
+      yield();
+      esp_task_wdt_reset();
     }
 
     // Read word string
@@ -209,6 +220,7 @@ std::string Dictionary::lookup(const std::string& rawWord, const std::function<v
                           ? sparseOffsets[closestSparseIdx + 1]
                           : idxFile.size();
 
+  int scanned = 0;
   while (idxFile.position() < chunkEnd) {
     if (shouldCancel && shouldCancel()) break;
 
@@ -226,6 +238,14 @@ std::string Dictionary::lookup(const std::string& rawWord, const std::function<v
     if (clean == targetWord) {
       idxFile.close();
       return readDefinition(dataOffset, dataSize);
+    }
+
+    // CrumBLE: chunk has up to SPARSE_INTERVAL (512) words; on a slow SD
+    // that's enough byte-by-byte reads to trip the task WDT in the worst
+    // case. Feed it every 64 iterations.
+    if ((++scanned & 0x3F) == 0) {
+      yield();
+      esp_task_wdt_reset();
     }
   }
 
@@ -313,6 +333,13 @@ std::vector<std::string> Dictionary::findSimilar(const std::string& rawWord, int
     int dist = editDistance(targetWord, clean, 3);
     if (dist <= 3) {
       candidates.push_back({word, dist});
+    }
+
+    // CrumBLE: 3000-word linear scan on the byte-by-byte SD reader is
+    // multi-second on a slow card -- feed WDT every 64 iterations.
+    if ((wordsScanned & 0x3F) == 0) {
+      yield();
+      esp_task_wdt_reset();
     }
   }
   idxFile.close();

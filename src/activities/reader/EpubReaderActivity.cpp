@@ -1738,8 +1738,13 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
 
       if (Dictionary::isIndexReady()) {
         launchWordSelect();
-      } else if (Dictionary::hasCachedIndex()) {
-        Dictionary::loadCachedIndex();
+      } else if (Dictionary::loadCachedIndex()) {
+        // Cache present AND loaded cleanly (~50ms). If the file existed
+        // but was truncated/corrupt, loadCachedIndex returns false here
+        // and we fall through to the prompt -- we'd rather ask the user
+        // to consent to a rebuild than silently freeze inside the first
+        // lookup() call (which is what happens if we proceed assuming
+        // the cache loaded when it didn't).
         launchWordSelect();
       } else {
         startActivityForResult(
