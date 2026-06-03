@@ -10,6 +10,7 @@
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "MappedInputManager.h"
+#include "util/CacheWriteRecovery.h"
 #include "ReaderUtils.h"
 #include "RecentBooksStore.h"
 #include "activities/boot_sleep/SleepCoverAssets.h"
@@ -445,7 +446,7 @@ void TxtReaderActivity::renderStatusBar() const {
 
 void TxtReaderActivity::saveProgress() const {
   FsFile f;
-  if (Storage.openFileForWrite("TRS", txt->getCachePath() + "/progress.bin", f)) {
+  if (CacheWriteRecovery::openForWriteOrRecover("TRS", txt->getCachePath() + "/progress.bin", f)) {
     // 6-byte format: page(2 bytes LE) + file offset(4 bytes LE)
     // The offset lets drawCurrentPageToBuffer render without requiring index.bin.
     const size_t offset = (currentPage < static_cast<int>(pageOffsets.size())) ? pageOffsets[currentPage] : 0;
@@ -581,7 +582,7 @@ bool TxtReaderActivity::loadPageIndexCache() {
 void TxtReaderActivity::savePageIndexCache() const {
   std::string cachePath = txt->getCachePath() + "/index.bin";
   FsFile f;
-  if (!Storage.openFileForWrite("TRS", cachePath, f)) {
+  if (!CacheWriteRecovery::openForWriteOrRecover("TRS", cachePath, f)) {
     LOG_ERR("TRS", "Failed to save page index cache");
     return;
   }
