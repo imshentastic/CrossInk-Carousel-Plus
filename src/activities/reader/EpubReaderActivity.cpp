@@ -24,6 +24,7 @@
 #include "../settings/KOReaderSettingsActivity.h"
 #include "BookSettingsDrawerActivity.h"
 // CrumBLE: dictionary feature (ported from SEEK reader sumegig/seek-reader).
+#include "DictionaryIndexBuildActivity.h"
 #include "DictionaryWordSelectActivity.h"
 #include "LookedUpWordsActivity.h"
 #include "util/Dictionary.h"
@@ -1711,12 +1712,59 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
           }
         }
       }
-      if (pageForLookup) {
+      if (!pageForLookup) break;
+
+      // CrumBLE: before launching word select, make sure the dictionary
+      // index is ready. Three paths:
+      //   (a) already in RAM -> go straight to word select.
+      //   (b) cache file on SD exists -> load it inline (~50ms) then go.
+      //   (c) no cache -> ask the user to consent to a one-time ~10s
+      //       scan, then run DictionaryIndexBuildActivity, then go.
+      // Without this gate the first-ever lookup would freeze
+      // DictionaryDefinitionActivity for ~10s with only "Looking up..."
+      // on screen, with no warning to the user.
+      const int readerFontId = SETTINGS.getReaderFontId();
+      const auto orientation = SETTINGS.orientation;
+      const auto cachePath = epub->getCachePath();
+      auto pageShared = std::make_shared<std::unique_ptr<Page>>(std::move(pageForLookup));
+      auto launchWordSelect = [this, pageShared, readerFontId, orientedMarginLeft, orientedMarginTop, cachePath,
+                               orientation, nextPageFirstWord]() {
         startActivityForResult(
-            std::make_unique<DictionaryWordSelectActivity>(
-                renderer, mappedInput, std::move(pageForLookup), SETTINGS.getReaderFontId(), orientedMarginLeft,
-                orientedMarginTop, epub->getCachePath(), SETTINGS.orientation, nextPageFirstWord),
+            std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(*pageShared), readerFontId,
+                                                          orientedMarginLeft, orientedMarginTop, cachePath, orientation,
+                                                          nextPageFirstWord),
             [this](const ActivityResult& result) { requestUpdate(); });
+      };
+
+      if (Dictionary::isIndexReady()) {
+        launchWordSelect();
+      } else if (Dictionary::hasCachedIndex()) {
+        Dictionary::loadCachedIndex();
+        launchWordSelect();
+      } else {
+        startActivityForResult(
+            std::make_unique<ChoicePromptActivity>(
+                renderer, mappedInput, tr(STR_DICT_INDEX_PROMPT_TITLE), tr(STR_DICT_INDEX_PROMPT_BODY),
+                std::vector<std::string>{tr(STR_DICT_INDEX_PROMPT_BUILD), tr(STR_DICT_INDEX_PROMPT_CANCEL)},
+                /*ignoreInitialConfirmRelease=*/true),
+            [this, launchWordSelect](const ActivityResult& promptResult) {
+              int chosen = -1;
+              if (const auto* cp = std::get_if<ChoicePromptResult>(&promptResult.data)) {
+                chosen = cp->choice;
+              }
+              if (promptResult.isCancelled || chosen != 0) {
+                requestUpdate();
+                return;
+              }
+              startActivityForResult(std::make_unique<DictionaryIndexBuildActivity>(renderer, mappedInput),
+                                     [this, launchWordSelect](const ActivityResult& buildResult) {
+                                       if (buildResult.isCancelled) {
+                                         requestUpdate();
+                                         return;
+                                       }
+                                       launchWordSelect();
+                                     });
+            });
       }
       break;
     }

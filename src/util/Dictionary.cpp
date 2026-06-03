@@ -24,6 +24,10 @@ static uint32_t swap32(uint32_t val) {
 
 bool Dictionary::exists() { return Storage.exists(DICT_FILE) && Storage.exists(IDX_FILE); }
 
+bool Dictionary::isIndexReady() { return indexLoaded; }
+
+bool Dictionary::hasCachedIndex() { return Storage.exists(CACHE_FILE); }
+
 std::string Dictionary::cleanWord(const std::string& word) {
   std::string clean;
   for (char c : word) {

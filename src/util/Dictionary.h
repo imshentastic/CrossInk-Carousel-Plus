@@ -27,14 +27,28 @@ class Dictionary {
 
   static void freeMemory();
 
+  // CrumBLE: gating helpers for the explicit-consent prompt before the
+  // one-time ~10s index scan. isIndexReady() returns true if the sparse
+  // offset table is already in RAM (no work needed). hasCachedIndex()
+  // returns true if /.crosspoint/dict_idx.cache exists on disk (cheap
+  // existence check -- callers should still call loadIndex to actually
+  // populate the in-RAM table, which is fast from cache). loadIndex
+  // and loadCachedIndex are promoted to public so the LOOKUP entry
+  // point can drive the load explicitly instead of letting it happen
+  // inside the first lookup() call.
+  static bool isIndexReady();
+  static bool hasCachedIndex();
+
+  static bool loadIndex(const std::function<void(int percent)>& onProgress = nullptr,
+                        const std::function<bool()>& shouldCancel = nullptr);
+  static bool loadCachedIndex();
+
  private:
   static constexpr int SPARSE_INTERVAL = 512;
   static std::vector<uint32_t> sparseOffsets;
   static uint32_t totalWords;
   static bool indexLoaded;
 
-  static bool loadIndex(const std::function<void(int percent)>& onProgress, const std::function<bool()>& shouldCancel);
-  static bool loadCachedIndex();
   static void saveCachedIndex();
 
   static std::string readWord(FsFile& file);
