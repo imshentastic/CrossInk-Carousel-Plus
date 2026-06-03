@@ -1858,6 +1858,217 @@ async function bakePxc(jpegBytes, viewportW, viewportH) {
   }
 }
 
+// CrumBLE optimizer preflight modal. Before BT-bake or prebake locks the
+// book's layout to a specific reader-settings snapshot, surface that
+// snapshot to the user so they can verify (and edit) the values that will
+// be embedded in the manifest -- and, on edit, push the corrected SETTINGS
+// back to the device so the first cold open finds the prebake's
+// fingerprint matching reality.
+//
+// Returns a Promise that resolves with the final renderInfo to use for the
+// bake (potentially edited and re-fetched from the device after a save),
+// or rejects with an Error('Cancelled by user') if the user backs out.
+async function showOptimizerPreflightModal(renderInfo, fileName) {
+  // Enum tables. Indexes match the CrossPointSettings.h enums byte-for-byte
+  // -- the device validates the same ranges in handleSaveReaderSettings, so
+  // any drift here would be caught server-side. Keep in sync with that file.
+  const FONT_FAMILY = [
+    { v: 0, label: 'Lexend Deca' },
+    { v: 1, label: 'Bitter' },
+    { v: 2, label: 'CharE-Ink' },
+  ];
+  const FONT_SIZE = [
+    { v: 0, label: 'Tiny (8pt)' },
+    { v: 1, label: 'Small (10pt)' },
+    { v: 2, label: 'Medium (12pt)' },
+    { v: 3, label: 'Large (14pt)' },
+    { v: 4, label: 'Extra Large (16pt)' },
+    { v: 5, label: 'Teensy (6pt)' },
+    { v: 6, label: 'Huge (20pt)' },
+  ];
+  const ORIENTATION = [
+    { v: 0, label: 'Portrait' },
+    { v: 1, label: 'Landscape (CW)' },
+    { v: 3, label: 'Landscape (CCW)' },
+  ];
+  const LINE_SPACING = [
+    { v: 0, label: 'Tight' },
+    { v: 1, label: 'Normal' },
+    { v: 2, label: 'Wide' },
+  ];
+  const PARAGRAPH_ALIGNMENT = [
+    { v: 0, label: 'Justified' },
+    { v: 1, label: 'Left' },
+    { v: 2, label: 'Center' },
+    { v: 3, label: 'Right' },
+  ];
+  const IMAGE_RENDERING = [
+    { v: 0, label: 'Show images' },
+    { v: 1, label: 'Placeholder' },
+    { v: 2, label: 'Suppress' },
+  ];
+
+  return new Promise((resolve, reject) => {
+    const overlay = document.createElement('div');
+    overlay.style.cssText =
+      'position:fixed;inset:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;' +
+      'justify-content:center;z-index:10000;font-family:-apple-system,system-ui,sans-serif;';
+    const dialog = document.createElement('div');
+    dialog.style.cssText =
+      'background:#fff;color:#222;border-radius:12px;max-width:560px;width:90%;max-height:85vh;overflow-y:auto;' +
+      'padding:24px;box-shadow:0 12px 32px rgba(0,0,0,0.2);';
+    const header = document.createElement('div');
+    header.innerHTML =
+      '<h2 style="margin:0 0 6px;font-size:20px;color:#222">Lock in reader settings?</h2>' +
+      '<p style="margin:0 0 16px;color:#555;font-size:14px;line-height:1.5">' +
+      'Optimizing this book takes up to a few minutes (depending on length and images) ' +
+      'and locks the prepared layout to specific reader settings. Verify these are the ' +
+      'settings you read with. Anything you change here updates the device too.</p>';
+    dialog.appendChild(header);
+
+    const settingNote = document.createElement('p');
+    settingNote.style.cssText = 'margin:0 0 10px;font-size:13px;color:#777';
+    settingNote.textContent = `Book: ${fileName}`;
+    dialog.appendChild(settingNote);
+
+    const form = document.createElement('div');
+    form.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:10px 14px;margin:8px 0 16px;';
+
+    const makeSelect = (label, key, options, current) => {
+      const wrap = document.createElement('label');
+      wrap.style.cssText = 'display:flex;flex-direction:column;font-size:13px;color:#444';
+      const span = document.createElement('span');
+      span.style.cssText = 'margin-bottom:3px;font-weight:500';
+      span.textContent = label;
+      const sel = document.createElement('select');
+      sel.dataset.key = key;
+      sel.dataset.current = current;
+      sel.style.cssText = 'padding:6px 8px;border:1px solid #c2c2c2;border-radius:4px;font-size:14px;background:#fff;color:#222';
+      for (const opt of options) {
+        const o = document.createElement('option');
+        o.value = opt.v;
+        o.textContent = opt.label;
+        if (opt.v === current) o.selected = true;
+        sel.appendChild(o);
+      }
+      wrap.appendChild(span);
+      wrap.appendChild(sel);
+      form.appendChild(wrap);
+    };
+    const makeNumber = (label, key, current, min, max) => {
+      const wrap = document.createElement('label');
+      wrap.style.cssText = 'display:flex;flex-direction:column;font-size:13px;color:#444';
+      const span = document.createElement('span');
+      span.style.cssText = 'margin-bottom:3px;font-weight:500';
+      span.textContent = label;
+      const inp = document.createElement('input');
+      inp.type = 'number';
+      inp.min = String(min);
+      inp.max = String(max);
+      inp.value = String(current);
+      inp.dataset.key = key;
+      inp.dataset.current = String(current);
+      inp.style.cssText = 'padding:6px 8px;border:1px solid #c2c2c2;border-radius:4px;font-size:14px;background:#fff;color:#222';
+      wrap.appendChild(span);
+      wrap.appendChild(inp);
+      form.appendChild(wrap);
+    };
+    const makeBool = (label, key, current) => {
+      const wrap = document.createElement('label');
+      wrap.style.cssText =
+        'display:flex;align-items:center;gap:8px;font-size:13px;color:#444;cursor:pointer';
+      const inp = document.createElement('input');
+      inp.type = 'checkbox';
+      inp.dataset.key = key;
+      inp.dataset.current = String(current ? 1 : 0);
+      inp.checked = !!current;
+      inp.style.cssText = 'width:18px;height:18px;cursor:pointer';
+      const span = document.createElement('span');
+      span.textContent = label;
+      wrap.appendChild(inp);
+      wrap.appendChild(span);
+      form.appendChild(wrap);
+    };
+
+    makeSelect('Font family', 'fontFamily', FONT_FAMILY, renderInfo.fontFamily | 0);
+    makeSelect('Font size', 'fontSize', FONT_SIZE, renderInfo.fontSize | 0);
+    makeSelect('Orientation', 'orientation', ORIENTATION, renderInfo.orientation | 0);
+    makeNumber('Screen margin (px)', 'screenMargin', renderInfo.screenMargin | 0, 0, 50);
+    makeSelect('Line spacing', 'lineSpacing', LINE_SPACING, renderInfo.lineSpacing | 0);
+    makeSelect('Paragraph alignment', 'paragraphAlignment', PARAGRAPH_ALIGNMENT, renderInfo.paragraphAlignment | 0);
+    makeSelect('Image rendering', 'imageRendering', IMAGE_RENDERING, renderInfo.imageRendering | 0);
+    makeBool('Extra paragraph spacing', 'extraParagraphSpacing', renderInfo.extraParagraphSpacing | 0);
+    makeBool('Force paragraph indents', 'forceParagraphIndents', renderInfo.forceParagraphIndents | 0);
+    makeBool('Hyphenation', 'hyphenationEnabled', renderInfo.hyphenationEnabled | 0);
+    makeBool('Embedded CSS', 'embeddedStyle', renderInfo.embeddedStyle | 0);
+    makeBool('Bionic reading', 'bionicReadingEnabled', renderInfo.bionicReadingEnabled | 0);
+    makeBool('Guide reading', 'guideReadingEnabled', renderInfo.guideReadingEnabled | 0);
+    dialog.appendChild(form);
+
+    const buttons = document.createElement('div');
+    buttons.style.cssText = 'display:flex;gap:10px;justify-content:flex-end;margin-top:8px';
+    const cancel = document.createElement('button');
+    cancel.textContent = 'Cancel';
+    cancel.style.cssText =
+      'padding:9px 18px;border:1px solid #c2c2c2;background:#fafafa;border-radius:6px;' +
+      'font-size:14px;cursor:pointer;color:#444';
+    const confirm = document.createElement('button');
+    confirm.textContent = 'Looks good, optimize';
+    confirm.style.cssText =
+      'padding:9px 18px;border:1px solid #2c7a3f;background:#2c7a3f;color:#fff;border-radius:6px;' +
+      'font-size:14px;cursor:pointer;font-weight:600';
+    buttons.appendChild(cancel);
+    buttons.appendChild(confirm);
+    dialog.appendChild(buttons);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    const close = () => { try { document.body.removeChild(overlay); } catch (e) { /* gone already */ } };
+    cancel.onclick = () => { close(); reject(new Error('Cancelled by user')); };
+    overlay.onclick = (e) => { if (e.target === overlay) { close(); reject(new Error('Cancelled by user')); } };
+
+    confirm.onclick = async () => {
+      const updates = {};
+      const dirtyKeys = [];
+      form.querySelectorAll('[data-key]').forEach(el => {
+        const key = el.dataset.key;
+        const cur = el.dataset.current;
+        const val = (el.type === 'checkbox') ? (el.checked ? '1' : '0') : el.value;
+        if (val !== cur) {
+          dirtyKeys.push(key);
+          if (el.type === 'checkbox') updates[key] = el.checked ? 1 : 0;
+          else updates[key] = Number(val);
+        }
+      });
+      if (dirtyKeys.length === 0) {
+        close();
+        resolve(renderInfo);
+        return;
+      }
+      confirm.disabled = true;
+      confirm.textContent = 'Saving settings...';
+      try {
+        const resp = await fetch('/api/save-reader-settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updates),
+        });
+        if (!resp.ok) {
+          const errText = await resp.text();
+          throw new Error('Save failed: ' + errText);
+        }
+        const fresh = await fetch('/api/reader-render-info').then(r => r.json());
+        close();
+        resolve(fresh);
+      } catch (e) {
+        confirm.disabled = false;
+        confirm.textContent = 'Looks good, optimize';
+        alert('Could not save settings: ' + (e.message || e));
+      }
+    };
+  });
+}
+
 // =============================================================================
 // CrumBLE Phase 5b: chapter-indexing prebake (WASM-backed)
 // =============================================================================
@@ -2218,6 +2429,20 @@ async function convertEpubFile(file, progressCallback) {
     if (!renderInfo || !(renderInfo.viewportWidth > 0) || !(renderInfo.viewportHeight > 0)) {
       renderInfo = null;
     } else {
+      // Preflight: lock in the reader settings now. The bake's manifest +
+      // section fingerprints will be derived from these values, and the
+      // device's first cold open compares against SETTINGS as they are at
+      // that moment -- so if the user has any of these wrong, the cache
+      // misses immediately and the optimization is for nothing. Pause
+      // here, show the user what we're about to commit, let them edit
+      // before we start the long-running work. Cancel aborts the whole
+      // optimization (propagates up to convertEpubFile's caller).
+      try {
+        renderInfo = await showOptimizerPreflightModal(renderInfo, file.name);
+      } catch (e) {
+        log(`Optimization cancelled before start: ${e.message || e}`, 'warning', 'INFO');
+        throw e;
+      }
       log(`Bluetooth image cache: baking .pxc for ${renderInfo.device} viewport ${renderInfo.viewportWidth}x${renderInfo.viewportHeight}`, '', 'INFO');
     }
   } else {
