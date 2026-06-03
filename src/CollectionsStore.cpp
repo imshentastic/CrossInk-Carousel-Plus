@@ -381,6 +381,42 @@ int CollectionsStore::addBooksToCollection(const std::string& collectionId, cons
   return 0;
 }
 
+bool CollectionsStore::reorderBooksInCollection(const std::string& collectionId,
+                                                const std::vector<std::string>& newOrder) {
+  for (auto& c : collections) {
+    if (c.id != collectionId) continue;
+    if (c.isVirtual) {
+      LOG_ERR("CLN", "Refusing reorder on virtual collection: %s", collectionId.c_str());
+      return false;
+    }
+    // Validate: newOrder must be a permutation of c.bookPaths (no adds/drops).
+    // Catches stale-list races -- e.g. user adds a book in another menu while
+    // the reorder activity was open. In that case we'd silently lose the new
+    // book on save; better to refuse and let the user re-open the reorder.
+    if (newOrder.size() != c.bookPaths.size()) {
+      LOG_ERR("CLN", "reorderBooks: size mismatch (%zu vs %zu) on %s", newOrder.size(),
+              c.bookPaths.size(), collectionId.c_str());
+      return false;
+    }
+    std::unordered_set<std::string> existing(c.bookPaths.begin(), c.bookPaths.end());
+    for (const auto& p : newOrder) {
+      if (existing.find(p) == existing.end()) {
+        LOG_ERR("CLN", "reorderBooks: path %s not in collection %s", p.c_str(), collectionId.c_str());
+        return false;
+      }
+    }
+    c.bookPaths = newOrder;
+    // Force Manual sort so the new order isn't immediately re-shuffled by
+    // whichever sort was active when the user opened the menu.
+    c.sortMode = CollectionSort::Manual;
+    saveToFile();
+    LOG_INF("CLN", "Reordered %zu books in %s, sort -> Manual", newOrder.size(), collectionId.c_str());
+    return true;
+  }
+  LOG_ERR("CLN", "reorderBooksInCollection: unknown collection %s", collectionId.c_str());
+  return false;
+}
+
 std::string CollectionsStore::disambiguateName(const std::string& name, const std::string& ignoreId) const {
   if (name.empty()) return name;
   auto isTaken = [&](const std::string& candidate) {

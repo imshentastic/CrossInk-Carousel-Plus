@@ -160,6 +160,17 @@ class CollectionsStore {
   // collection found / virtual).
   int addBooksToCollection(const std::string& collectionId, const std::vector<std::string>& bookPaths);
 
+  // CrumBLE: replace a user collection's bookPaths with the given ordered
+  // list AND force its sortMode to Manual (otherwise the new order would
+  // be re-shuffled by the active sort on next render). Intended for the
+  // shelf-header "Reorder Books" action -- the caller passes the result
+  // of RearrangeCollectionsActivity. Refuses virtual collections (their
+  // book lists aren't stored), refuses if any path in newOrder isn't
+  // already in the collection (prevents stale-list races from silently
+  // dropping books), and persists on success. Returns true on success,
+  // false if validation fails or the collection isn't found.
+  bool reorderBooksInCollection(const std::string& collectionId, const std::vector<std::string>& newOrder);
+
   // Read-only accessors.
   bool isBookInCollection(const std::string& collectionId, const std::string& bookPath) const;
   const Collection* findCollection(const std::string& collectionId) const;
