@@ -2116,9 +2116,21 @@
     document.getElementById('uploadBtn').disabled = false;
   }
 
+  // Set true when the upload batch finishes successfully. On the next
+  // closeUploadModal() call the page refreshes so the file list shows
+  // the newly-uploaded files. We don't refresh inline at finish-time
+  // anymore because that auto-dismissed the modal before the user could
+  // review the conversion log.
+  let modalNeedsRefreshOnClose = false;
+
   function closeUploadModal() {
     // Prevent closing during upload/conversion
     if (isUploadInProgress) {
+      return;
+    }
+    if (modalNeedsRefreshOnClose) {
+      modalNeedsRefreshOnClose = false;
+      window.location.reload();
       return;
     }
     document.getElementById('uploadModal').classList.remove('open');
@@ -2856,6 +2868,11 @@ async function uploadFile() {
   let currentIndex = 0;
   const failedFiles = [];
   let useWebSocket = true; // Try WebSocket first
+  // CrumBLE: the preflight modal locks in reader settings before the
+  // first book's optimization runs. The user confirms once and the same
+  // SETTINGS apply for the whole batch -- showing the modal again per
+  // file would make the batch flow feel like a per-file confirmation.
+  let batchPreflightDone = false;
 
   // Check if we should use batch logging mode
   const epubFilesToConvert = files.filter(f => f.name.toLowerCase().endsWith('.epub') && convertEnabled);
@@ -2872,19 +2889,25 @@ async function uploadFile() {
       // All files processed - show summary
       if (failedFiles.length === 0) {
         progressFill.style.backgroundColor = '#4caf50';
-        progressText.textContent = 'All uploads complete!';
+        progressFill.style.width = '100%';
+        const optimizedCount = files.filter(f => f.name.toLowerCase().endsWith('.epub')).length;
+        progressText.textContent = files.length === 1
+          ? `Uploaded ${files[0].name}${optimizedCount ? ' (optimized)' : ''}. Close when ready.`
+          : `Uploaded ${files.length} files${optimizedCount ? ` (${optimizedCount} optimized)` : ''}. Close when ready.`;
 
         // Finalize batch log if in batch mode
-        if (useBatchLog) {
-          finalizeBatchLog();
-          setTimeout(() => {
-            window.location.reload();
-          }, 2000);
-        } else {
-          setTimeout(() => {
-            window.location.reload();
-          }, 1000);
-        }
+        if (useBatchLog) finalizeBatchLog();
+
+        // Leave the upload modal open so the user can review the log /
+        // see what was uploaded and close on their own time. Re-enable
+        // the close button (it was disabled during the in-progress
+        // state) and clear the in-progress flag so a refresh on close
+        // shows the freshly-uploaded files when they DO close.
+        isUploadInProgress = false;
+        document.getElementById('uploadModalClose').classList.remove('disabled');
+        const cancelBtn = document.querySelector('.delete-btn-cancel');
+        if (cancelBtn) cancelBtn.textContent = 'Close';
+        modalNeedsRefreshOnClose = true;
       } else {
         progressFill.style.backgroundColor = '#e74c3c';
         const failedList = failedFiles.map(f => f.name).join(', ');
@@ -3025,7 +3048,12 @@ async function uploadFile() {
       const preOptToggle = document.getElementById('optimize-for-device-checkbox');
       const preOptOn = !!preOptToggle && preOptToggle.checked;
       const willOptimize = isEpubFile && (needsConversion || preOptOn);
-      if (willOptimize) {
+      // Show preflight ONCE per batch -- the same SETTINGS lock applies
+      // to every book in this upload session, so re-prompting per file
+      // would feel like a confirmation gate the user has to clear over
+      // and over. batchPreflightDone is set at the uploadFile() scope
+      // so cancel/error on a later file doesn't re-trigger the modal.
+      if (willOptimize && !batchPreflightDone) {
         try {
           const riResp = await fetch('/api/reader-render-info');
           if (riResp.ok) {
@@ -3036,9 +3064,13 @@ async function uploadFile() {
               // both re-fetch render-info themselves after the device-
               // side SETTINGS have been updated. The modal call's only
               // purpose at this layer is "wait until user confirms".
-              await showOptimizerPreflightModal(ri, file.name);
+              const batchLabel = files.length > 1
+                ? `${file.name} + ${files.length - 1} more`
+                : file.name;
+              await showOptimizerPreflightModal(ri, batchLabel);
             }
           }
+          batchPreflightDone = true;
         } catch (preErr) {
           // User cancelled (or modal threw) -- propagate up as a
           // conversion error so the caller logs it and moves on.
@@ -3139,9 +3171,16 @@ async function uploadFile() {
             throw new Error(`could not find uploaded EPUB at ${listingPath} (looked for size=${file.size})`);
           }
           const devicePath = listingPath + actualEntry.name;
-          await prebakeChapters(file, devicePath, (percent) => {
+          await prebakeChapters(file, devicePath, (percent, status) => {
             // Scale prebake into [80, 100].
-            progressFill.style.width = `${80 + Math.round(percent * 0.2)}%`;
+            const barPct = 80 + Math.round(percent * 0.2);
+            progressFill.style.width = `${barPct}%`;
+            // Show the running status (e.g. "uploading cache file 47/182")
+            // alongside the overall percent so the user can see the bar
+            // IS still moving when each per-file tick is sub-pixel-tiny.
+            const suffix = status ? ` — ${status}` : '';
+            progressText.textContent =
+              `Optimizing chapter indexing for ${file.name}... ${barPct}%${suffix}`;
           });
           progressFill.style.width = '100%';
         } catch (preErr) {

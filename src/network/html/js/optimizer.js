@@ -2193,12 +2193,17 @@ async function ensureRemoteDir(parentPath, dirName) {
 //   { hashId, uploaded, failed, totalBytes, elapsedMs }
 async function prebakeChapters(epubBlob, deviceFilePath, progressCallback) {
   const startTime = Date.now();
-  const reportProgress = (pct) => {
+  // progressCallback signature: (percent, optionalStatusText). The caller
+  // updates the progress bar with `percent` and the caption with the
+  // status text when present. Wraps in try/catch because the caller can
+  // also throw inside the callback (e.g. on cancellation paths) and we
+  // don't want a UI error to abort the prebake.
+  const reportProgress = (pct, status) => {
     if (progressCallback) {
-      try { progressCallback(Math.max(0, Math.min(100, pct))); } catch (e) {}
+      try { progressCallback(Math.max(0, Math.min(100, pct)), status); } catch (e) {}
     }
   };
-  reportProgress(0);
+  reportProgress(0, 'starting prebake...');
 
   // 1. Fetch live render-info from the device (same endpoint the BT optimizer
   //    uses for .pxc baking). Required because the CLI hard-errors on
@@ -2213,12 +2218,12 @@ async function prebakeChapters(epubBlob, deviceFilePath, progressCallback) {
   if (!(renderInfo.fitVersion >= 2)) {
     throw new Error(`device reports fitVersion=${renderInfo.fitVersion}; chapter prebake needs >=2 (update firmware)`);
   }
-  reportProgress(5);
+  reportProgress(5, 'loading WASM module...');
 
   // 2. Boot the WASM module (downloads ~850 KB gz on first call).
   log('Chapter prebake: loading WASM module...', '', 'PRE');
   const Module = await loadCrumblePrebakeModule();
-  reportProgress(15);
+  reportProgress(15, 'building chapter index...');
 
   // 3. Stage the EPUB + settings file into MEMFS so the CLI sees them as
   //    regular files. The CLI's --device-path argument controls the cache
@@ -2263,7 +2268,7 @@ async function prebakeChapters(epubBlob, deviceFilePath, progressCallback) {
     const detail = captured ? `\n--- CLI output ---\n${captured}` : '';
     throw new Error(`prebake CLI exited with code ${rc}${detail}`);
   }
-  reportProgress(50);
+  reportProgress(50, 'uploading cache files...');
 
   // 5. Walk MEMFS to find the produced cache directory. Layout:
   //    /out/.crosspoint/epub_<hash>/{book.bin,sections-prebake/*.bin,...}
@@ -2342,8 +2347,14 @@ async function prebakeChapters(epubBlob, deviceFilePath, progressCallback) {
       failed++;
       log(`Upload error ${relPath}: ${e.message}`, 'warning', 'PRE-FAIL');
     }
-    // 50% -> 95% across the upload phase.
-    reportProgress(50 + Math.floor(45 * (i + 1) / allFiles.length));
+    // 50% -> 95% across the upload phase. Include the running file
+    // count in the status text so the user can see SOMETHING moves even
+    // when each upload nudges the bar by only a fraction of a percent
+    // (~0.25% per file for the typical ~180-file cache).
+    reportProgress(
+      50 + Math.floor(45 * (i + 1) / allFiles.length),
+      `uploading cache file ${i + 1}/${allFiles.length}`,
+    );
   }
 
   // 8. Clean MEMFS so the next book in a batch doesn't pile up entries.
