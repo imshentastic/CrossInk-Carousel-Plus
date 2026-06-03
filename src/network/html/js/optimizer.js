@@ -1967,16 +1967,20 @@ async function ensureRemoteDir(parentPath, dirName) {
 }
 
 // Run the WASM prebake against `epubBlob` and stream the resulting cache
-// files to the device. `deviceFileName` is the basename of the EPUB as it
-// will exist on the device's SD card -- used to compute the cache hash so
-// the device finds the prebake at the right path on next book open.
+// files to the device. `deviceFilePath` is the FULL absolute SD-card path
+// of the EPUB (e.g. "/Books/MyBook.epub"), NOT just the basename --
+// Epub::cachePathForFilePath on the device hashes the whole path string,
+// so if we only pass "/MyBook.epub" while the device sees "/Books/
+// MyBook.epub", the hashes differ and the prebake files land in a cache
+// dir the device doesn't look at. Caller is responsible for joining the
+// upload's currentPath with the filename.
 //
 // Calls progressCallback(donePct) with values 0..100 across the whole run
 // (download settings -> run WASM -> upload N files).
 //
 // Throws on any fatal error. Returns a summary object on success:
 //   { hashId, uploaded, failed, totalBytes, elapsedMs }
-async function prebakeChapters(epubBlob, deviceFileName, progressCallback) {
+async function prebakeChapters(epubBlob, deviceFilePath, progressCallback) {
   const startTime = Date.now();
   const reportProgress = (pct) => {
     if (progressCallback) {
@@ -2025,7 +2029,10 @@ async function prebakeChapters(epubBlob, deviceFileName, progressCallback) {
   //    --device-path tells it which SD-card path to hash for the cache
   //    directory name -- without this it'd hash "/input.epub" instead
   //    of the real device-side path.
-  const devicePath = '/' + deviceFileName;
+  // deviceFilePath comes in already absolute from the caller; verify and
+  // fall back defensively so we don't quietly hash a relative path.
+  let devicePath = deviceFilePath || '';
+  if (!devicePath.startsWith('/')) devicePath = '/' + devicePath;
   const cliArgs = [
     '--settings-file', settingsPath,
     '--output-dir', outDir,

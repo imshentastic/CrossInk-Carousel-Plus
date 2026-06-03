@@ -3078,7 +3078,25 @@ async function uploadFile() {
         try {
           progressText.textContent = `Optimizing chapter indexing for ${file.name}...`;
           progressFill.style.backgroundColor = '#3498db'; // Blue for prebake phase
-          await prebakeChapters(file, file.name, (percent) => {
+          // Resolve the EXACT post-upload SD path the device sees. We have
+          // to query the device after the upload because StringUtils::
+          // sanitizeFilename truncates names to 150 bytes (plus various
+          // codepoint normalisations), so file.name as the browser knows
+          // it may differ from what the device persists -- which is what
+          // Epub::cachePathForFilePath hashes for the cache dir name.
+          // Match by size + .epub heuristic; uploads of identical-size
+          // EPUBs in the same dir are vanishingly unlikely.
+          let listingPath = currentPath || '/';
+          if (!listingPath.endsWith('/')) listingPath += '/';
+          const listingResp = await fetch('/api/files?path=' + encodeURIComponent(listingPath));
+          const listing = listingResp.ok ? await listingResp.json() : [];
+          const actualEntry = listing.find((e) => e.isEpub && e.size === file.size)
+                           || listing.find((e) => e.name === file.name);
+          if (!actualEntry) {
+            throw new Error(`could not find uploaded EPUB at ${listingPath} (looked for size=${file.size})`);
+          }
+          const devicePath = listingPath + actualEntry.name;
+          await prebakeChapters(file, devicePath, (percent) => {
             progressFill.style.width = `${percent}%`;
           });
           progressFill.style.backgroundColor = '#27ae60'; // Back to green
