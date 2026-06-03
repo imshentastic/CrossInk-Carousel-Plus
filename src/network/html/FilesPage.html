@@ -1577,37 +1577,21 @@
           <div id="convertInfo" style="display:none; margin-bottom: 10px; font-size: 0.9em;">
           </div>
 
-          <!-- Bluetooth-friendly chapters + always-on optimisation toggles.
-               All three live outside Advanced because they're the on/off
-               switches a normal user wants visible without digging. -->
+          <!-- Single "do all the off-device work" toggle. Folds in what
+               used to be three separate switches (.pxc image cache,
+               chapter indexing, BT-friendly chapter text). The browser
+               does the heavy lifting -- decoding/resizing images,
+               building the chapter index, computing the manifest -- and
+               ships a per-book cache directory to the device so the
+               actual reading is butter smooth. -->
           <div class="bt-friendly-option" id="btFriendlyOption">
             <div class="bt-friendly-row">
               <div class="bt-friendly-text">
-                <div class="setting-title">📖 Bluetooth-friendly chapters</div>
-                <div class="setting-desc">Store chapter text uncompressed for best BT performance<br>Note: EPUB file size up to 4x larger</div>
+                <div class="setting-title">Pre-optimize for instant reading</div>
+                <div class="setting-desc">Pre-shrink images and pre-build the chapter index off-device. Your computer does the heavy lifting once so the device opens this book instantly and chapter turns feel snappy.<br>Adds ~30-60 s to upload time per book.</div>
               </div>
               <label class="toggle-switch">
-                <input type="checkbox" id="store-text-uncompressed-checkbox">
-                <span class="toggle-slider"></span>
-              </label>
-            </div>
-            <div class="bt-friendly-row">
-              <div class="bt-friendly-text">
-                <div class="setting-title">🖼️ Generate .pxc image cache</div>
-                <div class="setting-desc">Pre-render each image for the device's screen — speeds up indexing on image-heavy chapters<br>Note: increases EPUB size; turn off if you never read with a Bluetooth remote</div>
-              </div>
-              <label class="toggle-switch">
-                <input type="checkbox" id="bake-pxc-checkbox" checked>
-                <span class="toggle-slider"></span>
-              </label>
-            </div>
-            <div class="bt-friendly-row">
-              <div class="bt-friendly-text">
-                <div class="setting-title">⚡ Optimize chapter indexing</div>
-                <div class="setting-desc">After upload, build the chapter index for this book so chapters open instantly on first read<br>Adds ~15-30 s per book, uses live device reader settings</div>
-              </div>
-              <label class="toggle-switch">
-                <input type="checkbox" id="prebake-chapters-checkbox" checked>
+                <input type="checkbox" id="optimize-for-device-checkbox" checked>
                 <span class="toggle-slider"></span>
               </label>
             </div>
@@ -2155,8 +2139,6 @@
     document.getElementById('convertWarning').style.display = 'none';
     const btFriendlyOption = document.getElementById('btFriendlyOption');
     if (btFriendlyOption) btFriendlyOption.style.display = 'none';
-    const storeTextCb = document.getElementById('store-text-uncompressed-checkbox');
-    if (storeTextCb) storeTextCb.checked = false;
     // Clear image picker cache and reset layout
     epubImagesCache = [];
     imageStates = {};
@@ -2947,10 +2929,26 @@ async function uploadFile() {
     progressText.style.color = '';
     progressText.textContent = `${stageText} ${file.name} (${currentIndex + 1}/${files.length})${methodText}`;
 
+    // Single continuous progress bar across all three phases when the
+    // "Pre-optimize for instant reading" toggle is on:
+    //   convert: 0-25%, upload: 25-80%, prebake: 80-100%
+    // Two phases (convert + upload) when only BT-style image optimization
+    // is on without chapter prebake:
+    //   convert: 0-50%, upload: 50-100%
+    // Single phase (upload only) when Optimize EPUB is off:
+    //   upload: 0-100%
+    // We can't know at convert time whether prebake will succeed, so the
+    // budget is based on whether the prebake toggle is checked AND the
+    // file is an EPUB. The phase-end snaps are tracked below so a phase
+    // that bails early hands off to the next one without rewinding.
+    const willPrebake = isEpubUpload && !!document.getElementById('optimize-for-device-checkbox')?.checked;
+    const convertEnd = needsConversion ? (willPrebake ? 25 : 50) : 0;
+    const uploadEnd = willPrebake ? 80 : 100;
+
     const onProgress = (loaded, total) => {
       const uploadPercent = Math.round((loaded / total) * 100);
-      // If conversion succeeded, display goes from 50-100%, otherwise 0-100%
-      const displayPercent = conversionSucceeded ? 50 + Math.round(uploadPercent / 2) : uploadPercent;
+      // Scale upload into [convertEnd, uploadEnd]: linear interp.
+      const displayPercent = convertEnd + Math.round((uploadEnd - convertEnd) * uploadPercent / 100);
       progressFill.style.width = displayPercent + '%';
       const prefix = conversionSucceeded ? 'Converting & uploading' : 'Uploading';
       progressText.textContent = `${prefix} ${file.name} (${currentIndex + 1}/${files.length})${methodText} — ${uploadPercent}%`;
@@ -3008,9 +3006,10 @@ async function uploadFile() {
     };
 
     try {
-      // Convert EPUB if needed
+      // Convert EPUB if needed. Single-colour bar across all phases now:
+      // the bar conveys overall progress, the text above it tells the
+      // user which phase is running.
       if (needsConversion) {
-        progressFill.style.backgroundColor = '#9b59b6'; // Purple for conversion
         progressText.textContent = `Converting ${file.name} (${currentIndex + 1}/${files.length})...`;
 
         // Clear log for single file mode, or just add separator for batch mode
@@ -3025,13 +3024,16 @@ async function uploadFile() {
 
         try {
           const convertedBlob = await convertEpubFile(file, (percent) => {
-            // Pass current quality setting to converter
-            progressFill.style.width = (percent * 0.5) + '%'; // Conversion takes first 50%
+            // Scale convert into [0, convertEnd]. convertEnd is 25% when
+            // prebake will follow, 50% when only convert + upload run.
+            progressFill.style.width = Math.round(percent * convertEnd / 100) + '%';
           });
 
           // Create new File from converted blob
           file = new File([convertedBlob], file.name, { type: 'application/epub+zip' });
-          progressFill.style.backgroundColor = '#27ae60'; // Back to green for upload
+          // Single colour across all phases -- the bar conveys progress,
+          // not phase identity. Phase identity is in the text above it.
+          progressFill.style.backgroundColor = '#27ae60';
           conversionSucceeded = true;
           convOriginalSize = origFileSize;
           convNewSize = convertedBlob.size;
@@ -3069,15 +3071,17 @@ async function uploadFile() {
 
       // CrumBLE Phase 5b: chapter-indexing prebake. Runs against the EPUB
       // we just uploaded (the converted blob if BT optimization succeeded,
-      // otherwise the original). Gated by the user-visible checkbox; only
-      // applies to .epub uploads. Failure is non-fatal -- we still report
-      // the upload as complete; only the chapter speed-up is missed.
-      const prebakeCheckbox = document.getElementById('prebake-chapters-checkbox');
+      // otherwise the original). Gated by the single "Pre-optimize for
+      // instant reading" toggle -- same switch as the BT pass; both
+      // optimisations live behind one user mental model. Only applies to
+      // .epub uploads. Failure is non-fatal -- we still report the upload
+      // as complete; only the chapter speed-up is missed.
+      const prebakeCheckbox = document.getElementById('optimize-for-device-checkbox');
       const isEpubUpload = file && file.name && /\.epub$/i.test(file.name);
       if (prebakeCheckbox && prebakeCheckbox.checked && isEpubUpload) {
         try {
           progressText.textContent = `Optimizing chapter indexing for ${file.name}...`;
-          progressFill.style.backgroundColor = '#3498db'; // Blue for prebake phase
+          // Single-colour bar: don't repaint here, keep green continuous.
           // Resolve the EXACT post-upload SD path the device sees. We have
           // to query the device after the upload because StringUtils::
           // sanitizeFilename truncates names to 150 bytes (plus various
@@ -3097,9 +3101,10 @@ async function uploadFile() {
           }
           const devicePath = listingPath + actualEntry.name;
           await prebakeChapters(file, devicePath, (percent) => {
-            progressFill.style.width = `${percent}%`;
+            // Scale prebake into [80, 100].
+            progressFill.style.width = `${80 + Math.round(percent * 0.2)}%`;
           });
-          progressFill.style.backgroundColor = '#27ae60'; // Back to green
+          progressFill.style.width = '100%';
         } catch (preErr) {
           console.error('Chapter prebake error:', preErr);
           if (typeof logError === 'function') {

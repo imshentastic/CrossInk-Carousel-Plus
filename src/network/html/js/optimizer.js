@@ -2186,16 +2186,15 @@ async function convertEpubFile(file, progressCallback) {
   });
 
   const out = new JSZip();
-  // CrumBLE: "Bluetooth-friendly chapters" stores chapter XHTML uncompressed so
-  // the device needs no DEFLATE inflate window to cold-load a chapter -- chapter
-  // boundaries / Select / jumps / font changes then work even with a remote
-  // connected (which fragments the heap so a 32 KB contiguous block is
-  // unavailable). Small entries (CSS/OPF/NCX) are left DEFLATE; the device's
-  // window-sizing handles those. Only the large XHTML needs storing.
-  const bluetoothTextMode = !!document.getElementById('store-text-uncompressed-checkbox')?.checked;
-  const xhtmlFileOpts = bluetoothTextMode
-    ? { compression: 'STORE', createFolders: false }
-    : { compression: 'DEFLATE', compressionOptions: { level: 8 }, createFolders: false };
+  // Phase 5: chapter-prebake mode (the single "Pre-optimize for instant
+  // reading" toggle in the modal) supersedes the old "Bluetooth-friendly
+  // chapters" / store-XHTML-uncompressed toggle. When chapter prebake is
+  // on the device loads sections from sections-prebake/*.bin and never
+  // needs to inflate a DEFLATE chapter, so the 32 KB inflate window
+  // bypass that the old toggle achieved is delivered for free. We always
+  // DEFLATE chapter XHTML now -- smaller EPUB, no downside under the
+  // prebake flow.
+  const xhtmlFileOpts = { compression: 'DEFLATE', compressionOptions: { level: 8 }, createFolders: false };
   // CrumBLE: fetch the device's reader render-info so we can pre-render each image
   // to its .pxc pixel cache at the exact dimensions the device will use. The
   // optimizer is served by the device, so this returns the live viewport.
@@ -2206,7 +2205,10 @@ async function convertEpubFile(file, progressCallback) {
   //      a BT remote.
   //   2. Render-info fetch must succeed (fails when the optimizer runs
   //      standalone off-device).
-  const bakePxcEnabled = document.getElementById('bake-pxc-checkbox')?.checked !== false;
+  // Same checkbox now drives BT-pass .pxc baking AND the chapter prebake
+  // pass (read separately in FilesPage.html's upload step). One toggle,
+  // both off-device optimisations, single user mental model.
+  const bakePxcEnabled = document.getElementById('optimize-for-device-checkbox')?.checked !== false;
   let renderInfo = null;
   if (bakePxcEnabled) {
     try {
