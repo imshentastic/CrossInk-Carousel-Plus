@@ -1577,7 +1577,9 @@
           <div id="convertInfo" style="display:none; margin-bottom: 10px; font-size: 0.9em;">
           </div>
 
-          <!-- Bluetooth-friendly chapters: shown whenever Optimize EPUB is checked -->
+          <!-- Bluetooth-friendly chapters + always-on optimisation toggles.
+               All three live outside Advanced because they're the on/off
+               switches a normal user wants visible without digging. -->
           <div class="bt-friendly-option" id="btFriendlyOption">
             <div class="bt-friendly-row">
               <div class="bt-friendly-text">
@@ -1586,6 +1588,26 @@
               </div>
               <label class="toggle-switch">
                 <input type="checkbox" id="store-text-uncompressed-checkbox">
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="bt-friendly-row">
+              <div class="bt-friendly-text">
+                <div class="setting-title">🖼️ Generate .pxc image cache</div>
+                <div class="setting-desc">Pre-render each image for the device's screen — speeds up indexing on image-heavy chapters<br>Note: increases EPUB size; turn off if you never read with a Bluetooth remote</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="bake-pxc-checkbox" checked>
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <div class="bt-friendly-row">
+              <div class="bt-friendly-text">
+                <div class="setting-title">⚡ Optimize chapter indexing</div>
+                <div class="setting-desc">After upload, build the chapter index for this book so chapters open instantly on first read<br>Adds ~15-30 s per book, uses live device reader settings</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="prebake-chapters-checkbox" checked>
                 <span class="toggle-slider"></span>
               </label>
             </div>
@@ -1684,36 +1706,6 @@
                cache, leaving the EPUB smaller but slowing image-heavy
                chapters that get loaded over Bluetooth (the reader has to
                JPEG-decode each image at runtime, which fragments heap). -->
-          <div class="advanced-setting-row">
-            <div class="setting-label">
-              <div class="setting-title">🖼️ Generate .pxc image cache</div>
-              <div class="setting-desc">Pre-render each image for the device's screen — speeds up indexing on image-heavy chapters<br>Note: increases EPUB size; turn off if you never read with a Bluetooth remote</div>
-            </div>
-            <div class="setting-controls">
-              <label class="toggle-switch">
-                <input type="checkbox" id="bake-pxc-checkbox" checked>
-                <span class="toggle-slider"></span>
-              </label>
-            </div>
-          </div>
-          <!-- CrumBLE Phase 5b: chapter-indexing prebake. Runs after the EPUB
-               upload completes. Generates book.bin + sections-prebake/ +
-               manifest in the browser via the WASM-compiled prebake CLI, then
-               uploads each file directly to its final SD path via the
-               proven /upload endpoint. No bundling, no device-side extract;
-               every transfer is a single small file. -->
-          <div class="advanced-setting-row">
-            <div class="setting-label">
-              <div class="setting-title">⚡ Optimize chapter indexing</div>
-              <div class="setting-desc">After upload, build the chapter index for this book so chapters open instantly on first read<br>Adds ~15-30 s per book, uses live device reader settings, requires no extra steps</div>
-            </div>
-            <div class="setting-controls">
-              <label class="toggle-switch">
-                <input type="checkbox" id="prebake-chapters-checkbox">
-                <span class="toggle-slider"></span>
-              </label>
-            </div>
-          </div>
           </div><!-- advanced-settings-content -->
       </div><!-- end convert-options -->
       <!-- Image Picker Section - in picker-columns for two-column layout -->
