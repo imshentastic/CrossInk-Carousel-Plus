@@ -1,9 +1,11 @@
 #include "DictionaryWordSelectActivity.h"
 
+#include <Arduino.h>  // ESP.getMaxAllocHeap()
 #include <Epub/Page.h>
 #include <Epub/blocks/TextBlock.h>
 #include <GfxRenderer.h>
 #include <I18n.h>
+#include <Logging.h>
 
 #include <algorithm>
 #include <cctype>
@@ -52,11 +54,24 @@ void DictionaryWordSelectActivity::extractWords() {
   rows.clear();
   if (!page) return;
 
-  // FIX: Pre-allocate vectors to prevent massive heap fragmentation.
-  // An average screen has ~250-300 words. Vector reallocation without reserve()
-  // creates a "Swiss cheese" heap, eventually starving the E-ink renderer.
-  words.reserve(350);
-  rows.reserve(40);
+  // Pre-allocate vectors to prevent massive heap fragmentation.
+  // CrumBLE tuning: reserve(350) is ~22 KB on a fragmented heap with BLE
+  // connected (NimBLE ~58 KB, maxAlloc often drops to 7-10 KB), which
+  // bad_allocs and reboots the device. Reduced to 80 (~5 KB) -- covers
+  // most pages and re-allocates from there for long ones. Exceptions
+  // are disabled (-fno-exceptions), so a failing allocation would call
+  // __terminate() and reboot. Defense in depth against the LOOKUP
+  // entry's heap pre-flight: re-check max contiguous alloc here, and
+  // bail out clean if it slipped. Render falls back to showing the
+  // page with no highlight (handled by the rows-empty guard).
+  constexpr uint32_t EXTRACT_MIN_MAX_ALLOC = 8000;
+  if (ESP.getMaxAllocHeap() < EXTRACT_MIN_MAX_ALLOC) {
+    LOG_ERR("DICT", "extractWords: maxAlloc=%u below %u; aborting word build",
+            ESP.getMaxAllocHeap(), EXTRACT_MIN_MAX_ALLOC);
+    return;
+  }
+  words.reserve(80);
+  rows.reserve(20);
 
   int currentRowIndex = -1;
   int16_t lastY = -1;

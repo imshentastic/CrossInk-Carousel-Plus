@@ -1657,6 +1657,27 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       break;
     }
     case EpubReaderMenuActivity::MenuAction::LOOKUP: {
+      // CrumBLE: pre-flight heap check. DictionaryWordSelect::extractWords
+      // reserves a vector of WordInfo entries (~64 bytes each); with BLE
+      // connected (~58 KB NimBLE state), the largest contiguous free block
+      // can drop below the reserve size, and operator new throws
+      // std::bad_alloc -> __cxxabiv1::__terminate -> reboot.
+      // Bail out with an actionable alert before launching anything. The
+      // LOOKUP menu entry only appears when Dictionary::exists(), so users
+      // expect this to work; a clear message that names the BT cost is
+      // friendlier than a silent crash. 25 KB threshold matches the worst
+      // case of the reserve plus the index scan's working set.
+      constexpr uint32_t LOOKUP_MIN_MAX_ALLOC = 25000;
+      if (ESP.getMaxAllocHeap() < LOOKUP_MIN_MAX_ALLOC) {
+        LOG_INF("ERS", "Lookup pre-flight: maxAlloc=%u below %u, raising alert",
+                ESP.getMaxAllocHeap(), LOOKUP_MIN_MAX_ALLOC);
+        strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_LOOKUP_TITLE),
+                sizeof(APP_STATE.pendingAlertTitle) - 1);
+        strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_LOOKUP_BODY),
+                sizeof(APP_STATE.pendingAlertBody) - 1);
+        APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
+        break;
+      }
       // Port of SEEK reader's dictionary lookup. Compute the orientation-
       // adjusted margins from the current page so the word-select overlay
       // can hit-test taps against the rendered glyphs; also peek the FIRST

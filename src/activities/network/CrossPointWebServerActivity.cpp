@@ -9,6 +9,7 @@
 
 #include <cstddef>
 
+#include "BluetoothHIDManager.h"
 #include "LibraryIndex.h"
 #include "MappedInputManager.h"
 #include "NetworkModeSelectionActivity.h"
@@ -48,7 +49,27 @@ int barsForRssi(int rssi, int currentBars) {
 void CrossPointWebServerActivity::onEnter() {
   Activity::onEnter();
 
-  LOG_DBG("WEBACT", "Free heap at onEnter: %d bytes", ESP.getFreeHeap());
+  LOG_INF("WEBACT", "Free heap at onEnter: %d bytes (maxAlloc %d)", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
+  // CrumBLE: tear NimBLE down before File Transfer comes up. NimBLE holds
+  // ~58 KB of stack state while connected, and the FT web server runs with
+  // very little headroom on x4 / even less on x3. Symptom we're guarding
+  // against: "phone can't load FT page after personal hotspot" and "x3
+  // frozen on Hotspot Mode" -- both consistent with the TX-buffer / WiFi
+  // alloc starving when NimBLE is still holding its slab. BT remote is
+  // irrelevant in FT anyway (the user is interacting via their phone),
+  // so a synchronous teardown here costs the user nothing. No-op when
+  // BT is already off (the common non-reader case). Matches the
+  // exitToHomeWithPopup teardown pattern in Activity.cpp.
+  {
+    auto& bt = BluetoothHIDManager::getInstance();
+    if (bt.isEnabled()) {
+      LOG_INF("WEBACT", "Disabling NimBLE before web server start (~58 KB reclaim)");
+      bt.disable();
+      LOG_INF("WEBACT", "Free heap after BT disable: %d bytes (maxAlloc %d)", ESP.getFreeHeap(),
+              ESP.getMaxAllocHeap());
+    }
+  }
 
   // CrumBLE: free the loaded SD-card font before WiFi/web-server come up. File
   // transfer runs with very little heap (~26 KB free while serving), and a
