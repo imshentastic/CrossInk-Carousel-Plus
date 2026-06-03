@@ -159,6 +159,16 @@
       color: #e74c3c;
       background-color: rgba(231, 76, 60, 0.05);
     }
+    .optimize-action-btn {
+      background: transparent;
+      border-color: var(--border-color);
+      color: var(--label-color);
+    }
+    .optimize-action-btn:hover {
+      border-color: #27ae60;
+      color: #27ae60;
+      background-color: rgba(39, 174, 96, 0.05);
+    }
     /* Upload modal */
     .modal-overlay {
       display: none;
@@ -1545,6 +1555,7 @@
   <div class="action-buttons">
     <button class="action-btn upload-action-btn" onclick="openUploadModal()">📤 Upload</button>
     <button class="action-btn folder-action-btn" onclick="openFolderModal()">📁 New Folder</button>
+    <button class="action-btn optimize-action-btn" onclick="optimizeSelectedOnDevice()">Optimize Selected</button>
     <button class="action-btn delete-action-btn" onclick="openDeleteSelectedModal()">🗑️ Delete Selected</button>
   </div>
 </div>
@@ -1578,7 +1589,7 @@
 <div class="modal-overlay" id="uploadModal">
   <div class="modal">
     <button class="modal-close" id="uploadModalClose" onclick="closeUploadModal()">&times;</button>
-    <h3>📤 Upload file</h3>
+    <h3 id="uploadModalTitle">📤 Upload file</h3>
     <div class="upload-form">
       <p class="file-info">Select a file to upload to <strong id="uploadPathDisplay"></strong></p>
       <input type="file" id="fileInput" onchange="validateFile()" multiple>
@@ -2165,6 +2176,13 @@
     const fileInput = document.getElementById('fileInput');
     fileInput.value = '';
     fileInput.classList.remove('has-files');
+    // optimizeSelectedOnDevice() hides the file picker chrome -- restore
+    // it here so the next openUploadModal() / Upload click works.
+    fileInput.style.display = '';
+    const convertOptionsReset = document.getElementById('convertOptions');
+    if (convertOptionsReset) convertOptionsReset.style.display = '';
+    const titleResetEl = document.getElementById('uploadModalTitle');
+    if (titleResetEl) titleResetEl.textContent = '📤 Upload file';
     const uploadBtn = document.getElementById('uploadBtn');
     uploadBtn.disabled = true;
     uploadBtn.style.display = 'block';
@@ -2415,6 +2433,209 @@
       });
     });
     return items;
+  }
+
+  // CrumBLE Phase 5d: optimize EPUBs that are ALREADY on the device.
+  //
+  // Same end-state as a fresh upload-with-Pre-optimize-checked, but
+  // without forcing the user to keep a local copy of the book or
+  // re-upload over WiFi (which on big libraries is the prohibitively
+  // slow step). Flow per file:
+  //   1. fetch /download?path=<file>   -> EPUB bytes back to the browser
+  //   2. convertEpubFile(blob)         -> BT pass (image resize, .pxc)
+  //   3. POST /upload?path=<parent>    -> overwrite the original .epub
+  //                                       at its existing location
+  //   4. prebakeChapters(blob, path)   -> emit book.bin + sections-prebake
+  //                                       and stream cache files to
+  //                                       /.crosspoint/epub_<hash>/
+  // The same preflight modal fires ONCE at the start of the batch
+  // (matching the multi-file upload path). The Cancel/Close button
+  // follows the same grey/red/green state machine. Failures on any
+  // single file are non-fatal: the batch continues with the next file
+  // and the failed entries surface in the retry banner.
+  async function optimizeSelectedOnDevice() {
+    const sel = getSelectedItems();
+    const epubs = sel.filter(s => !s.isFolder && /\.epub$/i.test(s.name));
+    if (epubs.length === 0) {
+      alert('Select one or more EPUB files to optimize. Folders and non-EPUB files are ignored.');
+      return;
+    }
+    if (epubs.length < sel.length) {
+      const skipped = sel.length - epubs.length;
+      const ok = confirm(
+        `${epubs.length} EPUB file${epubs.length === 1 ? '' : 's'} selected. ` +
+        `${skipped} non-EPUB selection${skipped === 1 ? '' : 's'} will be ignored. Continue?`,
+      );
+      if (!ok) return;
+    }
+
+    // Open the upload modal as a progress surface. We don't use the
+    // file picker -- everything's coming from the device -- but the
+    // modal's progress bar / log panel / three-state Close button are
+    // exactly what we want.
+    const modal = document.getElementById('uploadModal');
+    modal.classList.add('open');
+    document.getElementById('progress-container').style.display = 'block';
+    const progressFill = document.getElementById('progress-fill');
+    const progressText = document.getElementById('progress-text');
+    progressFill.style.width = '0%';
+    progressFill.style.backgroundColor = '#27ae60';
+    // Hide the file picker chrome since this flow's source is the SD card.
+    const fileInput = document.getElementById('fileInput');
+    const uploadBtn = document.getElementById('uploadBtn');
+    const convertOptions = document.getElementById('convertOptions');
+    const startConvBtn = document.getElementById('startConversionBtn');
+    if (fileInput) fileInput.style.display = 'none';
+    if (uploadBtn) uploadBtn.style.display = 'none';
+    if (convertOptions) convertOptions.style.display = 'none';
+    if (startConvBtn) startConvBtn.style.display = 'none';
+    const titleEl = document.getElementById('uploadModalTitle');
+    if (titleEl) titleEl.textContent = 'Optimize selected';
+    // Three-state Cancel/Close: red while running.
+    isUploadInProgress = true;
+    uploadGeneration++;
+    document.getElementById('uploadModalClose').classList.add('disabled');
+    const cancelBtn = document.querySelector('#uploadModal .delete-btn-cancel');
+    if (cancelBtn) {
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.classList.add('in-progress');
+    }
+
+    clearLog();
+    showLog();
+    log(`Optimizing ${epubs.length} EPUB${epubs.length === 1 ? '' : 's'} on device...`, '', 'INFO');
+
+    // Preflight ONCE for the whole batch -- the device's SETTINGS lock
+    // for the bake matches what gets baked into the manifest. Same
+    // call shape FilesPage.html uses for fresh uploads.
+    try {
+      const riResp = await fetch('/api/reader-render-info');
+      if (riResp.ok) {
+        const ri = await riResp.json();
+        if (ri && ri.viewportWidth > 0 && ri.viewportHeight > 0) {
+          const batchLabel = epubs.length > 1 ? `${epubs[0].name} + ${epubs.length - 1} more` : epubs[0].name;
+          await showOptimizerPreflightModal(ri, batchLabel);
+        }
+      }
+    } catch (preErr) {
+      log(`Cancelled before start: ${preErr.message || preErr}`, 'warning', 'INFO');
+      isUploadInProgress = false;
+      document.getElementById('uploadModalClose').classList.remove('disabled');
+      if (cancelBtn) {
+        cancelBtn.classList.remove('in-progress');
+        cancelBtn.textContent = 'Cancel';
+      }
+      // Restore the chrome we hid so the next openUploadModal() works.
+      if (fileInput) fileInput.style.display = '';
+      if (uploadBtn) uploadBtn.style.display = '';
+      if (convertOptions) convertOptions.style.display = '';
+      return;
+    }
+
+    const failed = [];
+    let okCount = 0;
+
+    // Per-file phase budget. Each file gets an equal slice of [0, 100]
+    // and we sub-budget convert (0-25%) / upload (25-80%) / prebake
+    // (80-100%) within its own slice -- same proportions as fresh
+    // uploads so the UI feel matches.
+    const fileSliceSize = 100 / epubs.length;
+    const fileOriginPct = (idx) => idx * fileSliceSize;
+    const fileScale = (idx, localPct) => fileOriginPct(idx) + (localPct * fileSliceSize / 100);
+
+    for (let i = 0; i < epubs.length; i++) {
+      const item = epubs[i];
+      const itemPath = item.path; // e.g. "/Books/Foo.epub"
+      const parentPath = itemPath.substring(0, itemPath.lastIndexOf('/') + 1) || '/';
+      const fileName = item.name;
+      progressText.textContent = `Optimizing ${fileName} (${i + 1}/${epubs.length})...`;
+
+      try {
+        // 1. Download the EPUB from device back to browser.
+        log(`[${i + 1}/${epubs.length}] Downloading ${fileName}...`, '', 'INFO');
+        const dlResp = await fetch('/download?path=' + encodeURIComponent(itemPath));
+        if (!dlResp.ok) {
+          throw new Error(`download failed: HTTP ${dlResp.status}`);
+        }
+        const epubBlob = await dlResp.blob();
+        const epubFile = new File([epubBlob], fileName, { type: 'application/epub+zip' });
+        progressFill.style.width = fileScale(i, 5) + '%';
+
+        // 2. Run the BT pass in the browser (image processing, .pxc bake).
+        log(`[${i + 1}/${epubs.length}] Optimizing images...`, '', 'INFO');
+        const convertedBlob = await convertEpubFile(epubFile, (pct) => {
+          progressFill.style.width = fileScale(i, 5 + pct * 0.20) + '%'; // 5%->25% local
+        });
+        const convertedFile = new File([convertedBlob], fileName, { type: 'application/epub+zip' });
+
+        // 3. Upload the optimized EPUB back to its same SD path
+        //    (overwrites the original).
+        log(`[${i + 1}/${epubs.length}] Uploading optimized EPUB...`, '', 'INFO');
+        await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.upload.addEventListener('progress', (e) => {
+            if (e.lengthComputable) {
+              const uploadPct = (e.loaded / e.total) * 100;
+              progressFill.style.width = fileScale(i, 25 + uploadPct * 0.55) + '%'; // 25%->80%
+            }
+          });
+          xhr.addEventListener('load', () => {
+            if (xhr.status >= 200 && xhr.status < 300) resolve();
+            else reject(new Error(`upload HTTP ${xhr.status}: ${xhr.responseText}`));
+          });
+          xhr.addEventListener('error', () => reject(new Error('upload network error')));
+          xhr.addEventListener('abort', () => reject(new Error('upload aborted')));
+          xhr.open('POST', '/upload?path=' + encodeURIComponent(parentPath));
+          const formData = new FormData();
+          formData.append('file', convertedFile, fileName);
+          xhr.send(formData);
+        });
+
+        // 4. Chapter prebake: produces book.bin + sections-prebake/ +
+        //    manifest and uploads them to /.crosspoint/epub_<hash>/.
+        log(`[${i + 1}/${epubs.length}] Building chapter index...`, '', 'INFO');
+        await prebakeChapters(convertedFile, itemPath, (pct, status) => {
+          const local = 80 + pct * 0.20; // 80%->100%
+          progressFill.style.width = fileScale(i, local) + '%';
+          if (status) {
+            progressText.textContent =
+              `Optimizing ${fileName} (${i + 1}/${epubs.length})... ${status}`;
+          }
+        });
+
+        okCount++;
+        log(`[${i + 1}/${epubs.length}] ${fileName}: OK`, '', 'INFO');
+      } catch (err) {
+        console.error(`Optimization failed for ${fileName}:`, err);
+        log(`[${i + 1}/${epubs.length}] ${fileName}: FAILED -- ${err.message || err}`, 'warning', 'OPT-FAIL');
+        failed.push({ name: fileName, path: itemPath, error: err.message || String(err) });
+      }
+    }
+
+    // Terminal state -- mirror the upload modal's three-state Close.
+    progressFill.style.width = '100%';
+    isUploadInProgress = false;
+    document.getElementById('uploadModalClose').classList.remove('disabled');
+    if (cancelBtn) {
+      cancelBtn.textContent = 'Close';
+      cancelBtn.classList.remove('in-progress');
+      cancelBtn.classList.add('done');
+    }
+    if (failed.length === 0) {
+      progressFill.style.backgroundColor = '#4caf50';
+      progressText.textContent = 'Finished, close when ready.';
+      modalNeedsRefreshOnClose = true;
+    } else {
+      progressFill.style.backgroundColor = '#e74c3c';
+      progressText.textContent =
+        okCount > 0
+          ? `Finished with errors. ${okCount}/${epubs.length} optimized.`
+          : 'Finished with errors. See log for details.';
+      modalNeedsBannerOnClose = true;
+      failedUploadsGlobal = failedUploadsGlobal.concat(
+        failed.map(f => ({ name: f.name, error: f.error, file: null })),
+      );
+    }
   }
 
   // Open delete modal for currently selected checkboxes
