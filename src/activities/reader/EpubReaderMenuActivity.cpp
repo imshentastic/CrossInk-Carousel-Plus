@@ -81,9 +81,11 @@ EpubReaderMenuActivity::EpubReaderMenuActivity(GfxRenderer& renderer, MappedInpu
                                                const bool hasFootnotes, const bool hasBookmarks,
                                                const bool isCurrentPageBookmarked, const bool isBookCompleted,
                                                const bool autoPageTurnActive,
-                                               const uint16_t autoPageTurnIntervalSeconds)
+                                               const uint16_t autoPageTurnIntervalSeconds,
+                                               const bool hasDictionary, const bool hasLookupHistory)
     : Activity("EpubReaderMenu", renderer, mappedInput),
-      menuItems(buildMenuItems(hasFootnotes, hasBookmarks, isCurrentPageBookmarked, isBookCompleted)),
+      menuItems(buildMenuItems(hasFootnotes, hasBookmarks, isCurrentPageBookmarked, isBookCompleted,
+                               hasDictionary, hasLookupHistory)),
       title(title),
       pendingOrientation(currentOrientation),
       currentPage(currentPage),
@@ -95,14 +97,27 @@ EpubReaderMenuActivity::EpubReaderMenuActivity(GfxRenderer& renderer, MappedInpu
 std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMenuItems(bool hasFootnotes,
                                                                                      bool hasBookmarks,
                                                                                      bool isCurrentPageBookmarked,
-                                                                                     bool isBookCompleted) {
+                                                                                     bool isBookCompleted,
+                                                                                     bool hasDictionary,
+                                                                                     bool hasLookupHistory) {
   std::vector<MenuItem> items;
   // 14 upstream items + 1 (CrumBLE Bluetooth entry).
   constexpr size_t baseItemCount = 15;
-  const size_t totalItemCount = baseItemCount + (hasFootnotes ? 1u : 0u) + (hasBookmarks ? 2u : 0u);
+  const size_t totalItemCount = baseItemCount + (hasFootnotes ? 1u : 0u) + (hasBookmarks ? 2u : 0u) +
+                                (hasDictionary ? 1u : 0u) + (hasLookupHistory ? 1u : 0u);
   items.reserve(totalItemCount);
   if (hasFootnotes) {
     items.push_back({MenuAction::FOOTNOTES, StrId::STR_FOOTNOTES});
+  }
+  // CrumBLE: dictionary entries (ported from SEEK reader). Surfaced near
+  // the top of the menu because lookup is a quick, frequent action --
+  // putting it next to Footnotes keeps the "look at this thing" actions
+  // together. Only appear when a StarDict file is present on the SD.
+  if (hasDictionary) {
+    items.push_back({MenuAction::LOOKUP, StrId::STR_LOOKUP});
+    if (hasLookupHistory) {
+      items.push_back({MenuAction::LOOKED_UP_WORDS, StrId::STR_LOOKED_UP_WORDS});
+    }
   }
   items.push_back({MenuAction::SELECT_CHAPTER, StrId::STR_SELECT_CHAPTER});
   items.push_back({MenuAction::READER_OPTIONS, StrId::STR_READER_OPTIONS});

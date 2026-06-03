@@ -23,6 +23,11 @@
 #include "../settings/BluetoothSettingsActivity.h"
 #include "../settings/KOReaderSettingsActivity.h"
 #include "BookSettingsDrawerActivity.h"
+// CrumBLE: dictionary feature (ported from SEEK reader sumegig/seek-reader).
+#include "DictionaryWordSelectActivity.h"
+#include "LookedUpWordsActivity.h"
+#include "util/Dictionary.h"
+#include "util/LookupHistory.h"
 #include "BookStatsActivity.h"
 #include "CollectionsStore.h"
 #include "CrossPointSettings.h"
@@ -1335,11 +1340,19 @@ void EpubReaderActivity::loop() {
     }
     const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
 
+    // CrumBLE: dictionary availability gates the LOOKUP / LOOKED_UP_WORDS
+    // menu entries (port of SEEK reader's feature). Dictionary::exists()
+    // checks for the StarDict .idx/.dict files at the SD root; lookup
+    // history is per-book in the cache dir, so we only surface "Looked Up
+    // Words" when there's actually anything to show.
+    const bool hasDictionary = Dictionary::exists();
+    const bool hasLookupHistory = hasDictionary && LookupHistory::hasHistory(epub->getCachePath());
     startActivityForResult(std::make_unique<EpubReaderMenuActivity>(
                                renderer, mappedInput, epub->getTitle(), currentPage, totalPages, bookProgressPercent,
                                SETTINGS.orientation, !currentPageFootnotes.empty(), !BOOKMARKS.getBookmarks().empty(),
                                BOOKMARKS.hasBookmarkForPage(bmSpine, bmProgress, bookmarkPageCount), isBookCompleted,
-                               automaticPageTurnActive, getAutoPageTurnIntervalSeconds()),
+                               automaticPageTurnActive, getAutoPageTurnIntervalSeconds(),
+                               hasDictionary, hasLookupHistory),
                            [this](const ActivityResult& result) {
                              // Always apply orientation change even if the menu was cancelled
                              const auto& menu = std::get<MenuResult>(result.data);
@@ -1640,6 +1653,76 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
                                }
                                requestUpdate();
                              });
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::LOOKUP: {
+      // Port of SEEK reader's dictionary lookup. Compute the orientation-
+      // adjusted margins from the current page so the word-select overlay
+      // can hit-test taps against the rendered glyphs; also peek the FIRST
+      // word of the next section so the overlay knows when the user has
+      // selected the last word on the current page (for cursor navigation
+      // wraparound). See sumegig/seek-reader commit b3074a2 -- this case
+      // mirrors that integration point but adapted to our RenderLock /
+      // margin-computation conventions.
+      std::unique_ptr<Page> pageForLookup;
+      std::string nextPageFirstWord;
+      int orientedMarginTop = 0;
+      int orientedMarginLeft = 0;
+      {
+        RenderLock lock(*this);
+        if (!section) {
+          requestUpdate();
+          break;
+        }
+        int orientedMarginRight;
+        int orientedMarginBottom;
+        renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
+                                         &orientedMarginLeft);
+        orientedMarginTop += SETTINGS.screenMargin;
+        orientedMarginLeft += SETTINGS.screenMargin;
+        orientedMarginRight += SETTINGS.screenMargin;
+        const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();
+        if (automaticPageTurnActive &&
+            (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight())) {
+          orientedMarginBottom += std::max(
+              SETTINGS.screenMargin,
+              static_cast<uint8_t>(statusBarHeight + UITheme::getInstance().getMetrics().statusBarVerticalMargin));
+        } else {
+          orientedMarginBottom += std::max(SETTINGS.screenMargin, statusBarHeight);
+        }
+        pageForLookup = section->loadPageFromSectionFile();
+        if (section->currentPage < section->pageCount - 1) {
+          const int savedPage = section->currentPage;
+          section->currentPage = savedPage + 1;
+          auto nextPage = section->loadPageFromSectionFile();
+          section->currentPage = savedPage;
+          if (nextPage) {
+            for (const auto& element : nextPage->elements) {
+              if (!element || element->getTag() != TAG_PageLine) continue;
+              const auto& line = static_cast<const PageLine&>(*element);
+              auto block = line.getBlock();
+              if (!block) continue;
+              const auto& words = block->getWords();
+              if (!words.empty()) {
+                nextPageFirstWord = words.front();
+                break;
+              }
+            }
+          }
+        }
+      }
+      if (pageForLookup) {
+        startActivityForResult(
+            std::make_unique<DictionaryWordSelectActivity>(
+                renderer, mappedInput, std::move(pageForLookup), SETTINGS.getReaderFontId(), orientedMarginLeft,
+                orientedMarginTop, epub->getCachePath(), SETTINGS.orientation, nextPageFirstWord),
+            [this](const ActivityResult& result) { requestUpdate(); });
+      }
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::LOOKED_UP_WORDS: {
+      startActivityForResult(std::make_unique<LookedUpWordsActivity>(renderer, mappedInput, epub->getCachePath()),
+                             [this](const ActivityResult& result) { requestUpdate(); });
       break;
     }
     case EpubReaderMenuActivity::MenuAction::GO_TO_PERCENT: {

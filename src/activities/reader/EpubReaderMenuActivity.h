@@ -31,7 +31,13 @@ class EpubReaderMenuActivity final : public Activity {
     BOOKMARK_TOGGLE,
     VIEW_BOOKMARKS,
     DELETE_BOOKMARKS,
-    BLUETOOTH
+    BLUETOOTH,
+    // CrumBLE: dictionary lookup (port of SEEK reader's feature). LOOKUP
+    // opens a word-selection overlay over the current page; LOOKED_UP_
+    // WORDS shows the per-book history. Only added to the menu when
+    // Dictionary::exists() (StarDict files are on the SD card).
+    LOOKUP,
+    LOOKED_UP_WORDS
   };
 
   explicit EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const std::string& title,
@@ -39,7 +45,8 @@ class EpubReaderMenuActivity final : public Activity {
                                   const uint8_t currentOrientation, const bool hasFootnotes, const bool hasBookmarks,
                                   const bool isCurrentPageBookmarked, const bool isBookCompleted,
                                   const bool autoPageTurnActive = false,
-                                  const uint16_t autoPageTurnIntervalSeconds = 0);
+                                  const uint16_t autoPageTurnIntervalSeconds = 0,
+                                  const bool hasDictionary = false, const bool hasLookupHistory = false);
 
   void onEnter() override;
   void onExit() override;
@@ -55,7 +62,7 @@ class EpubReaderMenuActivity final : public Activity {
   };
 
   static std::vector<MenuItem> buildMenuItems(bool hasFootnotes, bool hasBookmarks, bool isCurrentPageBookmarked,
-                                              bool isBookCompleted);
+                                              bool isBookCompleted, bool hasDictionary, bool hasLookupHistory);
 
   // Fixed menu layout
   const std::vector<MenuItem> menuItems;
