@@ -668,25 +668,38 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
           static_cast<unsigned>(pm.imageRendering),
           pm.bionicReadingEnabled, pm.guideReadingEnabled);
 
-  // .pxc-manifest-style prompt: confirm applies the prebake's prepared
-  // layout (restoring cache compatibility), cancel keeps current settings
-  // (book will rebuild chapter-by-chapter against the live cache). This
-  // is uniform across both the "you just changed a setting" and "you
-  // opened a book whose settings already don't match the prebake" cases
-  // -- both want the same choice between "use what was prepared" and
-  // "keep what I have."
+  // Action-labeled two-option prompt. The previous confirm/cancel polarity
+  // (confirm = restore prepared) tricked users who had just edited a
+  // setting in the drawer: they expected "Confirm" to mean "apply what I
+  // typed," and instead saw their edit get reverted by what they thought
+  // was the affirmative button. Action labels remove the ambiguity --
+  // the user clicks the verb that names what they want to happen.
+  // Option 0 (default) keeps the user's current settings; Back/Cancel
+  // maps to that same outcome because "do nothing destructive" is the
+  // less surprising fallback when someone backs out of the prompt.
   const std::string promptBody =
-      "This book was prepared with different reader settings. Switch to the "
-      "prepared layout for faster reading, or keep your current settings and "
-      "let the device rebuild each chapter as you reach it?";
+      "This book was prepared with different reader settings. Keep your current "
+      "settings (chapters will rebuild against the live cache), or restore the "
+      "prepared layout for instant chapter loads?";
   prebakePromptShowing_ = true;
   startActivityForResult(
-      std::make_unique<ConfirmationActivity>(
-          renderer, mappedInput, "Use prepared layout?", promptBody,
+      std::make_unique<ChoicePromptActivity>(
+          renderer, mappedInput, "Settings differ from prepared layout",
+          promptBody,
+          std::vector<std::string>{"Keep my current settings", "Restore prepared layout"},
           /*ignoreInitialConfirmRelease=*/true),
       [this](const ActivityResult& result) {
         prebakePromptShowing_ = false;
-        if (result.isCancelled) {
+        // ChoicePromptResult lives inside result.data. choice: 0 = "Keep
+        // my current settings", 1 = "Restore prepared layout", -1 =
+        // user backed out. Treat back-out as "Keep" -- the less
+        // destructive default.
+        int chosen = -1;
+        if (const auto* cp = std::get_if<ChoicePromptResult>(&result.data)) {
+          chosen = cp->choice;
+        }
+        const bool keepCurrent = result.isCancelled || chosen != 1;
+        if (keepCurrent) {
           // User declined -- keep their current settings. Don't delete the
           // prebake (Section.cpp's clearCache only ever touches sections/,
           // never sections-prebake/), so if they later open the book again
