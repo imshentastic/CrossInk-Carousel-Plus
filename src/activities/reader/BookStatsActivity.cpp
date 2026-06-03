@@ -1,6 +1,7 @@
 #include "BookStatsActivity.h"
 
 #include <Bitmap.h>
+#include <Epub.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -23,9 +24,21 @@ namespace {
 // Mirror of the cache-path convention used elsewhere in the firmware
 // (HomeActivity, Epub.h:42, Xtc.h:52, Txt.cpp:94). Stats files live at
 // <cachePath>/stats.bin.
+//
+// CrumBLE: EPUB cache paths hash with ZipFile::fnvHash64 (see
+// Epub::cachePathForFilePath at Epub.cpp:213), NOT std::hash. The
+// earlier impl here used std::hash for all three formats, so EPUB
+// stats were loaded from a non-existent directory and the carousel
+// reported zero sessions / zero pages for every book the user
+// navigated to. Until the sessionCount>0 filter was dropped, the
+// bug was masked because only the initial book (whose stats are
+// passed in by value, not loaded) survived the filter. Txt and Xtc
+// still use std::hash; switching them would orphan existing caches.
 std::string statsCachePathFor(const std::string& bookPath) {
+  if (FsHelpers::hasEpubExtension(bookPath)) {
+    return Epub::cachePathForFilePath(bookPath, "/.crosspoint");
+  }
   const std::size_t h = std::hash<std::string>{}(bookPath);
-  if (FsHelpers::hasEpubExtension(bookPath)) return "/.crosspoint/epub_" + std::to_string(h);
   if (FsHelpers::hasXtcExtension(bookPath)) return "/.crosspoint/xtc_" + std::to_string(h);
   return "/.crosspoint/txt_" + std::to_string(h);
 }
