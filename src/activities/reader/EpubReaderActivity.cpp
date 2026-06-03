@@ -357,6 +357,24 @@ void EpubReaderActivity::onEnter() {
   prebakePromptShowing_ = false;
   deferredOnEnterPending_ = true;
   firstRenderCompleted_ = false;
+  // Eager prebake-manifest load: the switch-back prompt has to fire
+  // BEFORE the first render's section.loadSectionFile path falls through
+  // to createSectionFile (the "indexing" screen), otherwise the device
+  // starts rebuilding the chapter even though the user is about to be
+  // asked whether they want the prepared layout restored. The original
+  // call lived in runDeferredOnEnter, which runs AFTER the first render,
+  // so the prompt fired too late and the index work was already under
+  // way. Manifest read is one ~250 byte JSON file -- safe to move into
+  // the synchronous onEnter path.
+  if (SETTINGS.optimizeChapterIndexing && epub) {
+    PrebakeManifest pm;
+    if (tryLoadPrebakeManifest(epub->getCachePath(), pm)) {
+      prebakeManifest_ = pm;
+      LOG_INF("ERA", "Eager-loaded prebake manifest: fontId=%ld viewport=%ux%u",
+              static_cast<long>(pm.fontId), static_cast<unsigned>(pm.viewportWidth),
+              static_cast<unsigned>(pm.viewportHeight));
+    }
+  }
   // Reset BLE-link edge state on every book open: a fresh book may have a
   // different manifest (or none), and any prior link tracking is stale.
   btWasLinked_ = false;
@@ -549,20 +567,18 @@ void EpubReaderActivity::runDeferredOnEnter() {
     }
   }
 
-  // CrumBLE: parse the prebake'd manifest if the user has opted in and the
-  // cache exists. Gated by SETTINGS.optimizeChapterIndexing so this branch
-  // is dead code (and the helper-fired prompt below stays silent) until the
-  // user flips the toggle on. Cheap when it does run: one SD open + small
-  // JSON parse. The result drives the switch-back prompt in tick() when
-  // current SETTINGS would invalidate the cache.
-  if (SETTINGS.optimizeChapterIndexing) {
+  // Manifest load was hoisted to onEnter() so the switch-back prompt
+  // can fire BEFORE the first render starts indexing. Keep a fallback
+  // here for the unlikely case where the toggle was flipped on
+  // mid-session between onEnter and the deferred tick -- otherwise
+  // the prompt would never see the manifest until the next book open.
+  if (SETTINGS.optimizeChapterIndexing && !prebakeManifest_.has_value()) {
     PrebakeManifest pm;
     if (tryLoadPrebakeManifest(epub->getCachePath(), pm)) {
       prebakeManifest_ = pm;
-      LOG_INF("ERA", "Loaded prebake manifest: fontId=%ld viewport=%ux%u lineComp=%.3f embed=%d",
+      LOG_INF("ERA", "Loaded prebake manifest in deferred onEnter: fontId=%ld viewport=%ux%u",
               static_cast<long>(pm.fontId), static_cast<unsigned>(pm.viewportWidth),
-              static_cast<unsigned>(pm.viewportHeight), static_cast<double>(pm.lineCompression),
-              pm.embeddedStyle);
+              static_cast<unsigned>(pm.viewportHeight));
     }
   }
 }
