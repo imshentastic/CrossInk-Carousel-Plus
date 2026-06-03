@@ -1901,6 +1901,12 @@ function loadCrumblePrebakeFactory() {
   return crumblePrebakeModuleFactoryPromise;
 }
 
+// Buffer for capturing the CLI's print/printErr output across a single
+// callMain. Cleared before each run; on non-zero exit we include the
+// captured contents in the thrown error so the user sees WHAT the CLI
+// rejected instead of just an opaque "exit code N".
+const crumblePrebakeOutputBuf = [];
+
 // Get a ready Module instance. The factory is invoked once and the resulting
 // Module is reused across runs (EXIT_RUNTIME=0 keeps MEMFS + libc alive
 // between callMain invocations). This means we pay the ~850 KB WASM
@@ -1910,11 +1916,25 @@ async function loadCrumblePrebakeModule() {
   crumblePrebakeModulePromise = (async () => {
     const factory = await loadCrumblePrebakeFactory();
     return await factory({
-      // Quiet the noisy emscripten stdout/stderr -- prebake CLI logs are
-      // useful but we route them through the optimizer log panel ourselves
-      // so the user can see what happened.
-      print: (msg) => { try { log(`[prebake] ${msg}`, '', 'PRE'); } catch (e) {} },
-      printErr: (msg) => { try { log(`[prebake-err] ${msg}`, 'warning', 'PRE-ERR'); } catch (e) {} },
+      // Route emscripten stdout/stderr through three places:
+      //   1. The optimizer log panel (per-line, prefixed by [prebake] /
+      //      [prebake-err]) -- visible while the modal is open.
+      //   2. console.log / console.error -- persists across page reloads
+      //      when DevTools "Preserve log" is on.
+      //   3. crumblePrebakeOutputBuf -- the running buffer we attach to
+      //      a thrown error when callMain returns non-zero, so the user
+      //      sees the CLI's own failure message even after the log
+      //      panel scrolls or the modal closes.
+      print: (msg) => {
+        crumblePrebakeOutputBuf.push(msg);
+        try { console.log('[prebake]', msg); } catch (e) {}
+        try { log(`[prebake] ${msg}`, '', 'PRE'); } catch (e) {}
+      },
+      printErr: (msg) => {
+        crumblePrebakeOutputBuf.push(msg);
+        try { console.error('[prebake-err]', msg); } catch (e) {}
+        try { log(`[prebake-err] ${msg}`, 'warning', 'PRE-ERR'); } catch (e) {}
+      },
     });
   })();
   return crumblePrebakeModulePromise;
@@ -2006,16 +2026,24 @@ async function prebakeChapters(epubBlob, deviceFileName, progressCallback) {
   //    directory name -- without this it'd hash "/input.epub" instead
   //    of the real device-side path.
   const devicePath = '/' + deviceFileName;
-  log(`Chapter prebake: running CLI (--device-path=${devicePath})...`, '', 'PRE');
-  const rc = Module.callMain([
+  const cliArgs = [
     '--settings-file', settingsPath,
     '--output-dir', outDir,
     '--device-path', devicePath,
     '--skip-thumbs',
     inputPath,
-  ]);
+  ];
+  log(`Chapter prebake: callMain(${JSON.stringify(cliArgs)})`, '', 'PRE');
+  // Clear the print/printErr capture buffer right before we run so any
+  // earlier session output doesn't pollute this run's diagnostics.
+  crumblePrebakeOutputBuf.length = 0;
+  const rc = Module.callMain(cliArgs);
   if (rc !== 0) {
-    throw new Error(`prebake CLI exited with code ${rc}`);
+    // Surface whatever the CLI actually said on its way out. Without this
+    // the thrown error is just "exit code N" with no clue what was wrong.
+    const captured = crumblePrebakeOutputBuf.slice(-12).join('\n');
+    const detail = captured ? `\n--- CLI output ---\n${captured}` : '';
+    throw new Error(`prebake CLI exited with code ${rc}${detail}`);
   }
   reportProgress(50);
 
