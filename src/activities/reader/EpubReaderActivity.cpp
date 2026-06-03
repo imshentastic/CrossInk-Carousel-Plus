@@ -1657,20 +1657,37 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       break;
     }
     case EpubReaderMenuActivity::MenuAction::LOOKUP: {
-      // CrumBLE: pre-flight heap check. DictionaryWordSelect::extractWords
-      // reserves a vector of WordInfo entries (~64 bytes each); with BLE
-      // connected (~58 KB NimBLE state), the largest contiguous free block
-      // can drop below the reserve size, and operator new throws
-      // std::bad_alloc -> __cxxabiv1::__terminate -> reboot.
-      // Bail out with an actionable alert before launching anything. The
-      // LOOKUP menu entry only appears when Dictionary::exists(), so users
-      // expect this to work; a clear message that names the BT cost is
-      // friendlier than a silent crash. 25 KB threshold matches the worst
-      // case of the reserve plus the index scan's working set.
+      // CrumBLE: auto-disable BT for the duration of the dictionary flow.
+      // NimBLE holds ~58 KB of stack state while connected, which leaves
+      // heap too fragmented for DictionaryWordSelect::extractWords to
+      // allocate its WordInfo vector -- previously bad_alloc'd into
+      // __cxxabiv1::__terminate and rebooted. User explicitly opted in
+      // to "auto-disable BT on Lookup, reconnect on exit": the BT remote
+      // is unusable inside the dictionary screens anyway (the crash is
+      // 100% reproducible with BT on), so dropping it for the duration
+      // is the right trade. User navigates dictionary UI with device
+      // buttons during; requestEnableLater on each exit path brings the
+      // bonded remote back on their next button press post-Lookup.
+      auto& btMgr = BluetoothHIDManager::getInstance();
+      const bool bleWasOnForLookup = btMgr.isEnabled();
+      if (bleWasOnForLookup) {
+        LOG_INF("ERS", "Lookup: disabling BT to free heap for word build (re-enabling on exit)");
+        btMgr.disable();
+        LOG_INF("ERS", "Lookup: heap after BT disable: free=%u maxAlloc=%u",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      }
+
+      // Pre-flight heap check AFTER the BT teardown. Even with NimBLE gone,
+      // a long session on a fragmented heap can still bottom out below
+      // the WordInfo reserve. In that case we bail with an actionable
+      // alert and re-enable BT immediately since we never got to use it.
+      // 25 KB threshold matches the worst case of the reserve plus the
+      // index scan's working set.
       constexpr uint32_t LOOKUP_MIN_MAX_ALLOC = 25000;
       if (ESP.getMaxAllocHeap() < LOOKUP_MIN_MAX_ALLOC) {
-        LOG_INF("ERS", "Lookup pre-flight: maxAlloc=%u below %u, raising alert",
+        LOG_INF("ERS", "Lookup pre-flight: maxAlloc=%u below %u even after BT off, raising alert",
                 ESP.getMaxAllocHeap(), LOOKUP_MIN_MAX_ALLOC);
+        if (bleWasOnForLookup) btMgr.requestEnableLater();
         strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_LOOKUP_TITLE),
                 sizeof(APP_STATE.pendingAlertTitle) - 1);
         strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_LOOKUP_BODY),
@@ -1748,13 +1765,26 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       const auto orientation = SETTINGS.orientation;
       const auto cachePath = epub->getCachePath();
       auto pageShared = std::make_shared<std::unique_ptr<Page>>(std::move(pageForLookup));
+      // CrumBLE: every exit path from the dictionary flow must re-enable
+      // BT if we disabled it on entry, so the bonded remote reconnects
+      // on the user's next press. requestEnableLater() defers to the
+      // main loop's drain (next tick), which is the safe place to bring
+      // NimBLE back up.
+      auto reEnableBleIfNeeded = [bleWasOnForLookup]() {
+        if (bleWasOnForLookup) {
+          BluetoothHIDManager::getInstance().requestEnableLater();
+        }
+      };
       auto launchWordSelect = [this, pageShared, readerFontId, orientedMarginLeft, orientedMarginTop, cachePath,
-                               orientation, nextPageFirstWord]() {
+                               orientation, nextPageFirstWord, reEnableBleIfNeeded]() {
         startActivityForResult(
             std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(*pageShared), readerFontId,
                                                           orientedMarginLeft, orientedMarginTop, cachePath, orientation,
                                                           nextPageFirstWord),
-            [this](const ActivityResult& result) { requestUpdate(); });
+            [this, reEnableBleIfNeeded](const ActivityResult& result) {
+              reEnableBleIfNeeded();
+              requestUpdate();
+            });
       };
 
       if (Dictionary::isIndexReady()) {
@@ -1773,18 +1803,20 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
                 renderer, mappedInput, tr(STR_DICT_INDEX_PROMPT_TITLE), tr(STR_DICT_INDEX_PROMPT_BODY),
                 std::vector<std::string>{tr(STR_DICT_INDEX_PROMPT_BUILD), tr(STR_DICT_INDEX_PROMPT_CANCEL)},
                 /*ignoreInitialConfirmRelease=*/true),
-            [this, launchWordSelect](const ActivityResult& promptResult) {
+            [this, launchWordSelect, reEnableBleIfNeeded](const ActivityResult& promptResult) {
               int chosen = -1;
               if (const auto* cp = std::get_if<ChoicePromptResult>(&promptResult.data)) {
                 chosen = cp->choice;
               }
               if (promptResult.isCancelled || chosen != 0) {
+                reEnableBleIfNeeded();
                 requestUpdate();
                 return;
               }
               startActivityForResult(std::make_unique<DictionaryIndexBuildActivity>(renderer, mappedInput),
-                                     [this, launchWordSelect](const ActivityResult& buildResult) {
+                                     [this, launchWordSelect, reEnableBleIfNeeded](const ActivityResult& buildResult) {
                                        if (buildResult.isCancelled) {
+                                         reEnableBleIfNeeded();
                                          requestUpdate();
                                          return;
                                        }
@@ -1795,8 +1827,26 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       break;
     }
     case EpubReaderMenuActivity::MenuAction::LOOKED_UP_WORDS: {
+      // CrumBLE: same BT auto-disable / re-enable wrapper as the LOOKUP
+      // case. LookedUpWordsActivity is just a history list, but tapping
+      // an entry drills into DictionaryDefinitionActivity which calls
+      // Dictionary::lookup -- same heap pressure that crashes Lookup
+      // with NimBLE active. Dropping BT on entry keeps the saved-words
+      // flow safe; requestEnableLater on activity finish brings the
+      // bonded remote back on the user's next press.
+      auto& btMgr = BluetoothHIDManager::getInstance();
+      const bool bleWasOnForHistory = btMgr.isEnabled();
+      if (bleWasOnForHistory) {
+        LOG_INF("ERS", "LookedUpWords: disabling BT (re-enabling on exit)");
+        btMgr.disable();
+      }
       startActivityForResult(std::make_unique<LookedUpWordsActivity>(renderer, mappedInput, epub->getCachePath()),
-                             [this](const ActivityResult& result) { requestUpdate(); });
+                             [this, bleWasOnForHistory](const ActivityResult& result) {
+                               if (bleWasOnForHistory) {
+                                 BluetoothHIDManager::getInstance().requestEnableLater();
+                               }
+                               requestUpdate();
+                             });
       break;
     }
     case EpubReaderMenuActivity::MenuAction::GO_TO_PERCENT: {
