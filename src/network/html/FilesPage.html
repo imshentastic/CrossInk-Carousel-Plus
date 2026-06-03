@@ -1564,7 +1564,7 @@
         <div class="convert-options" id="convertOptions" style="display:none;">
           <div class="convert-row">
             <label class="convert-checkbox">
-              <input type="checkbox" id="convertBeforeUpload" onchange="toggleConvertOptions()">
+              <input type="checkbox" id="convertBeforeUpload" onchange="toggleConvertOptions()" checked>
               <span>Optimize EPUB</span>
             </label>
             <span class="convert-separator">—</span>
@@ -1587,8 +1587,8 @@
           <div class="bt-friendly-option" id="btFriendlyOption">
             <div class="bt-friendly-row">
               <div class="bt-friendly-text">
-                <div class="setting-title">Pre-optimize for instant reading</div>
-                <div class="setting-desc">Pre-shrink images and pre-build the chapter index off-device. Your computer does the heavy lifting once so the device opens this book instantly and chapter turns feel snappy.<br>Adds ~30-60 s to upload time per book.</div>
+                <div class="setting-title">Pre-cache chapter indexing / images</div>
+                <div class="setting-desc">Optimizes for instant chapter turns and accelerated book opening. Adds ~40 s to upload time per book in exchange for zero-delay reading!</div>
               </div>
               <label class="toggle-switch">
                 <input type="checkbox" id="optimize-for-device-checkbox" checked>
@@ -2134,7 +2134,7 @@
     document.getElementById('progress-container').style.display = 'none';
     document.getElementById('progress-fill').style.width = '0%';
     document.getElementById('progress-fill').style.backgroundColor = '#27ae60';
-    document.getElementById('convertBeforeUpload').checked = false;
+    document.getElementById('convertBeforeUpload').checked = true;
     document.getElementById('convertInfo').style.display = 'none';
     document.getElementById('convertWarning').style.display = 'none';
     const btFriendlyOption = document.getElementById('btFriendlyOption');
@@ -3006,6 +3006,39 @@ async function uploadFile() {
     };
 
     try {
+      // CrumBLE preflight: when either the BT pass OR the chapter prebake
+      // will run on this EPUB, lock in the reader settings BEFORE the long
+      // work starts. The modal surfaces the snapshot the bake will embed
+      // into the manifest, lets the user edit any field, and pushes
+      // changes to the device via /api/save-reader-settings so SETTINGS
+      // matches the bake's fingerprint on first open. Cancel aborts the
+      // entire upload step for this file (no conversion, no upload, no
+      // prebake) -- onError handles the bookkeeping.
+      const isEpubFile = file && file.name && /\.epub$/i.test(file.name);
+      const preOptToggle = document.getElementById('optimize-for-device-checkbox');
+      const preOptOn = !!preOptToggle && preOptToggle.checked;
+      const willOptimize = isEpubFile && (needsConversion || preOptOn);
+      if (willOptimize) {
+        try {
+          const riResp = await fetch('/api/reader-render-info');
+          if (riResp.ok) {
+            const ri = await riResp.json();
+            if (ri && ri.viewportWidth > 0 && ri.viewportHeight > 0) {
+              // Modal returns the (possibly edited) renderInfo. We don't
+              // need the value here -- convertEpubFile / prebakeChapters
+              // both re-fetch render-info themselves after the device-
+              // side SETTINGS have been updated. The modal call's only
+              // purpose at this layer is "wait until user confirms".
+              await showOptimizerPreflightModal(ri, file.name);
+            }
+          }
+        } catch (preErr) {
+          // User cancelled (or modal threw) -- propagate up as a
+          // conversion error so the caller logs it and moves on.
+          throw preErr;
+        }
+      }
+
       // Convert EPUB if needed. Single-colour bar across all phases now:
       // the bar conveys overall progress, the text above it tells the
       // user which phase is running.

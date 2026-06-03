@@ -2422,6 +2422,12 @@ async function convertEpubFile(file, progressCallback) {
   const bakePxcEnabled = document.getElementById('optimize-for-device-checkbox')?.checked !== false;
   let renderInfo = null;
   if (bakePxcEnabled) {
+    // FilesPage.html runs the preflight modal BEFORE calling
+    // convertEpubFile so the user only sees it once even when both the
+    // BT pass and the chapter prebake pass need the same locked-in
+    // settings. By the time we get here, SETTINGS on the device already
+    // reflects the user's edits (the modal POSTed them) -- we just need
+    // a fresh render-info snapshot to drive the .pxc bake.
     try {
       const resp = await fetch('/api/reader-render-info');
       if (resp.ok) renderInfo = await resp.json();
@@ -2429,20 +2435,6 @@ async function convertEpubFile(file, progressCallback) {
     if (!renderInfo || !(renderInfo.viewportWidth > 0) || !(renderInfo.viewportHeight > 0)) {
       renderInfo = null;
     } else {
-      // Preflight: lock in the reader settings now. The bake's manifest +
-      // section fingerprints will be derived from these values, and the
-      // device's first cold open compares against SETTINGS as they are at
-      // that moment -- so if the user has any of these wrong, the cache
-      // misses immediately and the optimization is for nothing. Pause
-      // here, show the user what we're about to commit, let them edit
-      // before we start the long-running work. Cancel aborts the whole
-      // optimization (propagates up to convertEpubFile's caller).
-      try {
-        renderInfo = await showOptimizerPreflightModal(renderInfo, file.name);
-      } catch (e) {
-        log(`Optimization cancelled before start: ${e.message || e}`, 'warning', 'INFO');
-        throw e;
-      }
       log(`Bluetooth image cache: baking .pxc for ${renderInfo.device} viewport ${renderInfo.viewportWidth}x${renderInfo.viewportHeight}`, '', 'INFO');
     }
   } else {
