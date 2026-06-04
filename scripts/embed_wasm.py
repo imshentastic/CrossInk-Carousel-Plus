@@ -33,7 +33,16 @@ TARGETS = [
 
 
 def embed(src_path: Path, identifier: str) -> None:
-    if not src_path.exists():
+    # CRUMBLE_OMIT_WASM=1 forces stub generation even when the WASM is
+    # built. Used for release builds where we want the firmware binary
+    # to stay small enough to leave OTA headroom; the device-side
+    # /js/crumble-prebake.* handlers fall through to a 404 and the web
+    # optimizer falls back to its CDN-loaded variant.
+    if os.environ.get("CRUMBLE_OMIT_WASM") == "1":
+        print(f"[embed_wasm] skip {src_path.name}: CRUMBLE_OMIT_WASM=1")
+        compressed = b""
+        original_size = 0
+    elif not src_path.exists():
         # The WASM build is optional -- if the developer hasn't run
         # tools/crumble-prebake/build-wash.sh, emit a tiny stub header
         # so the firmware still compiles. The /js/crumble-prebake.*
