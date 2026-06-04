@@ -1,5 +1,15 @@
 # Changelog
 
+## [crumble-v4.0.1] - 2026-06-04
+
+### Changed
+- **Two firmware variants ship side by side**: `crumble-firmware-4.0.1.bin` (slim, 6.08 MB, drops the CharEink built-in font, fits the 6.25 MB legacy OTA partition) and `crumble-firmware-4.0.1-full-needs-USB-flash.bin` (full, 6.85 MB, keeps all three built-in fonts but requires USB flash). Users who want CharEink without the partition pain can flash the slim build and install CharEink as a custom SD-card font via `CrumBLE-ChareInk-SDfont.zip`.
+- Version bump from 4.0.0 → 4.0.1 is purely a clarity marker. The 4.0.0 release was re-uploaded multiple times during a debugging session (with WASM dropped, with WASM re-added, slim variant added) and users who downloaded mid-iteration have different bits all labelled "4.0.0". 4.0.1 is the canonical settled artifact.
+
+### Fixed
+- Settled the `crumble-prebake.{js,wasm}` embedding decision: ALWAYS embedded so the EPUB optimizer's prebake step works offline. A previous iteration of 4.0.0 stripped the WASM to keep the binary smaller, but the optimizer then silently failed the prebake step (book uploaded fine, but no instant chapter turns + a misleading "FAILED" log entry).
+- Build flag `OMIT_CHAREINK_FONT` added so the slim binary drops the CharEink family cleanly (picker hides the option, font ID lookup falls back to Bitter for users with a stale CHAREINK preference).
+
 ## [crumble-v4.0.0] - 2026-06-04
 
 ### Added
