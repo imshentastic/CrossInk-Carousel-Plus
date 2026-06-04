@@ -215,6 +215,13 @@ class CollectionsStore {
   // re-scans lazily.
   void invalidateScannedVirtuals() const;
 
+  // CrumBLE: drop the in-RAM collections vector (and any scanned-virtual
+  // caches). Called from FT entry to reclaim heap; on-disk JSON is
+  // untouched. CrossPointWebServerActivity::onExit silentRestarts the
+  // device so we don't need to re-load -- the next boot's begin()
+  // does that.
+  void releaseMemory();
+
   // CrumBLE: re-sort the in-memory collections vector to match the given id
   // sequence and persist the new order. IDs present in the vector but not
   // in `orderedIds` are kept at the end in their current relative order

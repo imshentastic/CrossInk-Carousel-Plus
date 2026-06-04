@@ -775,6 +775,18 @@ void CollectionsStore::invalidateScannedVirtuals() const {
   newPathsCache_.clear();
 }
 
+void CollectionsStore::releaseMemory() {
+  // Drop in-RAM caches + the collections vector itself. Capacity returns
+  // to zero on libstdc++ via shrink_to_fit. On-disk JSON is not touched.
+  invalidateScannedVirtuals();
+  finishedPathsCache_.shrink_to_fit();
+  newPathsCache_.shrink_to_fit();
+  collections.clear();
+  collections.shrink_to_fit();
+  activeId.clear();
+  activeId.shrink_to_fit();
+}
+
 void CollectionsStore::rebuildScannedVirtualsIfNeeded() const {
   if (scannedVirtualsValid_) return;
   finishedPathsCache_.clear();

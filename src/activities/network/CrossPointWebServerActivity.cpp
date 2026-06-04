@@ -10,9 +10,11 @@
 #include <cstddef>
 
 #include "BluetoothHIDManager.h"
+#include "CollectionsStore.h"
 #include "CrossPointState.h"
 #include "LibraryIndex.h"
 #include "MappedInputManager.h"
+#include "SeriesIndex.h"
 #include "NetworkModeSelectionActivity.h"
 #include "SdCardFontSystem.h"
 #include "SilentRestart.h"
@@ -86,6 +88,17 @@ void CrossPointWebServerActivity::onEnter() {
   // Recently Added / All Books visit.
   LibraryIndex::getInstance().releaseMemory();
   LOG_INF("WEBACT", "Free heap after index release: %d bytes (maxAlloc %d)",
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
+  // CrumBLE: also drop SeriesIndex + CollectionsStore in-RAM state.
+  // SeriesIndex's pooled stringPool can hold tens of KB for libraries
+  // with lots of series-tagged books; CollectionsStore holds the
+  // collections vector + finished/new path caches. Both reload on
+  // the silentRestart that exitToOrigin triggers in onExit, so we
+  // don't strand persistent state.
+  SeriesIndex::getInstance().releaseMemory();
+  CollectionsStore::getInstance().releaseMemory();
+  LOG_INF("WEBACT", "Free heap after series/collections release: %d bytes (maxAlloc %d)",
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   // CrumBLE: pre-flight heap check AFTER all reclamations.
