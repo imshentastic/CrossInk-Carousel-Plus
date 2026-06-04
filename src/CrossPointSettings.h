@@ -278,6 +278,13 @@ class CrossPointSettings {
   enum QUICK_RESUME_SLEEP_SCREEN {
     QUICK_RESUME_NEVER = 0,
     QUICK_RESUME_AFTER_TIMEOUT = 1,
+    // CrumBLE: fast wake regardless of sleep trigger (auto-timeout OR
+    // manual power-button). Pairs with sleepScreen = CUSTOM (or any
+    // other image-rendering mode) so the user sees their chosen sleep
+    // image on the way in AND gets a near-instant wake -- the framebuffer
+    // is saved at sleep time and restored on wake via the same
+    // BootResume::QuickResume path used by sleepScreen=QUICK_RESUME.
+    QUICK_RESUME_ALWAYS = 2,
     QUICK_RESUME_SLEEP_SCREEN_COUNT
   };
 

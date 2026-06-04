@@ -280,9 +280,15 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
     add(SettingInfo::Enum(StrId::STR_SLEEP_SCREEN_ORDER, &CrossPointSettings::sleepScreenOrder,
                           {StrId::STR_SLEEP_ORDER_RANDOM, StrId::STR_SLEEP_ORDER_ALPHABETICAL}, "sleepScreenOrder",
                           StrId::STR_CAT_DISPLAY));
-    add(SettingInfo::Enum(StrId::STR_QUICK_RESUME_TIMEOUT, &CrossPointSettings::quickResumeSleepScreen,
-                          {StrId::STR_STATE_OFF, StrId::STR_STATE_ON}, "quickResumeSleepScreen",
-                          StrId::STR_CAT_DISPLAY));
+    // CrumBLE: was Off / On (mapped Off=NEVER, On=AFTER_TIMEOUT). Bumped
+    // to a three-option enum so the user can pick "Always" for fast wake
+    // regardless of how they put the device to sleep -- pairs naturally
+    // with a custom sleep image (sleepScreen = CUSTOM / COVER / etc.).
+    // Indices map 1:1 to the QUICK_RESUME_SLEEP_SCREEN enum values.
+    add(SettingInfo::Enum(StrId::STR_QUICK_RESUME, &CrossPointSettings::quickResumeSleepScreen,
+                          {StrId::STR_STATE_OFF, StrId::STR_QUICK_RESUME_AFTER_TIMEOUT,
+                           StrId::STR_QUICK_RESUME_ALWAYS_LABEL},
+                          "quickResumeSleepScreen", StrId::STR_CAT_DISPLAY));
     add(SettingInfo::Enum(StrId::STR_HIDE_BATTERY, &CrossPointSettings::hideBatteryPercentage,
                           {StrId::STR_NEVER, StrId::STR_IN_READER, StrId::STR_ALWAYS}, "hideBatteryPercentage",
                           StrId::STR_CAT_DISPLAY));
