@@ -1872,11 +1872,34 @@ async function showOptimizerPreflightModal(renderInfo, fileName) {
   // Enum tables. Indexes match the CrossPointSettings.h enums byte-for-byte
   // -- the device validates the same ranges in handleSaveReaderSettings, so
   // any drift here would be caught server-side. Keep in sync with that file.
+  //
+  // Font-family is special: the dropdown carries STRING tags rather than
+  // numeric values so we can represent both built-in fonts ("builtin:N")
+  // and SD-card fonts ("sd:<family-name>") in the same select. Built-in
+  // tags map to numeric fontFamily on save; SD tags map to
+  // sdFontFamilyName. See the confirm.onclick handler below.
   const FONT_FAMILY = [
-    { v: 0, label: 'Lexend Deca' },
-    { v: 1, label: 'Bitter' },
-    { v: 2, label: 'CharE-Ink' },
+    { v: 'builtin:0', label: 'Lexend Deca' },
+    { v: 'builtin:1', label: 'Bitter' },
+    { v: 'builtin:2', label: 'CharE-Ink' },
   ];
+
+  // CrumBLE 4.1.1: pull SD-card font families from the device so users
+  // with a custom .cpfont can confirm / pick it in this dialog. Missing
+  // or failed /api/fonts response just falls through to built-ins only.
+  try {
+    const fontsResp = await fetch('/api/fonts');
+    if (fontsResp.ok) {
+      const fontsData = await fontsResp.json();
+      for (const family of (fontsData.families || [])) {
+        if (family && typeof family.name === 'string' && family.name.length > 0) {
+          FONT_FAMILY.push({ v: `sd:${family.name}`, label: `${family.name} (SD)` });
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('Preflight: /api/fonts unavailable; SD-card font families will be missing from the picker', e);
+  }
   const FONT_SIZE = [
     { v: 0, label: 'Tiny (8pt)' },
     { v: 1, label: 'Small (10pt)' },
@@ -1990,7 +2013,12 @@ async function showOptimizerPreflightModal(renderInfo, fileName) {
       form.appendChild(wrap);
     };
 
-    makeSelect('Font family', 'fontFamily', FONT_FAMILY, renderInfo.fontFamily | 0);
+    // CrumBLE 4.1.1: pick the current font tag based on whether an SD
+    // font is selected (sdFontFamilyName non-empty) or a built-in one.
+    const currentFontTag = (renderInfo.sdFontFamilyName && renderInfo.sdFontFamilyName.length > 0)
+      ? `sd:${renderInfo.sdFontFamilyName}`
+      : `builtin:${renderInfo.fontFamily | 0}`;
+    makeSelect('Font family', 'fontFamily', FONT_FAMILY, currentFontTag);
     makeSelect('Font size', 'fontSize', FONT_SIZE, renderInfo.fontSize | 0);
     makeSelect('Orientation', 'orientation', ORIENTATION, renderInfo.orientation | 0);
     makeNumber('Screen margin (px)', 'screenMargin', renderInfo.screenMargin | 0, 0, 50);
@@ -2036,8 +2064,22 @@ async function showOptimizerPreflightModal(renderInfo, fileName) {
         const val = (el.type === 'checkbox') ? (el.checked ? '1' : '0') : el.value;
         if (val !== cur) {
           dirtyKeys.push(key);
-          if (el.type === 'checkbox') updates[key] = el.checked ? 1 : 0;
-          else updates[key] = Number(val);
+          if (el.type === 'checkbox') {
+            updates[key] = el.checked ? 1 : 0;
+          } else if (key === 'fontFamily' && typeof val === 'string' && val.startsWith('sd:')) {
+            // CrumBLE 4.1.1: SD-card font selection. Route the picked
+            // family name to sdFontFamilyName; keep fontFamily at its
+            // current built-in value so the device's font-resolution
+            // path knows to consult the SD registry.
+            updates.sdFontFamilyName = val.substring(3);
+          } else if (key === 'fontFamily' && typeof val === 'string' && val.startsWith('builtin:')) {
+            // Built-in font selection. Clear any prior SD selection so
+            // the device falls back to the numeric fontFamily enum.
+            updates.fontFamily = Number(val.substring(8));
+            updates.sdFontFamilyName = '';
+          } else {
+            updates[key] = Number(val);
+          }
         }
       });
       if (dirtyKeys.length === 0) {
