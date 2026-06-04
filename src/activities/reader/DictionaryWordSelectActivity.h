@@ -35,7 +35,15 @@ class DictionaryWordSelectActivity final : public Activity {
   //   - HighlightRange: tap a word to anchor, navigate to expand the
   //     selection, tap again to finish. Emits a HighlightRangeResult
   //     with both word indices + the joined preview text.
-  enum class Mode { Lookup, HighlightRange };
+  enum class Mode {
+    Lookup,            // tap a word -> definition lookup
+    HighlightRange,    // two-tap inclusive range on a single page (phase 2)
+    HighlightSingleWord  // one-tap single word; used to pick the END
+                       // anchor of a cross-page/cross-chapter highlight
+                       // whose START anchor is held in EpubReaderActivity.
+                       // Emits HighlightRangeResult with start==end and the
+                       // picked word's raw text in previewText.
+  };
 
   explicit DictionaryWordSelectActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                         std::unique_ptr<Page> page, int fontId, int marginLeft, int marginTop,

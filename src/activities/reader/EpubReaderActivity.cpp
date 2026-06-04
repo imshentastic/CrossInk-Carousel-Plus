@@ -1353,7 +1353,7 @@ void EpubReaderActivity::loop() {
                                SETTINGS.orientation, !currentPageFootnotes.empty(), !BOOKMARKS.getBookmarks().empty(),
                                BOOKMARKS.hasBookmarkForPage(bmSpine, bmProgress, bookmarkPageCount), isBookCompleted,
                                automaticPageTurnActive, getAutoPageTurnIntervalSeconds(),
-                               hasDictionary, hasLookupHistory),
+                               hasDictionary, hasLookupHistory, pendingHighlightStart_.has_value()),
                            [this](const ActivityResult& result) {
                              // Always apply orientation change even if the menu was cancelled
                              const auto& menu = std::get<MenuResult>(result.data);
@@ -1956,10 +1956,30 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
               return;
             }
             const auto* hr = std::get_if<HighlightRangeResult>(&result.data);
-            if (!hr || hr->startWordIndex < 0 || hr->endWordIndex < 0) {
+            if (!hr || hr->startWordIndex < 0) {
               requestUpdate();
               return;
             }
+            // Anchor-only result (end == -1): user pressed Hold after
+            // placing start. Stash for the FINISH_HIGHLIGHT path.
+            if (hr->endWordIndex < 0) {
+              PendingHighlightStart hold;
+              hold.spineIndex = hlSpine;
+              hold.progress = hlProgress;
+              hold.pageCount = static_cast<uint16_t>(hlPageCount);
+              hold.wordIndex = static_cast<uint16_t>(hr->startWordIndex);
+              hold.startWordText = hr->previewText;  // single word's raw text
+              hold.chapterTitle = hlChapterTitle;
+              pendingHighlightStart_ = std::move(hold);
+              LOG_INF("ERS", "Highlight anchor held at spine=%u progress=%.3f word=%d",
+                      hlSpine, hlProgress, hr->startWordIndex);
+              // Show a brief banner so the user knows the start was saved.
+              GUI.drawPopup(renderer, tr(STR_HIGHLIGHT_HELD));
+              delay(900);
+              requestUpdate();
+              return;
+            }
+            // Full range (same-page): save directly.
             const auto addResult = BOOKMARKS.addHighlight(
                 hlSpine, hlProgress, static_cast<uint16_t>(hr->startWordIndex), hlSpine, hlProgress,
                 static_cast<uint16_t>(hr->endWordIndex), hlPageCount,
@@ -1969,6 +1989,121 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
             } else {
               bookmarkFeedbackType = BookmarkFeedbackType::LimitReached;
             }
+            pendingBookmarkFeedback = true;
+            bookmarkFeedbackShowTime = millis();
+            requestUpdate();
+          });
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::CANCEL_HIGHLIGHT: {
+      pendingHighlightStart_.reset();
+      GUI.drawPopup(renderer, tr(STR_HIGHLIGHT_CANCELLED));
+      delay(700);
+      requestUpdate();
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::FINISH_HIGHLIGHT: {
+      if (!pendingHighlightStart_.has_value()) break;
+      // Same BT teardown + heap pre-flight + page extraction as ADD_HIGHLIGHT.
+      auto& btMgrF = BluetoothHIDManager::getInstance();
+      const bool bleWasOnForFinish = btMgrF.isEnabled();
+      if (bleWasOnForFinish) {
+        LOG_INF("ERS", "FinishHighlight: disabling BT (re-enabling on exit)");
+        btMgrF.disable();
+        LOG_INF("ERS", "FinishHighlight: heap after BT disable: free=%u maxAlloc=%u",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      }
+      constexpr uint32_t FINISH_MIN_MAX_ALLOC = 32000;
+      if (ESP.getMaxAllocHeap() < FINISH_MIN_MAX_ALLOC) {
+        LOG_INF("ERS", "FinishHighlight pre-flight: maxAlloc=%u below %u, raising alert",
+                ESP.getMaxAllocHeap(), FINISH_MIN_MAX_ALLOC);
+        if (bleWasOnForFinish) btMgrF.requestEnableLater();
+        strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_LOOKUP_TITLE),
+                sizeof(APP_STATE.pendingAlertTitle) - 1);
+        strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_LOOKUP_BODY),
+                sizeof(APP_STATE.pendingAlertBody) - 1);
+        APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
+        break;
+      }
+
+      std::unique_ptr<Page> pageForFinish;
+      int orientedMarginTopF = 0;
+      int orientedMarginLeftF = 0;
+      {
+        RenderLock lock(*this);
+        if (!section) {
+          requestUpdate();
+          if (bleWasOnForFinish) btMgrF.requestEnableLater();
+          break;
+        }
+        int orientedMarginRightF = 0;
+        int orientedMarginBottomF = 0;
+        renderer.getOrientedViewableTRBL(&orientedMarginTopF, &orientedMarginRightF, &orientedMarginBottomF,
+                                         &orientedMarginLeftF);
+        orientedMarginTopF += SETTINGS.screenMargin;
+        orientedMarginLeftF += SETTINGS.screenMargin;
+        orientedMarginRightF += SETTINGS.screenMargin;
+        const uint8_t statusBarHeightF = UITheme::getInstance().getStatusBarHeight();
+        if (automaticPageTurnActive &&
+            (statusBarHeightF == 0 || statusBarHeightF == UITheme::getInstance().getProgressBarHeight())) {
+          orientedMarginBottomF += std::max(
+              SETTINGS.screenMargin,
+              static_cast<uint8_t>(statusBarHeightF + UITheme::getInstance().getMetrics().statusBarVerticalMargin));
+        } else {
+          orientedMarginBottomF += std::max(SETTINGS.screenMargin, statusBarHeightF);
+        }
+        pageForFinish = section->loadPageFromSectionFile();
+      }
+      if (!pageForFinish) {
+        if (bleWasOnForFinish) btMgrF.requestEnableLater();
+        break;
+      }
+
+      // Snapshot END-side reader state -- the END page is wherever the
+      // user navigated to between the Hold and now. (May be same spine,
+      // may be a later spine for cross-chapter.)
+      const uint16_t endSpine = static_cast<uint16_t>(currentSpineIndex);
+      const float endProgressVal = static_cast<float>(section->currentPage) / static_cast<float>(section->pageCount);
+
+      startActivityForResult(
+          std::make_unique<DictionaryWordSelectActivity>(
+              renderer, mappedInput, std::move(pageForFinish), SETTINGS.getReaderFontId(), orientedMarginLeftF,
+              orientedMarginTopF, epub->getCachePath(), SETTINGS.orientation, std::string{},
+              DictionaryWordSelectActivity::Mode::HighlightSingleWord),
+          [this, bleWasOnForFinish, endSpine, endProgressVal](const ActivityResult& result) {
+            if (bleWasOnForFinish) BluetoothHIDManager::getInstance().requestEnableLater();
+            if (result.isCancelled || !pendingHighlightStart_.has_value()) {
+              requestUpdate();
+              return;
+            }
+            const auto* hr = std::get_if<HighlightRangeResult>(&result.data);
+            if (!hr || hr->startWordIndex < 0) {
+              requestUpdate();
+              return;
+            }
+            const auto& start = *pendingHighlightStart_;
+            // Build preview as "<start word>... <end word>" so the user
+            // gets a sense of both anchors even across pages/chapters.
+            // The single-page Phase 2 path produces a full joined string;
+            // multi-anchor path can't easily walk intervening text without
+            // loading every page in between, so we approximate.
+            std::string preview = start.startWordText;
+            preview += "... ";
+            preview += hr->previewText;
+            if (preview.size() > BOOKMARK_PREVIEW_MAX - 1) {
+              preview.resize(BOOKMARK_PREVIEW_MAX - 4);
+              preview += "...";
+            }
+            const auto addResult = BOOKMARKS.addHighlight(
+                start.spineIndex, start.progress, start.wordIndex, endSpine, endProgressVal,
+                static_cast<uint16_t>(hr->endWordIndex), start.pageCount,
+                start.chapterTitle.empty() ? nullptr : start.chapterTitle.c_str(), preview.c_str());
+            if (addResult == BookmarkStore::AddResult::Added) {
+              bookmarkFeedbackType = BookmarkFeedbackType::Added;
+            } else {
+              bookmarkFeedbackType = BookmarkFeedbackType::LimitReached;
+            }
+            pendingHighlightStart_.reset();
             pendingBookmarkFeedback = true;
             bookmarkFeedbackShowTime = millis();
             requestUpdate();

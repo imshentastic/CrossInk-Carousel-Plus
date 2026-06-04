@@ -42,7 +42,15 @@ class EpubReaderMenuActivity final : public Activity {
     // word-select activity in HighlightRange mode; user taps the start
     // word, navigates to the end, taps again. Always available alongside
     // BOOKMARK_TOGGLE -- the latter stays for fast page-marking.
-    ADD_HIGHLIGHT
+    ADD_HIGHLIGHT,
+    // CrumBLE: cross-page / cross-chapter flow. After ADD_HIGHLIGHT's
+    // first-word anchor is placed, hitting Back ("Hold") emits an
+    // anchor-only result; the reader stores it as pendingHighlightStart_
+    // and surfaces FINISH (pick end on whatever later page) and CANCEL.
+    // ADD_HIGHLIGHT is hidden when the pending state is held so the menu
+    // doesn't dangle two ways to start a new one.
+    FINISH_HIGHLIGHT,
+    CANCEL_HIGHLIGHT
   };
 
   explicit EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const std::string& title,
@@ -51,7 +59,8 @@ class EpubReaderMenuActivity final : public Activity {
                                   const bool isCurrentPageBookmarked, const bool isBookCompleted,
                                   const bool autoPageTurnActive = false,
                                   const uint16_t autoPageTurnIntervalSeconds = 0,
-                                  const bool hasDictionary = false, const bool hasLookupHistory = false);
+                                  const bool hasDictionary = false, const bool hasLookupHistory = false,
+                                  const bool hasPendingHighlight = false);
 
   void onEnter() override;
   void onExit() override;
@@ -67,7 +76,8 @@ class EpubReaderMenuActivity final : public Activity {
   };
 
   static std::vector<MenuItem> buildMenuItems(bool hasFootnotes, bool hasBookmarks, bool isCurrentPageBookmarked,
-                                              bool isBookCompleted, bool hasDictionary, bool hasLookupHistory);
+                                              bool isBookCompleted, bool hasDictionary, bool hasLookupHistory,
+                                              bool hasPendingHighlight);
 
   // Fixed menu layout
   const std::vector<MenuItem> menuItems;

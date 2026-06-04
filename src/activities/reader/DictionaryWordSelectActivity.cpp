@@ -258,9 +258,21 @@ void DictionaryWordSelectActivity::loop() {
         startActivityForResult(
             std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, wordToLookup, cachePath, fontId),
             [this](const ActivityResult& result) { requestUpdate(); });
+      } else if (mode_ == Mode::HighlightSingleWord) {
+        // One-tap mode for cross-page END pick. Emit start==end + just
+        // the raw word's text as preview; the reader combines this with
+        // the held start anchor to build the actual saved highlight.
+        ActivityResult result;
+        HighlightRangeResult hr;
+        hr.startWordIndex = selectedWordIdx;
+        hr.endWordIndex = selectedWordIdx;
+        hr.previewText = words[selectedWordIdx].text;
+        result.data = hr;
+        setResult(std::move(result));
+        finish();
       } else {
-        // HighlightRange mode: first Confirm anchors the start; second
-        // Confirm finishes with the range. Anchor lives until activity exit.
+        // HighlightRange (same-page): first Confirm anchors the start;
+        // second Confirm finishes with the range. Anchor lives until exit.
         if (highlightAnchorWordIdx_ < 0) {
           highlightAnchorWordIdx_ = selectedWordIdx;
           requestUpdate();
@@ -280,7 +292,21 @@ void DictionaryWordSelectActivity::loop() {
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     ActivityResult result;
-    result.isCancelled = true;
+    // CrumBLE: in HighlightRange mode with the anchor placed, Back means
+    // "hold the start for later" instead of cancel -- emit a result with
+    // startWordIndex=anchor and endWordIndex=-1. Reader stores this as
+    // pendingHighlightStart_ and surfaces FINISH / CANCEL in the menu.
+    // Lookup mode and pre-anchor HighlightRange still treat Back as cancel.
+    if (mode_ == Mode::HighlightRange && highlightAnchorWordIdx_ >= 0 &&
+        highlightAnchorWordIdx_ < static_cast<int>(words.size())) {
+      HighlightRangeResult hr;
+      hr.startWordIndex = highlightAnchorWordIdx_;
+      hr.endWordIndex = -1;  // signal: anchor only
+      hr.previewText = words[highlightAnchorWordIdx_].text;
+      result.data = hr;
+    } else {
+      result.isCancelled = true;
+    }
     setResult(std::move(result));
     finish();
   }
@@ -340,14 +366,21 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
     }
   }
 
-  // CrumBLE: button hints differ by mode. Lookup keeps Cancel/Lookup/.../Prev-Next.
-  // HighlightRange shows Cancel/(Start|End) so the user knows what the next
-  // Confirm will do at each step.
+  // CrumBLE: button hints differ by mode and state.
+  //   Lookup        : Cancel / Lookup     /.../ Prev-Next
+  //   Range (pre-)  : Cancel / Start      /.../ Prev-Next
+  //   Range (held)  : Hold   / End        /.../ Prev-Next
+  //                   ^ Back changes meaning once an anchor is placed.
+  //   SingleWord    : Cancel / End        /.../ Prev-Next
+  const char* btn1Label = tr(STR_CANCEL);
   const char* btn2Label = tr(STR_LOOKUP);
   if (mode_ == Mode::HighlightRange) {
     btn2Label = (highlightAnchorWordIdx_ < 0) ? tr(STR_HIGHLIGHT_START) : tr(STR_HIGHLIGHT_END);
+    if (highlightAnchorWordIdx_ >= 0) btn1Label = tr(STR_HIGHLIGHT_HOLD);
+  } else if (mode_ == Mode::HighlightSingleWord) {
+    btn2Label = tr(STR_HIGHLIGHT_END);
   }
-  const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), btn2Label, "", tr(STR_PREV_NEXT));
+  const auto labels = mappedInput.mapLabels(btn1Label, btn2Label, "", tr(STR_PREV_NEXT));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 }

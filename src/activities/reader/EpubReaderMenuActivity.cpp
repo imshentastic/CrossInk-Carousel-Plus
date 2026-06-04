@@ -82,10 +82,11 @@ EpubReaderMenuActivity::EpubReaderMenuActivity(GfxRenderer& renderer, MappedInpu
                                                const bool isCurrentPageBookmarked, const bool isBookCompleted,
                                                const bool autoPageTurnActive,
                                                const uint16_t autoPageTurnIntervalSeconds,
-                                               const bool hasDictionary, const bool hasLookupHistory)
+                                               const bool hasDictionary, const bool hasLookupHistory,
+                                               const bool hasPendingHighlight)
     : Activity("EpubReaderMenu", renderer, mappedInput),
       menuItems(buildMenuItems(hasFootnotes, hasBookmarks, isCurrentPageBookmarked, isBookCompleted,
-                               hasDictionary, hasLookupHistory)),
+                               hasDictionary, hasLookupHistory, hasPendingHighlight)),
       title(title),
       pendingOrientation(currentOrientation),
       currentPage(currentPage),
@@ -99,7 +100,8 @@ std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMenuI
                                                                                      bool isCurrentPageBookmarked,
                                                                                      bool isBookCompleted,
                                                                                      bool hasDictionary,
-                                                                                     bool hasLookupHistory) {
+                                                                                     bool hasLookupHistory,
+                                                                                     bool hasPendingHighlight) {
   std::vector<MenuItem> items;
   // 14 upstream items + 1 (CrumBLE Bluetooth entry).
   constexpr size_t baseItemCount = 15;
@@ -127,9 +129,16 @@ std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMenuI
   items.push_back({MenuAction::GO_TO_PERCENT, StrId::STR_GO_TO_PERCENT});
   items.push_back(
       {MenuAction::BOOKMARK_TOGGLE, isCurrentPageBookmarked ? StrId::STR_REMOVE_BOOKMARK : StrId::STR_ADD_BOOKMARK});
-  // CrumBLE: ranged highlight (the new bookmark UX). Always offered;
-  // page-level toggle above stays for users who just want a fast mark.
-  items.push_back({MenuAction::ADD_HIGHLIGHT, StrId::STR_ADD_HIGHLIGHT});
+  // CrumBLE: ranged highlight. With no held anchor, ADD_HIGHLIGHT starts
+  // a fresh selection. With a held anchor (the user backed out with the
+  // start placed for a cross-page highlight), surface FINISH + CANCEL
+  // instead -- showing ADD here would leave two ways to start.
+  if (hasPendingHighlight) {
+    items.push_back({MenuAction::FINISH_HIGHLIGHT, StrId::STR_FINISH_HIGHLIGHT});
+    items.push_back({MenuAction::CANCEL_HIGHLIGHT, StrId::STR_CANCEL_HIGHLIGHT});
+  } else {
+    items.push_back({MenuAction::ADD_HIGHLIGHT, StrId::STR_ADD_HIGHLIGHT});
+  }
   if (hasBookmarks) {
     items.push_back({MenuAction::VIEW_BOOKMARKS, StrId::STR_VIEW_BOOKMARKS});
     items.push_back({MenuAction::DELETE_BOOKMARKS, StrId::STR_DELETE_BOOKMARKS});
