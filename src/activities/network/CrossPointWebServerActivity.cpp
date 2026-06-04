@@ -5,6 +5,7 @@
 #include <GfxRenderer.h>
 #include <I18n.h>
 #include <WiFi.h>
+#include <esp_bt.h>
 #include <esp_task_wdt.h>
 
 #include <cstddef>
@@ -69,9 +70,30 @@ void CrossPointWebServerActivity::onEnter() {
     if (bt.isEnabled()) {
       LOG_INF("WEBACT", "Disabling NimBLE before web server start (~58 KB reclaim)");
       bt.disable();
-      LOG_INF("WEBACT", "Free heap after BT disable: %d bytes (maxAlloc %d)", ESP.getFreeHeap(),
-              ESP.getMaxAllocHeap());
+      LOG_INF("WEBACT", "Free heap after NimBLE host deinit: %d bytes (maxAlloc %d)",
+              ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     }
+    // CrumBLE: aggressive controller-layer teardown. BluetoothHIDManager::
+    // disable() calls NimBLEDevice::deinit(false) which only releases the
+    // NimBLE *host* stack -- the ESP32-C3 BT *controller* keeps its static
+    // buffers (~25 KB) allocated. We never need BT back this boot because
+    // onExit silentRestarts the device, so it's safe to tear the controller
+    // down too and call esp_bt_mem_release to return its memory to the
+    // general heap. Conditional on the controller actually being up; on a
+    // fresh boot where BT was never enabled, these are no-ops.
+    const esp_bt_controller_status_t btStatus = esp_bt_controller_get_status();
+    if (btStatus == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+      esp_bt_controller_disable();
+    }
+    if (btStatus != ESP_BT_CONTROLLER_STATUS_IDLE) {
+      esp_bt_controller_deinit();
+    }
+    // mem_release returns the controller's static buffers permanently.
+    // After this call, esp_bt_controller_init() will fail until reboot --
+    // exactly what we want since onExit triggers a silentRestart anyway.
+    esp_bt_mem_release(ESP_BT_MODE_BLE);
+    LOG_INF("WEBACT", "Free heap after BT controller release: %d bytes (maxAlloc %d)",
+            ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   }
 
   // CrumBLE: free the loaded SD-card font before WiFi/web-server come up. File

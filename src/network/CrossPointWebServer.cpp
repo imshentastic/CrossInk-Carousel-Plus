@@ -428,7 +428,8 @@ static void sendBufferGzip(WebServer* server, const char* mime, const char* data
     LOG_ERR("WEB", "serve %s refused: free=%u below 14KB floor", tag, preFree);
     server->send(503, "text/plain",
                  "The device is low on memory and cannot serve this page right now.\n"
-                 "Close the book on the device and try again, or reboot the device.\n");
+                 "Reboot the device (long-press power, then short-press to turn it "
+                 "back on) and reconnect to File Transfer.\n");
     return;
   }
   server->sendHeader("Content-Encoding", "gzip");
