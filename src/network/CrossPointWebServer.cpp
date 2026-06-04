@@ -421,16 +421,43 @@ static void sendBufferGzip(WebServer* server, const char* mime, const char* data
   // Bumped to 22 KB so a comparable session refuses up front and the
   // user gets an actionable 503 in their browser instead of a hung
   // device. Lower-pressure sessions still pass cleanly.
-  const uint32_t preFree = ESP.getFreeHeap();
-  const uint32_t preMax = ESP.getMaxAllocHeap();
+  uint32_t preFree = ESP.getFreeHeap();
+  uint32_t preMax = ESP.getMaxAllocHeap();
   LOG_INF("WEB", "serve %s: %u B, pre free=%u maxAlloc=%u", tag, (unsigned)len, preFree, preMax);
   if (preFree < 22u * 1024u) {
-    LOG_ERR("WEB", "serve %s refused: free=%u below 14KB floor", tag, preFree);
-    server->send(503, "text/plain",
-                 "The device is low on memory and cannot serve this page right now.\n"
-                 "Wait a few seconds and reload, or back out of File Transfer and "
-                 "reconnect. If it keeps happening, reboot the device (long-press "
-                 "power, then short-press to turn it back on).\n");
+    // CrumBLE: brief wait + recheck before declaring defeat. WiFi TX
+    // buffers + recently-closed connections release within a few hundred
+    // ms; many "low at request time" hits recover into a normal serve
+    // without any user action.
+    LOG_INF("WEB", "serve %s: heap low (free=%u); waiting briefly for recovery", tag, preFree);
+    for (int i = 0; i < 6; ++i) {
+      delay(150);
+      esp_task_wdt_reset();
+      const uint32_t now = ESP.getFreeHeap();
+      if (now >= 22u * 1024u) {
+        LOG_INF("WEB", "serve %s: heap recovered (free=%u after %d ms)", tag, now, (i + 1) * 150);
+        preFree = now;
+        preMax = ESP.getMaxAllocHeap();
+        break;
+      }
+    }
+  }
+  if (preFree < 22u * 1024u) {
+    // Still low after the grace wait. Instead of an error to the user,
+    // return a tiny self-refreshing "Loading" page (under 400 bytes).
+    // The phone browser auto-reloads every 3 s; by the time the next
+    // hit lands the device usually has its memory back. No tab close,
+    // no manual retry, no scary error -- just an extra second of wait.
+    LOG_ERR("WEB", "serve %s soft-fail: free=%u below floor; returning auto-refresh page", tag, preFree);
+    static constexpr const char* kLoadingHtml =
+        "<!doctype html><html><head>"
+        "<meta http-equiv=\"refresh\" content=\"3\">"
+        "<title>Loading...</title>"
+        "<style>body{font-family:sans-serif;text-align:center;padding:40px;color:#333}"
+        "h2{font-weight:400}p{color:#666}</style>"
+        "</head><body><h2>Preparing File Transfer...</h2>"
+        "<p>Reloading automatically.</p></body></html>";
+    server->send(200, "text/html", kLoadingHtml);
     return;
   }
   server->sendHeader("Content-Encoding", "gzip");
