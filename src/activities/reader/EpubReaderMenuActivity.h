@@ -31,6 +31,7 @@ class EpubReaderMenuActivity final : public Activity {
     BOOKMARK_TOGGLE,
     VIEW_BOOKMARKS,
     DELETE_BOOKMARKS,
+    EXPORT_BOOKMARKS,
     BLUETOOTH,
     // CrumBLE: dictionary lookup (port of SEEK reader's feature). LOOKUP
     // opens a word-selection overlay over the current page; LOOKED_UP_

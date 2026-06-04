@@ -2002,6 +2002,97 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       requestUpdate();
       break;
     }
+    case EpubReaderMenuActivity::MenuAction::EXPORT_BOOKMARKS: {
+      // CrumBLE phase 7: dump every bookmark/highlight for the current
+      // book to /highlights/<sanitized basename>.txt, in book order
+      // (by spineIndex + progress). Each entry has a small header
+      // (chapter + position) plus the preview text on its own line.
+      // Empty-preview entries (page-only bookmarks / migrated v3
+      // records) still get a header line so the file is a complete
+      // record of the user's marks.
+      const auto& bms = BOOKMARKS.getBookmarks();
+      if (bms.empty()) {
+        requestUpdate();
+        break;
+      }
+      Storage.mkdir("/highlights");
+
+      // Derive output filename from the book path (basename, sans extension).
+      std::string outName = epub->getPath();
+      const auto lastSlash = outName.find_last_of('/');
+      if (lastSlash != std::string::npos) outName = outName.substr(lastSlash + 1);
+      const auto lastDot = outName.find_last_of('.');
+      if (lastDot != std::string::npos && lastDot > 0) outName = outName.substr(0, lastDot);
+      // Replace any chars that would confuse the FAT filesystem.
+      for (auto& c : outName) {
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+          c = '_';
+        }
+      }
+      const std::string outPath = "/highlights/" + outName + ".txt";
+
+      // Snapshot + sort by (spineIndex, progress) so the output reads in
+      // book order regardless of the order the user created the marks.
+      std::vector<Bookmark> sorted(bms.begin(), bms.end());
+      std::sort(sorted.begin(), sorted.end(), [](const Bookmark& a, const Bookmark& b) {
+        if (a.spineIndex != b.spineIndex) return a.spineIndex < b.spineIndex;
+        return a.progress < b.progress;
+      });
+
+      FsFile out;
+      if (!Storage.openFileForWrite("ERS", outPath, out)) {
+        LOG_ERR("ERS", "Highlight export: openFileForWrite failed for %s", outPath.c_str());
+        GUI.drawPopup(renderer, tr(STR_EXPORT_FAILED));
+        delay(900);
+        requestUpdate();
+        break;
+      }
+
+      auto writeStr = [&out](const char* s) {
+        if (!s || !*s) return;
+        out.write(reinterpret_cast<const uint8_t*>(s), strlen(s));
+      };
+      auto writeLine = [&writeStr](const char* s) {
+        writeStr(s);
+        writeStr("\n");
+      };
+
+      // File header: book title + author + count.
+      writeStr("# ");
+      writeLine(epub->getTitle().c_str());
+      if (!epub->getAuthor().empty()) {
+        writeStr("# by ");
+        writeLine(epub->getAuthor().c_str());
+      }
+      char countBuf[64];
+      snprintf(countBuf, sizeof(countBuf), "# %u highlight%s\n\n",
+               static_cast<unsigned>(sorted.size()), sorted.size() == 1 ? "" : "s");
+      writeStr(countBuf);
+
+      for (const auto& bm : sorted) {
+        const char* chap = (bm.chapterTitle[0] != '\0') ? bm.chapterTitle : "(unknown chapter)";
+        char header[160];
+        snprintf(header, sizeof(header), "[%s, %d%%]\n", chap,
+                 static_cast<int>(std::lround(bm.progress * 100.0)));
+        writeStr(header);
+        if (bm.preview[0] != '\0') {
+          writeLine(bm.preview);
+        } else {
+          writeLine("(page bookmark)");
+        }
+        writeStr("\n");
+      }
+      out.close();
+      LOG_INF("ERS", "Highlight export: wrote %zu entries to %s", sorted.size(), outPath.c_str());
+
+      // Build a short toast: "Exported to /highlights/<name>.txt"
+      std::string toast = tr(STR_HIGHLIGHTS_EXPORTED);
+      toast += outName + ".txt";
+      GUI.drawPopup(renderer, toast.c_str());
+      delay(1200);
+      requestUpdate();
+      break;
+    }
     case EpubReaderMenuActivity::MenuAction::FINISH_HIGHLIGHT: {
       if (!pendingHighlightStart_.has_value()) break;
       // Same BT teardown + heap pre-flight + page extraction as ADD_HIGHLIGHT.

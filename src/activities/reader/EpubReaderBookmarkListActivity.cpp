@@ -12,7 +12,9 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 
-static constexpr int ROW_HEIGHT = 50;
+// CrumBLE phase 6: rows now show a 3rd line for the highlight preview
+// text when present, so the bumped row height accommodates it.
+static constexpr int ROW_HEIGHT = 64;
 static constexpr int LIST_START_Y = 60;
 static constexpr unsigned long BOOKMARK_DELETE_HOLD_MS = 1000;
 
@@ -183,11 +185,22 @@ void EpubReaderBookmarkListActivity::render(RenderLock&&) {
     const Bookmark& bm = bookmarks[itemIndex];
     const char* chapter = (bm.chapterTitle[0] != '\0') ? bm.chapterTitle : tr(STR_UNKNOWN_CHAPTER);
     const std::string chapterTrunc = renderer.truncatedText(UI_10_FONT_ID, chapter, contentWidth - 40);
-    renderer.drawText(UI_10_FONT_ID, marginLeft, rowY + 6, chapterTrunc.c_str(), !isSelected);
+    renderer.drawText(UI_10_FONT_ID, marginLeft, rowY + 4, chapterTrunc.c_str(), !isSelected);
 
     char pageBuf[24];
     snprintf(pageBuf, sizeof(pageBuf), "%d%%", static_cast<int>(std::lround(bm.progress * 100.0)));
-    renderer.drawText(SMALL_FONT_ID, marginLeft, rowY + 28, pageBuf, !isSelected);
+    renderer.drawText(SMALL_FONT_ID, marginLeft, rowY + 24, pageBuf, !isSelected);
+
+    // CrumBLE phase 6: preview text on the 3rd line when present.
+    // Empty preview (= migrated v3 point bookmark or v4 without text) is
+    // skipped so old-style bookmarks stay visually compact instead of
+    // showing a blank row.
+    if (bm.preview[0] != '\0') {
+      const std::string previewTrunc =
+          renderer.truncatedText(SMALL_FONT_ID, bm.preview, contentWidth - 40, EpdFontFamily::ITALIC);
+      renderer.drawText(SMALL_FONT_ID, marginLeft, rowY + 44, previewTrunc.c_str(), !isSelected,
+                        EpdFontFamily::ITALIC);
+    }
   }
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
