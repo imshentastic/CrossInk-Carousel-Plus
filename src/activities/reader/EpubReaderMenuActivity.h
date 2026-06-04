@@ -51,8 +51,23 @@ class EpubReaderMenuActivity final : public Activity {
     // ADD_HIGHLIGHT is hidden when the pending state is held so the menu
     // doesn't dangle two ways to start a new one.
     FINISH_HIGHLIGHT,
-    CANCEL_HIGHLIGHT
+    CANCEL_HIGHLIGHT,
+    // CrumBLE in-book menu reorg: SECTION_BREAK is a non-selectable
+    // visual divider row. The theme draws a horizontal line under it
+    // with no label, separating logical clusters of menu actions.
+    SECTION_BREAK,
+    // CrumBLE in-book menu reorg: opens an inline "Bookmarks" sub-screen
+    // showing Add Highlight + the existing bookmark management actions.
+    // Handled inside this activity via mode_ rather than starting a new
+    // activity, so the existing Back-to-reader flow stays a single
+    // finish().
+    OPEN_BOOKMARKS_SUBMENU,
   };
+
+  // CrumBLE in-book menu reorg: tracks whether we're rendering the main
+  // menu or the inline Bookmarks sub-screen. Back from Bookmarks pops
+  // back to Main; Back from Main exits the whole menu activity.
+  enum class MenuMode { Main, Bookmarks };
 
   explicit EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const std::string& title,
                                   const int currentPage, const int totalPages, const int bookProgressPercent,
@@ -76,12 +91,14 @@ class EpubReaderMenuActivity final : public Activity {
     StrId labelId;
   };
 
-  static std::vector<MenuItem> buildMenuItems(bool hasFootnotes, bool hasBookmarks, bool isCurrentPageBookmarked,
-                                              bool isBookCompleted, bool hasDictionary, bool hasLookupHistory,
-                                              bool hasPendingHighlight);
+  static std::vector<MenuItem> buildMainMenuItems(bool hasFootnotes, bool hasBookmarks, bool isCurrentPageBookmarked,
+                                                  bool isBookCompleted, bool hasDictionary, bool hasLookupHistory,
+                                                  bool hasPendingHighlight);
+  static std::vector<MenuItem> buildBookmarksSubmenuItems(bool hasBookmarks, bool isCurrentPageBookmarked);
 
-  // Fixed menu layout
-  const std::vector<MenuItem> menuItems;
+  // CrumBLE in-book menu reorg: menuItems is now mutable so we can swap it
+  // between the Main layout and the inline Bookmarks sub-screen.
+  std::vector<MenuItem> menuItems;
 
   int selectedIndex = 0;
 
@@ -96,4 +113,26 @@ class EpubReaderMenuActivity final : public Activity {
   bool autoPageTurnActive = false;
   uint16_t autoPageTurnIntervalSeconds = 0;
   bool settingsChanged = false;
+
+  // CrumBLE: rebuild context preserved for switching back to Main from the
+  // Bookmarks sub-screen without re-querying the reader for these flags.
+  bool hasFootnotes_ = false;
+  bool hasBookmarks_ = false;
+  bool isCurrentPageBookmarked_ = false;
+  bool isBookCompleted_ = false;
+  bool hasDictionary_ = false;
+  bool hasLookupHistory_ = false;
+  bool hasPendingHighlight_ = false;
+
+  MenuMode mode_ = MenuMode::Main;
+
+  // Helpers to switch between Main and Bookmarks sub-screen.
+  void enterBookmarksSubmenu();
+  void exitBookmarksSubmenu();
+
+  // Move selection past a SECTION_BREAK row in the indicated direction.
+  // Returns the next selectable index; falls back to the input if all rows
+  // happen to be section breaks (shouldn't happen but kept safe).
+  int skipSectionBreakForward(int from) const;
+  int skipSectionBreakBackward(int from) const;
 };

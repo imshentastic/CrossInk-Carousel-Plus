@@ -114,23 +114,10 @@ void EpubReaderBookmarkListActivity::loop() {
       return;
     }
     if (!bookmarks.empty() && selectedIndex >= 0 && selectedIndex < static_cast<int>(bookmarks.size())) {
-      // CrumBLE: if the selected row's preview spills past the visible
-      // limit AND isn't already expanded, treat the first Confirm tap
-      // as "expand the row so I can read the whole quote" -- the
-      // second tap jumps. If the preview already fits or the row is
-      // already expanded, jump immediately.
-      const auto pageWidth = renderer.getScreenWidth();
-      const auto orientation = renderer.getOrientation();
-      const bool isLandscapeCw = orientation == GfxRenderer::Orientation::LandscapeClockwise;
-      const bool isLandscapeCcw = orientation == GfxRenderer::Orientation::LandscapeCounterClockwise;
-      const int hintGutterWidth = (isLandscapeCw || isLandscapeCcw) ? 30 : 0;
-      const int contentWidth = pageWidth - hintGutterWidth;
-      const int lines = previewLineCount(bookmarks[selectedIndex], contentWidth);
-      if (lines > PREVIEW_MAX_LINES && expandedIndex_ != selectedIndex) {
-        expandedIndex_ = selectedIndex;
-        requestUpdate();
-        return;
-      }
+      // CrumBLE: Confirm jumps directly to the bookmark location. The
+      // first-tap-to-expand UX was reverted -- preview text is capped at
+      // BOOKMARK_PREVIEW_MAX so an expansion was at best one extra line,
+      // and the user preferred the direct jump.
       setResult(BookmarkResult{bookmarks[selectedIndex].spineIndex, bookmarks[selectedIndex].progress});
       finish();
     }

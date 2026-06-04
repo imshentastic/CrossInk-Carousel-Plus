@@ -85,75 +85,168 @@ EpubReaderMenuActivity::EpubReaderMenuActivity(GfxRenderer& renderer, MappedInpu
                                                const bool hasDictionary, const bool hasLookupHistory,
                                                const bool hasPendingHighlight)
     : Activity("EpubReaderMenu", renderer, mappedInput),
-      menuItems(buildMenuItems(hasFootnotes, hasBookmarks, isCurrentPageBookmarked, isBookCompleted,
-                               hasDictionary, hasLookupHistory, hasPendingHighlight)),
+      menuItems(buildMainMenuItems(hasFootnotes, hasBookmarks, isCurrentPageBookmarked, isBookCompleted,
+                                   hasDictionary, hasLookupHistory, hasPendingHighlight)),
       title(title),
       pendingOrientation(currentOrientation),
       currentPage(currentPage),
       totalPages(totalPages),
       bookProgressPercent(bookProgressPercent),
       autoPageTurnActive(autoPageTurnActive),
-      autoPageTurnIntervalSeconds(autoPageTurnIntervalSeconds) {}
+      autoPageTurnIntervalSeconds(autoPageTurnIntervalSeconds),
+      hasFootnotes_(hasFootnotes),
+      hasBookmarks_(hasBookmarks),
+      isCurrentPageBookmarked_(isCurrentPageBookmarked),
+      isBookCompleted_(isBookCompleted),
+      hasDictionary_(hasDictionary),
+      hasLookupHistory_(hasLookupHistory),
+      hasPendingHighlight_(hasPendingHighlight) {
+  // First selectable row may be a SECTION_BREAK depending on which
+  // conditional rows surfaced; skip past it.
+  if (!menuItems.empty() && menuItems[0].action == MenuAction::SECTION_BREAK) {
+    selectedIndex = skipSectionBreakForward(0);
+  }
+}
 
-std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMenuItems(bool hasFootnotes,
-                                                                                     bool hasBookmarks,
-                                                                                     bool isCurrentPageBookmarked,
-                                                                                     bool isBookCompleted,
-                                                                                     bool hasDictionary,
-                                                                                     bool hasLookupHistory,
-                                                                                     bool hasPendingHighlight) {
+std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMainMenuItems(bool hasFootnotes,
+                                                                                         bool hasBookmarks,
+                                                                                         bool isCurrentPageBookmarked,
+                                                                                         bool isBookCompleted,
+                                                                                         bool hasDictionary,
+                                                                                         bool hasLookupHistory,
+                                                                                         bool hasPendingHighlight) {
+  // CrumBLE in-book menu reorg v2: three sections separated by visual line
+  // dividers (SECTION_BREAK rows). The theme draws a horizontal line under
+  // each break row with no label, so the menu reads as three clusters
+  // without forcing section titles.
+  //
+  // Section 1 (quick actions): Footnotes, Lookup, Looked-Up Words,
+  //   Add/Finish/Cancel Highlight, Reading Stats, Auto Page Turn.
+  // Section 2 (navigate + customise): Select Chapter, Go to %, Sync
+  //   Progress, Reader Options (Orientation lives inside it via the
+  //   STR_CAT_READER category), Controls, Bookmarks (opens an inline
+  //   sub-screen with Add Highlight + View / Export / Clear), Bluetooth.
+  // Section 3 (output / state): Display QR, Screenshot, Mark Finished,
+  //   Delete Book Cache.
+  //
+  // Dropped vs the old menu:
+  //   - Go Home (user request -- close the menu and the front-button
+  //     remap or device button takes you home anyway)
+  //   - Orientation top-level row (Reader Options already exposes it)
+  //   - Add Bookmark legacy row (still removed; the bookmarks
+  //     management lens is the Bookmarks sub-screen)
   std::vector<MenuItem> items;
-  // 14 upstream items + 1 (CrumBLE Bluetooth entry).
-  constexpr size_t baseItemCount = 15;
-  const size_t totalItemCount = baseItemCount + (hasFootnotes ? 1u : 0u) + (hasBookmarks ? 2u : 0u) +
-                                (hasDictionary ? 1u : 0u) + (hasLookupHistory ? 1u : 0u);
-  items.reserve(totalItemCount);
+  items.reserve(24);
+
+  // === Section 1 : Quick actions ===
   if (hasFootnotes) {
     items.push_back({MenuAction::FOOTNOTES, StrId::STR_FOOTNOTES});
   }
-  // CrumBLE: dictionary entries (ported from SEEK reader). Surfaced near
-  // the top of the menu because lookup is a quick, frequent action --
-  // putting it next to Footnotes keeps the "look at this thing" actions
-  // together. Only appear when a StarDict file is present on the SD.
   if (hasDictionary) {
     items.push_back({MenuAction::LOOKUP, StrId::STR_LOOKUP});
     if (hasLookupHistory) {
       items.push_back({MenuAction::LOOKED_UP_WORDS, StrId::STR_LOOKED_UP_WORDS});
     }
   }
-  items.push_back({MenuAction::SELECT_CHAPTER, StrId::STR_SELECT_CHAPTER});
-  items.push_back({MenuAction::READER_OPTIONS, StrId::STR_READER_OPTIONS});
-  items.push_back({MenuAction::CONTROLS_OPTIONS, StrId::STR_CAT_CONTROLS});
-  items.push_back({MenuAction::ROTATE_SCREEN, StrId::STR_ORIENTATION});
-  items.push_back({MenuAction::AUTO_PAGE_TURN, StrId::STR_AUTO_TURN_INTERVAL_SECONDS});
-  items.push_back({MenuAction::GO_TO_PERCENT, StrId::STR_GO_TO_PERCENT});
-  items.push_back(
-      {MenuAction::BOOKMARK_TOGGLE, isCurrentPageBookmarked ? StrId::STR_REMOVE_BOOKMARK : StrId::STR_ADD_BOOKMARK});
-  // CrumBLE: ranged highlight. With no held anchor, ADD_HIGHLIGHT starts
-  // a fresh selection. With a held anchor (the user backed out with the
-  // start placed for a cross-page highlight), surface FINISH + CANCEL
-  // instead -- showing ADD here would leave two ways to start.
+  // Highlight quick action. Pending-hold state replaces Add with the
+  // Finish/Cancel pair so the menu doesn't dangle two ways to start.
   if (hasPendingHighlight) {
     items.push_back({MenuAction::FINISH_HIGHLIGHT, StrId::STR_FINISH_HIGHLIGHT});
     items.push_back({MenuAction::CANCEL_HIGHLIGHT, StrId::STR_CANCEL_HIGHLIGHT});
   } else {
     items.push_back({MenuAction::ADD_HIGHLIGHT, StrId::STR_ADD_HIGHLIGHT});
   }
+  items.push_back({MenuAction::READING_STATS, StrId::STR_READING_STATS});
+  items.push_back({MenuAction::AUTO_PAGE_TURN, StrId::STR_AUTO_TURN_INTERVAL_SECONDS});
+
+  // === Section 2 : Navigate + customise ===
+  items.push_back({MenuAction::SECTION_BREAK, StrId::STR_NONE_OPT});
+  items.push_back({MenuAction::SELECT_CHAPTER, StrId::STR_SELECT_CHAPTER});
+  items.push_back({MenuAction::GO_TO_PERCENT, StrId::STR_GO_TO_PERCENT});
+  items.push_back({MenuAction::SYNC, StrId::STR_SYNC_PROGRESS});
+  items.push_back({MenuAction::READER_OPTIONS, StrId::STR_READER_OPTIONS});
+  items.push_back({MenuAction::CONTROLS_OPTIONS, StrId::STR_CAT_CONTROLS});
+  // CrumBLE: Bookmarks is a sub-screen with the four management entries.
+  // Surfaced unconditionally so the user can always reach Add Highlight
+  // through it even on a book with no existing bookmarks. The label here
+  // is "Bookmarks" -- the inner "View Bookmarks" row owns the list view.
+  items.push_back({MenuAction::OPEN_BOOKMARKS_SUBMENU, StrId::STR_BOOKMARKS});
+  items.push_back({MenuAction::BLUETOOTH, StrId::STR_BLUETOOTH});  // CrumBLE
+
+  // === Section 3 : Output + state ===
+  items.push_back({MenuAction::SECTION_BREAK, StrId::STR_NONE_OPT});
+  items.push_back({MenuAction::DISPLAY_QR, StrId::STR_DISPLAY_QR});
+  items.push_back({MenuAction::SCREENSHOT, StrId::STR_SCREENSHOT_BUTTON});
+  items.push_back(
+      {MenuAction::TOGGLE_COMPLETED, isBookCompleted ? StrId::STR_MARK_UNFINISHED : StrId::STR_MARK_FINISHED});
+  items.push_back({MenuAction::DELETE_CACHE, StrId::STR_DELETE_CACHE});
+
+  // isCurrentPageBookmarked / hasBookmarks are not used here directly --
+  // those drive what shows in the Bookmarks sub-screen (built separately).
+  (void)isCurrentPageBookmarked;
+  (void)hasBookmarks;
+  return items;
+}
+
+std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildBookmarksSubmenuItems(
+    bool hasBookmarks, bool isCurrentPageBookmarked) {
+  // CrumBLE: inline Bookmarks sub-screen. Reachable from the main menu's
+  // "Bookmarks" row. Mirrors the management actions that used to live
+  // inline at the top of the menu, plus Add Highlight as the canonical
+  // entry point for the highlight flow.
+  std::vector<MenuItem> items;
+  items.reserve(5);
+  items.push_back({MenuAction::ADD_HIGHLIGHT, StrId::STR_ADD_HIGHLIGHT});
   if (hasBookmarks) {
     items.push_back({MenuAction::VIEW_BOOKMARKS, StrId::STR_VIEW_BOOKMARKS});
     items.push_back({MenuAction::EXPORT_BOOKMARKS, StrId::STR_EXPORT_HIGHLIGHTS});
     items.push_back({MenuAction::DELETE_BOOKMARKS, StrId::STR_DELETE_BOOKMARKS});
   }
-  items.push_back({MenuAction::SCREENSHOT, StrId::STR_SCREENSHOT_BUTTON});
-  items.push_back({MenuAction::DISPLAY_QR, StrId::STR_DISPLAY_QR});
-  items.push_back({MenuAction::GO_HOME, StrId::STR_GO_HOME_BUTTON});
-  items.push_back({MenuAction::DELETE_CACHE, StrId::STR_DELETE_CACHE});
-  items.push_back({MenuAction::SYNC, StrId::STR_SYNC_PROGRESS});
-  items.push_back({MenuAction::READING_STATS, StrId::STR_READING_STATS});
-  items.push_back({MenuAction::BLUETOOTH, StrId::STR_BLUETOOTH});  // CrumBLE
-  items.push_back(
-      {MenuAction::TOGGLE_COMPLETED, isBookCompleted ? StrId::STR_MARK_UNFINISHED : StrId::STR_MARK_FINISHED});
+  // Remove-bookmark for the current page lives here too, only when set.
+  if (isCurrentPageBookmarked) {
+    items.push_back({MenuAction::BOOKMARK_TOGGLE, StrId::STR_REMOVE_BOOKMARK});
+  }
   return items;
+}
+
+int EpubReaderMenuActivity::skipSectionBreakForward(int from) const {
+  const int n = static_cast<int>(menuItems.size());
+  if (n == 0) return from;
+  int idx = from;
+  for (int i = 0; i < n; i++) {
+    if (idx >= 0 && idx < n && menuItems[idx].action != MenuAction::SECTION_BREAK) return idx;
+    idx = ButtonNavigator::nextIndex(idx, n);
+  }
+  return from;
+}
+
+int EpubReaderMenuActivity::skipSectionBreakBackward(int from) const {
+  const int n = static_cast<int>(menuItems.size());
+  if (n == 0) return from;
+  int idx = from;
+  for (int i = 0; i < n; i++) {
+    if (idx >= 0 && idx < n && menuItems[idx].action != MenuAction::SECTION_BREAK) return idx;
+    idx = ButtonNavigator::previousIndex(idx, n);
+  }
+  return from;
+}
+
+void EpubReaderMenuActivity::enterBookmarksSubmenu() {
+  mode_ = MenuMode::Bookmarks;
+  menuItems = buildBookmarksSubmenuItems(hasBookmarks_, isCurrentPageBookmarked_);
+  selectedIndex = 0;
+  requestUpdate();
+}
+
+void EpubReaderMenuActivity::exitBookmarksSubmenu() {
+  mode_ = MenuMode::Main;
+  menuItems = buildMainMenuItems(hasFootnotes_, hasBookmarks_, isCurrentPageBookmarked_, isBookCompleted_,
+                                 hasDictionary_, hasLookupHistory_, hasPendingHighlight_);
+  selectedIndex = 0;
+  if (!menuItems.empty() && menuItems[0].action == MenuAction::SECTION_BREAK) {
+    selectedIndex = skipSectionBreakForward(0);
+  }
+  requestUpdate();
 }
 
 void EpubReaderMenuActivity::onEnter() {
@@ -164,19 +257,44 @@ void EpubReaderMenuActivity::onEnter() {
 void EpubReaderMenuActivity::onExit() { Activity::onExit(); }
 
 void EpubReaderMenuActivity::loop() {
-  // Handle navigation
+  // Handle navigation. SECTION_BREAK rows are visual dividers -- skip them
+  // when stepping the cursor so they read as decoration, not list items.
   buttonNavigator.onNext([this] {
-    selectedIndex = ButtonNavigator::nextIndex(selectedIndex, static_cast<int>(menuItems.size()));
+    const int n = static_cast<int>(menuItems.size());
+    selectedIndex = ButtonNavigator::nextIndex(selectedIndex, n);
+    if (selectedIndex >= 0 && selectedIndex < n &&
+        menuItems[selectedIndex].action == MenuAction::SECTION_BREAK) {
+      selectedIndex = skipSectionBreakForward(selectedIndex);
+    }
     requestUpdate();
   });
 
   buttonNavigator.onPrevious([this] {
-    selectedIndex = ButtonNavigator::previousIndex(selectedIndex, static_cast<int>(menuItems.size()));
+    const int n = static_cast<int>(menuItems.size());
+    selectedIndex = ButtonNavigator::previousIndex(selectedIndex, n);
+    if (selectedIndex >= 0 && selectedIndex < n &&
+        menuItems[selectedIndex].action == MenuAction::SECTION_BREAK) {
+      selectedIndex = skipSectionBreakBackward(selectedIndex);
+    }
     requestUpdate();
   });
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
     const auto selectedAction = menuItems[selectedIndex].action;
+
+    // SECTION_BREAK is a decoration row; Confirm on it is a no-op even if
+    // the cursor somehow landed on one (shouldn't happen with skip logic).
+    if (selectedAction == MenuAction::SECTION_BREAK) {
+      return;
+    }
+
+    // Bookmarks sub-screen entry: swap menuItems to the four management
+    // rows and stay in this activity. Back later pops us out.
+    if (selectedAction == MenuAction::OPEN_BOOKMARKS_SUBMENU) {
+      enterBookmarksSubmenu();
+      return;
+    }
+
     if (selectedAction == MenuAction::ROTATE_SCREEN) {
       // Cycle orientation preview locally; actual rotation happens on menu exit.
       pendingOrientation = (pendingOrientation + 1) % orientationLabels.size();
@@ -264,6 +382,12 @@ void EpubReaderMenuActivity::loop() {
     finish();
     return;
   } else if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+    // Bookmarks sub-screen: Back pops back to the Main menu instead of
+    // closing the whole menu activity.
+    if (mode_ == MenuMode::Bookmarks) {
+      exitBookmarksSubmenu();
+      return;
+    }
     ActivityResult result;
     result.isCancelled = true;
     result.data = MenuResult{-1, pendingOrientation, settingsChanged};
@@ -279,8 +403,11 @@ void EpubReaderMenuActivity::render(RenderLock&&) {
   auto metrics = UITheme::getInstance().getMetrics();
   Rect screen = UITheme::getInstance().getScreenSafeArea(renderer, true, false);
 
+  // Header shows the book title in Main mode, "Bookmarks" in the sub-screen
+  // so the user has explicit confirmation of where they are.
+  const std::string headerTitle = mode_ == MenuMode::Bookmarks ? std::string(tr(STR_BOOKMARKS)) : title;
   GUI.drawHeader(renderer, Rect{screen.x, screen.y + metrics.topPadding, screen.width, metrics.headerHeight},
-                 title.c_str());
+                 headerTitle.c_str());
 
   // Progress summary
   std::string progressLine;
@@ -300,7 +427,13 @@ void EpubReaderMenuActivity::render(RenderLock&&) {
 
   GUI.drawList(
       renderer, Rect{screen.x, contentTop, screen.width, contentHeight}, menuItems.size(), selectedIndex,
-      [this](int index) { return I18N.get(menuItems[index].labelId); }, nullptr, nullptr,
+      // Row label. SECTION_BREAK rows return an empty string so the divider
+      // renders as a bare horizontal line with no header text above it.
+      [this](int index) -> std::string {
+        if (menuItems[index].action == MenuAction::SECTION_BREAK) return "";
+        return I18N.get(menuItems[index].labelId);
+      },
+      nullptr, nullptr,
       [this](int index) -> std::string {
         const auto value = menuItems[index].action;
         if (value == MenuAction::ROTATE_SCREEN) {
@@ -313,7 +446,10 @@ void EpubReaderMenuActivity::render(RenderLock&&) {
           return "";
         }
       },
-      true);
+      true, nullptr,
+      // isHeaderRow predicate: SECTION_BREAK rows become non-selectable
+      // theme-drawn dividers (horizontal line under an empty label).
+      [this](int index) { return menuItems[index].action == MenuAction::SECTION_BREAK; });
 
   // Footer / Hints
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));

@@ -375,6 +375,10 @@ void CrossPointWebServerActivity::startWebServer() {
   // Give it the renderer so /api/reader-render-info can compute the reader's
   // viewport + emSize for the optimizer's .pxc baking.
   webServer->setRenderer(&renderer);
+  // CrumBLE: settings-JSON pre-build was tried; held ~12 KB at runtime and
+  // starved later page serves into a guard-trip restart loop. /api/settings
+  // returns 503 in this build (the device-side Settings UI is the canonical
+  // path); /api/wifi, /api/opds, /api/files all work normally.
   webServer->begin();
 
   if (webServer->isRunning()) {
@@ -481,6 +485,12 @@ void CrossPointWebServerActivity::loop() {
       constexpr int MAX_ITERATIONS = 500;
       for (int i = 0; i < MAX_ITERATIONS && webServer->isRunning(); i++) {
         webServer->handleClient();
+        // CrumBLE: as soon as a handler tripped the low-heap guard, stop
+        // processing further requests. Browsers fire several /api/* calls
+        // in parallel after a page load -- if we keep serving them under
+        // a 18 KB free / 15 KB maxAlloc budget the next allocator call
+        // craters before our auto-recovery silentRestart gets to run.
+        if (peekFtRestartRequest()) break;
         // Reset watchdog every 32 iterations
         if ((i & 0x1F) == 0x1F) {
           esp_task_wdt_reset();

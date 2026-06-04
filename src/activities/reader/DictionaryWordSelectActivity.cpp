@@ -268,7 +268,11 @@ void DictionaryWordSelectActivity::loop() {
         HighlightRangeResult hr;
         hr.startWordIndex = selectedWordIdx;
         hr.endWordIndex = selectedWordIdx;
-        const int leadIn = std::max(0, selectedWordIdx - 8);
+        // Lead-in window sized to roughly fill the BOOKMARK_PREVIEW_MAX
+        // budget on its own; the reader's cross-page join (start trailing
+        // + " ... " + end lead-in) will truncate the END half when the
+        // combined string exceeds the cap.
+        const int leadIn = std::max(0, selectedWordIdx - 14);
         hr.previewText = buildPreviewBetween(leadIn, selectedWordIdx);
         result.data = hr;
         setResult(std::move(result));
@@ -309,8 +313,12 @@ void DictionaryWordSelectActivity::loop() {
       // anchor so the held preview ("Start saved...") and the eventual
       // bookmark preview both read as a passage rather than a single
       // word. Bounded by available words on this page.
+      // Trailing window sized to roughly fill the BOOKMARK_PREVIEW_MAX
+      // budget on its own. Wider than the lookup-style 8-word context;
+      // gives the user a readable passage when reviewing the held start
+      // ("Start saved...") and again in the final bookmark preview.
       const int trailingEnd =
-          std::min(static_cast<int>(words.size()) - 1, highlightAnchorWordIdx_ + 8);
+          std::min(static_cast<int>(words.size()) - 1, highlightAnchorWordIdx_ + 14);
       hr.previewText = buildPreviewBetween(highlightAnchorWordIdx_, trailingEnd);
       result.data = hr;
     } else {

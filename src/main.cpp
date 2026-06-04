@@ -1133,12 +1133,21 @@ void setup() {
       APP_STATE.saveToFile();
       if (loadSleepFrameBuffer()) {
         // Frame restored: swap the sleep moon for the loading icon.
+        const auto pageWidth = renderer.getScreenWidth();
         const auto pageHeight = renderer.getScreenHeight();
-        // CrumBLE: use the brand cookie logo instead of the diagonal-
-        // dots LoadingIcon. Same bottom-left anchor, just a richer
-        // identity mark on the quick-resume overlay.
+        // CrumBLE: brand cookie logo as the quick-resume status badge.
+        // We draw a circular white halo first (fillRoundedRect with
+        // cornerRadius = halfSide -> perfect circle) then layer the
+        // square cookie on top. The 6 px halo gives the logo's edges
+        // some breathing room from the sleep frame around it and keeps
+        // the cookie silhouette legible on any background (cover, custom).
         constexpr int kLogoSize = 120;
-        renderer.drawImage(Logo120, 0, pageHeight - kLogoSize, kLogoSize, kLogoSize);
+        constexpr int kHaloPadding = 6;
+        constexpr int kHaloSize = kLogoSize + kHaloPadding * 2;
+        const int haloX = (pageWidth - kHaloSize) / 2;
+        const int haloY = (pageHeight - kHaloSize) / 2;
+        renderer.fillRoundedRect(haloX, haloY, kHaloSize, kHaloSize, kHaloSize / 2, Color::White);
+        renderer.drawImage(Logo120, haloX + kHaloPadding, haloY + kHaloPadding, kLogoSize, kLogoSize);
         renderer.displayBuffer(HalDisplay::HALF_REFRESH);
       } else {
         activityManager.goToBoot();  // frame file missing, fall back to the splash

@@ -172,7 +172,28 @@ void BookSettingsDrawerActivity::onExit() {
 void BookSettingsDrawerActivity::buildItems() {
   items.clear();
 
-  // 1) Pull every Reader-category non-Action setting, in declaration order.
+  // CrumBLE: drawer item order was rearranged so the Bluetooth quick action
+  // sits at the TOP of the drawer rather than appended after the Reader
+  // settings. The BT row is the most common drawer action mid-read (drop
+  // BLE to free heap for a chapter rebuild, then reconnect) and putting it
+  // first reduces the number of d-pad steps to reach it. Reader settings
+  // follow in their original declaration order.
+
+  // 1) Bluetooth action row(s). Behavior depends on current link state:
+  //
+  //   - Not linked: show TWO connect rows -- "BT Quick Connect" (full images)
+  //     and "BT No Images Quick Connect" (suppress image decode to keep a
+  //     stable link on image-heavy books). Both enable BLE and connect to the
+  //     bonded remote.
+  //
+  //   - Linked: show ONE disconnect row. Label reflects which mode is active:
+  //     "BT No Images Disconnect" if suppressImages is armed, "BT Quick
+  //     Disconnect" otherwise. Pressing it disables BLE (and clears image
+  //     suppression on the way out). Avoids the confusing UX of offering a
+  //     "Quick Connect" button while a remote is already connected.
+  buildBluetoothItems();
+
+  // 2) Pull every Reader-category non-Action setting, in declaration order.
   //
   // PREFERRED PATH: when EpubReaderActivity built a settings cache at book
   // open (heap healthy, BLE not yet eating 58 KB), we iterate that vector
@@ -226,98 +247,93 @@ void BookSettingsDrawerActivity::buildItems() {
     }
   }
 
-  // 2) Bluetooth action row(s). Behavior depends on current link state:
-  //
-  //   - Not linked: show TWO connect rows -- "BT Quick Connect" (full images)
-  //     and "BT No Images Quick Connect" (suppress image decode to keep a
-  //     stable link on image-heavy books). Both enable BLE and connect to the
-  //     bonded remote.
-  //
-  //   - Linked: show ONE disconnect row. Label reflects which mode is active:
-  //     "BT No Images Disconnect" if suppressImages is armed, "BT Quick
-  //     Disconnect" otherwise. Pressing it disables BLE (and clears image
-  //     suppression on the way out). Avoids the confusing UX of offering a
-  //     "Quick Connect" button while a remote is already connected.
+  // BT rows now live at the TOP of the drawer (built in step 1 above via
+  // buildBluetoothItems()). The trailing reader-settings appender used to
+  // run here; nothing else to do.
+}
+
+void BookSettingsDrawerActivity::buildBluetoothItems() {
+  auto& btMgr = BluetoothHIDManager::getInstance();
+  const bool stackUp = btMgr.isEnabled();
+  const bool linked = stackUp && SETTINGS.bleBondedDeviceAddr[0] != '\0' &&
+                      btMgr.isConnected(SETTINGS.bleBondedDeviceAddr);
+
+  if (linked) {
+    Item disc;
+    disc.nameId = StrId::STR_BT_QUICK_CONNECT;  // base id for theming; customName overrides label
+    disc.isAction = true;
+    disc.customName = renderer.suppressImages() ? std::string("BT No Images Disconnect")
+                                                : std::string("BT Quick Disconnect");
+    disc.activate = [this]() {
+      // Hardcoded popup -- sub-second op, not worth a 25-translation round-trip.
+      GUI.drawPopup(renderer, "Disconnecting Bluetooth...");
+      renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+      BluetoothHIDManager::getInstance().disable();
+      // disable() doesn't clear the renderer's image-suppression flag (that's
+      // owned by the renderer, not the BT manager). Clear it here so the next
+      // render restores images without waiting for the loop()'s link-teardown
+      // check to fire.
+      renderer.setSuppressImages(false);
+      MenuResult result;
+      result.settingsChanged = settingsChanged;
+      setResult(ActivityResult{result});
+      finish();
+    };
+    items.push_back(std::move(disc));
+    return;
+  }
+
+  // Not linked: surface BOTH connect rows (regular + no-images variant).
+
+  // Bluetooth quick-action, no-images variant. Sets MenuResult flags so the
+  // reader can sequence: (1) drain any pending re-layout first (settings just
+  // toggled), (2) run the .pxc manifest-mismatch check and prompt if needed,
+  // (3) finally enable BLE and connect. Doing this synchronously here used to
+  // race the NimBLE handshake against a heap-heavy section rebuild and brick
+  // the connect.
   {
-    auto& btMgr = BluetoothHIDManager::getInstance();
-    const bool stackUp = btMgr.isEnabled();
-    const bool linked = stackUp && SETTINGS.bleBondedDeviceAddr[0] != '\0' &&
-                        btMgr.isConnected(SETTINGS.bleBondedDeviceAddr);
-
-    if (linked) {
-      Item disc;
-      disc.nameId = StrId::STR_BT_QUICK_CONNECT;  // base id for theming; customName overrides label
-      disc.isAction = true;
-      disc.customName = renderer.suppressImages() ? std::string("BT No Images Disconnect")
-                                                  : std::string("BT Quick Disconnect");
-      disc.activate = [this]() {
-        // Hardcoded popup -- sub-second op, not worth a 25-translation round-trip.
-        GUI.drawPopup(renderer, "Disconnecting Bluetooth...");
-        renderer.displayBuffer(HalDisplay::FAST_REFRESH);
-        BluetoothHIDManager::getInstance().disable();
-        // disable() doesn't clear the renderer's image-suppression flag (that's
-        // owned by the renderer, not the BT manager). Clear it here so the next
-        // render restores images without waiting for the loop()'s link-teardown
-        // check to fire.
-        renderer.setSuppressImages(false);
-        MenuResult result;
-        result.settingsChanged = settingsChanged;
-        setResult(ActivityResult{result});
-        finish();
-      };
-      items.push_back(std::move(disc));
-    } else {
-      // 2a) Bluetooth quick-action, no-images variant. Sets MenuResult flags
-      // so the reader can sequence: (1) drain any pending re-layout first
-      // (settings just toggled), (2) run the .pxc manifest-mismatch check and
-      // prompt if needed, (3) finally enable BLE and connect. Doing this
-      // synchronously here used to race the NimBLE handshake against a
-      // heap-heavy section rebuild and brick the connect.
-      {
-        Item btNoImg;
-        btNoImg.nameId = StrId::STR_BT_NO_IMAGES_QUICK_CONNECT;
-        btNoImg.isAction = true;
-        btNoImg.activate = [this]() {
-          const bool hasBonded = SETTINGS.bleBondedDeviceAddr[0] != '\0';
-          MenuResult result;
-          result.settingsChanged = settingsChanged;
-          if (!hasBonded) {
-            // No bonded remote -- bounce to the pairing UI as before. Don't
-            // bother flagging connect-after-relayout; the user has to pair
-            // first and the BT UI handles its own connect flow.
-            result.requestBluetoothFlow = true;
-          } else {
-            result.bleConnectRequested = true;
-            result.bleConnectNoImages = true;
-          }
-          setResult(ActivityResult{result});
-          finish();
-        };
-        items.push_back(std::move(btNoImg));
+    Item btNoImg;
+    btNoImg.nameId = StrId::STR_BT_NO_IMAGES_QUICK_CONNECT;
+    btNoImg.isAction = true;
+    btNoImg.activate = [this]() {
+      const bool hasBonded = SETTINGS.bleBondedDeviceAddr[0] != '\0';
+      MenuResult result;
+      result.settingsChanged = settingsChanged;
+      if (!hasBonded) {
+        // No bonded remote -- bounce to the pairing UI as before. Don't
+        // bother flagging connect-after-relayout; the user has to pair
+        // first and the BT UI handles its own connect flow.
+        result.requestBluetoothFlow = true;
+      } else {
+        result.bleConnectRequested = true;
+        result.bleConnectNoImages = true;
       }
+      setResult(ActivityResult{result});
+      finish();
+    };
+    items.push_back(std::move(btNoImg));
+  }
 
-      // 2b) Bluetooth quick-action. Same deferred flow as the No Images
-      // variant above, minus image suppression.
-      {
-        Item bt;
-        bt.nameId = StrId::STR_BT_QUICK_CONNECT;
-        bt.isAction = true;
-        bt.activate = [this]() {
-          const bool hasBonded = SETTINGS.bleBondedDeviceAddr[0] != '\0';
-          MenuResult result;
-          result.settingsChanged = settingsChanged;
-          if (!hasBonded) {
-            result.requestBluetoothFlow = true;
-          } else {
-            result.bleConnectRequested = true;
-            result.bleConnectNoImages = false;
-          }
-          setResult(ActivityResult{result});
-          finish();
-        };
-        items.push_back(std::move(bt));
+  // Bluetooth quick-action. Same deferred flow as the No Images variant
+  // above, minus image suppression.
+  {
+    Item bt;
+    bt.nameId = StrId::STR_BT_QUICK_CONNECT;
+    bt.isAction = true;
+    bt.activate = [this]() {
+      const bool hasBonded = SETTINGS.bleBondedDeviceAddr[0] != '\0';
+      MenuResult result;
+      result.settingsChanged = settingsChanged;
+      if (!hasBonded) {
+        result.requestBluetoothFlow = true;
+      } else {
+        result.bleConnectRequested = true;
+        result.bleConnectNoImages = false;
       }
-    }
+      setResult(ActivityResult{result});
+      finish();
+    };
+    items.push_back(std::move(bt));
   }
 }
 

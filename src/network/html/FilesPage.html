@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Files - CrossInk</title>
+  <title>Files - CrumBLE</title>
   <!-- jszip is loaded on demand (only when optimizing an EPUB) via ensureJSZip()
        so plain file browsing/uploading doesn't pay to serve ~28 KB on every
        page load -- that extra serve was exhausting the device's tiny
@@ -1566,7 +1566,7 @@
   </style>
 </head>
 <body>
-<h1 class="crossink-header">CrossInk</h1>
+<h1 class="crossink-header">CrumBLE</h1>
 
 <div class="nav-links">
   <a href="/">Home</a>
@@ -1612,7 +1612,7 @@
   </div>
 </div>
 
-<p style="text-align: center; color: var(--label-color); font-size: 0.85em; padding: 20px 0; margin: 0;">CrossInk &bull; Open Source</p>
+<p style="text-align: center; color: var(--label-color); font-size: 0.85em; padding: 20px 0; margin: 0;">CrumBLE &bull; CrossInk fork &bull; Open Source</p>
 
 <!-- Upload Modal -->
 <div class="modal-overlay" id="uploadModal">
@@ -1646,11 +1646,22 @@
                building the chapter index, computing the manifest -- and
                ships a per-book cache directory to the device so the
                actual reading is butter smooth. -->
-          <!-- CrumBLE: pre-cache was previously a user-toggleable option.
-               Removed -- there's no scenario where skipping prebake is
-               a better choice than running it (the only cost is ~40 s
-               of upload time, vastly outweighed by zero-delay reading).
-               Every EPUB upload now runs the prebake unconditionally. -->
+          <!-- CrumBLE: pre-cache toggle. Restored after experimentation so
+               the user can opt out when upload speed matters more than
+               instant chapter turns. Default ON: the prebake step adds
+               ~40 s but pays for itself in zero-delay reading. -->
+          <div class="bt-friendly-option" id="btFriendlyOption">
+            <div class="bt-friendly-row">
+              <div class="bt-friendly-text">
+                <div class="setting-title">Pre-Cache for fast chapter turns <span class="recommended-pill">Highly Recommended</span></div>
+                <div class="setting-desc">Optimizes for instant chapter turns and accelerated book opening. Adds ~40 s to upload time per book in exchange for zero-delay reading!</div>
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" id="optimize-for-device-checkbox" checked>
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
 
           <div class="convert-settings" id="convertSettings" style="display:block;">
             <span>⚫ True-Grayscale</span>
@@ -1907,7 +1918,7 @@
 
   if (currentPath !== '/') {
     const leaf = currentPath.split('/').filter(Boolean).pop();
-    if (leaf) document.title = leaf + ' - Files - CrossInk Reader';
+    if (leaf) document.title = leaf + ' - Files - CrumBLE';
   }
 
   // Network status monitoring
@@ -2232,6 +2243,10 @@
     document.getElementById('progress-fill').style.width = '0%';
     document.getElementById('progress-fill').style.backgroundColor = '#27ae60';
     document.getElementById('convertBeforeUpload').checked = true;
+    // CrumBLE: hide pre-cache sub-option on modal reset. It re-appears
+    // in toggleConvertOptions() when the master Optimize-EPUB stays on.
+    const btFriendlyOption = document.getElementById('btFriendlyOption');
+    if (btFriendlyOption) btFriendlyOption.style.display = 'none';
     document.getElementById('convertInfo').style.display = 'none';
     document.getElementById('convertWarning').style.display = 'none';
     // Clear image picker cache and reset layout
@@ -2277,6 +2292,12 @@
     if (checked) ensureOptimizer().catch(err => console.error('Optimizer preload failed:', err));
     document.getElementById('convertWarning').style.display = checked ? 'block' : 'none';
     document.getElementById('convertInfo').style.display = checked ? 'block' : 'none';
+    // Show the pre-cache toggle alongside Optimize EPUB. Hidden when
+    // Optimize EPUB is off because skipping image transcoding implies
+    // skipping prebake too -- no point pre-caching a book the user
+    // doesn't want optimised for the device in the first place.
+    const btFriendlyOption = document.getElementById('btFriendlyOption');
+    if (btFriendlyOption) btFriendlyOption.style.display = checked ? 'block' : 'none';
     // Update button text and style
     if (checked) {
       uploadBtn.textContent = 'Optimize & Upload';
@@ -2797,11 +2818,11 @@
     const hasEpub = Array.from(files).some(f => f.name.toLowerCase().endsWith('.epub'));
     if (files.length > 0 && hasEpub) {
       convertOptions.style.display = 'block';
-      // Sync the master Optimize-EPUB toggle state to its sub-UI
-      // (convertWarning / convertInfo). Without this call the sub-UI
-      // stays display:none on first pick because the master's checked
-      // state was set declaratively and never fired a change event for
-      // toggleConvertOptions to react to.
+      // Sync sub-option visibility (btFriendlyOption + the Pre-cache row
+      // inside it) to the master toggle's CURRENT state. Without this
+      // call the sub-options stay display:none on first pick because the
+      // master's checked state was set declaratively and never fired a
+      // change event for toggleConvertOptions to react to.
       toggleConvertOptions();
     } else {
       convertOptions.style.display = 'none';
@@ -3307,9 +3328,7 @@ async function uploadFile() {
     // file is an EPUB. The phase-end snaps are tracked below so a phase
     // that bails early hands off to the next one without rewinding.
     const isEpubUpload = file && file.name && /\.epub$/i.test(file.name);
-    // CrumBLE: pre-cache is unconditional for EPUB uploads (the toggle
-    // was removed -- there's no use case for opting out).
-    const willPrebake = isEpubUpload;
+    const willPrebake = isEpubUpload && !!document.getElementById('optimize-for-device-checkbox')?.checked;
     const convertEnd = needsConversion ? (willPrebake ? 25 : 50) : 0;
     const uploadEnd = willPrebake ? 80 : 100;
 
@@ -3383,10 +3402,9 @@ async function uploadFile() {
       // entire upload step for this file (no conversion, no upload, no
       // prebake) -- onError handles the bookkeeping.
       const isEpubFile = file && file.name && /\.epub$/i.test(file.name);
-      // CrumBLE: every EPUB upload runs the prebake step, so the
-      // SETTINGS-lock preflight is needed whenever the file is an EPUB
-      // -- not gated on the (removed) per-batch pre-cache toggle.
-      const willOptimize = isEpubFile;
+      const preOptToggle = document.getElementById('optimize-for-device-checkbox');
+      const preOptOn = !!preOptToggle && preOptToggle.checked;
+      const willOptimize = isEpubFile && (needsConversion || preOptOn);
       // Show preflight ONCE per batch -- the same SETTINGS lock applies
       // to every book in this upload session, so re-prompting per file
       // would feel like a confirmation gate the user has to clear over
@@ -3487,8 +3505,8 @@ async function uploadFile() {
       // optimisations live behind one user mental model. Only applies to
       // .epub uploads. Failure is non-fatal -- we still report the upload
       // as complete; only the chapter speed-up is missed.
-      // CrumBLE: always run the prebake for EPUB uploads (toggle removed).
-      if (isEpubUpload) {
+      const prebakeCheckbox = document.getElementById('optimize-for-device-checkbox');
+      if (prebakeCheckbox && prebakeCheckbox.checked && isEpubUpload) {
         try {
           progressText.textContent = `Optimizing chapter indexing for ${file.name}...`;
           // Single-colour bar: don't repaint here, keep green continuous.
