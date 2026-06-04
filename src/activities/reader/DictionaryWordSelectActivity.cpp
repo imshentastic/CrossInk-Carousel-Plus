@@ -11,6 +11,7 @@
 #include <cctype>
 #include <cmath>
 
+#include "BookmarkStore.h"  // BOOKMARK_PREVIEW_MAX
 #include "DictionaryDefinitionActivity.h"
 #include "MappedInputManager.h"
 #include "components/UITheme.h"
@@ -18,7 +19,7 @@
 DictionaryWordSelectActivity::DictionaryWordSelectActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                                            std::unique_ptr<Page> page, int fontId, int marginLeft,
                                                            int marginTop, std::string cachePath, uint8_t orientation,
-                                                           std::string nextPageFirstWord)
+                                                           std::string nextPageFirstWord, Mode mode)
     : Activity("DictionaryWordSelect", renderer, mappedInput),
       page(std::move(page)),
       fontId(fontId),
@@ -26,7 +27,8 @@ DictionaryWordSelectActivity::DictionaryWordSelectActivity(GfxRenderer& renderer
       marginTop(marginTop),
       cachePath(std::move(cachePath)),
       orientation(orientation),
-      nextPageFirstWord(std::move(nextPageFirstWord)) {}
+      nextPageFirstWord(std::move(nextPageFirstWord)),
+      mode_(mode) {}
 
 void DictionaryWordSelectActivity::onEnter() {
   Activity::onEnter();
@@ -244,12 +246,36 @@ void DictionaryWordSelectActivity::loop() {
   }
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    int selectedWordIdx = rows[currentRow].wordIndices[currentWordInRow];
-    std::string wordToLookup = words[selectedWordIdx].lookupText;
+    if (rows.empty() || currentRow < 0 || currentRow >= static_cast<int>(rows.size()) ||
+        rows[currentRow].wordIndices.empty() || currentWordInRow < 0 ||
+        currentWordInRow >= static_cast<int>(rows[currentRow].wordIndices.size())) {
+      // No selectable word -- ignore the press.
+    } else {
+      int selectedWordIdx = rows[currentRow].wordIndices[currentWordInRow];
 
-    startActivityForResult(
-        std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, wordToLookup, cachePath, fontId),
-        [this](const ActivityResult& result) { requestUpdate(); });
+      if (mode_ == Mode::Lookup) {
+        std::string wordToLookup = words[selectedWordIdx].lookupText;
+        startActivityForResult(
+            std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, wordToLookup, cachePath, fontId),
+            [this](const ActivityResult& result) { requestUpdate(); });
+      } else {
+        // HighlightRange mode: first Confirm anchors the start; second
+        // Confirm finishes with the range. Anchor lives until activity exit.
+        if (highlightAnchorWordIdx_ < 0) {
+          highlightAnchorWordIdx_ = selectedWordIdx;
+          requestUpdate();
+        } else {
+          ActivityResult result;
+          HighlightRangeResult hr;
+          hr.startWordIndex = std::min(highlightAnchorWordIdx_, selectedWordIdx);
+          hr.endWordIndex = std::max(highlightAnchorWordIdx_, selectedWordIdx);
+          hr.previewText = buildPreviewBetween(hr.startWordIndex, hr.endWordIndex);
+          result.data = hr;
+          setResult(std::move(result));
+          finish();
+        }
+      }
+    }
   }
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
@@ -275,7 +301,7 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
     int selectedWordIdx = rows[currentRow].wordIndices[currentWordInRow];
     const int lineHeight = renderer.getLineHeight(fontId);
 
-    auto drawHighlight = [&](int index) {
+    auto drawSingleWordBox = [&](int index) {
       const WordInfo& word = words[index];
       int boxX = word.screenX;
       int boxY = word.screenY;
@@ -287,24 +313,66 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
       renderer.fillRect(boxX + boxWidth + 1, boxY - 3, 2, lineHeight + 8, true);
     };
 
-    drawHighlight(selectedWordIdx);
+    // HighlightRange mode + anchor placed: render an underline across
+    // every word in the inclusive range [anchor, cursor]. Single-word
+    // box still used to mark the cursor itself so the user sees where
+    // the next Confirm will end the range.
+    if (mode_ == Mode::HighlightRange && highlightAnchorWordIdx_ >= 0 &&
+        highlightAnchorWordIdx_ < static_cast<int>(words.size())) {
+      const int lo = std::min(highlightAnchorWordIdx_, selectedWordIdx);
+      const int hi = std::max(highlightAnchorWordIdx_, selectedWordIdx);
+      for (int i = lo; i <= hi && i < static_cast<int>(words.size()); ++i) {
+        const WordInfo& w = words[i];
+        // Thicker underline (3 px) under each in-range word; lets the
+        // selection be visually distinct from the cursor's box. Skips
+        // continuation slots to avoid double-marking hyphenated halves.
+        if (w.continuationOf != -1) continue;
+        renderer.fillRect(w.screenX, w.screenY + lineHeight + 2, w.width, 3, true);
+      }
+    }
 
+    drawSingleWordBox(selectedWordIdx);
     if (words[selectedWordIdx].continuationIndex != -1) {
-      drawHighlight(words[selectedWordIdx].continuationIndex);
+      drawSingleWordBox(words[selectedWordIdx].continuationIndex);
     }
     if (words[selectedWordIdx].continuationOf != -1) {
-      drawHighlight(words[selectedWordIdx].continuationOf);
+      drawSingleWordBox(words[selectedWordIdx].continuationOf);
     }
   }
 
-  // CrumBLE: drop the STR_UP_DOWN tag -- up/down navigation is obvious
-  // from the physical arrow buttons (or side rocker), and labeling the
-  // logical "previous" slot with "Up/Down" is redundant. STR_PREV_NEXT
-  // still tags the right/left slot, which is the non-obvious bit
-  // (jumping word-by-word vs. line-by-line).
-  const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), tr(STR_LOOKUP), "", tr(STR_PREV_NEXT));
+  // CrumBLE: button hints differ by mode. Lookup keeps Cancel/Lookup/.../Prev-Next.
+  // HighlightRange shows Cancel/(Start|End) so the user knows what the next
+  // Confirm will do at each step.
+  const char* btn2Label = tr(STR_LOOKUP);
+  if (mode_ == Mode::HighlightRange) {
+    btn2Label = (highlightAnchorWordIdx_ < 0) ? tr(STR_HIGHLIGHT_START) : tr(STR_HIGHLIGHT_END);
+  }
+  const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), btn2Label, "", tr(STR_PREV_NEXT));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+}
+
+std::string DictionaryWordSelectActivity::buildPreviewBetween(int a, int b) const {
+  const int lo = std::min(a, b);
+  const int hi = std::max(a, b);
+  if (lo < 0 || hi >= static_cast<int>(words.size())) return {};
+
+  std::string out;
+  out.reserve(BOOKMARK_PREVIEW_MAX);
+  for (int i = lo; i <= hi; ++i) {
+    // Skip continuation halves so hyphenated words aren't duplicated.
+    if (words[i].continuationOf != -1) continue;
+    if (!out.empty()) out += ' ';
+    out += words[i].text;
+    // Cap early once the string would exceed storage (-1 for NUL,
+    // -3 for the ellipsis). Saves cycles on long ranges.
+    if (out.size() >= BOOKMARK_PREVIEW_MAX - 4) break;
+  }
+  if (out.size() > BOOKMARK_PREVIEW_MAX - 1) {
+    out.resize(BOOKMARK_PREVIEW_MAX - 4);
+    out += "...";
+  }
+  return out;
 }
 
 void DictionaryWordSelectActivity::mergeHyphenatedWords() {

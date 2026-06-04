@@ -37,7 +37,12 @@ class EpubReaderMenuActivity final : public Activity {
     // WORDS shows the per-book history. Only added to the menu when
     // Dictionary::exists() (StarDict files are on the SD card).
     LOOKUP,
-    LOOKED_UP_WORDS
+    LOOKED_UP_WORDS,
+    // CrumBLE: highlights = ranged bookmarks. ADD_HIGHLIGHT opens the
+    // word-select activity in HighlightRange mode; user taps the start
+    // word, navigates to the end, taps again. Always available alongside
+    // BOOKMARK_TOGGLE -- the latter stays for fast page-marking.
+    ADD_HIGHLIGHT
   };
 
   explicit EpubReaderMenuActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const std::string& title,

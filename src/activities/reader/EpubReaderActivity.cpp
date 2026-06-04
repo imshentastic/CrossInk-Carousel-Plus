@@ -1869,6 +1869,112 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
                              });
       break;
     }
+    case EpubReaderMenuActivity::MenuAction::ADD_HIGHLIGHT: {
+      // CrumBLE: phase 2/7 of the highlight UX. Reuses the dictionary
+      // word-select activity in HighlightRange mode. Same BT teardown +
+      // heap pre-flight as LOOKUP because the WordInfo vector allocation
+      // is the same; bad_alloc here would still reboot the device.
+      auto& btMgrH = BluetoothHIDManager::getInstance();
+      const bool bleWasOnForHighlight = btMgrH.isEnabled();
+      if (bleWasOnForHighlight) {
+        LOG_INF("ERS", "AddHighlight: disabling BT (re-enabling on exit)");
+        btMgrH.disable();
+        LOG_INF("ERS", "AddHighlight: heap after BT disable: free=%u maxAlloc=%u",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      }
+      constexpr uint32_t HIGHLIGHT_MIN_MAX_ALLOC = 32000;
+      if (ESP.getMaxAllocHeap() < HIGHLIGHT_MIN_MAX_ALLOC) {
+        LOG_INF("ERS", "AddHighlight pre-flight: maxAlloc=%u below %u, raising alert",
+                ESP.getMaxAllocHeap(), HIGHLIGHT_MIN_MAX_ALLOC);
+        if (bleWasOnForHighlight) btMgrH.requestEnableLater();
+        strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_LOOKUP_TITLE),
+                sizeof(APP_STATE.pendingAlertTitle) - 1);
+        strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_LOOKUP_BODY),
+                sizeof(APP_STATE.pendingAlertBody) - 1);
+        APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
+        break;
+      }
+
+      // Same page/margin extraction as LOOKUP -- the activity needs the
+      // current Page to render and hit-test taps. Behind RenderLock so
+      // we don't race the render task's frame in progress.
+      std::unique_ptr<Page> pageForHighlight;
+      int orientedMarginTopH = 0;
+      int orientedMarginLeftH = 0;
+      {
+        RenderLock lock(*this);
+        if (!section) {
+          requestUpdate();
+          if (bleWasOnForHighlight) btMgrH.requestEnableLater();
+          break;
+        }
+        int orientedMarginRightH = 0;
+        int orientedMarginBottomH = 0;
+        renderer.getOrientedViewableTRBL(&orientedMarginTopH, &orientedMarginRightH, &orientedMarginBottomH,
+                                         &orientedMarginLeftH);
+        orientedMarginTopH += SETTINGS.screenMargin;
+        orientedMarginLeftH += SETTINGS.screenMargin;
+        orientedMarginRightH += SETTINGS.screenMargin;
+        const uint8_t statusBarHeightH = UITheme::getInstance().getStatusBarHeight();
+        if (automaticPageTurnActive &&
+            (statusBarHeightH == 0 || statusBarHeightH == UITheme::getInstance().getProgressBarHeight())) {
+          orientedMarginBottomH += std::max(
+              SETTINGS.screenMargin,
+              static_cast<uint8_t>(statusBarHeightH + UITheme::getInstance().getMetrics().statusBarVerticalMargin));
+        } else {
+          orientedMarginBottomH += std::max(SETTINGS.screenMargin, statusBarHeightH);
+        }
+        pageForHighlight = section->loadPageFromSectionFile();
+      }
+      if (!pageForHighlight) {
+        if (bleWasOnForHighlight) btMgrH.requestEnableLater();
+        break;
+      }
+
+      // Snapshot reader state so the result handler can save the highlight
+      // (we move pageForHighlight into the new activity, so we read
+      // currentPage / pageCount / spineIndex up front).
+      const uint16_t hlSpine = static_cast<uint16_t>(currentSpineIndex);
+      const float hlProgress = static_cast<float>(section->currentPage) / static_cast<float>(section->pageCount);
+      const int hlPageCount = section->pageCount;
+      std::string hlChapterTitle;
+      {
+        const int tocIdx = epub->getTocIndexForSpineIndex(currentSpineIndex);
+        if (tocIdx != -1) hlChapterTitle = epub->getTocItem(tocIdx).title;
+      }
+
+      startActivityForResult(
+          std::make_unique<DictionaryWordSelectActivity>(
+              renderer, mappedInput, std::move(pageForHighlight), SETTINGS.getReaderFontId(), orientedMarginLeftH,
+              orientedMarginTopH, epub->getCachePath(), SETTINGS.orientation, std::string{},
+              DictionaryWordSelectActivity::Mode::HighlightRange),
+          [this, bleWasOnForHighlight, hlSpine, hlProgress, hlPageCount,
+           hlChapterTitle](const ActivityResult& result) {
+            if (bleWasOnForHighlight) BluetoothHIDManager::getInstance().requestEnableLater();
+            if (result.isCancelled) {
+              requestUpdate();
+              return;
+            }
+            const auto* hr = std::get_if<HighlightRangeResult>(&result.data);
+            if (!hr || hr->startWordIndex < 0 || hr->endWordIndex < 0) {
+              requestUpdate();
+              return;
+            }
+            const auto addResult = BOOKMARKS.addHighlight(
+                hlSpine, hlProgress, static_cast<uint16_t>(hr->startWordIndex), hlSpine, hlProgress,
+                static_cast<uint16_t>(hr->endWordIndex), hlPageCount,
+                hlChapterTitle.empty() ? nullptr : hlChapterTitle.c_str(), hr->previewText.c_str());
+            if (addResult == BookmarkStore::AddResult::Added) {
+              bookmarkFeedbackType = BookmarkFeedbackType::Added;
+            } else {
+              bookmarkFeedbackType = BookmarkFeedbackType::LimitReached;
+            }
+            pendingBookmarkFeedback = true;
+            bookmarkFeedbackShowTime = millis();
+            requestUpdate();
+          });
+      break;
+    }
     case EpubReaderMenuActivity::MenuAction::GO_TO_PERCENT: {
       float bookProgress = 0.0f;
       {
