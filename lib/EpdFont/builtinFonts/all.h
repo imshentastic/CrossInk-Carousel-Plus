@@ -73,6 +73,13 @@
 #include BUILTIN_READING_FONT_HEADER(bitter_20_regular)
 #endif
 
+// CrumBLE: OMIT_CHAREINK_FONT drops the entire CharEink family. Saves
+// ~700-900 KB binary -- used in the OTA-fit "slim" release build so
+// the firmware stays under the 6.25 MB legacy partition. The picker
+// in SettingsList.h omits the CharEink option in lockstep; users who
+// had CharEink selected before this flag turned on fall back to
+// Bitter via getFallbackReaderFontIdForFamily.
+#ifndef OMIT_CHAREINK_FONT
 #ifndef OMIT_TEENSY_FONT
 #include BUILTIN_READING_FONT_HEADER(charein_8_bold)
 #include BUILTIN_READING_FONT_HEADER(charein_8_bolditalic)
@@ -121,6 +128,7 @@
 #include BUILTIN_READING_FONT_HEADER(charein_20_italic)
 #include BUILTIN_READING_FONT_HEADER(charein_20_regular)
 #endif
+#endif  // OMIT_CHAREINK_FONT
 
 #ifndef OMIT_TEENSY_FONT
 #include BUILTIN_READING_FONT_HEADER(lexenddeca_8_bold)

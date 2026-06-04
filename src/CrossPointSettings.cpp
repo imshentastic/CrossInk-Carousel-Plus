@@ -136,6 +136,12 @@ CrossPointSettings::FONT_SIZE firstAvailableReaderFontSize() {
 int getFallbackReaderFontIdForFamily(const CrossPointSettings::FONT_FAMILY family) {
   switch (family) {
     case CrossPointSettings::CHAREINK:
+#ifdef OMIT_CHAREINK_FONT
+      // CharEink family is OMIT'd; fall through to the BITTER case below
+      // so users with CHAREINK saved as their preference still get a
+      // legible reader font instead of a missing-font crash.
+      [[fallthrough]];
+#else
 #ifndef OMIT_TINY_FONT
       return CHAREINK_10_FONT_ID;
 #elif !defined(OMIT_SMALL_FONT)
@@ -155,6 +161,7 @@ int getFallbackReaderFontIdForFamily(const CrossPointSettings::FONT_FAMILY famil
 #else
 #error "No reader fonts enabled for CHAREINK"
 #endif
+#endif  // OMIT_CHAREINK_FONT
     case CrossPointSettings::BITTER:
 #ifndef OMIT_TINY_FONT
       return BITTER_10_FONT_ID;
@@ -761,6 +768,11 @@ int CrossPointSettings::getReaderFontId() const {
       }
       return getFallbackReaderFontIdForFamily(LEXENDDECA);
     case CHAREINK:
+#ifdef OMIT_CHAREINK_FONT
+      // CharEink family is OMIT'd; fall back to BITTER for users with
+      // a stale CHAREINK preference (silent migration, no crash).
+      return getFallbackReaderFontIdForFamily(BITTER);
+#else
       switch (effectiveSize) {
 #ifndef OMIT_TEENSY_FONT
         case TEENSY:
@@ -800,6 +812,7 @@ int CrossPointSettings::getReaderFontId() const {
 #endif
       }
       return getFallbackReaderFontIdForFamily(CHAREINK);
+#endif  // OMIT_CHAREINK_FONT
     case BITTER:
       switch (effectiveSize) {
 #ifndef OMIT_TEENSY_FONT
