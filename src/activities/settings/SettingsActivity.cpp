@@ -250,7 +250,9 @@ void SettingsActivity::rebuildSettingsLists() {
   std::vector<SettingInfo> libraryChildren;
   libraryChildren.push_back(SettingInfo::Submenu(StrId::STR_SETTINGS_FILES, std::move(libraryFiles)));
   pushByName(libraryChildren, allSettings, StrId::STR_SERIES_DETECTION);
-  pushByName(libraryChildren, allSettings, StrId::STR_OPTIMIZE_CHAPTER_INDEXING);
+  // CrumBLE 4.1: STR_OPTIMIZE_CHAPTER_INDEXING toggle removed (see
+  // SettingsList.h). Field is always on. Nothing to surface in the
+  // Library submenu for it anymore.
 
   rootSettings_.push_back(SettingInfo::Submenu(StrId::STR_CAT_LIBRARY, std::move(libraryChildren)));
 
