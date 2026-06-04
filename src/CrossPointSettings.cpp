@@ -342,24 +342,12 @@ void CrossPointSettings::retryDeferredSaveIfNeeded() const {
 }
 
 bool CrossPointSettings::loadFromFile() {
-  // CrumBLE 4.1: optimizeChapterIndexing is the always-on default now.
-  // If an older device had it saved off (it was opt-in in 4.0), force
-  // it back to 1 after load so the prebake flow works without the
-  // user having to know about the (now removed) setting.
-  const auto forceOptimizeChapterIndexingOn = [this]() {
-    if (optimizeChapterIndexing == 0) {
-      optimizeChapterIndexing = 1;
-      LOG_DBG("CPS", "Migrated optimizeChapterIndexing 0 -> 1 (setting removed; always on)");
-    }
-  };
-
   // Try JSON first
   if (Storage.exists(SETTINGS_FILE_JSON)) {
     String json = Storage.readFile(SETTINGS_FILE_JSON);
     if (!json.isEmpty()) {
       bool resave = false;
       bool result = JsonSettingsIO::loadSettings(*this, json.c_str(), &resave);
-      forceOptimizeChapterIndexingOn();
       if (result && resave) {
         if (saveToFile()) {
           LOG_DBG("CPS", "Resaved settings to update format");
@@ -375,7 +363,6 @@ bool CrossPointSettings::loadFromFile() {
   // Fall back to binary migration
   if (Storage.exists(SETTINGS_FILE_BIN)) {
     if (loadFromBinaryFile()) {
-      forceOptimizeChapterIndexingOn();
       migrateLanguageBinaryFile();
       if (saveToFile()) {
         Storage.rename(SETTINGS_FILE_BIN, SETTINGS_FILE_BAK);
