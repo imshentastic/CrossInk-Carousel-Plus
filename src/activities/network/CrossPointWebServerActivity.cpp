@@ -161,6 +161,24 @@ void CrossPointWebServerActivity::onEnter() {
   lastHandleClientTime = 0;
   requestUpdate();
 
+  // CrumBLE: if the previous boot just silentRestarted from this same
+  // activity (auto-recovery from a low-heap serve), skip the network
+  // mode picker entirely and dive back into the mode the user already
+  // chose. Mirrors what would happen if they were to back out + re-
+  // enter + re-pick the same mode by hand, except invisibly. Mode
+  // hint values: 1 = JOIN_NETWORK, 2 = CREATE_HOTSPOT.
+  const uint32_t modeHint = consumeSilentRebootFtModeHint();
+  if (modeHint == 1) {
+    LOG_INF("WEBACT", "Auto-restore: JOIN_NETWORK from silent-reboot hint");
+    onNetworkModeSelected(NetworkMode::JOIN_NETWORK);
+    return;
+  }
+  if (modeHint == 2) {
+    LOG_INF("WEBACT", "Auto-restore: CREATE_HOTSPOT from silent-reboot hint");
+    onNetworkModeSelected(NetworkMode::CREATE_HOTSPOT);
+    return;
+  }
+
   // Launch network mode selection subactivity
   LOG_DBG("WEBACT", "Launching NetworkModeSelectionActivity...");
   startActivityForResult(std::make_unique<NetworkModeSelectionActivity>(renderer, mappedInput),
@@ -490,6 +508,11 @@ void CrossPointWebServerActivity::loop() {
     if (consumeFtRestartRequest()) {
       LOG_INF("WEBACT", "Auto-recovery: silentRestart to FT (free=%u maxAlloc=%u)",
               ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      // Stash the current mode so the next boot's FT onEnter skips the
+      // mode picker and goes straight back to the same flow (auto-
+      // connect to last SSID for JOIN, or just restart softAP for
+      // HOTSPOT). 1 = JOIN_NETWORK, 2 = CREATE_HOTSPOT.
+      setSilentRebootFtModeHint(isApMode ? 2u : 1u);
       // Mirror onExit cleanup that matters before restart: stop our own
       // services so WiFi isn't holding sockets mid-restart.
       stopWebServer();

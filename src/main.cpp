@@ -394,6 +394,12 @@ const char* wakeupRouteName(const HalGPIO::WakeupReason reason) {
 // Definitions for SilentRestart.h. RTC_NOINIT survives ESP.restart() but not power loss.
 RTC_NOINIT_ATTR uint32_t silentRebootMagic;
 RTC_NOINIT_ATTR uint32_t silentRebootTarget;
+// CrumBLE: optional mode hint for SILENT_REBOOT_TARGET_FILE_TRANSFER. Set
+// by the FT activity right before silentRestartToFileTransfer so the
+// next boot's FT entry can skip NetworkModeSelectionActivity and go
+// straight to onNetworkModeSelected(<saved>). 0 = no hint, fall through
+// to the normal mode-picker. 1 = JOIN_NETWORK, 2 = CREATE_HOTSPOT.
+RTC_NOINIT_ATTR uint32_t silentRebootFtModeHint;
 constexpr uint32_t SILENT_REBOOT_MAGIC = 0xC1EAB007;
 constexpr uint32_t SILENT_REBOOT_TARGET_HOME = 0;
 constexpr uint32_t SILENT_REBOOT_TARGET_READER = 1;
@@ -439,10 +445,28 @@ void silentRestartToFileTransfer() {
   if (deepSleepInProgress) return;
   silentRebootTarget = SILENT_REBOOT_TARGET_FILE_TRANSFER;
   silentRebootMagic = SILENT_REBOOT_MAGIC;
-  LOG_DBG("MAIN", "Silent restart (target=file-transfer)");
+  LOG_DBG("MAIN", "Silent restart (target=file-transfer, modeHint=%u)",
+          static_cast<unsigned>(silentRebootFtModeHint));
   GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
   delay(50);
   ESP.restart();
+}
+
+void setSilentRebootFtModeHint(uint32_t mode) {
+  silentRebootFtModeHint = mode;
+}
+
+// Snapshot taken at setup() time, AFTER the silent-reboot magic check
+// validated that the RTC state is genuinely ours (cold boot leaves
+// RTC_NOINIT memory uninitialized). FT activity reads this from
+// onEnter and clears it; surviving exactly one consume call ensures
+// a later normal entry doesn't accidentally auto-restore.
+static uint32_t g_pendingFtModeHintSnapshot = 0;
+
+uint32_t consumeSilentRebootFtModeHint() {
+  const uint32_t v = g_pendingFtModeHintSnapshot;
+  g_pendingFtModeHintSnapshot = 0;
+  return v;
 }
 
 void silentRestartToReader() {
@@ -954,8 +978,16 @@ void setup() {
   const bool isSilentReboot = (silentRebootMagic == SILENT_REBOOT_MAGIC);
   const uint32_t snapshotTarget =
       (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_FILE_TRANSFER) ? silentRebootTarget : 0;
+  // Snapshot the FT mode hint into a normal variable before clearing
+  // RTC state, so the FT activity's onEnter can read it via
+  // consumeSilentRebootFtModeHint(). Only honour it on a confirmed
+  // silent reboot to FT -- everything else gets zero (cold-boot RTC
+  // garbage or stale state from a different silent-reboot target).
+  g_pendingFtModeHintSnapshot =
+      (isSilentReboot && snapshotTarget == SILENT_REBOOT_TARGET_FILE_TRANSFER) ? silentRebootFtModeHint : 0;
   silentRebootMagic = 0;
   silentRebootTarget = 0;
+  silentRebootFtModeHint = 0;
 
   gpio.begin();
   powerManager.begin();

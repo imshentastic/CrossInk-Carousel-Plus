@@ -455,20 +455,16 @@ static void sendBufferGzip(WebServer* server, const char* mime, const char* data
     // the device is slower the browser just refreshes again -- worst
     // case we loop the friendly page a few times instead of failing.
     LOG_ERR("WEB", "serve %s low-heap: scheduling silentRestart to FT", tag);
-    static constexpr const char* kReconnectingHtml =
-        "<!doctype html><html><head>"
-        "<meta http-equiv=\"refresh\" content=\"8\">"
-        "<title>Reconnecting...</title>"
-        "<style>body{font-family:sans-serif;text-align:center;padding:40px;color:#333}"
-        "h2{font-weight:400;margin-bottom:10px}p{color:#666;margin:6px}"
-        ".spinner{display:inline-block;width:40px;height:40px;border:3px solid #ddd;"
-        "border-top-color:#27ae60;border-radius:50%;animation:s 1s linear infinite;"
-        "margin:20px}@keyframes s{to{transform:rotate(360deg)}}</style>"
-        "</head><body><div class=\"spinner\"></div>"
-        "<h2>Reconnecting...</h2>"
-        "<p>The device is refreshing its memory and will be back in a few seconds.</p>"
-        "<p>This page will reload automatically.</p></body></html>";
-    server->send(200, "text/html", kReconnectingHtml);
+    // CrumBLE: feedback minimised. Empty body + a meta-refresh header
+    // -- the browser shows nothing (or whatever was rendered last) and
+    // silently reloads after ~8 s, by which time the device is back
+    // with a fresh heap and serves the real FilesPage. The tab title
+    // stays as the user expects ("File Transfer"). No "Reconnecting..."
+    // banner, no spinner, no instructions to wait -- just a brief
+    // "slow load" moment from the user's perspective.
+    server->sendHeader("Refresh", "8");
+    server->send(200, "text/html",
+                 "<!doctype html><html><head><title>File Transfer</title></head><body></body></html>");
     // Send completes before we set the flag so the response actually
     // reaches the browser before the device reboots.
     g_pendingFtRestart = true;
