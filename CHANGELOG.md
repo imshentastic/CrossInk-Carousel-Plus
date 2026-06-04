@@ -1,10 +1,5 @@
 # Changelog
 
-## [crumble-v4.1.1] - 2026-06-04
-
-### Fixed
-- **Optimizer preflight modal now includes SD-card fonts.** Users with a custom `.cpfont` family (e.g. the CharEink SD-card bundle, or any community font dropped into `/fonts/` on the SD card) can now confirm or change their font in the "Lock in reader settings?" dialog that fires before each EPUB optimization. Previously the dropdown hardcoded only the three built-in families (Lexend Deca / Bitter / CharEink) and silently dropped SD selections. The fix pulls the family list from `/api/fonts` at modal open and routes the saved selection through `sdFontFamilyName` when an SD font is picked.
-
 ## [crumble-v4.1.0] - 2026-06-04
 
 ### Added
@@ -15,6 +10,9 @@
 
 ### Changed
 - Version bump 4.0.1 → 4.1.0 because "OTA actually works now" is a meaningful new capability worth a minor-version bump.
+
+### Fixed
+- **Optimizer preflight modal now includes SD-card fonts.** Users with a custom `.cpfont` family (e.g. the CharEink SD-card bundle, or any community font dropped into `/fonts/` on the SD card) can now confirm or change their font in the "Lock in reader settings?" dialog that fires before each EPUB optimization. Previously the dropdown hardcoded only the three built-in families (Lexend Deca / Bitter / CharEink) and silently dropped SD selections. The fix pulls the family list from `/api/fonts` at modal open and routes the saved selection through `sdFontFamilyName` when an SD font is picked.
 
 ## [crumble-v4.0.1] - 2026-06-04
 
