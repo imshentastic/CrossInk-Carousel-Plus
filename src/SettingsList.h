@@ -139,8 +139,14 @@ inline uint8_t closestBuiltinFontSizeIndex(const uint8_t targetPointSize) {
 // Build the font family setting dynamically. When registry is non-null, SD card fonts
 // are appended after the built-in fonts. Otherwise only built-in fonts are listed.
 inline SettingInfo buildFontFamilySetting(const SdCardFontRegistry* registry) {
-  // Built-in font labels (StrId)
-  std::vector<StrId> enumValues = {StrId::STR_LEXEND_DECA, StrId::STR_BITTER, StrId::STR_CHAREINK};
+  // Built-in font labels (StrId). CrumBLE: OMIT_CHAREINK_FONT drops the
+  // CharEink option from the picker so the slim OTA build doesn't show
+  // a font family that isn't actually embedded.
+  std::vector<StrId> enumValues = {StrId::STR_LEXEND_DECA, StrId::STR_BITTER,
+#ifndef OMIT_CHAREINK_FONT
+                                   StrId::STR_CHAREINK
+#endif
+  };
   // Runtime string labels for SD card fonts
   std::vector<std::string> enumStringValues;
 
@@ -163,7 +169,9 @@ inline SettingInfo buildFontFamilySetting(const SdCardFontRegistry* registry) {
   if (sdFontCount > 0) {
     allStringValues.push_back(I18N.get(StrId::STR_LEXEND_DECA));
     allStringValues.push_back(I18N.get(StrId::STR_BITTER));
+#ifndef OMIT_CHAREINK_FONT
     allStringValues.push_back(I18N.get(StrId::STR_CHAREINK));
+#endif
     allStringValues.insert(allStringValues.end(), enumStringValues.begin(), enumStringValues.end());
   }
 
@@ -333,7 +341,12 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
     // Built-in font-family entry. Replaced per-call with a registry-aware
     // version when SD fonts are installed.
     add(SettingInfo::Enum(StrId::STR_FONT_FAMILY, &CrossPointSettings::fontFamily,
-                          {StrId::STR_LEXEND_DECA, StrId::STR_BITTER, StrId::STR_CHAREINK}, "fontFamily",
+                          {StrId::STR_LEXEND_DECA, StrId::STR_BITTER,
+#ifndef OMIT_CHAREINK_FONT
+                           StrId::STR_CHAREINK
+#endif
+                          },
+                          "fontFamily",
                           StrId::STR_CAT_READER));
     add(buildBuiltinFontSizeSetting());
     // CrumBLE: "Download Font Size Range" (sdFontSizeRange) is omitted from the
