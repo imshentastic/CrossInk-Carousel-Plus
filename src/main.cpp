@@ -397,6 +397,12 @@ RTC_NOINIT_ATTR uint32_t silentRebootTarget;
 constexpr uint32_t SILENT_REBOOT_MAGIC = 0xC1EAB007;
 constexpr uint32_t SILENT_REBOOT_TARGET_HOME = 0;
 constexpr uint32_t SILENT_REBOOT_TARGET_READER = 1;
+// CrumBLE: heap-defrag reboot from the FT web server when the heap is
+// too fragmented to serve. After this reboot, setup() routes straight
+// to CrossPointWebServerActivity so the user doesn't have to
+// re-navigate to File Transfer from Home -- mirrors the path they'd
+// take by hitting Back manually but skips the trip through the menu.
+constexpr uint32_t SILENT_REBOOT_TARGET_FILE_TRANSFER = 2;
 
 // How the device is coming back to life, resolved once at boot. Both resume
 // flows suppress the splash and leave the panel holding its pre-boot frame; a
@@ -424,6 +430,16 @@ void silentRestart() {
   // Without an overlay, users don't see the reboot and fire input through to
   // Home. Select on the default selectorIndex=0 then opens the most-recent
   // book, looking like a trampoline back to the reader they just exited.
+  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+  delay(50);
+  ESP.restart();
+}
+
+void silentRestartToFileTransfer() {
+  if (deepSleepInProgress) return;
+  silentRebootTarget = SILENT_REBOOT_TARGET_FILE_TRANSFER;
+  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  LOG_DBG("MAIN", "Silent restart (target=file-transfer)");
   GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
   delay(50);
   ESP.restart();
@@ -937,7 +953,7 @@ void setup() {
   // Bound the target range too — RTC_NOINIT memory is uninitialized on cold boot.
   const bool isSilentReboot = (silentRebootMagic == SILENT_REBOOT_MAGIC);
   const uint32_t snapshotTarget =
-      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_READER) ? silentRebootTarget : 0;
+      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_FILE_TRANSFER) ? silentRebootTarget : 0;
   silentRebootMagic = 0;
   silentRebootTarget = 0;
 
@@ -1103,6 +1119,13 @@ void setup() {
   } else if (HalSystem::isRebootFromPanic()) {
     // If we rebooted from a panic, go to crash report screen to show the panic info
     activityManager.goToCrashReport();
+  } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_FILE_TRANSFER) {
+    // CrumBLE: heap-defrag restart triggered from CrossPointWebServer when
+    // the FT serve guard fires. Route directly to FT so the user doesn't
+    // see Home flash through before re-entering. They'll still pick mode
+    // (Hotspot vs Join) again -- that screen is the FT activity's normal
+    // first step on entry.
+    activityManager.goToFileTransfer();
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_READER &&
              !APP_STATE.openEpubPath.empty()) {
     activityManager.goToReader(APP_STATE.openEpubPath);

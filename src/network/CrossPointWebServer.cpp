@@ -78,6 +78,22 @@ size_t wsUploadSize = 0;
 size_t wsUploadReceived = 0;
 unsigned long wsUploadStartTime = 0;
 bool wsUploadInProgress = false;
+
+// CrumBLE: set by sendBufferGzip when the heap is too low to serve. The
+// FT activity's loop() polls this via consumeFtRestartRequest() and
+// triggers silentRestartToFileTransfer once the request handler has
+// returned (so the response physically reaches the browser before the
+// device reboots).
+bool g_pendingFtRestart = false;
+}  // namespace anon
+
+bool consumeFtRestartRequest() {
+  if (!g_pendingFtRestart) return false;
+  g_pendingFtRestart = false;
+  return true;
+}
+
+namespace {
 uint8_t wsUploadClientNum = 255;  // 255 = no active upload client
 size_t wsLastProgressSent = 0;
 String wsLastCompleteName;
@@ -421,43 +437,41 @@ static void sendBufferGzip(WebServer* server, const char* mime, const char* data
   // Bumped to 22 KB so a comparable session refuses up front and the
   // user gets an actionable 503 in their browser instead of a hung
   // device. Lower-pressure sessions still pass cleanly.
-  uint32_t preFree = ESP.getFreeHeap();
-  uint32_t preMax = ESP.getMaxAllocHeap();
+  const uint32_t preFree = ESP.getFreeHeap();
+  const uint32_t preMax = ESP.getMaxAllocHeap();
   LOG_INF("WEB", "serve %s: %u B, pre free=%u maxAlloc=%u", tag, (unsigned)len, preFree, preMax);
   if (preFree < 22u * 1024u) {
-    // CrumBLE: brief wait + recheck before declaring defeat. WiFi TX
-    // buffers + recently-closed connections release within a few hundred
-    // ms; many "low at request time" hits recover into a normal serve
-    // without any user action.
-    LOG_INF("WEB", "serve %s: heap low (free=%u); waiting briefly for recovery", tag, preFree);
-    for (int i = 0; i < 6; ++i) {
-      delay(150);
-      esp_task_wdt_reset();
-      const uint32_t now = ESP.getFreeHeap();
-      if (now >= 22u * 1024u) {
-        LOG_INF("WEB", "serve %s: heap recovered (free=%u after %d ms)", tag, now, (i + 1) * 150);
-        preFree = now;
-        preMax = ESP.getMaxAllocHeap();
-        break;
-      }
-    }
-  }
-  if (preFree < 22u * 1024u) {
-    // Still low after the grace wait. Instead of an error to the user,
-    // return a tiny self-refreshing "Loading" page (under 400 bytes).
-    // The phone browser auto-reloads every 3 s; by the time the next
-    // hit lands the device usually has its memory back. No tab close,
-    // no manual retry, no scary error -- just an extra second of wait.
-    LOG_ERR("WEB", "serve %s soft-fail: free=%u below floor; returning auto-refresh page", tag, preFree);
-    static constexpr const char* kLoadingHtml =
+    // CrumBLE: the only real recovery on this hardware is what the user
+    // already does manually -- exit FT on the device so its onExit
+    // silentRestarts, then re-enter. We automate that here: schedule a
+    // silentRestart with target=FILE_TRANSFER so the device comes back
+    // directly into the FT activity (no Home tour), and meanwhile send
+    // the phone a friendly auto-refreshing "reconnecting" page. By the
+    // time the refresh fires (8 s), the device has rebooted, reconnected
+    // to WiFi, and the FT serve handlers are up again with a fresh heap.
+    //
+    // 8 s is the budget for: silentRestart (~50 ms) + ESP.restart()
+    // (~1 s) + setup() through WiFi connect (~3-5 s) + mDNS rebind. If
+    // the device is slower the browser just refreshes again -- worst
+    // case we loop the friendly page a few times instead of failing.
+    LOG_ERR("WEB", "serve %s low-heap: scheduling silentRestart to FT", tag);
+    static constexpr const char* kReconnectingHtml =
         "<!doctype html><html><head>"
-        "<meta http-equiv=\"refresh\" content=\"3\">"
-        "<title>Loading...</title>"
+        "<meta http-equiv=\"refresh\" content=\"8\">"
+        "<title>Reconnecting...</title>"
         "<style>body{font-family:sans-serif;text-align:center;padding:40px;color:#333}"
-        "h2{font-weight:400}p{color:#666}</style>"
-        "</head><body><h2>Preparing File Transfer...</h2>"
-        "<p>Reloading automatically.</p></body></html>";
-    server->send(200, "text/html", kLoadingHtml);
+        "h2{font-weight:400;margin-bottom:10px}p{color:#666;margin:6px}"
+        ".spinner{display:inline-block;width:40px;height:40px;border:3px solid #ddd;"
+        "border-top-color:#27ae60;border-radius:50%;animation:s 1s linear infinite;"
+        "margin:20px}@keyframes s{to{transform:rotate(360deg)}}</style>"
+        "</head><body><div class=\"spinner\"></div>"
+        "<h2>Reconnecting...</h2>"
+        "<p>The device is refreshing its memory and will be back in a few seconds.</p>"
+        "<p>This page will reload automatically.</p></body></html>";
+    server->send(200, "text/html", kReconnectingHtml);
+    // Send completes before we set the flag so the response actually
+    // reaches the browser before the device reboots.
+    g_pendingFtRestart = true;
     return;
   }
   server->sendHeader("Content-Encoding", "gzip");

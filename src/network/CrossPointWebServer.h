@@ -11,6 +11,12 @@
 
 class GfxRenderer;
 
+// CrumBLE: returns true (consuming the flag) when sendBufferGzip flagged
+// a heap-too-low serve as needing a silentRestart-to-FT cycle. The FT
+// activity polls this from loop() and triggers the restart so the 200
+// response physically reaches the phone before the device reboots.
+bool consumeFtRestartRequest();
+
 // Structure to hold file information
 struct FileInfo {
   String name;

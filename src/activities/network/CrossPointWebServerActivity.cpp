@@ -483,6 +483,27 @@ void CrossPointWebServerActivity::loop() {
       lastHandleClientTime = millis();
     }
 
+    // CrumBLE: sendBufferGzip flagged a low-heap serve; the response has
+    // already gone out (a small "Reconnecting..." page with an 8s meta-
+    // refresh). silentRestart to FT now so the device comes back with
+    // a fresh heap before the phone's next refresh fires.
+    if (consumeFtRestartRequest()) {
+      LOG_INF("WEBACT", "Auto-recovery: silentRestart to FT (free=%u maxAlloc=%u)",
+              ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      // Mirror onExit cleanup that matters before restart: stop our own
+      // services so WiFi isn't holding sockets mid-restart.
+      stopWebServer();
+      MDNS.end();
+      if (dnsServer) {
+        dnsServer->stop();
+        delete dnsServer;
+        dnsServer = nullptr;
+      }
+      delay(50);
+      silentRestartToFileTransfer();  // never returns
+      return;
+    }
+
     // Handle exit on Back button (also check outside loop)
     if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
       exitToOrigin();
