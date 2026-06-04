@@ -5,12 +5,17 @@
 #include <GfxRenderer.h>
 #include <I18n.h>
 #include <WiFi.h>
+#include <esp_bt.h>
 #include <esp_task_wdt.h>
 
 #include <cstddef>
 
+#include "BluetoothHIDManager.h"
+#include "CollectionsStore.h"
+#include "CrossPointState.h"
 #include "LibraryIndex.h"
 #include "MappedInputManager.h"
+#include "SeriesIndex.h"
 #include "NetworkModeSelectionActivity.h"
 #include "SdCardFontSystem.h"
 #include "SilentRestart.h"
@@ -48,7 +53,48 @@ int barsForRssi(int rssi, int currentBars) {
 void CrossPointWebServerActivity::onEnter() {
   Activity::onEnter();
 
-  LOG_DBG("WEBACT", "Free heap at onEnter: %d bytes", ESP.getFreeHeap());
+  LOG_INF("WEBACT", "Free heap at onEnter: %d bytes (maxAlloc %d)", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
+  // CrumBLE: tear NimBLE down before File Transfer comes up. NimBLE holds
+  // ~58 KB of stack state while connected, and the FT web server runs with
+  // very little headroom on x4 / even less on x3. Symptom we're guarding
+  // against: "phone can't load FT page after personal hotspot" and "x3
+  // frozen on Hotspot Mode" -- both consistent with the TX-buffer / WiFi
+  // alloc starving when NimBLE is still holding its slab. BT remote is
+  // irrelevant in FT anyway (the user is interacting via their phone),
+  // so a synchronous teardown here costs the user nothing. No-op when
+  // BT is already off (the common non-reader case). Matches the
+  // exitToHomeWithPopup teardown pattern in Activity.cpp.
+  {
+    auto& bt = BluetoothHIDManager::getInstance();
+    if (bt.isEnabled()) {
+      LOG_INF("WEBACT", "Disabling NimBLE before web server start (~58 KB reclaim)");
+      bt.disable();
+      LOG_INF("WEBACT", "Free heap after NimBLE host deinit: %d bytes (maxAlloc %d)",
+              ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    }
+    // CrumBLE: aggressive controller-layer teardown. BluetoothHIDManager::
+    // disable() calls NimBLEDevice::deinit(false) which only releases the
+    // NimBLE *host* stack -- the ESP32-C3 BT *controller* keeps its static
+    // buffers (~25 KB) allocated. We never need BT back this boot because
+    // onExit silentRestarts the device, so it's safe to tear the controller
+    // down too and call esp_bt_mem_release to return its memory to the
+    // general heap. Conditional on the controller actually being up; on a
+    // fresh boot where BT was never enabled, these are no-ops.
+    const esp_bt_controller_status_t btStatus = esp_bt_controller_get_status();
+    if (btStatus == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+      esp_bt_controller_disable();
+    }
+    if (btStatus != ESP_BT_CONTROLLER_STATUS_IDLE) {
+      esp_bt_controller_deinit();
+    }
+    // mem_release returns the controller's static buffers permanently.
+    // After this call, esp_bt_controller_init() will fail until reboot --
+    // exactly what we want since onExit triggers a silentRestart anyway.
+    esp_bt_mem_release(ESP_BT_MODE_BLE);
+    LOG_INF("WEBACT", "Free heap after BT controller release: %d bytes (maxAlloc %d)",
+            ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  }
 
   // CrumBLE: free the loaded SD-card font before WiFi/web-server come up. File
   // transfer runs with very little heap (~26 KB free while serving), and a
@@ -63,8 +109,48 @@ void CrossPointWebServerActivity::onEnter() {
   // stale so it's rebuilt (and picks up any just-uploaded books) on the next
   // Recently Added / All Books visit.
   LibraryIndex::getInstance().releaseMemory();
-  LOG_DBG("WEBACT", "Free heap after index release: %d bytes (maxAlloc %d)",
+  LOG_INF("WEBACT", "Free heap after index release: %d bytes (maxAlloc %d)",
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
+  // CrumBLE: also drop SeriesIndex + CollectionsStore in-RAM state.
+  // SeriesIndex's pooled stringPool can hold tens of KB for libraries
+  // with lots of series-tagged books; CollectionsStore holds the
+  // collections vector + finished/new path caches. Both reload on
+  // the silentRestart that exitToOrigin triggers in onExit, so we
+  // don't strand persistent state.
+  SeriesIndex::getInstance().releaseMemory();
+  CollectionsStore::getInstance().releaseMemory();
+  LOG_INF("WEBACT", "Free heap after series/collections release: %d bytes (maxAlloc %d)",
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
+  // CrumBLE: pre-flight heap check AFTER all reclamations.
+  //
+  // Threshold history:
+  //   40 KB -- original, scoped to WiFi softAP + DNS server startup. User
+  //            still hit "freezes when phone loads /files" because WiFi
+  //            connect alone consumed ~25 KB of maxAlloc after passing
+  //            this gate, and serving the 30 KB gzipped FilesPage burned
+  //            another 6 KB on top -- the device wound up at maxAlloc
+  //            ~6 KB with the render task starving.
+  //   55 KB -- intermediate, refused users with ~51 KB maxAlloc whose
+  //            sessions would have actually worked. Too conservative.
+  //   45 KB -- current. Math from observed costs:
+  //              wifi connect : -25 KB maxAlloc
+  //              serve /files : -6 KB maxAlloc
+  //              render task  : ~14 KB floor
+  //              -> 25 + 6 + 14 = 45 KB minimum safe entry maxAlloc
+  //            The per-page-serve guard (sendBufferGzip < 14 KB free)
+  //            is the secondary net for any case that slips through.
+  constexpr uint32_t FT_MIN_MAX_ALLOC = 45000;
+  if (ESP.getMaxAllocHeap() < FT_MIN_MAX_ALLOC) {
+    LOG_ERR("WEBACT", "FT pre-flight: maxAlloc=%u below %u, refusing to start", ESP.getMaxAllocHeap(),
+            FT_MIN_MAX_ALLOC);
+    strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_FT_TITLE), sizeof(APP_STATE.pendingAlertTitle) - 1);
+    strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_FT_BODY), sizeof(APP_STATE.pendingAlertBody) - 1);
+    APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
+    exitToOrigin();
+    return;
+  }
 
   // Reset state
   state = WebServerActivityState::MODE_SELECTION;
@@ -74,6 +160,24 @@ void CrossPointWebServerActivity::onEnter() {
   connectedSSID.clear();
   lastHandleClientTime = 0;
   requestUpdate();
+
+  // CrumBLE: if the previous boot just silentRestarted from this same
+  // activity (auto-recovery from a low-heap serve), skip the network
+  // mode picker entirely and dive back into the mode the user already
+  // chose. Mirrors what would happen if they were to back out + re-
+  // enter + re-pick the same mode by hand, except invisibly. Mode
+  // hint values: 1 = JOIN_NETWORK, 2 = CREATE_HOTSPOT.
+  const uint32_t modeHint = consumeSilentRebootFtModeHint();
+  if (modeHint == 1) {
+    LOG_INF("WEBACT", "Auto-restore: JOIN_NETWORK from silent-reboot hint");
+    onNetworkModeSelected(NetworkMode::JOIN_NETWORK);
+    return;
+  }
+  if (modeHint == 2) {
+    LOG_INF("WEBACT", "Auto-restore: CREATE_HOTSPOT from silent-reboot hint");
+    onNetworkModeSelected(NetworkMode::CREATE_HOTSPOT);
+    return;
+  }
 
   // Launch network mode selection subactivity
   LOG_DBG("WEBACT", "Launching NetworkModeSelectionActivity...");
@@ -271,6 +375,10 @@ void CrossPointWebServerActivity::startWebServer() {
   // Give it the renderer so /api/reader-render-info can compute the reader's
   // viewport + emSize for the optimizer's .pxc baking.
   webServer->setRenderer(&renderer);
+  // CrumBLE: settings-JSON pre-build was tried; held ~12 KB at runtime and
+  // starved later page serves into a guard-trip restart loop. /api/settings
+  // returns 503 in this build (the device-side Settings UI is the canonical
+  // path); /api/wifi, /api/opds, /api/files all work normally.
   webServer->begin();
 
   if (webServer->isRunning()) {
@@ -377,6 +485,12 @@ void CrossPointWebServerActivity::loop() {
       constexpr int MAX_ITERATIONS = 500;
       for (int i = 0; i < MAX_ITERATIONS && webServer->isRunning(); i++) {
         webServer->handleClient();
+        // CrumBLE: as soon as a handler tripped the low-heap guard, stop
+        // processing further requests. Browsers fire several /api/* calls
+        // in parallel after a page load -- if we keep serving them under
+        // a 18 KB free / 15 KB maxAlloc budget the next allocator call
+        // craters before our auto-recovery silentRestart gets to run.
+        if (peekFtRestartRequest()) break;
         // Reset watchdog every 32 iterations
         if ((i & 0x1F) == 0x1F) {
           esp_task_wdt_reset();
@@ -395,6 +509,32 @@ void CrossPointWebServerActivity::loop() {
         }
       }
       lastHandleClientTime = millis();
+    }
+
+    // CrumBLE: sendBufferGzip flagged a low-heap serve; the response has
+    // already gone out (a small "Reconnecting..." page with an 8s meta-
+    // refresh). silentRestart to FT now so the device comes back with
+    // a fresh heap before the phone's next refresh fires.
+    if (consumeFtRestartRequest()) {
+      LOG_INF("WEBACT", "Auto-recovery: silentRestart to FT (free=%u maxAlloc=%u)",
+              ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      // Stash the current mode so the next boot's FT onEnter skips the
+      // mode picker and goes straight back to the same flow (auto-
+      // connect to last SSID for JOIN, or just restart softAP for
+      // HOTSPOT). 1 = JOIN_NETWORK, 2 = CREATE_HOTSPOT.
+      setSilentRebootFtModeHint(isApMode ? 2u : 1u);
+      // Mirror onExit cleanup that matters before restart: stop our own
+      // services so WiFi isn't holding sockets mid-restart.
+      stopWebServer();
+      MDNS.end();
+      if (dnsServer) {
+        dnsServer->stop();
+        delete dnsServer;
+        dnsServer = nullptr;
+      }
+      delay(50);
+      silentRestartToFileTransfer();  // never returns
+      return;
     }
 
     // Handle exit on Back button (also check outside loop)

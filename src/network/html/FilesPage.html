@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Files - CrossInk</title>
+  <title>Files - CrumBLE</title>
   <!-- jszip is loaded on demand (only when optimizing an EPUB) via ensureJSZip()
        so plain file browsing/uploading doesn't pay to serve ~28 KB on every
        page load -- that extra serve was exhausting the device's tiny
@@ -284,6 +284,35 @@
       color: white;
       border-radius: 10px;
       font-size: 0.75em;
+    }
+    /* Pre-cached indicator next to EPUB filenames whose
+       /.crosspoint/epub_<HASH>/prebake-manifest.json exists. */
+    .prebaked-badge {
+      display: inline-block;
+      padding: 1px 6px;
+      background-color: #2c3e50;
+      color: #ecf0f1;
+      border-radius: 8px;
+      font-size: 0.7em;
+      margin-left: 6px;
+      vertical-align: middle;
+      letter-spacing: 0.02em;
+    }
+    /* "Highly Recommended" pill that sits inline with the toggle title.
+       Smaller + colour-emphasised so it telegraphs "you almost certainly
+       want this on" without screaming. */
+    .recommended-pill {
+      display: inline-block;
+      padding: 1px 7px;
+      background-color: #27ae60;
+      color: #ffffff;
+      border-radius: 8px;
+      font-size: 0.65em;
+      font-weight: 600;
+      margin-left: 6px;
+      vertical-align: middle;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
     }
     .file-icon {
       margin-right: 8px;
@@ -1537,7 +1566,7 @@
   </style>
 </head>
 <body>
-<h1 class="crossink-header">CrossInk</h1>
+<h1 class="crossink-header">CrumBLE</h1>
 
 <div class="nav-links">
   <a href="/">Home</a>
@@ -1583,7 +1612,7 @@
   </div>
 </div>
 
-<p style="text-align: center; color: var(--label-color); font-size: 0.85em; padding: 20px 0; margin: 0;">CrossInk &bull; Open Source</p>
+<p style="text-align: center; color: var(--label-color); font-size: 0.85em; padding: 20px 0; margin: 0;">CrumBLE &bull; CrossInk fork &bull; Open Source</p>
 
 <!-- Upload Modal -->
 <div class="modal-overlay" id="uploadModal">
@@ -1617,10 +1646,14 @@
                building the chapter index, computing the manifest -- and
                ships a per-book cache directory to the device so the
                actual reading is butter smooth. -->
+          <!-- CrumBLE: pre-cache toggle. Restored after experimentation so
+               the user can opt out when upload speed matters more than
+               instant chapter turns. Default ON: the prebake step adds
+               ~40 s but pays for itself in zero-delay reading. -->
           <div class="bt-friendly-option" id="btFriendlyOption">
             <div class="bt-friendly-row">
               <div class="bt-friendly-text">
-                <div class="setting-title">Pre-cache chapter indexing / images</div>
+                <div class="setting-title">Pre-Cache for fast chapter turns <span class="recommended-pill">Highly Recommended</span></div>
                 <div class="setting-desc">Optimizes for instant chapter turns and accelerated book opening. Adds ~40 s to upload time per book in exchange for zero-delay reading!</div>
               </div>
               <label class="toggle-switch">
@@ -1885,7 +1918,7 @@
 
   if (currentPath !== '/') {
     const leaf = currentPath.split('/').filter(Boolean).pop();
-    if (leaf) document.title = leaf + ' - Files - CrossInk Reader';
+    if (leaf) document.title = leaf + ' - Files - CrumBLE';
   }
 
   // Network status monitoring
@@ -2075,6 +2108,13 @@
           fileTableContent += `<td><input type="checkbox" class="select-item" data-path="${encodeURIComponent(filePath)}" data-name="${escapeHtml(file.name)}" data-type="file"></td>`;
           fileTableContent += `<td><span class="file-icon">${file.isEpub ? '📗' : '📄'}</span>`;
           fileTableContent += `<a rel="noopener noreferrer" target="_blank" href="/download?path=${encodeURIComponent(filePath)}" class="file-link">${escapeHtml(file.name)}</a>`;
+          // CrumBLE: pre-cached badge -- /api/files returns prebaked=true when
+          // a prebake-manifest.json exists in the per-book cache dir. Surfaces
+          // optimization status in the file manager so the user can spot which
+          // books they've already pre-processed without opening each one.
+          if (file.prebaked) {
+            fileTableContent += ` <span class="prebaked-badge" title="Chapter index pre-cached">Pre-cached</span>`;
+          }
           fileTableContent += '</td>';
           fileTableContent += file.isEpub ? '<td><span class="epub-badge">EPUB</span></td>' : `<td>${escapeHtml(file.name.split('.').pop().toUpperCase())}</td>`;
           fileTableContent += `<td>${formatFileSize(file.size)}</td>`;
@@ -2203,10 +2243,12 @@
     document.getElementById('progress-fill').style.width = '0%';
     document.getElementById('progress-fill').style.backgroundColor = '#27ae60';
     document.getElementById('convertBeforeUpload').checked = true;
-    document.getElementById('convertInfo').style.display = 'none';
-    document.getElementById('convertWarning').style.display = 'none';
+    // CrumBLE: hide pre-cache sub-option on modal reset. It re-appears
+    // in toggleConvertOptions() when the master Optimize-EPUB stays on.
     const btFriendlyOption = document.getElementById('btFriendlyOption');
     if (btFriendlyOption) btFriendlyOption.style.display = 'none';
+    document.getElementById('convertInfo').style.display = 'none';
+    document.getElementById('convertWarning').style.display = 'none';
     // Clear image picker cache and reset layout
     epubImagesCache = [];
     imageStates = {};
@@ -2250,7 +2292,10 @@
     if (checked) ensureOptimizer().catch(err => console.error('Optimizer preload failed:', err));
     document.getElementById('convertWarning').style.display = checked ? 'block' : 'none';
     document.getElementById('convertInfo').style.display = checked ? 'block' : 'none';
-    // Show the Bluetooth-friendly chapters option alongside Optimize EPUB.
+    // Show the pre-cache toggle alongside Optimize EPUB. Hidden when
+    // Optimize EPUB is off because skipping image transcoding implies
+    // skipping prebake too -- no point pre-caching a book the user
+    // doesn't want optimised for the device in the first place.
     const btFriendlyOption = document.getElementById('btFriendlyOption');
     if (btFriendlyOption) btFriendlyOption.style.display = checked ? 'block' : 'none';
     // Update button text and style
@@ -2499,6 +2544,30 @@
     if (cancelBtn) {
       cancelBtn.textContent = 'Cancel';
       cancelBtn.classList.add('in-progress');
+    }
+
+    // optimizer.js owns clearLog / showLog / log / convertEpubFile / the
+    // preflight modal. It's lazy-loaded so the base file-manager page
+    // stays small; if the user never engages the optimizer it's never
+    // fetched. Fresh-upload flows already call ensureOptimizer() before
+    // touching these helpers -- this flow needs to do the same or the
+    // entire batch dies with "clearLog is not defined".
+    try {
+      await ensureOptimizer();
+    } catch (loadErr) {
+      console.error('Optimizer module load failed:', loadErr);
+      alert('Could not load the optimizer module: ' + (loadErr.message || loadErr));
+      // Reset modal state so the user can dismiss it.
+      isUploadInProgress = false;
+      document.getElementById('uploadModalClose').classList.remove('disabled');
+      if (cancelBtn) {
+        cancelBtn.classList.remove('in-progress');
+        cancelBtn.textContent = 'Close';
+      }
+      if (fileInput) fileInput.style.display = '';
+      if (uploadBtn) uploadBtn.style.display = '';
+      if (convertOptions) convertOptions.style.display = '';
+      return;
     }
 
     clearLog();

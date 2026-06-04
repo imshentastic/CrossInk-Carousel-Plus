@@ -9,7 +9,11 @@
 #include "activities/Activity.h"
 #include "util/ButtonNavigator.h"
 
-enum class SettingType { TOGGLE, ENUM, ACTION, VALUE, STRING, SECTION_HEADER };
+// CrumBLE submenu redesign: SUBMENU rows hold a child SettingInfo list and a
+// title StrId. Confirm pushes the child list onto the SettingsActivity nav
+// stack; Back pops. SECTION_HEADER is retained for short groups that stay
+// inline rather than nesting.
+enum class SettingType { TOGGLE, ENUM, ACTION, VALUE, STRING, SECTION_HEADER, SUBMENU };
 
 enum class SettingAction {
   None,
@@ -56,6 +60,10 @@ struct SettingInfo {
   std::function<std::string()> stringGetter;
   std::function<void(const std::string&)> stringSetter;
 
+  // CrumBLE submenu: when type == SUBMENU, `children` is the list shown after
+  // the user opens this row. Empty for all other types.
+  std::vector<SettingInfo> children;
+
   SettingInfo& withObfuscated() {
     obfuscated = true;
     return *this;
@@ -101,6 +109,17 @@ struct SettingInfo {
     SettingInfo s;
     s.nameId = nameId;
     s.type = SettingType::SECTION_HEADER;
+    return s;
+  }
+
+  // CrumBLE: build a SUBMENU row. nameId is the row label, children is the
+  // SettingInfo list rendered after the user opens it. The user navigates
+  // back with the Back button, which pops the nav stack.
+  static SettingInfo Submenu(StrId nameId, std::vector<SettingInfo> children) {
+    SettingInfo s;
+    s.nameId = nameId;
+    s.type = SettingType::SUBMENU;
+    s.children = std::move(children);
     return s;
   }
 
@@ -171,28 +190,41 @@ inline std::string settingEnumOptionLabel(const SettingInfo& setting, const uint
 class SettingsActivity final : public Activity {
   ButtonNavigator buttonNavigator;
 
-  int selectedCategoryIndex = 0;  // Currently selected category
-  int selectedSettingIndex = 0;
-  int settingsCount = 0;
+  // CrumBLE submenu redesign: replaces the old four-category-tabs top level.
+  // rootSettings_ holds the six-entry top-level list (Display / Reader /
+  // Controls / Library / Sync & Network / System). Opening a SUBMENU row
+  // pushes a frame onto navStack_; Back pops it. selectedIndex is stored per
+  // frame so the cursor restores when the user backs out of a sub-screen.
+  std::vector<SettingInfo> rootSettings_;
 
-  // Per-category settings derived from shared list + device-only actions
-  std::vector<SettingInfo> displaySettings;
-  std::vector<SettingInfo> readerSettings;
-  std::vector<SettingInfo> controlsSettings;
-  std::vector<SettingInfo> systemSettings;
-  const std::vector<SettingInfo>* currentSettings = nullptr;
+  struct NavFrame {
+    // Pointer-stable for the duration of the activity: rootSettings_ is the
+    // base, and each submenu's `children` vector is owned by its parent
+    // entry in rootSettings_, so the address stays valid as long as we
+    // don't mutate the parent.
+    const std::vector<SettingInfo>* settings = nullptr;
+    StrId titleId = StrId::STR_SETTINGS_TITLE;
+    int selectedIndex = 0;
+  };
+  std::vector<NavFrame> navStack_;
 
   bool preserveQuickResumeTimeoutOn = false;
   bool quickResumeTimeoutAutoEnabled = false;
 
-  static constexpr int categoryCount = 4;
-  static const StrId categoryNames[categoryCount];
-
-  void enterCategory(int categoryIndex);
   void toggleCurrentSetting();
   void openSleepTimeoutPicker();
   void rebuildSettingsLists();
   void syncQuickResumeTimeoutForSleepScreen(bool sleepScreenChanged, bool quickResumeTimeoutChanged);
+
+  // Submenu nav helpers. enterSubmenu pushes the row's child list; goBack
+  // pops; currentFrame returns the top of the stack (or rootSettings_ if
+  // empty). selectableIndex skips SECTION_HEADER entries.
+  NavFrame& currentFrame() { return navStack_.back(); }
+  const NavFrame& currentFrame() const { return navStack_.back(); }
+  const std::vector<SettingInfo>& currentSettings() const { return *currentFrame().settings; }
+  int currentSettingsCount() const { return static_cast<int>(currentSettings().size()); }
+  void enterSubmenu(const SettingInfo& row);
+  void goBack();
 
  public:
   explicit SettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)

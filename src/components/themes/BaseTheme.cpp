@@ -748,10 +748,24 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
     }
 
     progressTextWidth = renderer.getTextWidth(SMALL_FONT_ID, progressStr);
-    renderer.drawText(
-        SMALL_FONT_ID,
-        renderer.getScreenWidth() - metrics.statusBarHorizontalMargin - orientedMarginRight - progressTextWidth, textY,
-        progressStr);
+    const int textX = renderer.getScreenWidth() - metrics.statusBarHorizontalMargin -
+                      orientedMarginRight - progressTextWidth;
+    // Page-number ghosting fix (mirrors the same pattern that already
+    // shipped for the battery percentage in RoundedRaffTheme): the FAST_
+    // REFRESH e-ink mode used for page turns doesn't always cleanly erase
+    // the previous status-bar text, so digit-count transitions like
+    // 100/100 -> 99/100 leave the leftmost "1" ghosted. Pre-clear a
+    // fixed-width region sized for the widest text we'd ever display
+    // ("9999/9999  100%") so the previous text is always covered before
+    // the new text draws. The clear is right-anchored to the same
+    // position the text uses, so it stays out of the title's column.
+    const int maxProgressTextWidth =
+        renderer.getTextWidth(SMALL_FONT_ID, "9999/9999  100%");
+    const int textHeight = renderer.getTextHeight(SMALL_FONT_ID);
+    const int clearX = renderer.getScreenWidth() - metrics.statusBarHorizontalMargin -
+                       orientedMarginRight - maxProgressTextWidth;
+    renderer.fillRect(clearX, textY, maxProgressTextWidth, textHeight, false);
+    renderer.drawText(SMALL_FONT_ID, textX, textY, progressStr);
   }
 
   // Draw Progress Bar

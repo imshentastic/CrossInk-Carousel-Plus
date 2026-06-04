@@ -23,6 +23,12 @@
 #include "../settings/BluetoothSettingsActivity.h"
 #include "../settings/KOReaderSettingsActivity.h"
 #include "BookSettingsDrawerActivity.h"
+// CrumBLE: dictionary feature (ported from SEEK reader sumegig/seek-reader).
+#include "DictionaryIndexBuildActivity.h"
+#include "DictionaryWordSelectActivity.h"
+#include "LookedUpWordsActivity.h"
+#include "util/Dictionary.h"
+#include "util/LookupHistory.h"
 #include "BookStatsActivity.h"
 #include "CollectionsStore.h"
 #include "CrossPointSettings.h"
@@ -357,6 +363,24 @@ void EpubReaderActivity::onEnter() {
   prebakePromptShowing_ = false;
   deferredOnEnterPending_ = true;
   firstRenderCompleted_ = false;
+  // Eager prebake-manifest load: the switch-back prompt has to fire
+  // BEFORE the first render's section.loadSectionFile path falls through
+  // to createSectionFile (the "indexing" screen), otherwise the device
+  // starts rebuilding the chapter even though the user is about to be
+  // asked whether they want the prepared layout restored. The original
+  // call lived in runDeferredOnEnter, which runs AFTER the first render,
+  // so the prompt fired too late and the index work was already under
+  // way. Manifest read is one ~250 byte JSON file -- safe to move into
+  // the synchronous onEnter path.
+  if (SETTINGS.optimizeChapterIndexing && epub) {
+    PrebakeManifest pm;
+    if (tryLoadPrebakeManifest(epub->getCachePath(), pm)) {
+      prebakeManifest_ = pm;
+      LOG_INF("ERA", "Eager-loaded prebake manifest: fontId=%ld viewport=%ux%u",
+              static_cast<long>(pm.fontId), static_cast<unsigned>(pm.viewportWidth),
+              static_cast<unsigned>(pm.viewportHeight));
+    }
+  }
   // Reset BLE-link edge state on every book open: a fresh book may have a
   // different manifest (or none), and any prior link tracking is stale.
   btWasLinked_ = false;
@@ -549,20 +573,18 @@ void EpubReaderActivity::runDeferredOnEnter() {
     }
   }
 
-  // CrumBLE: parse the prebake'd manifest if the user has opted in and the
-  // cache exists. Gated by SETTINGS.optimizeChapterIndexing so this branch
-  // is dead code (and the helper-fired prompt below stays silent) until the
-  // user flips the toggle on. Cheap when it does run: one SD open + small
-  // JSON parse. The result drives the switch-back prompt in tick() when
-  // current SETTINGS would invalidate the cache.
-  if (SETTINGS.optimizeChapterIndexing) {
+  // Manifest load was hoisted to onEnter() so the switch-back prompt
+  // can fire BEFORE the first render starts indexing. Keep a fallback
+  // here for the unlikely case where the toggle was flipped on
+  // mid-session between onEnter and the deferred tick -- otherwise
+  // the prompt would never see the manifest until the next book open.
+  if (SETTINGS.optimizeChapterIndexing && !prebakeManifest_.has_value()) {
     PrebakeManifest pm;
     if (tryLoadPrebakeManifest(epub->getCachePath(), pm)) {
       prebakeManifest_ = pm;
-      LOG_INF("ERA", "Loaded prebake manifest: fontId=%ld viewport=%ux%u lineComp=%.3f embed=%d",
+      LOG_INF("ERA", "Loaded prebake manifest in deferred onEnter: fontId=%ld viewport=%ux%u",
               static_cast<long>(pm.fontId), static_cast<unsigned>(pm.viewportWidth),
-              static_cast<unsigned>(pm.viewportHeight), static_cast<double>(pm.lineCompression),
-              pm.embeddedStyle);
+              static_cast<unsigned>(pm.viewportHeight));
     }
   }
 }
@@ -668,25 +690,38 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
           static_cast<unsigned>(pm.imageRendering),
           pm.bionicReadingEnabled, pm.guideReadingEnabled);
 
-  // .pxc-manifest-style prompt: confirm applies the prebake's prepared
-  // layout (restoring cache compatibility), cancel keeps current settings
-  // (book will rebuild chapter-by-chapter against the live cache). This
-  // is uniform across both the "you just changed a setting" and "you
-  // opened a book whose settings already don't match the prebake" cases
-  // -- both want the same choice between "use what was prepared" and
-  // "keep what I have."
+  // Action-labeled two-option prompt. The previous confirm/cancel polarity
+  // (confirm = restore prepared) tricked users who had just edited a
+  // setting in the drawer: they expected "Confirm" to mean "apply what I
+  // typed," and instead saw their edit get reverted by what they thought
+  // was the affirmative button. Action labels remove the ambiguity --
+  // the user clicks the verb that names what they want to happen.
+  // Option 0 (default) keeps the user's current settings; Back/Cancel
+  // maps to that same outcome because "do nothing destructive" is the
+  // less surprising fallback when someone backs out of the prompt.
   const std::string promptBody =
-      "This book was prepared with different reader settings. Switch to the "
-      "prepared layout for faster reading, or keep your current settings and "
-      "let the device rebuild each chapter as you reach it?";
+      "This book was prepared with different reader settings. Keep your current "
+      "settings (chapters will rebuild against the live cache), or restore the "
+      "prepared layout for instant chapter loads?";
   prebakePromptShowing_ = true;
   startActivityForResult(
-      std::make_unique<ConfirmationActivity>(
-          renderer, mappedInput, "Use prepared layout?", promptBody,
+      std::make_unique<ChoicePromptActivity>(
+          renderer, mappedInput, "Settings differ from prepared layout",
+          promptBody,
+          std::vector<std::string>{"Keep my current settings", "Restore prepared layout"},
           /*ignoreInitialConfirmRelease=*/true),
       [this](const ActivityResult& result) {
         prebakePromptShowing_ = false;
-        if (result.isCancelled) {
+        // ChoicePromptResult lives inside result.data. choice: 0 = "Keep
+        // my current settings", 1 = "Restore prepared layout", -1 =
+        // user backed out. Treat back-out as "Keep" -- the less
+        // destructive default.
+        int chosen = -1;
+        if (const auto* cp = std::get_if<ChoicePromptResult>(&result.data)) {
+          chosen = cp->choice;
+        }
+        const bool keepCurrent = result.isCancelled || chosen != 1;
+        if (keepCurrent) {
           // User declined -- keep their current settings. Don't delete the
           // prebake (Section.cpp's clearCache only ever touches sections/,
           // never sections-prebake/), so if they later open the book again
@@ -1306,11 +1341,19 @@ void EpubReaderActivity::loop() {
     }
     const int bookProgressPercent = clampPercent(static_cast<int>(bookProgress + 0.5f));
 
+    // CrumBLE: dictionary availability gates the LOOKUP / LOOKED_UP_WORDS
+    // menu entries (port of SEEK reader's feature). Dictionary::exists()
+    // checks for the StarDict .idx/.dict files at the SD root; lookup
+    // history is per-book in the cache dir, so we only surface "Looked Up
+    // Words" when there's actually anything to show.
+    const bool hasDictionary = Dictionary::exists();
+    const bool hasLookupHistory = hasDictionary && LookupHistory::hasHistory(epub->getCachePath());
     startActivityForResult(std::make_unique<EpubReaderMenuActivity>(
                                renderer, mappedInput, epub->getTitle(), currentPage, totalPages, bookProgressPercent,
                                SETTINGS.orientation, !currentPageFootnotes.empty(), !BOOKMARKS.getBookmarks().empty(),
                                BOOKMARKS.hasBookmarkForPage(bmSpine, bmProgress, bookmarkPageCount), isBookCompleted,
-                               automaticPageTurnActive, getAutoPageTurnIntervalSeconds()),
+                               automaticPageTurnActive, getAutoPageTurnIntervalSeconds(),
+                               hasDictionary, hasLookupHistory, pendingHighlightStart_.has_value()),
                            [this](const ActivityResult& result) {
                              // Always apply orientation change even if the menu was cancelled
                              const auto& menu = std::get<MenuResult>(result.data);
@@ -1342,6 +1385,27 @@ void EpubReaderActivity::loop() {
       mappedInput.getHeldTime() < ReaderUtils::GO_HOME_MS) {
     if (footnoteDepth > 0) {
       restoreSavedPosition();
+      return;
+    }
+    // CrumBLE: if the user arrived at the current page via View Bookmarks,
+    // route Back to re-open the bookmark list instead of exiting to Home.
+    // Consume the flag so subsequent Backs go to Home as normal.
+    if (returnToBookmarkListOnBack_) {
+      returnToBookmarkListOnBack_ = false;
+      startActivityForResult(
+          std::make_unique<EpubReaderBookmarkListActivity>(renderer, mappedInput, BOOKMARKS.getBookmarks()),
+          [this](const ActivityResult& result) {
+            if (!result.isCancelled) {
+              const auto& bm = std::get<BookmarkResult>(result.data);
+              RenderLock lock(*this);
+              currentSpineIndex = bm.spineIndex;
+              pendingSpineProgress = bm.progress;
+              pendingPercentJump = true;
+              section.reset();
+              returnToBookmarkListOnBack_ = true;  // re-arm for the next pick
+            }
+            requestUpdate();
+          });
       return;
     }
     exitToHomeWithPopup();
@@ -1613,6 +1677,551 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
                              });
       break;
     }
+    case EpubReaderMenuActivity::MenuAction::LOOKUP: {
+      // CrumBLE: auto-disable BT for the duration of the dictionary flow.
+      // NimBLE holds ~58 KB of stack state while connected, which leaves
+      // heap too fragmented for DictionaryWordSelect::extractWords to
+      // allocate its WordInfo vector -- previously bad_alloc'd into
+      // __cxxabiv1::__terminate and rebooted. User explicitly opted in
+      // to "auto-disable BT on Lookup, reconnect on exit": the BT remote
+      // is unusable inside the dictionary screens anyway (the crash is
+      // 100% reproducible with BT on), so dropping it for the duration
+      // is the right trade. User navigates dictionary UI with device
+      // buttons during; requestEnableLater on each exit path brings the
+      // bonded remote back on their next button press post-Lookup.
+      auto& btMgr = BluetoothHIDManager::getInstance();
+      const bool bleWasOnForLookup = btMgr.isEnabled();
+      if (bleWasOnForLookup) {
+        LOG_INF("ERS", "Lookup: disabling BT to free heap for word build (re-enabling on exit)");
+        btMgr.disable();
+        LOG_INF("ERS", "Lookup: heap after BT disable: free=%u maxAlloc=%u",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      }
+
+      // Pre-flight heap check AFTER the BT teardown. Even with NimBLE gone,
+      // a long session on a fragmented heap can still bottom out below
+      // the WordInfo reserve. User report: second Lookup attempt in a
+      // single session crashed -- BT cycle leaves the heap slightly more
+      // fragmented than before. Bump threshold from 25 KB to 32 KB so
+      // the alert catches that second-attempt case before extractWords
+      // bad_allocs. Cost: a few more "low memory" alerts in edge cases,
+      // each of which is correct (better than a reboot).
+      constexpr uint32_t LOOKUP_MIN_MAX_ALLOC = 32000;
+      if (ESP.getMaxAllocHeap() < LOOKUP_MIN_MAX_ALLOC) {
+        LOG_INF("ERS", "Lookup pre-flight: maxAlloc=%u below %u even after BT off, raising alert",
+                ESP.getMaxAllocHeap(), LOOKUP_MIN_MAX_ALLOC);
+        if (bleWasOnForLookup) btMgr.requestEnableLater();
+        strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_LOOKUP_TITLE),
+                sizeof(APP_STATE.pendingAlertTitle) - 1);
+        strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_LOOKUP_BODY),
+                sizeof(APP_STATE.pendingAlertBody) - 1);
+        APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
+        break;
+      }
+      // Port of SEEK reader's dictionary lookup. Compute the orientation-
+      // adjusted margins from the current page so the word-select overlay
+      // can hit-test taps against the rendered glyphs; also peek the FIRST
+      // word of the next section so the overlay knows when the user has
+      // selected the last word on the current page (for cursor navigation
+      // wraparound). See sumegig/seek-reader commit b3074a2 -- this case
+      // mirrors that integration point but adapted to our RenderLock /
+      // margin-computation conventions.
+      std::unique_ptr<Page> pageForLookup;
+      std::string nextPageFirstWord;
+      int orientedMarginTop = 0;
+      int orientedMarginLeft = 0;
+      {
+        RenderLock lock(*this);
+        if (!section) {
+          requestUpdate();
+          break;
+        }
+        int orientedMarginRight;
+        int orientedMarginBottom;
+        renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
+                                         &orientedMarginLeft);
+        orientedMarginTop += SETTINGS.screenMargin;
+        orientedMarginLeft += SETTINGS.screenMargin;
+        orientedMarginRight += SETTINGS.screenMargin;
+        const uint8_t statusBarHeight = UITheme::getInstance().getStatusBarHeight();
+        if (automaticPageTurnActive &&
+            (statusBarHeight == 0 || statusBarHeight == UITheme::getInstance().getProgressBarHeight())) {
+          orientedMarginBottom += std::max(
+              SETTINGS.screenMargin,
+              static_cast<uint8_t>(statusBarHeight + UITheme::getInstance().getMetrics().statusBarVerticalMargin));
+        } else {
+          orientedMarginBottom += std::max(SETTINGS.screenMargin, statusBarHeight);
+        }
+        pageForLookup = section->loadPageFromSectionFile();
+        if (section->currentPage < section->pageCount - 1) {
+          const int savedPage = section->currentPage;
+          section->currentPage = savedPage + 1;
+          auto nextPage = section->loadPageFromSectionFile();
+          section->currentPage = savedPage;
+          if (nextPage) {
+            for (const auto& element : nextPage->elements) {
+              if (!element || element->getTag() != TAG_PageLine) continue;
+              const auto& line = static_cast<const PageLine&>(*element);
+              auto block = line.getBlock();
+              if (!block) continue;
+              const auto& words = block->getWords();
+              if (!words.empty()) {
+                nextPageFirstWord = words.front();
+                break;
+              }
+            }
+          }
+        }
+      }
+      if (!pageForLookup) break;
+
+      // CrumBLE: before launching word select, make sure the dictionary
+      // index is ready. Three paths:
+      //   (a) already in RAM -> go straight to word select.
+      //   (b) cache file on SD exists -> load it inline (~50ms) then go.
+      //   (c) no cache -> ask the user to consent to a one-time ~10s
+      //       scan, then run DictionaryIndexBuildActivity, then go.
+      // Without this gate the first-ever lookup would freeze
+      // DictionaryDefinitionActivity for ~10s with only "Looking up..."
+      // on screen, with no warning to the user.
+      const int readerFontId = SETTINGS.getReaderFontId();
+      const auto orientation = SETTINGS.orientation;
+      const auto cachePath = epub->getCachePath();
+      auto pageShared = std::make_shared<std::unique_ptr<Page>>(std::move(pageForLookup));
+      // CrumBLE: every exit path from the dictionary flow must re-enable
+      // BT if we disabled it on entry, so the bonded remote reconnects
+      // on the user's next press. requestEnableLater() defers to the
+      // main loop's drain (next tick), which is the safe place to bring
+      // NimBLE back up.
+      auto reEnableBleIfNeeded = [bleWasOnForLookup]() {
+        if (bleWasOnForLookup) {
+          BluetoothHIDManager::getInstance().requestEnableLater();
+        }
+      };
+      auto launchWordSelect = [this, pageShared, readerFontId, orientedMarginLeft, orientedMarginTop, cachePath,
+                               orientation, nextPageFirstWord, reEnableBleIfNeeded]() {
+        startActivityForResult(
+            std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(*pageShared), readerFontId,
+                                                          orientedMarginLeft, orientedMarginTop, cachePath, orientation,
+                                                          nextPageFirstWord),
+            [this, reEnableBleIfNeeded](const ActivityResult& result) {
+              reEnableBleIfNeeded();
+              requestUpdate();
+            });
+      };
+
+      if (Dictionary::isIndexReady()) {
+        launchWordSelect();
+      } else if (Dictionary::loadCachedIndex()) {
+        // Cache present AND loaded cleanly (~50ms). If the file existed
+        // but was truncated/corrupt, loadCachedIndex returns false here
+        // and we fall through to the prompt -- we'd rather ask the user
+        // to consent to a rebuild than silently freeze inside the first
+        // lookup() call (which is what happens if we proceed assuming
+        // the cache loaded when it didn't).
+        launchWordSelect();
+      } else {
+        startActivityForResult(
+            std::make_unique<ChoicePromptActivity>(
+                renderer, mappedInput, tr(STR_DICT_INDEX_PROMPT_TITLE), tr(STR_DICT_INDEX_PROMPT_BODY),
+                std::vector<std::string>{tr(STR_DICT_INDEX_PROMPT_BUILD), tr(STR_DICT_INDEX_PROMPT_CANCEL)},
+                /*ignoreInitialConfirmRelease=*/true),
+            [this, launchWordSelect, reEnableBleIfNeeded](const ActivityResult& promptResult) {
+              int chosen = -1;
+              if (const auto* cp = std::get_if<ChoicePromptResult>(&promptResult.data)) {
+                chosen = cp->choice;
+              }
+              if (promptResult.isCancelled || chosen != 0) {
+                reEnableBleIfNeeded();
+                requestUpdate();
+                return;
+              }
+              startActivityForResult(std::make_unique<DictionaryIndexBuildActivity>(renderer, mappedInput),
+                                     [this, launchWordSelect, reEnableBleIfNeeded](const ActivityResult& buildResult) {
+                                       if (buildResult.isCancelled) {
+                                         reEnableBleIfNeeded();
+                                         requestUpdate();
+                                         return;
+                                       }
+                                       launchWordSelect();
+                                     });
+            });
+      }
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::LOOKED_UP_WORDS: {
+      // CrumBLE: same BT auto-disable / re-enable wrapper as the LOOKUP
+      // case. LookedUpWordsActivity is just a history list, but tapping
+      // an entry drills into DictionaryDefinitionActivity which calls
+      // Dictionary::lookup -- same heap pressure that crashes Lookup
+      // with NimBLE active. Dropping BT on entry keeps the saved-words
+      // flow safe; requestEnableLater on activity finish brings the
+      // bonded remote back on the user's next press.
+      auto& btMgr = BluetoothHIDManager::getInstance();
+      const bool bleWasOnForHistory = btMgr.isEnabled();
+      if (bleWasOnForHistory) {
+        LOG_INF("ERS", "LookedUpWords: disabling BT (re-enabling on exit)");
+        btMgr.disable();
+        LOG_INF("ERS", "LookedUpWords: heap after BT disable: free=%u maxAlloc=%u",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      }
+      // Pre-flight heap check: tapping an entry will eventually call
+      // Dictionary::lookup and (if the user opens word select later from
+      // there) hit the same WordInfo allocation pressure as LOOKUP. Same
+      // 32 KB threshold + same alert path.
+      constexpr uint32_t LOOKED_UP_MIN_MAX_ALLOC = 32000;
+      if (ESP.getMaxAllocHeap() < LOOKED_UP_MIN_MAX_ALLOC) {
+        LOG_INF("ERS", "LookedUpWords pre-flight: maxAlloc=%u below %u, raising alert",
+                ESP.getMaxAllocHeap(), LOOKED_UP_MIN_MAX_ALLOC);
+        if (bleWasOnForHistory) btMgr.requestEnableLater();
+        strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_LOOKUP_TITLE),
+                sizeof(APP_STATE.pendingAlertTitle) - 1);
+        strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_LOOKUP_BODY),
+                sizeof(APP_STATE.pendingAlertBody) - 1);
+        APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
+        break;
+      }
+      startActivityForResult(std::make_unique<LookedUpWordsActivity>(renderer, mappedInput, epub->getCachePath()),
+                             [this, bleWasOnForHistory](const ActivityResult& result) {
+                               if (bleWasOnForHistory) {
+                                 BluetoothHIDManager::getInstance().requestEnableLater();
+                               }
+                               requestUpdate();
+                             });
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::ADD_HIGHLIGHT: {
+      // CrumBLE: phase 2/7 of the highlight UX. Reuses the dictionary
+      // word-select activity in HighlightRange mode. Same BT teardown +
+      // heap pre-flight as LOOKUP because the WordInfo vector allocation
+      // is the same; bad_alloc here would still reboot the device.
+      auto& btMgrH = BluetoothHIDManager::getInstance();
+      const bool bleWasOnForHighlight = btMgrH.isEnabled();
+      if (bleWasOnForHighlight) {
+        LOG_INF("ERS", "AddHighlight: disabling BT (re-enabling on exit)");
+        btMgrH.disable();
+        LOG_INF("ERS", "AddHighlight: heap after BT disable: free=%u maxAlloc=%u",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      }
+      constexpr uint32_t HIGHLIGHT_MIN_MAX_ALLOC = 32000;
+      if (ESP.getMaxAllocHeap() < HIGHLIGHT_MIN_MAX_ALLOC) {
+        LOG_INF("ERS", "AddHighlight pre-flight: maxAlloc=%u below %u, raising alert",
+                ESP.getMaxAllocHeap(), HIGHLIGHT_MIN_MAX_ALLOC);
+        if (bleWasOnForHighlight) btMgrH.requestEnableLater();
+        strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_LOOKUP_TITLE),
+                sizeof(APP_STATE.pendingAlertTitle) - 1);
+        strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_LOOKUP_BODY),
+                sizeof(APP_STATE.pendingAlertBody) - 1);
+        APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
+        break;
+      }
+
+      // Same page/margin extraction as LOOKUP -- the activity needs the
+      // current Page to render and hit-test taps. Behind RenderLock so
+      // we don't race the render task's frame in progress.
+      std::unique_ptr<Page> pageForHighlight;
+      int orientedMarginTopH = 0;
+      int orientedMarginLeftH = 0;
+      {
+        RenderLock lock(*this);
+        if (!section) {
+          requestUpdate();
+          if (bleWasOnForHighlight) btMgrH.requestEnableLater();
+          break;
+        }
+        int orientedMarginRightH = 0;
+        int orientedMarginBottomH = 0;
+        renderer.getOrientedViewableTRBL(&orientedMarginTopH, &orientedMarginRightH, &orientedMarginBottomH,
+                                         &orientedMarginLeftH);
+        orientedMarginTopH += SETTINGS.screenMargin;
+        orientedMarginLeftH += SETTINGS.screenMargin;
+        orientedMarginRightH += SETTINGS.screenMargin;
+        const uint8_t statusBarHeightH = UITheme::getInstance().getStatusBarHeight();
+        if (automaticPageTurnActive &&
+            (statusBarHeightH == 0 || statusBarHeightH == UITheme::getInstance().getProgressBarHeight())) {
+          orientedMarginBottomH += std::max(
+              SETTINGS.screenMargin,
+              static_cast<uint8_t>(statusBarHeightH + UITheme::getInstance().getMetrics().statusBarVerticalMargin));
+        } else {
+          orientedMarginBottomH += std::max(SETTINGS.screenMargin, statusBarHeightH);
+        }
+        pageForHighlight = section->loadPageFromSectionFile();
+      }
+      if (!pageForHighlight) {
+        if (bleWasOnForHighlight) btMgrH.requestEnableLater();
+        break;
+      }
+
+      // Snapshot reader state so the result handler can save the highlight
+      // (we move pageForHighlight into the new activity, so we read
+      // currentPage / pageCount / spineIndex up front).
+      const uint16_t hlSpine = static_cast<uint16_t>(currentSpineIndex);
+      const float hlProgress = static_cast<float>(section->currentPage) / static_cast<float>(section->pageCount);
+      const int hlPageCount = section->pageCount;
+      std::string hlChapterTitle;
+      {
+        const int tocIdx = epub->getTocIndexForSpineIndex(currentSpineIndex);
+        if (tocIdx != -1) hlChapterTitle = epub->getTocItem(tocIdx).title;
+      }
+
+      startActivityForResult(
+          std::make_unique<DictionaryWordSelectActivity>(
+              renderer, mappedInput, std::move(pageForHighlight), SETTINGS.getReaderFontId(), orientedMarginLeftH,
+              orientedMarginTopH, epub->getCachePath(), SETTINGS.orientation, std::string{},
+              DictionaryWordSelectActivity::Mode::HighlightRange),
+          [this, bleWasOnForHighlight, hlSpine, hlProgress, hlPageCount,
+           hlChapterTitle](const ActivityResult& result) {
+            if (bleWasOnForHighlight) BluetoothHIDManager::getInstance().requestEnableLater();
+            if (result.isCancelled) {
+              requestUpdate();
+              return;
+            }
+            const auto* hr = std::get_if<HighlightRangeResult>(&result.data);
+            if (!hr || hr->startWordIndex < 0) {
+              requestUpdate();
+              return;
+            }
+            // Anchor-only result (end == -1): user pressed Hold after
+            // placing start. Stash for the FINISH_HIGHLIGHT path.
+            if (hr->endWordIndex < 0) {
+              PendingHighlightStart hold;
+              hold.spineIndex = hlSpine;
+              hold.progress = hlProgress;
+              hold.pageCount = static_cast<uint16_t>(hlPageCount);
+              hold.wordIndex = static_cast<uint16_t>(hr->startWordIndex);
+              hold.startWordText = hr->previewText;  // single word's raw text
+              hold.chapterTitle = hlChapterTitle;
+              pendingHighlightStart_ = std::move(hold);
+              LOG_INF("ERS", "Highlight anchor held at spine=%u progress=%.3f word=%d",
+                      hlSpine, hlProgress, hr->startWordIndex);
+              // Show a brief banner so the user knows the start was saved.
+              GUI.drawPopup(renderer, tr(STR_HIGHLIGHT_HELD));
+              delay(900);
+              requestUpdate();
+              return;
+            }
+            // Full range (same-page): save directly.
+            const auto addResult = BOOKMARKS.addHighlight(
+                hlSpine, hlProgress, static_cast<uint16_t>(hr->startWordIndex), hlSpine, hlProgress,
+                static_cast<uint16_t>(hr->endWordIndex), hlPageCount,
+                hlChapterTitle.empty() ? nullptr : hlChapterTitle.c_str(), hr->previewText.c_str());
+            if (addResult == BookmarkStore::AddResult::Added) {
+              bookmarkFeedbackType = BookmarkFeedbackType::Added;
+            } else {
+              bookmarkFeedbackType = BookmarkFeedbackType::LimitReached;
+            }
+            pendingBookmarkFeedback = true;
+            bookmarkFeedbackShowTime = millis();
+            requestUpdate();
+          });
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::CANCEL_HIGHLIGHT: {
+      pendingHighlightStart_.reset();
+      GUI.drawPopup(renderer, tr(STR_HIGHLIGHT_CANCELLED));
+      delay(700);
+      requestUpdate();
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::EXPORT_BOOKMARKS: {
+      // CrumBLE phase 7: dump every bookmark/highlight for the current
+      // book to /highlights/<sanitized basename>.txt, in book order
+      // (by spineIndex + progress). Each entry has a small header
+      // (chapter + position) plus the preview text on its own line.
+      // Empty-preview entries (page-only bookmarks / migrated v3
+      // records) still get a header line so the file is a complete
+      // record of the user's marks.
+      const auto& bms = BOOKMARKS.getBookmarks();
+      if (bms.empty()) {
+        requestUpdate();
+        break;
+      }
+      Storage.mkdir("/highlights");
+
+      // Derive output filename from the book path (basename, sans extension).
+      std::string outName = epub->getPath();
+      const auto lastSlash = outName.find_last_of('/');
+      if (lastSlash != std::string::npos) outName = outName.substr(lastSlash + 1);
+      const auto lastDot = outName.find_last_of('.');
+      if (lastDot != std::string::npos && lastDot > 0) outName = outName.substr(0, lastDot);
+      // Replace any chars that would confuse the FAT filesystem.
+      for (auto& c : outName) {
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
+          c = '_';
+        }
+      }
+      const std::string outPath = "/highlights/" + outName + ".txt";
+
+      // Snapshot + sort by (spineIndex, progress) so the output reads in
+      // book order regardless of the order the user created the marks.
+      std::vector<Bookmark> sorted(bms.begin(), bms.end());
+      std::sort(sorted.begin(), sorted.end(), [](const Bookmark& a, const Bookmark& b) {
+        if (a.spineIndex != b.spineIndex) return a.spineIndex < b.spineIndex;
+        return a.progress < b.progress;
+      });
+
+      FsFile out;
+      if (!Storage.openFileForWrite("ERS", outPath, out)) {
+        LOG_ERR("ERS", "Highlight export: openFileForWrite failed for %s", outPath.c_str());
+        GUI.drawPopup(renderer, tr(STR_EXPORT_FAILED));
+        delay(900);
+        requestUpdate();
+        break;
+      }
+
+      auto writeStr = [&out](const char* s) {
+        if (!s || !*s) return;
+        out.write(reinterpret_cast<const uint8_t*>(s), strlen(s));
+      };
+      auto writeLine = [&writeStr](const char* s) {
+        writeStr(s);
+        writeStr("\n");
+      };
+
+      // File header: book title + author + count.
+      writeStr("# ");
+      writeLine(epub->getTitle().c_str());
+      if (!epub->getAuthor().empty()) {
+        writeStr("# by ");
+        writeLine(epub->getAuthor().c_str());
+      }
+      char countBuf[64];
+      snprintf(countBuf, sizeof(countBuf), "# %u highlight%s\n\n",
+               static_cast<unsigned>(sorted.size()), sorted.size() == 1 ? "" : "s");
+      writeStr(countBuf);
+
+      for (const auto& bm : sorted) {
+        const char* chap = (bm.chapterTitle[0] != '\0') ? bm.chapterTitle : "(unknown chapter)";
+        char header[160];
+        snprintf(header, sizeof(header), "[%s, %d%%]\n", chap,
+                 static_cast<int>(std::lround(bm.progress * 100.0)));
+        writeStr(header);
+        if (bm.preview[0] != '\0') {
+          writeLine(bm.preview);
+        } else {
+          writeLine("(page bookmark)");
+        }
+        writeStr("\n");
+      }
+      out.close();
+      LOG_INF("ERS", "Highlight export: wrote %zu entries to %s", sorted.size(), outPath.c_str());
+
+      // Build a short toast: "Exported to /highlights/<name>.txt"
+      std::string toast = tr(STR_HIGHLIGHTS_EXPORTED);
+      toast += outName + ".txt";
+      GUI.drawPopup(renderer, toast.c_str());
+      delay(1200);
+      requestUpdate();
+      break;
+    }
+    case EpubReaderMenuActivity::MenuAction::FINISH_HIGHLIGHT: {
+      if (!pendingHighlightStart_.has_value()) break;
+      // Same BT teardown + heap pre-flight + page extraction as ADD_HIGHLIGHT.
+      auto& btMgrF = BluetoothHIDManager::getInstance();
+      const bool bleWasOnForFinish = btMgrF.isEnabled();
+      if (bleWasOnForFinish) {
+        LOG_INF("ERS", "FinishHighlight: disabling BT (re-enabling on exit)");
+        btMgrF.disable();
+        LOG_INF("ERS", "FinishHighlight: heap after BT disable: free=%u maxAlloc=%u",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      }
+      constexpr uint32_t FINISH_MIN_MAX_ALLOC = 32000;
+      if (ESP.getMaxAllocHeap() < FINISH_MIN_MAX_ALLOC) {
+        LOG_INF("ERS", "FinishHighlight pre-flight: maxAlloc=%u below %u, raising alert",
+                ESP.getMaxAllocHeap(), FINISH_MIN_MAX_ALLOC);
+        if (bleWasOnForFinish) btMgrF.requestEnableLater();
+        strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_LOOKUP_TITLE),
+                sizeof(APP_STATE.pendingAlertTitle) - 1);
+        strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_LOOKUP_BODY),
+                sizeof(APP_STATE.pendingAlertBody) - 1);
+        APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
+        break;
+      }
+
+      std::unique_ptr<Page> pageForFinish;
+      int orientedMarginTopF = 0;
+      int orientedMarginLeftF = 0;
+      {
+        RenderLock lock(*this);
+        if (!section) {
+          requestUpdate();
+          if (bleWasOnForFinish) btMgrF.requestEnableLater();
+          break;
+        }
+        int orientedMarginRightF = 0;
+        int orientedMarginBottomF = 0;
+        renderer.getOrientedViewableTRBL(&orientedMarginTopF, &orientedMarginRightF, &orientedMarginBottomF,
+                                         &orientedMarginLeftF);
+        orientedMarginTopF += SETTINGS.screenMargin;
+        orientedMarginLeftF += SETTINGS.screenMargin;
+        orientedMarginRightF += SETTINGS.screenMargin;
+        const uint8_t statusBarHeightF = UITheme::getInstance().getStatusBarHeight();
+        if (automaticPageTurnActive &&
+            (statusBarHeightF == 0 || statusBarHeightF == UITheme::getInstance().getProgressBarHeight())) {
+          orientedMarginBottomF += std::max(
+              SETTINGS.screenMargin,
+              static_cast<uint8_t>(statusBarHeightF + UITheme::getInstance().getMetrics().statusBarVerticalMargin));
+        } else {
+          orientedMarginBottomF += std::max(SETTINGS.screenMargin, statusBarHeightF);
+        }
+        pageForFinish = section->loadPageFromSectionFile();
+      }
+      if (!pageForFinish) {
+        if (bleWasOnForFinish) btMgrF.requestEnableLater();
+        break;
+      }
+
+      // Snapshot END-side reader state -- the END page is wherever the
+      // user navigated to between the Hold and now. (May be same spine,
+      // may be a later spine for cross-chapter.)
+      const uint16_t endSpine = static_cast<uint16_t>(currentSpineIndex);
+      const float endProgressVal = static_cast<float>(section->currentPage) / static_cast<float>(section->pageCount);
+
+      startActivityForResult(
+          std::make_unique<DictionaryWordSelectActivity>(
+              renderer, mappedInput, std::move(pageForFinish), SETTINGS.getReaderFontId(), orientedMarginLeftF,
+              orientedMarginTopF, epub->getCachePath(), SETTINGS.orientation, std::string{},
+              DictionaryWordSelectActivity::Mode::HighlightSingleWord),
+          [this, bleWasOnForFinish, endSpine, endProgressVal](const ActivityResult& result) {
+            if (bleWasOnForFinish) BluetoothHIDManager::getInstance().requestEnableLater();
+            if (result.isCancelled || !pendingHighlightStart_.has_value()) {
+              requestUpdate();
+              return;
+            }
+            const auto* hr = std::get_if<HighlightRangeResult>(&result.data);
+            if (!hr || hr->startWordIndex < 0) {
+              requestUpdate();
+              return;
+            }
+            const auto& start = *pendingHighlightStart_;
+            // Build preview as "<start word>... <end word>" so the user
+            // gets a sense of both anchors even across pages/chapters.
+            // The single-page Phase 2 path produces a full joined string;
+            // multi-anchor path can't easily walk intervening text without
+            // loading every page in between, so we approximate.
+            std::string preview = start.startWordText;
+            preview += "... ";
+            preview += hr->previewText;
+            if (preview.size() > BOOKMARK_PREVIEW_MAX - 1) {
+              preview.resize(BOOKMARK_PREVIEW_MAX - 4);
+              preview += "...";
+            }
+            const auto addResult = BOOKMARKS.addHighlight(
+                start.spineIndex, start.progress, start.wordIndex, endSpine, endProgressVal,
+                static_cast<uint16_t>(hr->endWordIndex), start.pageCount,
+                start.chapterTitle.empty() ? nullptr : start.chapterTitle.c_str(), preview.c_str());
+            if (addResult == BookmarkStore::AddResult::Added) {
+              bookmarkFeedbackType = BookmarkFeedbackType::Added;
+            } else {
+              bookmarkFeedbackType = BookmarkFeedbackType::LimitReached;
+            }
+            pendingHighlightStart_.reset();
+            pendingBookmarkFeedback = true;
+            bookmarkFeedbackShowTime = millis();
+            requestUpdate();
+          });
+      break;
+    }
     case EpubReaderMenuActivity::MenuAction::GO_TO_PERCENT: {
       float bookProgress = 0.0f;
       {
@@ -1803,6 +2412,9 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
               pendingSpineProgress = bm.progress;
               pendingPercentJump = true;
               section.reset();
+              // CrumBLE: arm the back-button shortcut so the next Back
+              // returns to the bookmark list instead of exiting Home.
+              returnToBookmarkListOnBack_ = true;
             }
             requestUpdate();
           });

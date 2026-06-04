@@ -4,6 +4,8 @@
 #include <I18n.h>
 #include <Logging.h>
 
+#include "util/CacheWriteRecovery.h"
+
 namespace {
 // Binary layout v1 (11 bytes):
 //   [0]     version (= 1)
@@ -82,7 +84,7 @@ void BookReadingStats::formatDuration(uint32_t seconds, char* buf, size_t len) {
 
 void BookReadingStats::save(const std::string& cachePath) const {
   FsFile f;
-  if (!Storage.openFileForWrite("STATS", cachePath + "/stats.bin", f)) {
+  if (!CacheWriteRecovery::openForWriteOrRecover("STATS", cachePath + "/stats.bin", f)) {
     LOG_ERR("STATS", "Could not write stats.bin");
     return;
   }

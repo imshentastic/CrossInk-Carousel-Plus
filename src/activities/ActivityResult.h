@@ -106,10 +106,23 @@ struct RearrangeCollectionsResult {
   std::vector<std::string> orderedIds;
 };
 
+// CrumBLE: result from DictionaryWordSelectActivity when invoked in
+// HighlightRange mode (the reused word-picker). startWordIndex and
+// endWordIndex are positions within the page's WordInfo vector
+// (already inclusive); previewText is the raw concatenated text of
+// the selected words, joined with single spaces, truncated and
+// ellipsized to BOOKMARK_PREVIEW_MAX-1 chars (the storage cap).
+// isCancelled signals Back-out; the indices are valid otherwise.
+struct HighlightRangeResult {
+  int startWordIndex = -1;
+  int endWordIndex = -1;
+  std::string previewText;
+};
+
 using ResultVariant = std::variant<std::monostate, WifiResult, KeyboardResult, MenuResult, ChapterResult, PercentResult,
                                    IntervalResult, PageResult, SyncResult, NetworkModeResult, FootnoteResult,
                                    BookmarkResult, FileBrowserActionResult, FilePathResult, SortPickerResult,
-                                   ChoicePromptResult, RearrangeCollectionsResult>;
+                                   ChoicePromptResult, RearrangeCollectionsResult, HighlightRangeResult>;
 
 struct ActivityResult {
   bool isCancelled = false;

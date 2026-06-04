@@ -78,6 +78,24 @@ size_t wsUploadSize = 0;
 size_t wsUploadReceived = 0;
 unsigned long wsUploadStartTime = 0;
 bool wsUploadInProgress = false;
+
+// CrumBLE: set by sendBufferGzip when the heap is too low to serve. The
+// FT activity's loop() polls this via consumeFtRestartRequest() and
+// triggers silentRestartToFileTransfer once the request handler has
+// returned (so the response physically reaches the browser before the
+// device reboots).
+bool g_pendingFtRestart = false;
+}  // namespace anon
+
+bool consumeFtRestartRequest() {
+  if (!g_pendingFtRestart) return false;
+  g_pendingFtRestart = false;
+  return true;
+}
+
+bool peekFtRestartRequest() { return g_pendingFtRestart; }
+
+namespace {
 uint8_t wsUploadClientNum = 255;  // 255 = no active upload client
 size_t wsLastProgressSent = 0;
 String wsLastCompleteName;
@@ -407,17 +425,82 @@ static void applyClientSendTimeout(WebServer* server) {
   server->client().setSocketOption(SO_SNDTIMEO, reinterpret_cast<char*>(&tv), sizeof(tv));
 }
 
+// CrumBLE: shared low-heap guard. Called at the top of every WebServer
+// handler that allocates a non-trivial buffer or builds the settings list.
+// If the heap is below the FT freeze threshold, send an empty page with a
+// meta-refresh header and schedule a silent restart back into FT -- same
+// recovery path as sendBufferGzip. Returns true when the handler should
+// bail (response already sent + restart queued); false to continue.
+static bool guardLowHeapOrAutoRestart(WebServer* server, const char* tag) {
+  // CrumBLE: apply the 5 s send timeout BEFORE doing anything else so the
+  // 503 short-circuit response (and any later send paths) can't wedge
+  // forever on a browser that closed the socket mid-fetch.
+  applyClientSendTimeout(server);
+  const uint32_t preFree = ESP.getFreeHeap();
+  const uint32_t preMax = ESP.getMaxAllocHeap();
+  // CrumBLE: 22 KB free / 12 KB maxAlloc was the working floor pre-cache.
+  // The cache experiment was reverted; back to the original numbers so
+  // page serves and API handlers have the headroom they expect.
+  if (preFree >= 22u * 1024u && preMax >= 12u * 1024u) {
+    LOG_INF("WEB", "guard %s ok: pre free=%u maxAlloc=%u", tag, preFree, preMax);
+    return false;
+  }
+  LOG_ERR("WEB", "guard %s low-heap (free=%u maxAlloc=%u): scheduling silentRestart to FT", tag, preFree, preMax);
+  server->sendHeader("Refresh", "8");
+  // Some browsers will not honour Refresh on a JSON response. Send an
+  // application/json body that the page-side fetch can detect (status 503
+  // + an empty array fallback) AND meta-refresh-equivalent via the header
+  // so a subsequent navigation still recovers.
+  server->send(503, "application/json", "[]");
+  g_pendingFtRestart = true;
+  return true;
+}
+
 // CrumBLE: every page/asset serve gets the same stall protection, and we log
 // heap around the send so a crater can be pinned to a specific response.
 static void sendBufferGzip(WebServer* server, const char* mime, const char* data,
                            size_t len, const char* tag) {
   applyClientSendTimeout(server);
-  LOG_INF("WEB", "serve %s: %u B, pre free=%d maxAlloc=%d", tag, (unsigned)len,
-          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  // CrumBLE: defensive guard against the "device freezes when phone hits
+  // /files" pattern. 22 KB free is the floor that consistently lets the
+  // FilesPage's ~12 KB post-serve dip avoid wedging subsequent /api/*.
+  const uint32_t preFree = ESP.getFreeHeap();
+  const uint32_t preMax = ESP.getMaxAllocHeap();
+  LOG_INF("WEB", "serve %s: %u B, pre free=%u maxAlloc=%u", tag, (unsigned)len, preFree, preMax);
+  if (preFree < 22u * 1024u) {
+    // CrumBLE: the only real recovery on this hardware is what the user
+    // already does manually -- exit FT on the device so its onExit
+    // silentRestarts, then re-enter. We automate that here: schedule a
+    // silentRestart with target=FILE_TRANSFER so the device comes back
+    // directly into the FT activity (no Home tour), and meanwhile send
+    // the phone a friendly auto-refreshing "reconnecting" page. By the
+    // time the refresh fires (8 s), the device has rebooted, reconnected
+    // to WiFi, and the FT serve handlers are up again with a fresh heap.
+    //
+    // 8 s is the budget for: silentRestart (~50 ms) + ESP.restart()
+    // (~1 s) + setup() through WiFi connect (~3-5 s) + mDNS rebind. If
+    // the device is slower the browser just refreshes again -- worst
+    // case we loop the friendly page a few times instead of failing.
+    LOG_ERR("WEB", "serve %s low-heap: scheduling silentRestart to FT", tag);
+    // CrumBLE: feedback minimised. Empty body + a meta-refresh header
+    // -- the browser shows nothing (or whatever was rendered last) and
+    // silently reloads after ~8 s, by which time the device is back
+    // with a fresh heap and serves the real FilesPage. The tab title
+    // stays as the user expects ("File Transfer"). No "Reconnecting..."
+    // banner, no spinner, no instructions to wait -- just a brief
+    // "slow load" moment from the user's perspective.
+    server->sendHeader("Refresh", "8");
+    server->send(200, "text/html",
+                 "<!doctype html><html><head><title>File Transfer</title></head><body></body></html>");
+    // Send completes before we set the flag so the response actually
+    // reaches the browser before the device reboots.
+    g_pendingFtRestart = true;
+    return;
+  }
   server->sendHeader("Content-Encoding", "gzip");
   server->send_P(200, mime, data, len);
-  LOG_INF("WEB", "serve %s done: post free=%d maxAlloc=%d", tag,
-          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  LOG_INF("WEB", "serve %s done: post free=%d maxAlloc=%d", tag, ESP.getFreeHeap(),
+          ESP.getMaxAllocHeap());
 }
 
 static void sendHtmlContent(WebServer* server, const char* data, size_t len) {
@@ -468,7 +551,10 @@ void CrossPointWebServer::handleStatus() const {
   const String ipAddr = apMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
 
   JsonDocument doc;
-  doc["version"] = CROSSPOINT_VERSION;
+  // CrumBLE: "version" is the CrumBLE marketing version (4.0, 4.1, ...)
+  // shown on HomePage's Device Status. Upstream CrossInk's sync point
+  // ships as a separate field for technical context.
+  doc["version"] = "CrumBLE " CRUMBLE_VERSION " (CrossInk " CROSSINK_VERSION ")";
   doc["ip"] = ipAddr;
   doc["mode"] = apMode ? "AP" : "STA";
   doc["rssi"] = apMode ? 0 : WiFi.RSSI();
@@ -546,6 +632,7 @@ void CrossPointWebServer::handleFileList() const {
 }
 
 void CrossPointWebServer::handleFileListData() const {
+  if (guardLowHeapOrAutoRestart(server.get(), "api-files")) return;
   // Get current path from query string (default to root)
   String currentPath = "/";
   if (server->hasArg("path")) {
@@ -558,42 +645,68 @@ void CrossPointWebServer::handleFileListData() const {
   }
 
   applyClientSendTimeout(server.get());
-  server->setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server->send(200, "application/json", "");
-  server->sendContent("[");
+  // CrumBLE freeze investigation: chunked sendContent streaming hangs on
+  // this device under any nontrivial heap pressure (same failure mode as
+  // /api/settings before we hoisted that into a startup cache). Build
+  // the full file-list JSON into a std::string first, then single send.
+  // Caps response at ~12 KB; directories with hundreds of entries get
+  // truncated rather than wedging the device.
+  constexpr size_t kFilesJsonBudget = 12 * 1024;
+  std::string body;
+  body.reserve(4 * 1024);
+  body += '[';
+
   char output[512];
   constexpr size_t outputSize = sizeof(output);
   bool seenFirst = false;
+  bool truncated = false;
+  size_t emittedRows = 0;
   JsonDocument doc;
 
-  scanFiles(currentPath.c_str(), [this, &output, &doc, seenFirst](const FileInfo& info) mutable {
-    // Stop streaming if the client/link dropped, so we don't spin sending to a
-    // dead socket (the send timeout above also bounds any single blocked write).
-    if (!server->client().connected()) return;
+  scanFiles(currentPath.c_str(), [&](const FileInfo& info) {
+    if (truncated) return;
     doc.clear();
     doc["name"] = info.name;
     doc["size"] = info.size;
     doc["isDirectory"] = info.isDirectory;
     doc["isEpub"] = info.isEpub;
+    if (info.isEpub && !info.isDirectory) {
+      std::string fullPath = currentPath.c_str();
+      if (fullPath.empty() || fullPath.back() != '/') fullPath += '/';
+      fullPath += info.name.c_str();
+      const std::string manifestPath =
+          Epub::cachePathForFilePath(fullPath, "/.crosspoint") + "/prebake-manifest.json";
+      doc["prebaked"] = Storage.exists(manifestPath.c_str());
+    } else {
+      doc["prebaked"] = false;
+    }
 
     const size_t written = serializeJson(doc, output, outputSize);
-    if (written >= outputSize) {
-      // JSON output truncated; skip this entry to avoid sending malformed JSON
-      LOG_DBG("WEB", "Skipping file entry with oversized JSON for name: %s", info.name.c_str());
+    if (written == 0 || written >= outputSize) return;
+    if (body.size() + 2 + written > kFilesJsonBudget) {
+      truncated = true;
       return;
     }
-
-    if (seenFirst) {
-      server->sendContent(",");
-    } else {
-      seenFirst = true;
-    }
-    server->sendContent(output);
+    if (seenFirst) body += ',';
+    else seenFirst = true;
+    body.append(output, written);
+    ++emittedRows;
   });
-  server->sendContent("]");
-  // End of streamed response, empty chunk to signal client
-  server->sendContent("");
-  LOG_DBG("WEB", "Served file listing page for path: %s", currentPath.c_str());
+  body += ']';
+
+  if (truncated) {
+    LOG_ERR("WEB", "api-files: truncated to %u rows (%u B) for path=%s (budget %u B)",
+            (unsigned)emittedRows, (unsigned)body.size(), currentPath.c_str(),
+            (unsigned)kFilesJsonBudget);
+  }
+  LOG_INF("WEB", "api-files: sending %u B rows=%u (free=%u maxAlloc=%u) path=%s",
+          (unsigned)body.size(), (unsigned)emittedRows, ESP.getFreeHeap(),
+          ESP.getMaxAllocHeap(), currentPath.c_str());
+  server->setContentLength(body.size());
+  server->send(200, "application/json", "");
+  server->sendContent(body.c_str());
+  LOG_INF("WEB", "api-files: done (post free=%u maxAlloc=%u)",
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 }
 
 void CrossPointWebServer::handleDownload() const {
@@ -1179,35 +1292,40 @@ void CrossPointWebServer::handleSettingsPage() const {
   LOG_DBG("WEB", "Served settings page");
 }
 
-void CrossPointWebServer::handleGetSettings() const {
-  // Pass the SD font registry so the fontFamily setting's enumStringValues
-  // includes SD-resident families — otherwise the web API only exposes the
-  // three built-in fonts.
-  const auto& settings = getSettingsList(&sdFontSystem.registry());
+void CrossPointWebServer::primeSettingsCache() {
+  // CrumBLE: build /api/settings JSON when called from a healthy-heap
+  // context (FT activity onEnter at ~106 KB). This is the ONLY place
+  // we allocate the ~8 KB body + the ~10 KB getSettingsList vector +
+  // the JsonDocument internal pool growth. handleGetSettings then just
+  // sends the cached string -- one server->send, no mid-request alloc.
+  applyClientSendTimeout(server.get());  // harmless no-op here; helps caller paths
+  const uint32_t preFree = ESP.getFreeHeap();
+  const uint32_t preMax = ESP.getMaxAllocHeap();
 
-  server->setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server->send(200, "application/json", "");
-  server->sendContent("[");
+  sdFontSystem.refreshIfDirty();
+  const auto settings = getSettingsList(&sdFontSystem.registry());
+
+  std::string body;
+  body.reserve(10 * 1024);
+  body += '[';
 
   char output[512];
   constexpr size_t outputSize = sizeof(output);
-  bool seenFirst = false;
   JsonDocument doc;
-
+  bool seenFirst = false;
+  int iterCount = 0;
   for (const auto& s : settings) {
-    if (!s.key) continue;  // Skip ACTION-only entries
+    if ((iterCount++ & 0x0F) == 0) esp_task_wdt_reset();
+    if (!s.key) continue;
 
     doc.clear();
     doc["key"] = s.key;
     doc["name"] = I18N.get(s.nameId);
     doc["category"] = I18N.get(s.category);
-
     switch (s.type) {
       case SettingType::TOGGLE: {
         doc["type"] = "toggle";
-        if (s.valuePtr) {
-          doc["value"] = static_cast<int>(SETTINGS.*(s.valuePtr));
-        }
+        if (s.valuePtr) doc["value"] = static_cast<int>(SETTINGS.*(s.valuePtr));
         break;
       }
       case SettingType::ENUM: {
@@ -1219,21 +1337,15 @@ void CrossPointWebServer::handleGetSettings() const {
         }
         JsonArray options = doc["options"].to<JsonArray>();
         if (!s.enumStringValues.empty()) {
-          for (const auto& opt : s.enumStringValues) {
-            options.add(opt);
-          }
+          for (const auto& opt : s.enumStringValues) options.add(opt);
         } else {
-          for (const auto& opt : s.enumValues) {
-            options.add(I18N.get(opt));
-          }
+          for (const auto& opt : s.enumValues) options.add(I18N.get(opt));
         }
         break;
       }
       case SettingType::VALUE: {
         doc["type"] = "value";
-        if (s.valuePtr) {
-          doc["value"] = static_cast<int>(SETTINGS.*(s.valuePtr));
-        }
+        if (s.valuePtr) doc["value"] = static_cast<int>(SETTINGS.*(s.valuePtr));
         doc["min"] = s.valueRange.min;
         doc["max"] = s.valueRange.max;
         doc["step"] = s.valueRange.step;
@@ -1253,23 +1365,33 @@ void CrossPointWebServer::handleGetSettings() const {
     }
 
     const size_t written = serializeJson(doc, output, outputSize);
-    if (written >= outputSize) {
-      LOG_DBG("WEB", "Skipping oversized setting JSON for: %s", s.key);
-      continue;
-    }
-
-    if (seenFirst) {
-      server->sendContent(",");
-    } else {
-      seenFirst = true;
-    }
-    server->sendContent(output);
+    if (written >= outputSize) continue;
+    if (seenFirst) body += ',';
+    else seenFirst = true;
+    body.append(output, written);
   }
+  body += ']';
 
-  server->sendContent("]");
-  server->sendContent("");
-  LOG_DBG("WEB", "Served settings API");
+  cachedSettingsJson_.swap(body);
+  LOG_INF("WEB", "primeSettingsCache: built %u B (pre free=%u maxAlloc=%u; post free=%u maxAlloc=%u)",
+          (unsigned)cachedSettingsJson_.size(), preFree, preMax, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 }
+
+void CrossPointWebServer::handleGetSettings() const {
+  // CrumBLE: /api/settings is disabled in this build. Every implementation
+  // we tried (chunked streaming, build-to-buffer, two-pass with explicit
+  // Content-Length, cache-at-FT-entry) tripped some combination of the
+  // ESP32-C3's lwIP send-timeout being unreliable, chunked-encoding
+  // overhead, and the heap-pressure cliff once the cache or build
+  // allocation was held. Returning 503 here makes the SettingsPage show
+  // its error state instead of spinning forever; wifi/opds/file APIs
+  // and the device-side Settings UI are unaffected.
+  applyClientSendTimeout(server.get());
+  LOG_INF("WEB", "api-settings: 503 (device-side Settings is the canonical path in 4.0)");
+  server->send(503, "application/json",
+               "{\"error\":\"web settings unavailable in 4.0; use device-side Settings\"}");
+}
+
 
 void CrossPointWebServer::handlePostSettings() {
   if (!server->hasArg("plain")) {
@@ -1343,6 +1465,13 @@ void CrossPointWebServer::handlePostSettings() {
   }
 
   SETTINGS.saveToFile();
+
+  // CrumBLE: rebuild the /api/settings cache so the next GET reflects
+  // the change. Done here while the POST handler context is still live
+  // -- the heap is at whatever level the POST request found it at, but
+  // building a cache on that same heap budget is no worse than the old
+  // path that built the JSON on every GET.
+  primeSettingsCache();
 
   LOG_DBG("WEB", "Applied %d setting(s)", applied);
   server->send(200, "text/plain", String("Applied ") + String(applied) + " setting(s)");
@@ -1506,12 +1635,13 @@ void CrossPointWebServer::handleSaveReaderSettings() const {
 // ---- OPDS Server API ----
 
 void CrossPointWebServer::handleGetOpdsServers() const {
+  if (guardLowHeapOrAutoRestart(server.get(), "api-opds")) return;
   const auto& servers = OPDS_STORE.getServers();
 
-  // Stream JSON array incrementally to avoid allocating the full response in memory
-  server->setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server->send(200, "application/json", "");
-  server->sendContent("[");
+  // CrumBLE: build-then-send-once (see handleGetSettings for rationale).
+  String body;
+  body.reserve(1024);
+  body += '[';
 
   char output[512];
   constexpr size_t outputSize = sizeof(output);
@@ -1529,12 +1659,12 @@ void CrossPointWebServer::handleGetOpdsServers() const {
     const size_t written = serializeJson(doc, output, outputSize);
     if (written >= outputSize) continue;
 
-    if (i > 0) server->sendContent(",");
-    server->sendContent(output);
+    if (i > 0) body += ',';
+    body += output;
   }
 
-  server->sendContent("]");
-  server->sendContent("");
+  body += ']';
+  server->send(200, "application/json", body);
   LOG_DBG("WEB", "Served OPDS servers API (%zu servers)", servers.size());
 }
 
@@ -1622,13 +1752,14 @@ void CrossPointWebServer::handleDeleteOpdsServer() {
 // ---- Wi-Fi Credentials API ----
 
 void CrossPointWebServer::handleGetWifiNetworks() const {
+  if (guardLowHeapOrAutoRestart(server.get(), "api-wifi")) return;
   const auto& credentials = WIFI_STORE.getCredentials();
   const std::string& lastConnectedSsid = WIFI_STORE.getLastConnectedSsid();
 
-  // Stream JSON array incrementally to avoid allocating the full response in memory
-  server->setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server->send(200, "application/json", "");
-  server->sendContent("[");
+  // CrumBLE: build-then-send-once (see handleGetSettings for rationale).
+  String body;
+  body.reserve(1024);
+  body += '[';
 
   char output[320];
   constexpr size_t outputSize = sizeof(output);
@@ -1645,12 +1776,12 @@ void CrossPointWebServer::handleGetWifiNetworks() const {
     const size_t written = serializeJson(doc, output, outputSize);
     if (written >= outputSize) continue;
 
-    if (i > 0) server->sendContent(",");
-    server->sendContent(output);
+    if (i > 0) body += ',';
+    body += output;
   }
 
-  server->sendContent("]");
-  server->sendContent("");
+  body += ']';
+  server->send(200, "application/json", body);
   LOG_DBG("WEB", "Served Wi-Fi credentials API (%zu network(s))", credentials.size());
 }
 

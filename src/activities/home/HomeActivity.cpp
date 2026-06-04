@@ -1493,6 +1493,7 @@ void HomeActivity::showHomeBookActionMenu(const std::string& bookPath) {
           case FileBrowserAction::CreateNewCollectionFromHeader:
           case FileBrowserAction::AddBooksToActiveCollection:
           case FileBrowserAction::MakeCollectionFromFolder:
+          case FileBrowserAction::ReorderBooksInCollection:
             // Not exposed in the home book menu — sleep-image / shelf-
             // header / file-browser-folder-only actions.
             return;
@@ -1583,6 +1584,13 @@ void HomeActivity::showShelfHeaderActionMenu() {
   }
   if (isUserCollection) {
     items.push_back({FileBrowserAction::RenameCollection, StrId::STR_RENAME_COLLECTION});
+  }
+  // CrumBLE: Reorder books only makes sense for user collections with 2+
+  // books. Virtuals are derived (their order is intrinsic to whatever
+  // source the resolver pulls from). 1-book collections have nothing to
+  // reorder; hiding the item there avoids the 1-row picker.
+  if (isUserCollection && CollectionsStore::getInstance().countBooksInCollection(active->id) >= 2) {
+    items.push_back({FileBrowserAction::ReorderBooksInCollection, StrId::STR_REORDER_BOOKS});
   }
   if (isUserCollection && !isFavorites) {
     items.push_back({FileBrowserAction::DeleteCollection, StrId::STR_DELETE_COLLECTION});
@@ -1829,6 +1837,51 @@ void HomeActivity::showShelfHeaderActionMenu() {
                   // off and back. Force a repaint by invalidating the
                   // snapshot.
                   shelfSnapshotValid = false;
+                }
+                requestUpdate();
+              });
+        } else if (action == FileBrowserAction::ReorderBooksInCollection) {
+          // CrumBLE: open RearrangeCollectionsActivity (generic over Items)
+          // over the active collection's books. User taps Confirm in the
+          // desired order; on finish we replace bookPaths in-place AND
+          // force sortMode to Manual via reorderBooksInCollection.
+          const Collection* active = CollectionsStore::getInstance().getActiveCollection();
+          if (active == nullptr || active->isVirtual) return;
+          const std::string activeId = active->id;
+          // Use the resolved view (honors series collapse / live virtuals if
+          // somehow virtual slips through), not the raw stored bookPaths.
+          const auto paths = CollectionsStore::getInstance().resolveBookPaths(activeId);
+          if (paths.size() < 2) {
+            requestUpdate();
+            return;
+          }
+          std::vector<RearrangeCollectionsActivity::Item> snapshot;
+          snapshot.reserve(paths.size());
+          for (const auto& p : paths) {
+            // Display label: filename without extension. Title-from-metadata
+            // would be nicer but would require a per-book SD read each open;
+            // the basename fallback is what the carousel/grid already uses
+            // when title isn't cached, so the labels here match what the
+            // user sees elsewhere for the same books.
+            std::string display = p;
+            const size_t lastSlash = display.find_last_of('/');
+            if (lastSlash != std::string::npos) display = display.substr(lastSlash + 1);
+            const size_t lastDot = display.find_last_of('.');
+            if (lastDot != std::string::npos && lastDot > 0) display = display.substr(0, lastDot);
+            snapshot.push_back({p, display});
+          }
+          startActivityForResult(
+              std::make_unique<RearrangeCollectionsActivity>(renderer, mappedInput, std::move(snapshot)),
+              [this, activeId](const ActivityResult& res) {
+                if (res.isCancelled) return;
+                const auto& rr = std::get<RearrangeCollectionsResult>(res.data);
+                if (rr.orderedIds.empty()) return;
+                if (CollectionsStore::getInstance().reorderBooksInCollection(activeId, rr.orderedIds)) {
+                  drawHomeToast(renderer, tr(STR_BOOKS_REORDERED));
+                  delay(800);
+                  invalidateShelfPathsCache();
+                  shelfSnapshotValid = false;
+                  shelfCoversLoaded = false;
                 }
                 requestUpdate();
               });

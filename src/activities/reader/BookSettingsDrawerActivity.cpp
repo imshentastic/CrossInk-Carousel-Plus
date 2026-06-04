@@ -13,6 +13,7 @@
 #include "CrossPointSettings.h"
 #include "EpubReaderActivity.h"  // prewarmReaderTextBuffer
 #include "MappedInputManager.h"
+#include "SdCardFontSystem.h"  // sdFontSystem for SD-aware FONT_FAMILY / FONT_SIZE rows
 #include "SettingsList.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -29,8 +30,31 @@ std::string valueTextForSetting(const SettingInfo& info) {
   if (info.type == SettingType::TOGGLE && info.valuePtr != nullptr) {
     return SETTINGS.*(info.valuePtr) ? I18N.get(StrId::STR_STATE_ON) : I18N.get(StrId::STR_STATE_OFF);
   }
-  if (info.type == SettingType::ENUM && info.valuePtr != nullptr) {
-    const uint8_t cur = SETTINGS.*(info.valuePtr);
+  if (info.type == SettingType::ENUM) {
+    // CrumBLE: resolve the current option index. valueGetter wins -- it's
+    // what FONT_FAMILY uses to combine built-in entries with SD card font
+    // names (see buildFontFamilySetting in SettingsList.h). Fall back to
+    // valuePtr when no getter is set (the common built-in path). Without
+    // this branch, FONT_FAMILY always falls through to "" and the drawer
+    // shows a blank value.
+    uint8_t cur = 0;
+    bool haveCur = false;
+    if (info.valueGetter) {
+      cur = info.valueGetter();
+      haveCur = true;
+    } else if (info.valuePtr != nullptr) {
+      cur = SETTINGS.*(info.valuePtr);
+      haveCur = true;
+    }
+    if (!haveCur) return std::string{};
+    // Prefer enumStringValues over enumValues. SD-aware settings build
+    // the runtime string list (built-in label + SD family names for
+    // FONT_FAMILY, point-size labels for SD FONT_SIZE) and leave the
+    // StrId enumValues empty. Built-in-only settings use enumValues.
+    if (!info.enumStringValues.empty()) {
+      if (cur < info.enumStringValues.size()) return info.enumStringValues[cur];
+      return std::string{};
+    }
     if (cur < info.enumValues.size()) {
       return I18N.get(info.enumValues[cur]);
     }
@@ -43,14 +67,30 @@ std::string valueTextForSetting(const SettingInfo& info) {
 }
 
 void applyDeltaToSetting(const SettingInfo& info, int delta) {
+  // CrumBLE: handle valueGetter/valueSetter (used by SD-aware settings like
+  // FONT_FAMILY) BEFORE the valuePtr-only paths. Without this, left/right
+  // on the FONT_FAMILY row would silently no-op when an SD font was
+  // installed and the user expected to cycle through built-in + SD names.
+  if (info.type == SettingType::ENUM && info.valueGetter && info.valueSetter) {
+    int count = static_cast<int>(info.enumStringValues.size());
+    if (count == 0) count = static_cast<int>(info.enumValues.size());
+    if (count <= 0) return;
+    int next = static_cast<int>(info.valueGetter()) + delta;
+    next = ((next % count) + count) % count;
+    info.valueSetter(static_cast<uint8_t>(next));
+    return;
+  }
   if (info.valuePtr == nullptr) return;
   if (info.type == SettingType::TOGGLE) {
     SETTINGS.*(info.valuePtr) = (SETTINGS.*(info.valuePtr) == 0) ? 1 : 0;
     return;
   }
   if (info.type == SettingType::ENUM) {
-    if (info.enumValues.empty()) return;
-    const int count = static_cast<int>(info.enumValues.size());
+    // Prefer enumStringValues count when present (SD-aware FONT_SIZE list
+    // has its sizes there, not in enumValues).
+    int count = static_cast<int>(info.enumStringValues.size());
+    if (count == 0) count = static_cast<int>(info.enumValues.size());
+    if (count <= 0) return;
     int next = static_cast<int>(SETTINGS.*(info.valuePtr)) + delta;
     next = ((next % count) + count) % count;
     SETTINGS.*(info.valuePtr) = static_cast<uint8_t>(next);
@@ -132,7 +172,28 @@ void BookSettingsDrawerActivity::onExit() {
 void BookSettingsDrawerActivity::buildItems() {
   items.clear();
 
-  // 1) Pull every Reader-category non-Action setting, in declaration order.
+  // CrumBLE: drawer item order was rearranged so the Bluetooth quick action
+  // sits at the TOP of the drawer rather than appended after the Reader
+  // settings. The BT row is the most common drawer action mid-read (drop
+  // BLE to free heap for a chapter rebuild, then reconnect) and putting it
+  // first reduces the number of d-pad steps to reach it. Reader settings
+  // follow in their original declaration order.
+
+  // 1) Bluetooth action row(s). Behavior depends on current link state:
+  //
+  //   - Not linked: show TWO connect rows -- "BT Quick Connect" (full images)
+  //     and "BT No Images Quick Connect" (suppress image decode to keep a
+  //     stable link on image-heavy books). Both enable BLE and connect to the
+  //     bonded remote.
+  //
+  //   - Linked: show ONE disconnect row. Label reflects which mode is active:
+  //     "BT No Images Disconnect" if suppressImages is armed, "BT Quick
+  //     Disconnect" otherwise. Pressing it disables BLE (and clears image
+  //     suppression on the way out). Avoids the confusing UX of offering a
+  //     "Quick Connect" button while a remote is already connected.
+  buildBluetoothItems();
+
+  // 2) Pull every Reader-category non-Action setting, in declaration order.
   //
   // PREFERRED PATH: when EpubReaderActivity built a settings cache at book
   // open (heap healthy, BLE not yet eating 58 KB), we iterate that vector
@@ -162,7 +223,15 @@ void BookSettingsDrawerActivity::buildItems() {
   } else {
     const auto heap = MemoryBudget::snapshot();
     if (MemoryBudget::hasHeap(heap, 28u * 1024u, 14u * 1024u)) {
-      settingsList_ = getSettingsList();
+      // CrumBLE: pass the SD font registry so FONT_FAMILY's enumStringValues
+      // includes installed SD families AND FONT_SIZE uses the SD font's
+      // size list when one is active. Without the registry, both rows
+      // render blank when the user has an SD font selected: FONT_FAMILY
+      // because its valueGetter looks for the active name in an empty
+      // sdFamilyNames capture, and FONT_SIZE because the built-in size
+      // enum has fewer entries than the SD font's index.
+      sdFontSystem.refreshIfDirty();
+      settingsList_ = getSettingsList(&sdFontSystem.registry());
       for (size_t i = 0; i < settingsList_.size(); ++i) {
         const auto& info = settingsList_[i];
         if (info.category != StrId::STR_CAT_READER) continue;
@@ -178,98 +247,93 @@ void BookSettingsDrawerActivity::buildItems() {
     }
   }
 
-  // 2) Bluetooth action row(s). Behavior depends on current link state:
-  //
-  //   - Not linked: show TWO connect rows -- "BT Quick Connect" (full images)
-  //     and "BT No Images Quick Connect" (suppress image decode to keep a
-  //     stable link on image-heavy books). Both enable BLE and connect to the
-  //     bonded remote.
-  //
-  //   - Linked: show ONE disconnect row. Label reflects which mode is active:
-  //     "BT No Images Disconnect" if suppressImages is armed, "BT Quick
-  //     Disconnect" otherwise. Pressing it disables BLE (and clears image
-  //     suppression on the way out). Avoids the confusing UX of offering a
-  //     "Quick Connect" button while a remote is already connected.
+  // BT rows now live at the TOP of the drawer (built in step 1 above via
+  // buildBluetoothItems()). The trailing reader-settings appender used to
+  // run here; nothing else to do.
+}
+
+void BookSettingsDrawerActivity::buildBluetoothItems() {
+  auto& btMgr = BluetoothHIDManager::getInstance();
+  const bool stackUp = btMgr.isEnabled();
+  const bool linked = stackUp && SETTINGS.bleBondedDeviceAddr[0] != '\0' &&
+                      btMgr.isConnected(SETTINGS.bleBondedDeviceAddr);
+
+  if (linked) {
+    Item disc;
+    disc.nameId = StrId::STR_BT_QUICK_CONNECT;  // base id for theming; customName overrides label
+    disc.isAction = true;
+    disc.customName = renderer.suppressImages() ? std::string("BT No Images Disconnect")
+                                                : std::string("BT Quick Disconnect");
+    disc.activate = [this]() {
+      // Hardcoded popup -- sub-second op, not worth a 25-translation round-trip.
+      GUI.drawPopup(renderer, "Disconnecting Bluetooth...");
+      renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+      BluetoothHIDManager::getInstance().disable();
+      // disable() doesn't clear the renderer's image-suppression flag (that's
+      // owned by the renderer, not the BT manager). Clear it here so the next
+      // render restores images without waiting for the loop()'s link-teardown
+      // check to fire.
+      renderer.setSuppressImages(false);
+      MenuResult result;
+      result.settingsChanged = settingsChanged;
+      setResult(ActivityResult{result});
+      finish();
+    };
+    items.push_back(std::move(disc));
+    return;
+  }
+
+  // Not linked: surface BOTH connect rows (regular + no-images variant).
+
+  // Bluetooth quick-action, no-images variant. Sets MenuResult flags so the
+  // reader can sequence: (1) drain any pending re-layout first (settings just
+  // toggled), (2) run the .pxc manifest-mismatch check and prompt if needed,
+  // (3) finally enable BLE and connect. Doing this synchronously here used to
+  // race the NimBLE handshake against a heap-heavy section rebuild and brick
+  // the connect.
   {
-    auto& btMgr = BluetoothHIDManager::getInstance();
-    const bool stackUp = btMgr.isEnabled();
-    const bool linked = stackUp && SETTINGS.bleBondedDeviceAddr[0] != '\0' &&
-                        btMgr.isConnected(SETTINGS.bleBondedDeviceAddr);
-
-    if (linked) {
-      Item disc;
-      disc.nameId = StrId::STR_BT_QUICK_CONNECT;  // base id for theming; customName overrides label
-      disc.isAction = true;
-      disc.customName = renderer.suppressImages() ? std::string("BT No Images Disconnect")
-                                                  : std::string("BT Quick Disconnect");
-      disc.activate = [this]() {
-        // Hardcoded popup -- sub-second op, not worth a 25-translation round-trip.
-        GUI.drawPopup(renderer, "Disconnecting Bluetooth...");
-        renderer.displayBuffer(HalDisplay::FAST_REFRESH);
-        BluetoothHIDManager::getInstance().disable();
-        // disable() doesn't clear the renderer's image-suppression flag (that's
-        // owned by the renderer, not the BT manager). Clear it here so the next
-        // render restores images without waiting for the loop()'s link-teardown
-        // check to fire.
-        renderer.setSuppressImages(false);
-        MenuResult result;
-        result.settingsChanged = settingsChanged;
-        setResult(ActivityResult{result});
-        finish();
-      };
-      items.push_back(std::move(disc));
-    } else {
-      // 2a) Bluetooth quick-action, no-images variant. Sets MenuResult flags
-      // so the reader can sequence: (1) drain any pending re-layout first
-      // (settings just toggled), (2) run the .pxc manifest-mismatch check and
-      // prompt if needed, (3) finally enable BLE and connect. Doing this
-      // synchronously here used to race the NimBLE handshake against a
-      // heap-heavy section rebuild and brick the connect.
-      {
-        Item btNoImg;
-        btNoImg.nameId = StrId::STR_BT_NO_IMAGES_QUICK_CONNECT;
-        btNoImg.isAction = true;
-        btNoImg.activate = [this]() {
-          const bool hasBonded = SETTINGS.bleBondedDeviceAddr[0] != '\0';
-          MenuResult result;
-          result.settingsChanged = settingsChanged;
-          if (!hasBonded) {
-            // No bonded remote -- bounce to the pairing UI as before. Don't
-            // bother flagging connect-after-relayout; the user has to pair
-            // first and the BT UI handles its own connect flow.
-            result.requestBluetoothFlow = true;
-          } else {
-            result.bleConnectRequested = true;
-            result.bleConnectNoImages = true;
-          }
-          setResult(ActivityResult{result});
-          finish();
-        };
-        items.push_back(std::move(btNoImg));
+    Item btNoImg;
+    btNoImg.nameId = StrId::STR_BT_NO_IMAGES_QUICK_CONNECT;
+    btNoImg.isAction = true;
+    btNoImg.activate = [this]() {
+      const bool hasBonded = SETTINGS.bleBondedDeviceAddr[0] != '\0';
+      MenuResult result;
+      result.settingsChanged = settingsChanged;
+      if (!hasBonded) {
+        // No bonded remote -- bounce to the pairing UI as before. Don't
+        // bother flagging connect-after-relayout; the user has to pair
+        // first and the BT UI handles its own connect flow.
+        result.requestBluetoothFlow = true;
+      } else {
+        result.bleConnectRequested = true;
+        result.bleConnectNoImages = true;
       }
+      setResult(ActivityResult{result});
+      finish();
+    };
+    items.push_back(std::move(btNoImg));
+  }
 
-      // 2b) Bluetooth quick-action. Same deferred flow as the No Images
-      // variant above, minus image suppression.
-      {
-        Item bt;
-        bt.nameId = StrId::STR_BT_QUICK_CONNECT;
-        bt.isAction = true;
-        bt.activate = [this]() {
-          const bool hasBonded = SETTINGS.bleBondedDeviceAddr[0] != '\0';
-          MenuResult result;
-          result.settingsChanged = settingsChanged;
-          if (!hasBonded) {
-            result.requestBluetoothFlow = true;
-          } else {
-            result.bleConnectRequested = true;
-            result.bleConnectNoImages = false;
-          }
-          setResult(ActivityResult{result});
-          finish();
-        };
-        items.push_back(std::move(bt));
+  // Bluetooth quick-action. Same deferred flow as the No Images variant
+  // above, minus image suppression.
+  {
+    Item bt;
+    bt.nameId = StrId::STR_BT_QUICK_CONNECT;
+    bt.isAction = true;
+    bt.activate = [this]() {
+      const bool hasBonded = SETTINGS.bleBondedDeviceAddr[0] != '\0';
+      MenuResult result;
+      result.settingsChanged = settingsChanged;
+      if (!hasBonded) {
+        result.requestBluetoothFlow = true;
+      } else {
+        result.bleConnectRequested = true;
+        result.bleConnectNoImages = false;
       }
-    }
+      setResult(ActivityResult{result});
+      finish();
+    };
+    items.push_back(std::move(bt));
   }
 }
 

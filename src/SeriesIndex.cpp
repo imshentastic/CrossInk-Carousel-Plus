@@ -103,6 +103,16 @@ const SeriesEntry* SeriesIndex::find(const std::string& path) const {
   return &entries[i];
 }
 
+void SeriesIndex::releaseMemory() {
+  // Drop entries + stringPool capacity. shrink_to_fit on a cleared
+  // vector returns capacity to zero on libstdc++. No on-disk change;
+  // begin() repopulates from JSON whenever the device restarts.
+  entries.clear();
+  entries.shrink_to_fit();
+  stringPool.clear();
+  stringPool.shrink_to_fit();
+}
+
 void SeriesIndex::forgetPath(const std::string& path) {
   const int existing = indexOfPath(path);
   if (existing < 0) return;

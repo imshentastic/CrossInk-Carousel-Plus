@@ -127,6 +127,32 @@ class EpubReaderActivity final : public Activity {
   bool pendingBookmarkFeedback = false;
   BookmarkFeedbackType bookmarkFeedbackType = BookmarkFeedbackType::Added;
   unsigned long bookmarkFeedbackShowTime = 0UL;
+
+  // CrumBLE phase 3/7: held start anchor for cross-page / cross-chapter
+  // highlights. Set when the user back-outs of WordSelect in HighlightRange
+  // mode with the start anchor placed -- the menu then surfaces
+  // FINISH_HIGHLIGHT / CANCEL_HIGHLIGHT until the user resolves. Cleared
+  // on save, cancel, or book close (we don't persist; if the user closes
+  // the book mid-highlight the partial state is intentionally dropped --
+  // word indices wouldn't necessarily survive a re-pagination anyway).
+  struct PendingHighlightStart {
+    uint16_t spineIndex;
+    float progress;        // start page's progress within section
+    uint16_t pageCount;    // start page count (for de-dup at save)
+    uint16_t wordIndex;    // word position within the start page
+    std::string startWordText;     // raw text -- becomes "<start>... <end>" preview
+    std::string chapterTitle;      // captured at hold time
+  };
+  std::optional<PendingHighlightStart> pendingHighlightStart_;
+
+  // CrumBLE: when the user jumps to a page via View Bookmarks, the next
+  // short-press Back should land them back in the bookmark list instead
+  // of exiting to Home. Set in the VIEW_BOOKMARKS result handler on a
+  // successful pick; consumed (and cleared) in the Back handler. Page
+  // turns and other navigation don't clear it -- the user can read
+  // around the bookmark, then Back to return to the list.
+  bool returnToBookmarkListOnBack_ = false;
+
   bool pendingCompletedFeedback = false;
   bool completedFeedbackIsFinished = false;
   unsigned long completedFeedbackShowTime = 0UL;

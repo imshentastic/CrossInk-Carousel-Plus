@@ -72,6 +72,9 @@ class BookSettingsDrawerActivity final : public Activity {
   };
 
   void buildItems();
+  // CrumBLE: BT rows extracted so they can be inserted at the TOP of the
+  // drawer list (most common drawer action mid-read).
+  void buildBluetoothItems();
   void layoutDrawer();
   void renderDrawer();
   void presentFastRefresh();

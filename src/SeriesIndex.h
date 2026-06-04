@@ -80,6 +80,13 @@ class SeriesIndex {
   // Removes the entry — used when a book is deleted from disk.
   void forgetPath(const std::string& path);
 
+  // CrumBLE: drop the in-RAM cache (entries + stringPool) without touching
+  // the on-disk JSON. Called from FT entry to reclaim heap for the WiFi /
+  // web-server pipeline. Safe to call repeatedly; the next begin() will
+  // reload from SD. For large libraries the pool can hold tens of KB --
+  // typically the biggest non-WiFi sticky consumer at FT time.
+  void releaseMemory();
+
   // Canonicalizes a series name into a stable key for grouping:
   //   - lowercase
   //   - collapses internal whitespace runs to single space

@@ -11,6 +11,21 @@
 
 class GfxRenderer;
 
+// CrumBLE: returns true (consuming the flag) when sendBufferGzip flagged
+// a heap-too-low serve as needing a silentRestart-to-FT cycle. The FT
+// activity polls this from loop() and triggers the restart so the 200
+// response physically reaches the phone before the device reboots.
+bool consumeFtRestartRequest();
+
+// CrumBLE: same flag, non-destructive read. The FT activity polls this
+// INSIDE its handleClient() tight loop -- once a handler has set the
+// flag, we must stop accepting more requests immediately or the next
+// already-queued one drains the heap below the recovery threshold
+// (typical sequence: SettingsPage triggers /api/settings, /api/wifi,
+// /api/opds in parallel; the first one's guard fires, the next one's
+// allocator craters because the response never gets a chance to send).
+bool peekFtRestartRequest();
+
 // Structure to hold file information
 struct FileInfo {
   String name;
@@ -75,9 +90,21 @@ class CrossPointWebServer {
   // baking). Set by CrossPointWebServerActivity before begin().
   void setRenderer(GfxRenderer* r) { renderer_ = r; }
 
+  // CrumBLE: pre-build the /api/settings JSON into a std::string cache while
+  // the FT activity has plenty of free heap (post-BT-release, ~106 KB).
+  // handleGetSettings then just serves the cached blob with one send() --
+  // no getSettingsList() rebuild + no JsonDocument allocation pressure mid-
+  // request. Called by CrossPointWebServerActivity before begin() and by
+  // handlePostSettings to refresh after a settings change.
+  void primeSettingsCache();
+
  private:
   std::unique_ptr<WebServer> server = nullptr;
   std::unique_ptr<WebSocketsServer> wsServer = nullptr;
+  // CrumBLE: pre-built /api/settings JSON. Populated by primeSettingsCache()
+  // and served verbatim by handleGetSettings. Cleared+rebuilt by handlePost
+  // Settings so the next GET reflects the change.
+  std::string cachedSettingsJson_;
   bool running = false;
   bool apMode = false;  // true when running in AP mode, false for STA mode
   GfxRenderer* renderer_ = nullptr;

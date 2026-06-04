@@ -94,6 +94,13 @@ enum class FileBrowserAction : int {
   // discovered book, and makes the collection active before returning
   // to Home. Skipped (with a toast) if the folder contains no books.
   MakeCollectionFromFolder = 23,
+  // CrumBLE: shelf-header item on user collections that have >= 2 books.
+  // Opens RearrangeCollectionsActivity (which is generic over Items) over
+  // the active collection's book list. The user taps Confirm in the order
+  // they want the books to appear; on finish, the order is persisted and
+  // the collection's sortMode is forced to Manual (otherwise the manual
+  // order would be overridden by whichever sort was active).
+  ReorderBooksInCollection = 24,
 };
 
 class FileBrowserActionActivity final : public Activity {

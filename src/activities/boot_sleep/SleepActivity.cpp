@@ -345,7 +345,7 @@ bool renderPngToSleepScreen(GfxRenderer& renderer, const std::string& filename) 
   return true;
 }
 
-void renderBitmapToSleepScreen(GfxRenderer& renderer, const Bitmap& bitmap) {
+void renderBitmapToSleepScreen(GfxRenderer& renderer, const Bitmap& bitmap, bool skipGreyscalePass = false) {
   int x, y;
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
@@ -400,7 +400,7 @@ void renderBitmapToSleepScreen(GfxRenderer& renderer, const Bitmap& bitmap) {
   // buffer here, before the optional grayscale passes overwrite it below.
   writeFramebufferCache(SLEEP_FB_CACHE_PATH);
 
-  if (hasGreyscale) {
+  if (hasGreyscale && !skipGreyscalePass) {
     bitmap.rewindToData();
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
@@ -851,7 +851,12 @@ void SleepActivity::cycleScreensaverFromDeepSleep(GfxRenderer& renderer) {
     return;
   }
 
-  renderBitmapToSleepScreen(renderer, bitmap);
+  // sleepCycleSkipGrayscale: optional opt-in for users who tap-cycle fast
+  // and would rather see a snappy BW frame than wait for the grayscale
+  // LSB/MSB double-pass. Default off so behaviour matches v3.7.3 unless
+  // the user explicitly turns it on in Display settings.
+  const bool skipGrayscale = SETTINGS.sleepCycleSkipGrayscale != 0;
+  renderBitmapToSleepScreen(renderer, bitmap, skipGrayscale);
 }
 
 void SleepActivity::renderCoverSleepScreen() const {

@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "BluetoothHIDManager.h"
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
 #include "SdCardFontSystem.h"
@@ -112,6 +113,35 @@ FontDownloadActivity::FontDownloadActivity(GfxRenderer& renderer, MappedInputMan
 
 void FontDownloadActivity::onEnter() {
   Activity::onEnter();
+
+  LOG_INF("FONT", "onEnter: free heap %u, maxAlloc %u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
+  // CrumBLE: tear NimBLE down before HTTPS + manifest fetch + font
+  // installs. NimBLE holds ~58 KB of stack state while connected, and
+  // HttpDownloader's TLS handshake + manifest buffers + font file
+  // download streams need contiguous heap that doesn't exist while
+  // NimBLE is alive. User-reported symptom: "Manage Fonts connects
+  // but fails to initialize any fonts" -- the WiFi connect succeeds,
+  // then fetchAndParseManifest's downloadToFile silently bails on the
+  // TLS alloc and the activity drops into ERROR with "Failed to fetch
+  // font list". CrossInk doesn't have BT remote support so it never
+  // sees this; the fix only applies on the CrumBLE side.
+  //
+  // Same pattern as CrossPointWebServerActivity::onEnter: synchronous
+  // disable (safe outside onExit), runs to completion before the WiFi
+  // mode switch. BT remote is irrelevant during font management (user
+  // navigates the family list with device buttons), so the cost to the
+  // user is zero. No-op when BT is already off.
+  {
+    auto& bt = BluetoothHIDManager::getInstance();
+    if (bt.isEnabled()) {
+      LOG_INF("FONT", "Disabling NimBLE before manifest fetch (~58 KB reclaim)");
+      bt.disable();
+      LOG_INF("FONT", "Free heap after BT disable: %u, maxAlloc %u", ESP.getFreeHeap(),
+              ESP.getMaxAllocHeap());
+    }
+  }
+
   sdFontSystem.releaseLoadedFont(renderer);
   WiFi.mode(WIFI_STA);
   startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),

@@ -1,5 +1,33 @@
 # Changelog
 
+## [crumble-v4.0.0] - 2026-06-04
+
+### Added
+- **Dictionary support (StarDict)**: ported from SEEK reader. Drop a StarDict `.ifo`/`.idx`/`.dict` set into `/dict/` on the SD card and tap-select any word in a book to look it up. The reader auto-disables BT during the lookup to free heap for the dictionary index, then reconnects on exit.
+- **Quote highlighting**: word-range selection. Long-press to mark a start word, navigate (same page or across pages/chapters), tap to finish. The bookmark list shows quote previews on each row; Confirm jumps straight to the bookmark location.
+- **EPUB optimizer pre-cache**: every EPUB uploaded over File Transfer can optionally be pre-baked into the device's section/page format. First-time book open is ~4 s and chapter turns are instant (no mid-read indexing). Adds ~40 s per upload; the toggle defaults ON in the Upload modal and can be skipped per-book. An "Optimize Selected" button optimizes EPUBs already on the SD card without re-uploading.
+- **Collections system enhancements**: rename collections, rearrange book order within a collection, build a collection from a folder by long-pressing Select in File Explorer.
+- **Bookshelf grid layout**: full-page 2x2, 3x3, or 4x4 cover tiles. Configurable per-collection.
+- **Quick Resume cookie logo**: bottom-left overlay on the sleep frame when Quick Resume is wired up. Replaces the previous diagonal-dots loading icon.
+- **Cycle Sleep Screen on Tap**: short/long-press buttons to flip between custom sleep images while the device is asleep, without unlocking.
+- **Series Detection** (opt-in): scans OPF metadata to group books by series.
+
+### Changed
+- **Settings UI redesigned into nested submenus**. The previous four-tab flat list is now six top-level groups: Display, Reader, Controls, Library, Sync & Network, System. Each opens its own sub-screen. Reader splits into Font / Layout / Style / Reading Aids / Customise Status Bar. Inspired by but not directly ported from CrossInk 1.3; the tree was designed specifically for CrumBLE's settings surface.
+- **In-book menu reorganized into three line-divided sections**: quick actions (Footnotes, Lookup, Add Highlight, Reading Stats, Auto Page Turn), navigate + customise (Select Chapter, Go to %, Sync Progress, Reader Options, Controls, Bookmarks ▸, Bluetooth), and output (Display QR, Screenshot, Mark Finished, Delete Cache). Bookmarks opens an inline sub-screen with Add Highlight + View / Export / Clear. Add Bookmark and Go Home removed; Orientation moved into Reader Options.
+- **Global Book Settings drawer**: BT Quick Connect now sits at the top of the drawer instead of after the Reader settings.
+- **Web UI rebranded** from CrossInk to CrumBLE (page titles, header, footer). Upstream CrossInk version still shown as a sync-point reference.
+- HOLD highlight preview captures ~14 words of trailing/leading context on each side instead of a single word, so the saved bookmark preview reads as a passage.
+
+### Fixed
+- **File Transfer no longer freezes on entry under heap pressure**. Several recovery paths added: BT controller is fully released (not just disabled) before the FT activity claims the heap; web server low-heap guard auto-restarts the FT activity (with the previous AP/STA mode preserved) instead of leaving the device wedged; the page-serve handler refuses-and-reloads if free heap drops below a safe floor.
+- **Wake-button long-press no longer fires during boot**. The wake-hold release edge used to persist into the first activity tick, briefly triggering whatever long-press action was bound to the power button. Now absorbed before the activity starts.
+- "Could not save progress" no longer repeats after backward navigation through chapters.
+- Ghost page-number bug fixed.
+
+### Known limitations
+- The web /settings page reports "settings unavailable" in 4.0; use the device-side Settings UI (the new nested submenus). All other web-UI features (File Manager, WiFi, OPDS, Fonts) work normally.
+
 ## [crumble-v3.7.3] - 2026-05-31
 
 ### Fixed

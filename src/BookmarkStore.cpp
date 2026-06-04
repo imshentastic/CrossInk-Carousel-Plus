@@ -10,8 +10,11 @@
 
 namespace {
 constexpr uint8_t LEGACY_VERSION = 2;
-constexpr uint8_t VERSION = 3;
-// Stored count is uint16_t in v3, but we keep an in-memory safety cap for ESP32-C3 RAM.
+// V3 = point bookmarks (pre-highlight). V4 = ranged highlights w/ preview text.
+// Loading either is supported; writes always emit v4.
+constexpr uint8_t POINT_VERSION = 3;
+constexpr uint8_t VERSION = 4;
+// Stored count is uint16_t in v3+, but we keep an in-memory safety cap for ESP32-C3 RAM.
 constexpr uint16_t MAX_BOOKMARKS = 1024;
 constexpr size_t INITIAL_BOOKMARK_RESERVE = 8;
 constexpr char BOOKMARKS_DIR[] = "/.crosspoint/bookmarks";
@@ -24,7 +27,7 @@ bool readBookmarkCount(FsFile& file, const uint8_t version, uint16_t& count) {
     return true;
   }
 
-  if (version == VERSION) {
+  if (version == POINT_VERSION || version == VERSION) {
     serialization::readPod(file, count);
     return true;
   }
@@ -93,6 +96,54 @@ BookmarkStore::AddResult BookmarkStore::addBookmark(uint16_t spineIndex, float p
   bm.progress = progress;
   bm.timestamp = 0;  // ESP32-C3 has no battery-backed RTC; reserved for future use
   snprintf(bm.chapterTitle, sizeof(bm.chapterTitle), "%s", chapterTitle ? chapterTitle : "");
+  // Point bookmark: zero-length range with empty preview. The new
+  // addHighlight() path populates these for ranged highlights.
+  bm.endSpineIndex = spineIndex;
+  bm.endProgress = progress;
+  bm.startWord = 0;
+  bm.endWord = 0;
+  bm.preview[0] = '\0';
+
+  bookmarks.push_back(bm);
+  dirty = true;
+  saveToFile();
+  return AddResult::Added;
+}
+
+BookmarkStore::AddResult BookmarkStore::addHighlight(uint16_t startSpine, float startProgress, uint16_t startWord,
+                                                     uint16_t endSpine, float endProgress, uint16_t endWord,
+                                                     int startPageCount, const char* chapterTitle,
+                                                     const char* preview) {
+  // De-dup the same-page-and-spine collision as addBookmark, but only when the
+  // range starts on the same physical page as an existing record. This lets
+  // users keep multiple highlights per page (different ranges) but still
+  // overwrites the legacy single-point bookmark when they upgrade it to a
+  // ranged highlight on that page.
+  if (startPageCount > 0) {
+    const float pageSlice = 1.0f / static_cast<float>(startPageCount);
+    const float pageStart = startProgress;
+    const float pageEnd = startProgress + pageSlice;
+    std::erase_if(bookmarks, [&](const Bookmark& b) {
+      return b.spineIndex == startSpine && b.progress >= pageStart && b.progress < pageEnd &&
+             b.startWord == 0 && b.endWord == 0 && b.endSpineIndex == b.spineIndex && b.preview[0] == '\0';
+    });
+  }
+
+  if (bookmarks.size() >= MAX_BOOKMARKS) {
+    LOG_ERR("BKS", "Bookmark limit (%u) reached", MAX_BOOKMARKS);
+    return AddResult::LimitReached;
+  }
+
+  Bookmark bm{};
+  bm.spineIndex = startSpine;
+  bm.progress = startProgress;
+  bm.timestamp = 0;
+  snprintf(bm.chapterTitle, sizeof(bm.chapterTitle), "%s", chapterTitle ? chapterTitle : "");
+  bm.endSpineIndex = endSpine;
+  bm.endProgress = endProgress;
+  bm.startWord = startWord;
+  bm.endWord = endWord;
+  snprintf(bm.preview, sizeof(bm.preview), "%s", preview ? preview : "");
 
   bookmarks.push_back(bm);
   dirty = true;
@@ -167,7 +218,7 @@ bool BookmarkStore::readFromFile() {
 
   uint8_t version;
   serialization::readPod(f, version);
-  if (version != LEGACY_VERSION && version != VERSION) {
+  if (version != LEGACY_VERSION && version != POINT_VERSION && version != VERSION) {
     LOG_ERR("BKS", "Unknown bookmark file version: %u", version);
     f.close();
     return false;
@@ -218,21 +269,52 @@ bool BookmarkStore::readFromFile() {
       return false;
     }
     serialization::readPod(f, bm.timestamp);
-    const int chRead = f.read(bm.chapterTitle, sizeof(bm.chapterTitle));
+    const int chRead = f.read(reinterpret_cast<uint8_t*>(bm.chapterTitle), sizeof(bm.chapterTitle));
     bm.chapterTitle[sizeof(bm.chapterTitle) - 1] = '\0';
     if (chRead != static_cast<int>(sizeof(bm.chapterTitle))) {
       LOG_ERR("BKS", "Bookmark file truncated at chapterTitle, record %u", i);
       f.close();
       return false;
     }
+
+    // V4 additions: end anchor + word indices + preview. Older formats
+    // (v2 legacy / v3 point) mirror start->end and leave preview empty;
+    // the next saveToFile() will rewrite as v4.
+    if (version == VERSION) {
+      if (f.available() < static_cast<int>(sizeof(bm.endSpineIndex) + sizeof(bm.endProgress) +
+                                            sizeof(bm.startWord) + sizeof(bm.endWord))) {
+        LOG_ERR("BKS", "Bookmark file truncated at v4 range fields, record %u", i);
+        f.close();
+        return false;
+      }
+      serialization::readPod(f, bm.endSpineIndex);
+      serialization::readPod(f, bm.endProgress);
+      serialization::readPod(f, bm.startWord);
+      serialization::readPod(f, bm.endWord);
+      const int prevRead = f.read(reinterpret_cast<uint8_t*>(bm.preview), sizeof(bm.preview));
+      bm.preview[sizeof(bm.preview) - 1] = '\0';
+      if (prevRead != static_cast<int>(sizeof(bm.preview))) {
+        LOG_ERR("BKS", "Bookmark file truncated at preview, record %u", i);
+        f.close();
+        return false;
+      }
+    } else {
+      // v2/v3 migration: degenerate (zero-length) highlight at the point.
+      bm.endSpineIndex = bm.spineIndex;
+      bm.endProgress = bm.progress;
+      bm.startWord = 0;
+      bm.endWord = 0;
+      bm.preview[0] = '\0';
+    }
+
     bookmarks.push_back(bm);
   }
 
   f.close();
-  if (version == LEGACY_VERSION) {
+  if (version != VERSION) {
     dirty = true;
     saveToFile();
-    LOG_DBG("BKS", "Migrated bookmark file to version %u", VERSION);
+    LOG_DBG("BKS", "Migrated bookmark file from v%u -> v%u", version, VERSION);
   }
   LOG_DBG("BKS", "Loaded %u bookmark(s)", count);
   return true;
@@ -259,10 +341,16 @@ bool BookmarkStore::writeToFile() const {
     serialization::writePod(f, bm.progress);
     serialization::writePod(f, bm.timestamp);
     f.write(reinterpret_cast<const uint8_t*>(bm.chapterTitle), sizeof(bm.chapterTitle));
+    // v4: range + word indices + preview
+    serialization::writePod(f, bm.endSpineIndex);
+    serialization::writePod(f, bm.endProgress);
+    serialization::writePod(f, bm.startWord);
+    serialization::writePod(f, bm.endWord);
+    f.write(reinterpret_cast<const uint8_t*>(bm.preview), sizeof(bm.preview));
   }
 
   f.close();
-  LOG_DBG("BKS", "Saved %u bookmark(s)", count);
+  LOG_DBG("BKS", "Saved %u bookmark(s) (v%u)", count, VERSION);
   return true;
 }
 
@@ -298,7 +386,7 @@ bool BookmarkStore::getAllBookmarkedBooks(std::vector<BookmarkedBookEntry>& out)
     }
     uint8_t version;
     serialization::readPod(f, version);
-    if (version != LEGACY_VERSION && version != VERSION) {
+    if (version != LEGACY_VERSION && version != POINT_VERSION && version != VERSION) {
       LOG_DBG("BKS", "Skipping bookmark file with unknown version: %s", name.c_str());
       f.close();
       continue;

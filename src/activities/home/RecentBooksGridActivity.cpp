@@ -670,9 +670,16 @@ void RecentBooksGridActivity::paintGridFocusUpdate(int prevFocusedIndex, int new
   // 2 px the fatter progress bar (kProgressBarHeight = 7) added to
   // the row stride -- without the pull-up, row 1's bar bottom would
   // crowd the page-dot indicator.
-  const int contentTop = titleAtTop ? (kHeaderTopPadding + kHeaderHeight + 6 + 40 + 18 - titleTopLift)
+  // CrumBLE: 2x2 + title-at-top needs a slightly taller strip than the
+  // other layouts. The 40 px box centers two SMALL lines with only ~3 px
+  // of margin above the strip's bottom edge, which clips the descenders
+  // of "m" / "h" in "12h 45m" on some fonts. Bumping to 46 gives ~6 px
+  // margin (no clipping) AND pushes the grid down 6 px via the formula
+  // below -- which doubles as the "grid too close to the author" tweak.
+  // Other layouts keep 40 so their existing vertical budgets stay tuned.
+  const int titleStripHeight = (is2x2 && titleAtTop) ? 46 : 40;
+  const int contentTop = titleAtTop ? (kHeaderTopPadding + kHeaderHeight + 6 + titleStripHeight + 18 - titleTopLift)
                                     : (is2x2 ? 66 : kLyraGridContentTop);
-  constexpr int titleStripHeight = 40;
   constexpr int kBottomMargin = 14;
   const int titleStripY = titleAtTop ? (kHeaderTopPadding + kHeaderHeight + 6)
                                      : (pageHeight - kBottomMargin - titleStripHeight);
@@ -684,7 +691,10 @@ void RecentBooksGridActivity::paintGridFocusUpdate(int prevFocusedIndex, int new
   const int gridSpacing = is3x3 ? 24 : kLyraGridSpacing;
   const int kProgressBarHeight = is2x2 ? 7 : 5;
   const int kProgressTopGap = 4;
-  const int rowSpacing = is2x2 ? 4 : (is3x3 ? (titleAtTop ? 14 : 18) : 5);
+  // CrumBLE: 2x2 + title-at-top adds inter-row spacing so the bottom
+  // row sits comfortably below the top row instead of feeling stacked.
+  // 2x2-bottom and other layouts keep their original spacing.
+  const int rowSpacing = is2x2 ? (titleAtTop ? 10 : 4) : (is3x3 ? (titleAtTop ? 14 : 18) : 5);
   const int totalGridWidth = gridColumns_ * coverWidth_ + (gridColumns_ - 1) * gridSpacing;
   const int startXOffset = (pageWidth - totalGridWidth) / 2;
   const int rowStride = coverHeight_ + kProgressTopGap + kProgressBarHeight + rowSpacing;
@@ -1191,7 +1201,12 @@ void RecentBooksGridActivity::render(RenderLock&&) {
   // 2 px the fatter progress bar (kProgressBarHeight = 7) added to
   // the row stride -- without the pull-up, row 1's bar bottom would
   // crowd the page-dot indicator.
-  const int contentTop = titleAtTop ? (kHeaderTopPadding + kHeaderHeight + 6 + 40 + 18 - titleTopLift)
+  // CrumBLE: 2x2 + title-at-top needs a slightly taller strip than the
+  // other layouts. See the matching tweak in paintGridFocusUpdate for
+  // the full rationale; this MUST stay in lockstep with that one so the
+  // partial-paint geometry lines up with the full-render geometry.
+  const int titleStripHeight_actual = (is2x2 && titleAtTop) ? 46 : 40;
+  const int contentTop = titleAtTop ? (kHeaderTopPadding + kHeaderHeight + 6 + titleStripHeight_actual + 18 - titleTopLift)
                                     : (is2x2 ? 66 : kLyraGridContentTop);
   // CrumBLE #113: selected-book label strip. Line 1 is the title in
   // UI_10 REGULAR (centered). Line 2 splits into three:
@@ -1200,7 +1215,7 @@ void RecentBooksGridActivity::render(RenderLock&&) {
   // moved up here because the bookshelf cells don't have room for it
   // each. Author + times come from the focused-book metadata + stats
   // caches via ensureFocusedMetaLoaded.
-  constexpr int titleStripHeight = 40;
+  const int titleStripHeight = titleStripHeight_actual;  // see comment at line 1205
   // CrumBLE: title strip moved from above the grid to the bottom of
   // the screen. Grid now starts directly below the header divider,
   // giving cells more vertical room. kBottomMargin bumped from 6 to
@@ -1245,7 +1260,10 @@ void RecentBooksGridActivity::render(RenderLock&&) {
   // top placement is geometrically tight (last row's progress bar sits
   // 1 px above the title strip already) so it keeps the smaller value.
   const int kProgressTopGap = 4;
-  const int rowSpacing = is2x2 ? 4 : (is3x3 ? (titleAtTop ? 14 : 18) : 5);
+  // CrumBLE: 2x2 + title-at-top adds inter-row spacing so the bottom
+  // row sits comfortably below the top row instead of feeling stacked.
+  // 2x2-bottom and other layouts keep their original spacing.
+  const int rowSpacing = is2x2 ? (titleAtTop ? 10 : 4) : (is3x3 ? (titleAtTop ? 14 : 18) : 5);
   const int totalGridWidth = gridColumns_ * coverWidth_ + (gridColumns_ - 1) * gridSpacing;
   const int startXOffset = (pageWidth - totalGridWidth) / 2;
   // CrumBLE #133 follow-up: Title Placement-aware Y. TOP sits just

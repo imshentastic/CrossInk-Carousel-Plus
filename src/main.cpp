@@ -87,6 +87,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
 #include "simulator/SimulatorSmokeTest.h"
 #endif
 #include "images/LoadingIcon.h"
+#include "images/Logo120.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
 
@@ -394,9 +395,21 @@ const char* wakeupRouteName(const HalGPIO::WakeupReason reason) {
 // Definitions for SilentRestart.h. RTC_NOINIT survives ESP.restart() but not power loss.
 RTC_NOINIT_ATTR uint32_t silentRebootMagic;
 RTC_NOINIT_ATTR uint32_t silentRebootTarget;
+// CrumBLE: optional mode hint for SILENT_REBOOT_TARGET_FILE_TRANSFER. Set
+// by the FT activity right before silentRestartToFileTransfer so the
+// next boot's FT entry can skip NetworkModeSelectionActivity and go
+// straight to onNetworkModeSelected(<saved>). 0 = no hint, fall through
+// to the normal mode-picker. 1 = JOIN_NETWORK, 2 = CREATE_HOTSPOT.
+RTC_NOINIT_ATTR uint32_t silentRebootFtModeHint;
 constexpr uint32_t SILENT_REBOOT_MAGIC = 0xC1EAB007;
 constexpr uint32_t SILENT_REBOOT_TARGET_HOME = 0;
 constexpr uint32_t SILENT_REBOOT_TARGET_READER = 1;
+// CrumBLE: heap-defrag reboot from the FT web server when the heap is
+// too fragmented to serve. After this reboot, setup() routes straight
+// to CrossPointWebServerActivity so the user doesn't have to
+// re-navigate to File Transfer from Home -- mirrors the path they'd
+// take by hitting Back manually but skips the trip through the menu.
+constexpr uint32_t SILENT_REBOOT_TARGET_FILE_TRANSFER = 2;
 
 // How the device is coming back to life, resolved once at boot. Both resume
 // flows suppress the splash and leave the panel holding its pre-boot frame; a
@@ -427,6 +440,34 @@ void silentRestart() {
   GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
   delay(50);
   ESP.restart();
+}
+
+void silentRestartToFileTransfer() {
+  if (deepSleepInProgress) return;
+  silentRebootTarget = SILENT_REBOOT_TARGET_FILE_TRANSFER;
+  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  LOG_DBG("MAIN", "Silent restart (target=file-transfer, modeHint=%u)",
+          static_cast<unsigned>(silentRebootFtModeHint));
+  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+  delay(50);
+  ESP.restart();
+}
+
+void setSilentRebootFtModeHint(uint32_t mode) {
+  silentRebootFtModeHint = mode;
+}
+
+// Snapshot taken at setup() time, AFTER the silent-reboot magic check
+// validated that the RTC state is genuinely ours (cold boot leaves
+// RTC_NOINIT memory uninitialized). FT activity reads this from
+// onEnter and clears it; surviving exactly one consume call ensures
+// a later normal entry doesn't accidentally auto-restore.
+static uint32_t g_pendingFtModeHintSnapshot = 0;
+
+uint32_t consumeSilentRebootFtModeHint() {
+  const uint32_t v = g_pendingFtModeHintSnapshot;
+  g_pendingFtModeHintSnapshot = 0;
+  return v;
 }
 
 void silentRestartToReader() {
@@ -580,9 +621,16 @@ bool handleGlobalPowerButtonAction(const CrossPointSettings::SHORT_PWRBTN action
 namespace {
 constexpr uint16_t POST_SLEEP_SCREEN_SETTLE_MS = 500;
 // In cycle mode, a press shorter than this is a tap (cycle); longer is a wake.
-// Set equal to the wake-duration threshold so there is no dead zone between
-// "tap" and "wake" — anything below cycles, anything above wakes.
-constexpr unsigned long SCREENSAVER_TAP_MAX_MS = CrossPointSettings::POWER_BUTTON_LONG_PRESS_MS;
+// Originally set equal to the wake-duration threshold (400 ms) so there was no
+// dead zone, but user reports showed that releases in the 200-400 ms range --
+// which usually mean "I tried to hold to wake but didn't quite make it" --
+// were getting interpreted as taps and cycling the screensaver instead.
+// Dropping to 200 ms keeps genuine deliberate taps (<150 ms) snappy while
+// leaving anything 200 ms+ to fall through into the wake path. The dead zone
+// between 200 ms and POWER_BUTTON_LONG_PRESS_MS (400 ms) is intentional:
+// presses in that range are likely accidental, and waking is the less
+// surprising outcome than cycling a screen the user wasn't asking for.
+constexpr unsigned long SCREENSAVER_TAP_MAX_MS = 200;
 
 constexpr uint8_t TILT_SLEEP_MAX_ATTEMPTS = 3;
 constexpr uint16_t TILT_SLEEP_RETRY_DELAY_MS = 10;
@@ -741,6 +789,7 @@ void enterDeepSleep(bool fromTimeout) {
 
   const bool isQuickResumeSleep =
       SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::QUICK_RESUME ||
+      SETTINGS.quickResumeSleepScreen == CrossPointSettings::QUICK_RESUME_SLEEP_SCREEN::QUICK_RESUME_ALWAYS ||
       (fromTimeout &&
        SETTINGS.quickResumeSleepScreen == CrossPointSettings::QUICK_RESUME_SLEEP_SCREEN::QUICK_RESUME_AFTER_TIMEOUT);
   APP_STATE.showBootScreen = !isQuickResumeSleep;
@@ -929,9 +978,17 @@ void setup() {
   // Bound the target range too — RTC_NOINIT memory is uninitialized on cold boot.
   const bool isSilentReboot = (silentRebootMagic == SILENT_REBOOT_MAGIC);
   const uint32_t snapshotTarget =
-      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_READER) ? silentRebootTarget : 0;
+      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_FILE_TRANSFER) ? silentRebootTarget : 0;
+  // Snapshot the FT mode hint into a normal variable before clearing
+  // RTC state, so the FT activity's onEnter can read it via
+  // consumeSilentRebootFtModeHint(). Only honour it on a confirmed
+  // silent reboot to FT -- everything else gets zero (cold-boot RTC
+  // garbage or stale state from a different silent-reboot target).
+  g_pendingFtModeHintSnapshot =
+      (isSilentReboot && snapshotTarget == SILENT_REBOOT_TARGET_FILE_TRANSFER) ? silentRebootFtModeHint : 0;
   silentRebootMagic = 0;
   silentRebootTarget = 0;
+  silentRebootFtModeHint = 0;
 
   gpio.begin();
   powerManager.begin();
@@ -1076,8 +1133,21 @@ void setup() {
       APP_STATE.saveToFile();
       if (loadSleepFrameBuffer()) {
         // Frame restored: swap the sleep moon for the loading icon.
+        const auto pageWidth = renderer.getScreenWidth();
         const auto pageHeight = renderer.getScreenHeight();
-        renderer.drawImage(LoadingIcon, 0, pageHeight - LOADINGICON_HEIGHT, LOADINGICON_WIDTH, LOADINGICON_HEIGHT);
+        // CrumBLE: brand cookie logo as the quick-resume status badge.
+        // We draw a circular white halo first (fillRoundedRect with
+        // cornerRadius = halfSide -> perfect circle) then layer the
+        // square cookie on top. The 6 px halo gives the logo's edges
+        // some breathing room from the sleep frame around it and keeps
+        // the cookie silhouette legible on any background (cover, custom).
+        constexpr int kLogoSize = 120;
+        constexpr int kHaloPadding = 6;
+        constexpr int kHaloSize = kLogoSize + kHaloPadding * 2;
+        const int haloX = (pageWidth - kHaloSize) / 2;
+        const int haloY = (pageHeight - kHaloSize) / 2;
+        renderer.fillRoundedRect(haloX, haloY, kHaloSize, kHaloSize, kHaloSize / 2, Color::White);
+        renderer.drawImage(Logo120, haloX + kHaloPadding, haloY + kHaloPadding, kLogoSize, kLogoSize);
         renderer.displayBuffer(HalDisplay::HALF_REFRESH);
       } else {
         activityManager.goToBoot();  // frame file missing, fall back to the splash
@@ -1095,6 +1165,13 @@ void setup() {
   } else if (HalSystem::isRebootFromPanic()) {
     // If we rebooted from a panic, go to crash report screen to show the panic info
     activityManager.goToCrashReport();
+  } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_FILE_TRANSFER) {
+    // CrumBLE: heap-defrag restart triggered from CrossPointWebServer when
+    // the FT serve guard fires. Route directly to FT so the user doesn't
+    // see Home flash through before re-entering. They'll still pick mode
+    // (Hotspot vs Join) again -- that screen is the FT activity's normal
+    // first step on entry.
+    activityManager.goToFileTransfer();
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_READER &&
              !APP_STATE.openEpubPath.empty()) {
     activityManager.goToReader(APP_STATE.openEpubPath);
@@ -1136,6 +1213,20 @@ void setup() {
 
   // Ensure we're not still holding the power button before leaving setup
   waitForPowerRelease();
+  // CrumBLE: absorb the release edge from the wake-hold so the first
+  // activity tick's wasReleased(POWER) doesn't fire. Without this, the
+  // user's configured short/long-press action triggers IMMEDIATELY on
+  // wake because getHeldTime() still reports the wake-hold duration
+  // when the activity's first input read happens.
+  //
+  // Same pattern as the Silent-reboot path above (line ~1147): two
+  // gpio.update() calls separated by > InputManager's DEBOUNCE_DELAY
+  // transition the released-bit through lastDebounceTime without
+  // setting releasedEvents, so the first loop()'s gpio.update() sees
+  // state == currentState and emits no edge.
+  gpio.update();
+  delay(10);
+  gpio.update();
   allowSleepAt = millis() + 2000;
 }
 

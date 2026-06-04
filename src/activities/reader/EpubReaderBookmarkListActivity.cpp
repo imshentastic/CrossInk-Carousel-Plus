@@ -12,7 +12,15 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 
-static constexpr int ROW_HEIGHT = 50;
+// CrumBLE phase 6: rows show chapter + progress + up to 3 lines of
+// highlight preview, wrapping the preview text to the row width. 96 px
+// gives ~16 px per body line plus the chapter/% header at the top --
+// enough that long highlights communicate their content at a glance.
+// Rows without a preview keep the chapter/% on a tighter footprint by
+// drawing the same row but skipping the preview block; visually that's
+// just a slightly emptier card and is intentional.
+static constexpr int ROW_HEIGHT = 96;
+static constexpr int PREVIEW_MAX_LINES = 3;
 static constexpr int LIST_START_Y = 60;
 static constexpr unsigned long BOOKMARK_DELETE_HOLD_MS = 1000;
 
@@ -106,6 +114,10 @@ void EpubReaderBookmarkListActivity::loop() {
       return;
     }
     if (!bookmarks.empty() && selectedIndex >= 0 && selectedIndex < static_cast<int>(bookmarks.size())) {
+      // CrumBLE: Confirm jumps directly to the bookmark location. The
+      // first-tap-to-expand UX was reverted -- preview text is capped at
+      // BOOKMARK_PREVIEW_MAX so an expansion was at best one extra line,
+      // and the user preferred the direct jump.
       setResult(BookmarkResult{bookmarks[selectedIndex].spineIndex, bookmarks[selectedIndex].progress});
       finish();
     }
@@ -117,25 +129,42 @@ void EpubReaderBookmarkListActivity::loop() {
 
   const int pageItems = getPageItems();
 
-  buttonNavigator.onNextRelease([this, total] {
+  // CrumBLE: any navigation collapses the expanded row so the user
+  // doesn't lose their place when scrolling away from it.
+  auto collapseExpanded = [this]() { expandedIndex_ = -1; };
+
+  buttonNavigator.onNextRelease([this, total, collapseExpanded] {
+    collapseExpanded();
     selectedIndex = ButtonNavigator::nextIndex(selectedIndex, total);
     requestUpdate();
   });
 
-  buttonNavigator.onPreviousRelease([this, total] {
+  buttonNavigator.onPreviousRelease([this, total, collapseExpanded] {
+    collapseExpanded();
     selectedIndex = ButtonNavigator::previousIndex(selectedIndex, total);
     requestUpdate();
   });
 
-  buttonNavigator.onNextContinuous([this, total, pageItems] {
+  buttonNavigator.onNextContinuous([this, total, pageItems, collapseExpanded] {
+    collapseExpanded();
     selectedIndex = ButtonNavigator::nextPageIndex(selectedIndex, total, pageItems);
     requestUpdate();
   });
 
-  buttonNavigator.onPreviousContinuous([this, total, pageItems] {
+  buttonNavigator.onPreviousContinuous([this, total, pageItems, collapseExpanded] {
+    collapseExpanded();
     selectedIndex = ButtonNavigator::previousPageIndex(selectedIndex, total, pageItems);
     requestUpdate();
   });
+}
+
+int EpubReaderBookmarkListActivity::previewLineCount(const Bookmark& bm, int contentWidth) const {
+  if (bm.preview[0] == '\0') return 0;
+  const int previewMaxW = contentWidth - 40;
+  // Use a generous cap (32 lines) so we get the true wrap count for
+  // really long quotes -- the cap exists to bound the temp vector.
+  auto lines = renderer.wrappedText(SMALL_FONT_ID, bm.preview, previewMaxW, 32);
+  return static_cast<int>(lines.size());
 }
 
 void EpubReaderBookmarkListActivity::render(RenderLock&&) {
@@ -168,26 +197,75 @@ void EpubReaderBookmarkListActivity::render(RenderLock&&) {
   const int total = static_cast<int>(bookmarks.size());
   const int pageStartIndex = (selectedIndex / pageItems) * pageItems;
   const int marginLeft = contentX + 20;
+  const int previewMaxW = contentWidth - 40;
+  const int previewLineH = renderer.getLineHeight(SMALL_FONT_ID);
+  const int listStartY = LIST_START_Y + contentY;
+  const int bottomReserve = ROW_HEIGHT;  // matches getPageItems() reservation
+  const int listMaxY = renderer.getScreenHeight() - bottomReserve;
 
+  int rowY = listStartY;
   for (int i = 0; i < pageItems; i++) {
     const int itemIndex = pageStartIndex + i;
     if (itemIndex >= total) break;
+    if (rowY >= listMaxY) break;
 
-    const int rowY = LIST_START_Y + contentY + i * ROW_HEIGHT;
     const bool isSelected = (itemIndex == selectedIndex);
+    const Bookmark& bm = bookmarks[itemIndex];
+
+    // CrumBLE: size this row dynamically. When the row is expanded
+    // (first Confirm on a row whose preview overflows), grow it to
+    // fit the full wrapped preview instead of capping at
+    // PREVIEW_MAX_LINES. Other rows stay at the regular ROW_HEIGHT.
+    const bool expanded = (itemIndex == expandedIndex_);
+    std::vector<std::string> previewLines;
+    if (bm.preview[0] != '\0') {
+      previewLines = renderer.wrappedText(SMALL_FONT_ID, bm.preview, previewMaxW,
+                                          expanded ? 32 : (PREVIEW_MAX_LINES + 1));
+    }
+    int rowH = ROW_HEIGHT;
+    if (expanded) {
+      // metadata (6+lineH) + small gap (4) + N preview lines + bottom pad (6)
+      const int previewLinesShown = static_cast<int>(previewLines.size());
+      const int contentH = 6 + previewLineH + 4 + previewLinesShown * previewLineH + 6;
+      rowH = std::max(ROW_HEIGHT, contentH);
+    }
+    // Clip the last visible row's bottom to the list area so we don't
+    // bleed into the hint strip.
+    if (rowY + rowH > listMaxY) rowH = listMaxY - rowY;
+    if (rowH <= 0) break;
 
     if (isSelected) {
-      renderer.fillRect(contentX, rowY, contentWidth - 1, ROW_HEIGHT, true);
+      renderer.fillRect(contentX, rowY, contentWidth - 1, rowH, true);
     }
 
-    const Bookmark& bm = bookmarks[itemIndex];
     const char* chapter = (bm.chapterTitle[0] != '\0') ? bm.chapterTitle : tr(STR_UNKNOWN_CHAPTER);
-    const std::string chapterTrunc = renderer.truncatedText(UI_10_FONT_ID, chapter, contentWidth - 40);
-    renderer.drawText(UI_10_FONT_ID, marginLeft, rowY + 6, chapterTrunc.c_str(), !isSelected);
+    char metaBuf[BOOKMARK_CHAPTER_TITLE_MAX + 16];
+    snprintf(metaBuf, sizeof(metaBuf), "%s  -  %d%%", chapter,
+             static_cast<int>(std::lround(bm.progress * 100.0)));
+    const std::string metaTrunc = renderer.truncatedText(SMALL_FONT_ID, metaBuf, previewMaxW);
+    renderer.drawText(SMALL_FONT_ID, marginLeft, rowY + 6, metaTrunc.c_str(), !isSelected);
 
-    char pageBuf[24];
-    snprintf(pageBuf, sizeof(pageBuf), "%d%%", static_cast<int>(std::lround(bm.progress * 100.0)));
-    renderer.drawText(SMALL_FONT_ID, marginLeft, rowY + 28, pageBuf, !isSelected);
+    if (!previewLines.empty()) {
+      int yCursor = rowY + 6 + previewLineH + 4;
+      const int maxLines = expanded ? static_cast<int>(previewLines.size()) : PREVIEW_MAX_LINES;
+      const int linesToDraw = std::min<int>(previewLines.size(), maxLines);
+      for (int li = 0; li < linesToDraw; ++li) {
+        std::string line = previewLines[li];
+        // Ellipsize the last visible line only when not expanded AND
+        // there's more underneath (the expansion path is meant to
+        // SHOW everything, so we never truncate when expanded).
+        if (!expanded && li == PREVIEW_MAX_LINES - 1 &&
+            static_cast<int>(previewLines.size()) > PREVIEW_MAX_LINES) {
+          line = renderer.truncatedText(SMALL_FONT_ID, (line + "...").c_str(), previewMaxW,
+                                        EpdFontFamily::ITALIC);
+        }
+        if (yCursor + previewLineH > rowY + rowH) break;  // clip if row got shrunk
+        renderer.drawText(SMALL_FONT_ID, marginLeft, yCursor, line.c_str(), !isSelected,
+                          EpdFontFamily::ITALIC);
+        yCursor += previewLineH;
+      }
+    }
+    rowY += rowH;
   }
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
