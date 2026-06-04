@@ -1,5 +1,16 @@
 # Changelog
 
+## [crumble-v4.1.0] - 2026-06-04
+
+### Added
+- **OTA updates now pull from CrumBLE's own GitHub releases** (`imshentastic/CrumBLE`) instead of upstream CrossInk-Carousel. Once you're on v4.1.0, `Settings → Check for Updates` finds every future CrumBLE release automatically — **this is the last manual flash you'll ever need**.
+  - The version comparison uses `CRUMBLE_VERSION` (4.1.0, 4.1.1, 4.2.0, ...) instead of upstream's `CROSSINK_VERSION` (only bumped when CrumBLE rebases onto a new CrossInk).
+  - The asset matcher refuses any `crumble-firmware-X.Y.Z-full-needs-USB-flash.bin` variant — those binaries are intentionally too large for the legacy 6.25 MB OTA partition and would brick anyone who tried to OTA them. Users who want CharEink built-in continue to flash the full binary manually via crosspointreader.com/#flash-tools.
+  - The OTA Update activity shows `CrumBLE X.Y.Z → 4.1.0` (stripped of the `crumble-v` tag prefix) so the UI reads cleanly.
+
+### Changed
+- Version bump 4.0.1 → 4.1.0 because "OTA actually works now" is a meaningful new capability worth a minor-version bump.
+
 ## [crumble-v4.0.1] - 2026-06-04
 
 ### Changed

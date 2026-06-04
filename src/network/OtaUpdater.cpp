@@ -18,19 +18,25 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback, void*, s
 #include "network/WifiPowerSaveGuard.h"
 
 namespace {
+// CrumBLE: OTA points at imshentastic/CrumBLE's own releases. The
+// upstream CrossInk-Carousel URL would give CrumBLE users misleading
+// "no update" or accidentally downgrade them to upstream.
 #ifndef CROSSINK_OTA_RELEASE_URL
-#define CROSSINK_OTA_RELEASE_URL "https://api.github.com/repos/chintanvajariya/CrossInk-Carousel/releases/latest"
+#define CROSSINK_OTA_RELEASE_URL "https://api.github.com/repos/imshentastic/CrumBLE/releases/latest"
 #endif
 
 constexpr char latestReleaseUrl[] = CROSSINK_OTA_RELEASE_URL;
 
-#ifdef CROSSPOINT_FIRMWARE_VARIANT
-constexpr char firmwareAssetStem[] = "carousel-firmware-" CROSSPOINT_FIRMWARE_VARIANT;
-constexpr char firmwareAssetName[] = "carousel-firmware-" CROSSPOINT_FIRMWARE_VARIANT ".bin";
-#else
-constexpr char firmwareAssetStem[] = "carousel-firmware";
-constexpr char firmwareAssetName[] = "carousel-firmware.bin";
-#endif
+// CrumBLE: release assets are named "crumble-firmware-X.Y.Z.bin" (slim,
+// OTA-friendly) and "crumble-firmware-X.Y.Z-full-needs-USB-flash.bin"
+// (larger, USB-only). The matcher below treats only the slim variant as
+// an OTA target -- delivering the full to a 6.25 MB legacy OTA slot
+// would brick the device with "Firmware too large". The stem is just
+// "crumble-firmware" (no -tiny suffix) since CrumBLE has one shipping
+// variant per release.
+constexpr char firmwareAssetStem[] = "crumble-firmware";
+constexpr char firmwareAssetName[] = "crumble-firmware.bin";
+constexpr char fullVariantMarker[] = "-full-needs-USB-flash";
 
 constexpr char binSuffix[] = ".bin";
 constexpr size_t VERSION_SEGMENT_COUNT = 4;
@@ -116,8 +122,24 @@ bool endsWith(const char* value, const char* suffix) {
   return strcmp(value + valueLength - suffixLength, suffix) == 0;
 }
 
+// Substring search: does `haystack` contain `needle` anywhere? Cheap
+// O(n*m) is fine here -- asset names are ~96 chars max.
+bool containsSubstring(const char* haystack, const char* needle) {
+  if (haystack == nullptr || needle == nullptr) return false;
+  const size_t needleLen = strlen(needle);
+  if (needleLen == 0) return true;
+  for (const char* p = haystack; *p != '\0'; ++p) {
+    if (strncmp(p, needle, needleLen) == 0) return true;
+  }
+  return false;
+}
+
 bool isMatchingFirmwareAssetName(const char* assetName) {
   if (assetName == nullptr) return false;
+  // CrumBLE: refuse the -full-needs-USB-flash variant even though it
+  // matches our stem -- it intentionally overflows the legacy 6.25 MB
+  // OTA partition and would brick devices on that layout.
+  if (containsSubstring(assetName, fullVariantMarker)) return false;
   if (strcmp(assetName, firmwareAssetName) == 0) return true;
   if (!startsWith(assetName, firmwareAssetStem)) return false;
   if (assetName[strlen(firmwareAssetStem)] != '-') return false;
@@ -238,14 +260,33 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
   return OK;
 }
 
+namespace {
+// CrumBLE release tags are "crumble-vX.Y.Z" (e.g. "crumble-v4.1.0").
+// parseVersion only handles optional 'v'/'V' + digits, so strip the
+// "crumble-" prefix before comparing -- otherwise every comparison
+// silently returns 0 (== no update) because parsing fails.
+const char* stripCrumbleTagPrefix(const char* tag) {
+  if (tag == nullptr) return tag;
+  constexpr char prefix[] = "crumble-";
+  constexpr size_t prefixLen = sizeof(prefix) - 1;
+  if (strncmp(tag, prefix, prefixLen) == 0) return tag + prefixLen;
+  return tag;
+}
+}  // namespace
+
 bool OtaUpdater::isUpdateNewer() const {
-  if (!updateAvailable || latestVersion.empty() || latestVersion == CROSSINK_VERSION) {
+  if (!updateAvailable || latestVersion.empty()) {
     return false;
   }
 
-  const int comparison = compareVersions(latestVersion.c_str(), CROSSINK_VERSION);
-  LOG_DBG("OTA", "Version comparison latest=%s current=%s result=%d", latestVersion.c_str(), CROSSINK_VERSION,
-          comparison);
+  // Compare CrumBLE versions (4.0.x / 4.1.x ...), not upstream CrossInk
+  // (which only bumps on rebase). Strip the "crumble-" tag prefix so
+  // parseVersion sees "vX.Y.Z" or "X.Y.Z".
+  const char* latest = stripCrumbleTagPrefix(latestVersion.c_str());
+  if (strcmp(latest, CRUMBLE_VERSION) == 0) return false;
+
+  const int comparison = compareVersions(latest, CRUMBLE_VERSION);
+  LOG_DBG("OTA", "Version comparison latest=%s current=%s result=%d", latest, CRUMBLE_VERSION, comparison);
   return comparison > 0;
 }
 
