@@ -158,7 +158,8 @@ Belarusian, Catalan, Czech, Danish, Dutch, English, Finnish, French, German, Hun
 
 English, French, German, Italian, Polish, Russian, Spanish, Swedish, Ukrainian.
 
-**Bundled reader fonts** — Bitter, Charein, Lexend Deca — each in regular / bold / italic / bold-italic at four sizes (10, 12, 14, 16 pt). For other fonts, drop a `.cpfont` file in `/fonts` on the SD card and it shows up in the reader's font picker.
+**Bundled reader fonts** — Bitter, Charein, Lexend Deca — each in regular / bold / italic / bold-italic at four sizes (10, 12, 14, 16 pt). For other fonts, drop a `.cpfont` file in `/fonts` on the SD card and it shows up in the reader's font picker. Generate your .cpfont from .ttf font families at https://crosspointreader.com/fonts
+
 
 ---
 
