@@ -121,6 +121,15 @@ String normalizeWebPath(const String& inputPath) {
 }
 
 bool isProtectedPath(const String& path) {
+  // CrumBLE: /.crosspoint/ is the device's own cache directory. The
+  // chapter-prebake optimizer writes here from the web UI (and EPUB /
+  // recents / collections store + read from here), so it MUST stay
+  // writable even when showHiddenFiles is off. Without this carve-out,
+  // every prebake upload fails with HTTP 400 "Access denied to
+  // protected path" because the leading ".crosspoint" segment starts
+  // with a dot.
+  if (path.startsWith("/.crosspoint/") || path == "/.crosspoint") return false;
+
   // Check every segment of the path, not just the last one.
   // This prevents access to e.g. /.hidden/somefile or /System Volume Information/foo
   int start = 0;
