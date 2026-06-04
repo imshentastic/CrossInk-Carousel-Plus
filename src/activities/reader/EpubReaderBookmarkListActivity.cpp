@@ -191,19 +191,22 @@ void EpubReaderBookmarkListActivity::render(RenderLock&&) {
     const Bookmark& bm = bookmarks[itemIndex];
     const char* chapter = (bm.chapterTitle[0] != '\0') ? bm.chapterTitle : tr(STR_UNKNOWN_CHAPTER);
 
-    // CrumBLE: preview-first layout. Stack order top -> bottom:
-    //   line 1..N: italic preview (up to PREVIEW_MAX_LINES, wraps)
-    //   bottom row: "<Chapter title>  -  NN%"  (single line)
-    // Order swapped from the previous chapter-first layout so the user
-    // scans the actual quote at-a-glance and the metadata sits as a
-    // subtle caption underneath -- matches how the saved book progress
-    // dot reads on the home shelf.
+    // CrumBLE: small caption on top, then the italic preview. Stack:
+    //   line 1: "<Chapter title>  -  NN%"  (SMALL_FONT_ID, single line)
+    //   line 2..N: italic preview (up to PREVIEW_MAX_LINES, wraps)
     const int previewMaxW = contentWidth - 40;
-    int yCursor = rowY + 6;
+    char metaBuf[BOOKMARK_CHAPTER_TITLE_MAX + 16];
+    snprintf(metaBuf, sizeof(metaBuf), "%s  -  %d%%", chapter,
+             static_cast<int>(std::lround(bm.progress * 100.0)));
+    const std::string metaTrunc = renderer.truncatedText(SMALL_FONT_ID, metaBuf, previewMaxW);
+    renderer.drawText(SMALL_FONT_ID, marginLeft, rowY + 6, metaTrunc.c_str(), !isSelected);
+
     if (bm.preview[0] != '\0') {
+      const int previewLineH = renderer.getLineHeight(SMALL_FONT_ID);
+      // Start preview just under the caption with a small gap.
+      int yCursor = rowY + 6 + previewLineH + 4;
       auto previewLines =
           renderer.wrappedText(SMALL_FONT_ID, bm.preview, previewMaxW, PREVIEW_MAX_LINES + 1);
-      const int previewLineH = renderer.getLineHeight(SMALL_FONT_ID);
       const int linesToDraw = std::min<int>(previewLines.size(), PREVIEW_MAX_LINES);
       for (int li = 0; li < linesToDraw; ++li) {
         std::string line = previewLines[li];
@@ -215,18 +218,7 @@ void EpubReaderBookmarkListActivity::render(RenderLock&&) {
                           EpdFontFamily::ITALIC);
         yCursor += previewLineH;
       }
-      yCursor += 4;  // breathing room between preview and metadata
     }
-
-    // Metadata caption: chapter title + percent, pinned near the row's
-    // bottom edge so it's always at the same baseline regardless of how
-    // many preview lines actually wrapped.
-    char metaBuf[BOOKMARK_CHAPTER_TITLE_MAX + 16];
-    snprintf(metaBuf, sizeof(metaBuf), "%s  -  %d%%", chapter,
-             static_cast<int>(std::lround(bm.progress * 100.0)));
-    const std::string metaTrunc = renderer.truncatedText(SMALL_FONT_ID, metaBuf, previewMaxW);
-    const int metaY = rowY + ROW_HEIGHT - renderer.getLineHeight(SMALL_FONT_ID) - 6;
-    renderer.drawText(SMALL_FONT_ID, marginLeft, metaY, metaTrunc.c_str(), !isSelected);
   }
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));

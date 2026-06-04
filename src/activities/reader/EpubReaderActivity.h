@@ -144,6 +144,15 @@ class EpubReaderActivity final : public Activity {
     std::string chapterTitle;      // captured at hold time
   };
   std::optional<PendingHighlightStart> pendingHighlightStart_;
+
+  // CrumBLE: when the user jumps to a page via View Bookmarks, the next
+  // short-press Back should land them back in the bookmark list instead
+  // of exiting to Home. Set in the VIEW_BOOKMARKS result handler on a
+  // successful pick; consumed (and cleared) in the Back handler. Page
+  // turns and other navigation don't clear it -- the user can read
+  // around the bookmark, then Back to return to the list.
+  bool returnToBookmarkListOnBack_ = false;
+
   bool pendingCompletedFeedback = false;
   bool completedFeedbackIsFinished = false;
   unsigned long completedFeedbackShowTime = 0UL;

@@ -1387,6 +1387,27 @@ void EpubReaderActivity::loop() {
       restoreSavedPosition();
       return;
     }
+    // CrumBLE: if the user arrived at the current page via View Bookmarks,
+    // route Back to re-open the bookmark list instead of exiting to Home.
+    // Consume the flag so subsequent Backs go to Home as normal.
+    if (returnToBookmarkListOnBack_) {
+      returnToBookmarkListOnBack_ = false;
+      startActivityForResult(
+          std::make_unique<EpubReaderBookmarkListActivity>(renderer, mappedInput, BOOKMARKS.getBookmarks()),
+          [this](const ActivityResult& result) {
+            if (!result.isCancelled) {
+              const auto& bm = std::get<BookmarkResult>(result.data);
+              RenderLock lock(*this);
+              currentSpineIndex = bm.spineIndex;
+              pendingSpineProgress = bm.progress;
+              pendingPercentJump = true;
+              section.reset();
+              returnToBookmarkListOnBack_ = true;  // re-arm for the next pick
+            }
+            requestUpdate();
+          });
+      return;
+    }
     exitToHomeWithPopup();
     return;
   }
@@ -2391,6 +2412,9 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
               pendingSpineProgress = bm.progress;
               pendingPercentJump = true;
               section.reset();
+              // CrumBLE: arm the back-button shortcut so the next Back
+              // returns to the bookmark list instead of exiting Home.
+              returnToBookmarkListOnBack_ = true;
             }
             requestUpdate();
           });
