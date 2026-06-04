@@ -1167,6 +1167,20 @@ void setup() {
 
   // Ensure we're not still holding the power button before leaving setup
   waitForPowerRelease();
+  // CrumBLE: absorb the release edge from the wake-hold so the first
+  // activity tick's wasReleased(POWER) doesn't fire. Without this, the
+  // user's configured short/long-press action triggers IMMEDIATELY on
+  // wake because getHeldTime() still reports the wake-hold duration
+  // when the activity's first input read happens.
+  //
+  // Same pattern as the Silent-reboot path above (line ~1147): two
+  // gpio.update() calls separated by > InputManager's DEBOUNCE_DELAY
+  // transition the released-bit through lastDebounceTime without
+  // setting releasedEvents, so the first loop()'s gpio.update() sees
+  // state == currentState and emits no edge.
+  gpio.update();
+  delay(10);
+  gpio.update();
   allowSleepAt = millis() + 2000;
 }
 
