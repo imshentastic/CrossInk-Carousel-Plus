@@ -439,18 +439,12 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
     // Calibre / EPUB-3 series metadata anyway.
     add(SettingInfo::Toggle(StrId::STR_SERIES_DETECTION, &CrossPointSettings::seriesDetectionEnabled,
                             "seriesDetectionEnabled", StrId::STR_CAT_SYSTEM));
-    // CrumBLE prebake: master switch for the off-device chapter-index
-    // optimizer. Off by default so the device behaves exactly like stock
-    // 3.7.3 until the user opts in. When on:
-    //   - Section.cpp tries sections-prebake/<n>.bin as a read-only fallback
-    //     (the prebake CLI / web optimizer puts its output there)
-    //   - EpubReaderActivity loads prebake-manifest.json on book open and
-    //     fires the "Use prepared layout?" prompt when current SETTINGS
-    //     don't match the cache's recorded fingerprint
-    //   - The reader's lazy background extractor processes any pending
-    //     <book-hash>.zip dropped via the file manager into sections-prebake/
-    add(SettingInfo::Toggle(StrId::STR_OPTIMIZE_CHAPTER_INDEXING, &CrossPointSettings::optimizeChapterIndexing,
-                            "optimizeChapterIndexing", StrId::STR_CAT_SYSTEM));
+    // CrumBLE 4.1: optimizeChapterIndexing toggle removed from the UI;
+    // the field is force-set to 1 by CrossPointSettings::loadFromFile so
+    // the prebake fallback path (section-cache + manifest + lazy zip
+    // extractor) always runs. Books without a prebake manifest open
+    // normally -- it's a fallback, not a requirement. See the field
+    // comment in CrossPointSettings.h for the runtime semantics.
 
     // --- KOReader Sync (web-only, uses KOReaderCredentialStore) ---
     add(SettingInfo::DynamicString(

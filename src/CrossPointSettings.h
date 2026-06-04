@@ -485,15 +485,21 @@ class CrossPointSettings {
   // When 0 (default), the device behaves exactly like stock 3.7.3: only
   // sections/*.bin is consulted on cache load, and no prebake-manifest.json
   // lookup runs at book open.
-  // When 1, the device also reads sections-prebake/*.bin as a fallback,
-  // checks the prebake JSON manifest fingerprint on book open, and
-  // prompts the user with "Use prepared layout?" when their current
-  // SETTINGS don't match the prepared cache. The lazy background
-  // extractor (which converts a pending zip drop into sections-prebake/
-  // entries) also only runs when this is on. Per-book opt-in: works
-  // alongside the existing /upload file manager flow so users who haven't
-  // run the optimizer on a particular book see no change in behavior.
-  uint8_t optimizeChapterIndexing = 0;
+  // CrumBLE 4.1: always 1 -- this was a user-toggleable opt-in during
+  // the prebake feature's bring-up but it's the headline 4.0+ workflow
+  // now and there's no reason to ship it disabled. The UI toggle was
+  // removed (see SettingsList.h) and loadFromFile force-overwrites any
+  // older saved-off value back to 1. Field retained so existing
+  // serialised settings.bin layouts keep working without a format bump.
+  //
+  // Runtime semantics when 1: the device reads sections-prebake/*.bin
+  // as a fallback, checks the prebake JSON manifest fingerprint on
+  // book open, prompts the user with "Use prepared layout?" when their
+  // current SETTINGS don't match the prepared cache, and runs the lazy
+  // background extractor that converts pending zip drops into
+  // sections-prebake/ entries. Books without a prebake manifest still
+  // open normally -- the path is a fallback, not a requirement.
+  uint8_t optimizeChapterIndexing = 1;
 
   ~CrossPointSettings() = default;
 
