@@ -2,7 +2,7 @@
 
 # CrumBLE
 
-**A personal fork of [CrossInk](https://github.com/uxjulia/CrossInk) for the Xteink X4 — adds full BLE support, on-demand sleep-screen cycling, customized Collections, Bookshelf display, an EPUB optimizer with optional BT pre-caching, and a quick-settings overlay drawer! Supports 23 languages and custom fonts.**
+**A personal fork of [CrossInk](https://github.com/uxjulia/CrossInk) for the Xteink X4 — adds full BLE support, dictionary lookup, quote highlighting, an EPUB optimizer with instant-chapter-turn pre-cache, on-demand sleep-screen cycling, customized Collections, Bookshelf display, and a quick-settings overlay drawer! Supports 23 languages and custom fonts.**
 
 </div>
 
@@ -37,7 +37,7 @@ Not a fan of always digging into file explorer to find your books? Want to group
 
 ### Bookshelf grid
 
-Browse the active collection as a 3×3 grid of cover thumbnails instead of cycling through the carousel:
+Browse the active collection as a 2×2, 3×3, or 4×4 grid of cover thumbnails instead of cycling through the carousel. Pick the grid size from the Bookshelf collection picker's Layout row.
 
 - **Bookshelf** entry on the home icon bar opens the grid over your current collection
 - **Short-press** the carousel header (collection title) opens the same grid
@@ -50,17 +50,25 @@ Browse the active collection as a 3×3 grid of cover thumbnails instead of cycli
   <img width="281" height="457" alt="Screenshot 2026-05-31 at 11 49 10 PM" src="https://github.com/user-attachments/assets/de66eb4c-5e09-4110-b72e-ddad5afe5cd0" />
 </p>
 
+### EPUB optimizer + pre-cache (instant chapter turns)
 
+Books normally index their chapter structure on first open and re-index when you change reading settings. CrumBLE lets your computer do the heavy lifting *off-device* during File Transfer instead — your X4/X3 just unpacks a pre-built section/page cache.
+
+- **Upload modal**: an **Optimize EPUB** master toggle (and an underlying **Pre-Cache for fast chapter turns** sub-toggle, default ON) runs the optimizer in your browser before the upload. Adds ~40 s per book in exchange for instant chapter turns and ~4 s cold book opens.
+- **Already on the SD card?** Select EPUBs in the file manager and use the **Optimize Selected** action to bake them in place without re-uploading.
+- The pre-cache locks in your current reader settings (font, font size, margin, image rendering, orientation) — if you change one mid-read, the reader prompts to switch back to the baked layout or fall through to live indexing.
+
+The previous Bluetooth-image-cache (`.pxc`) and chapter-text flattening features are still included as part of the optimizer's pre-cache pipeline.
 
 ### Bluetooth remote page-turner
 
 Pairing is done from WITHIN A BOOK ONLY! Click on the "Confirm" button while inside a book to open the reader menu. Navigate to Bluetooth and follow the instructions there to pair a BT HID remote (e.g. an [IINE GameBrick](https://www.amazon.com/dp/B0CK4DNQM4) or Free2) and use it as a wireless page-turner. BLE auto-disables when you exit the book to keep heap pressure off the parser, so you will need to reconnect again when you enter a new book.
 
-A **BT Quick Connect** action lives at the bottom of the [Global Book Settings drawer](#global-book-settings-drawer) for one-step re-connect to your last bonded remote without re-navigating the menu tree (long-press confirm when inside book). Once connected, the option becomes **BT Disconnect**. When I read, I open my book, open the drawer, press up twice and use the BT Quick Connect button to fast pair with my controller.
+Bluetooth will always be a challenge for this device, but I'm trying to bring the capability forth without disabling WiFi, full image/css disabling, etc. There are still some books (and I expect most manga/comics) that BLE will not work for, but I'm continuing to optimize. The optimizer's pre-cache pipeline also pre-renders images to per-device .pxc, see EPUB optimizer above
 
-Bluetooth will always be a challenge for this device, but I'm trying to bring the capability forth without disabling WiFi, full image/css disabling, etc. There are still some books (and I expect most manga/comics) that BLE will not work for but I'm continuing to optimize. Two additional options:
-- **EPUB optimizer Bluetooth enhancement**: The built-in EPUB optimizer (during File Transfer) now has some additional capabilities through the highly recommended BT toggle. Besides the baseline JPEG conversion that is already done, we can pre-render each image to a per-device pixel cache (`.pxc`) at your screen's exact viewport, then bake a small manifest of the current settings while also flattening chapter structure layout. This HEAVILY helps with image-heavy chapters as we avoid needing the JPEG/PNG decoder while maintaining BLE abilities. If your current font/margin/image-rendering/orientation differs from the bake, the reader will prompt you on BT connection, advising you to switch back to the baked layout for maximum BT operability. EPUB optimizing will slightly increase file size depending on the number and size of images, but will make BT reading much smoother.
-- **BT No Images Quick Connect**: Located about BT Quick Connect, this one-tap drawer action will temporarily suppress image decoding at render time (uses placeholder border) while BT is connected. It will automatically revert back once BT is disconnected, so just another option to have without any long-term commitment.
+- **BT Quick Connect**: Located at the top of the [Global Book Settings drawer](#global-book-settings-drawer) for one-step re-connect to your last bonded remote without re-navigating the menu tree (long-press confirm when inside book). Once connected, the option becomes **BT Disconnect**. When I read, I open my book, open the drawer, press up twice and use the BT Quick Connect button to fast pair with my controller.
+
+- **BT No Images Quick Connect**: Located at the top of the [Global Book Settings drawer](#global-book-settings-drawer), this one-tap drawer action will temporarily suppress image decoding at render time (uses placeholder border) while BT is connected. It will automatically revert back once BT is disconnected, so just another option to have without any long-term commitment.
 
 <p align="center">
   <img width="270" height="480" alt="IMG_9994" src="https://github.com/user-attachments/assets/6b0f1e34-2aae-4186-9229-6eb501cef5f1" />
@@ -69,13 +77,33 @@ Shout-out to [thedrunkpenguin](https://github.com/thedrunkpenguin/crosspoint-rea
 
 ### On-demand sleep-screen cycling
 
-A new display setting — **Tap Power While Asleep to Cycle** — lets you flip through your `/.sleep` images without fully waking the device. A brief power-button tap picks a fresh random image and re-enters deep sleep. Off by default (each cycle costs a boot + e-ink half-refresh worth of battery); pinned sleep images are skipped in cycle mode.
+A new display setting — **Tap Power While Asleep to Cycle** — lets you flip through your `/.sleep` images without fully waking the device. A brief power-button tap picks a fresh random image and re-enters deep sleep. Off by default (each cycle costs a boot + e-ink half-refresh worth of battery). You can also change the sort from 'random' to 'ordered'
 
 `.png` sleep images (with transparency) are also supported in **Custom** mode, not just BMP Page Overlay. Transparent regions compose over the clean last reader page, so a translucent PNG sleep screen reveals the page of the most recently accessed book underneath.
+
+Note: Quick Resume mode is now supported, and overlays the brand cookie logo on the bottom-left of your sleep frame so you can tell at a glance whether the device is in Quick Resume vs. fully off.
 
 <p align="center">
   <img src="https://github.com/imshentastic/CrumBLE/releases/download/readme-assets/05-sleep-cycle.gif" alt="Sleep screen cycling" width="280"/>
 </p>
+
+### Dictionary lookup
+
+Drop a StarDict (`.ifo` / `.idx` / `.dict`) into `/dict/` on the SD card, open any book, and tap-select a word from the in-book menu's **Lookup** entry to see the definition without leaving the page. A per-book lookup history surfaces under **Looked-Up Words** so you can re-find a definition without re-tapping the word.
+
+Bluetooth auto-disables during lookup to free heap for the dictionary index and reconnects on exit, so you can read with a BT remote and still hop into a definition when needed.
+
+Ported from [SEEK reader](https://github.com/seek-reader/seek) with full credit — couldn't ask for a better implementation to start from.
+
+### Quote highlighting
+
+A bookmark is now optionally a *passage*, not just a page marker.
+
+- Open **Add Highlight** from the in-book menu, tap the first word of the passage, navigate to the last word (same page or many pages later), tap to finish
+- The bookmark list shows the highlighted quote as a preview on each row; **Confirm** jumps straight to where the highlight starts in the book
+- Cross-page highlights can be "held" — tap the start word, hit Back ("HOLD"), turn pages, then come back via **Finish Highlight** in the menu when you're at the end word
+
+Export all highlights for a book to a plain-text file from the Bookmarks sub-menu's **Export to text file**.
 
 ### Global Book Settings drawer
 
@@ -86,6 +114,19 @@ Architecture adapted from [inx by Dave Allie](https://github.com/obijuankenobiii
 <p align="center">
   <img src="./docs/images/crumble/06-book-settings-drawer.png" alt="Global Book Settings drawer" width="280"/>
 </p>
+
+### Settings menu redesign
+
+The settings UI is reorganized into six nested submenus instead of the previous four-tab flat list:
+
+- **Display** — Sleep Screen, Theme & Layout, General
+- **Reader** — Font, Layout, Style, Reading Aids, Customise Status Bar
+- **Controls** — Power Button, Front Buttons, Side Buttons
+- **Library** — Files, Series Detection, Optimize Chapter Indexing
+- **Sync & Network** — Wi-Fi Networks, KOReader Sync, OPDS Servers
+- **System** — Sleep Timeout, Language, Check for Updates, SD Firmware Update, Clear Reading Cache
+
+Back from any nested submenu pops one level up; back from the root exits to Home.
 
 ---
 
