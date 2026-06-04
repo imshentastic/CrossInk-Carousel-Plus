@@ -352,17 +352,28 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
       const int padX = 1;
       const int padTop = 2;
       const int padBot = 2;
+      // First pass: fill the inter-word gap on the same row so the
+      // selection reads as one continuous highlighted block instead of
+      // a series of word boxes with white gaps. Two consecutive in-range
+      // words on the same rowIndex get a black bridge between them.
+      for (int i = lo; i < hi && i < static_cast<int>(words.size()) - 1; ++i) {
+        if (words[i].continuationOf != -1) continue;
+        if (words[i].rowIndex != words[i + 1].rowIndex) continue;
+        const int gapStart = words[i].screenX + words[i].width;
+        const int gapEnd = words[i + 1].screenX;
+        if (gapEnd > gapStart) {
+          renderer.fillRect(gapStart - padX, words[i].screenY - padTop,
+                            (gapEnd - gapStart) + padX * 2, lineHeight + padTop + padBot, true);
+        }
+      }
+      // Second pass: fill the words themselves and redraw in white.
       for (int i = lo; i <= hi && i < static_cast<int>(words.size()); ++i) {
         const WordInfo& w = words[i];
         if (w.continuationOf != -1) continue;
-        // Fill background black, then redraw word in white.
         renderer.fillRect(w.screenX - padX, w.screenY - padTop, w.width + padX * 2,
                           lineHeight + padTop + padBot, true);
         // textBlack=false -> white text. Style defaults to REGULAR since
-        // we don't store per-word EpdFontFamily::Style in WordInfo yet;
-        // the original block's italic/bold render survives wherever the
-        // selection doesn't overlap, and within the selection the small
-        // visual difference is acceptable for v1.
+        // we don't store per-word EpdFontFamily::Style in WordInfo yet.
         renderer.drawText(fontId, w.screenX, w.screenY, w.text.c_str(), false);
       }
     } else {
@@ -390,7 +401,10 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
   } else if (mode_ == Mode::HighlightSingleWord) {
     btn2Label = tr(STR_HIGHLIGHT_END);
   }
-  const auto labels = mappedInput.mapLabels(btn1Label, btn2Label, "", tr(STR_PREV_NEXT));
+  // CrumBLE: split "Prev/Next" into separate Prev + Next slots so each
+  // physical button shows its own hint instead of one button labelled
+  // "Prev/Next" and the other left blank.
+  const auto labels = mappedInput.mapLabels(btn1Label, btn2Label, tr(STR_PREV), tr(STR_NEXT));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 }

@@ -190,39 +190,43 @@ void EpubReaderBookmarkListActivity::render(RenderLock&&) {
 
     const Bookmark& bm = bookmarks[itemIndex];
     const char* chapter = (bm.chapterTitle[0] != '\0') ? bm.chapterTitle : tr(STR_UNKNOWN_CHAPTER);
-    const std::string chapterTrunc = renderer.truncatedText(UI_10_FONT_ID, chapter, contentWidth - 40);
-    renderer.drawText(UI_10_FONT_ID, marginLeft, rowY + 4, chapterTrunc.c_str(), !isSelected);
 
-    char pageBuf[24];
-    snprintf(pageBuf, sizeof(pageBuf), "%d%%", static_cast<int>(std::lround(bm.progress * 100.0)));
-    renderer.drawText(SMALL_FONT_ID, marginLeft, rowY + 24, pageBuf, !isSelected);
-
-    // CrumBLE phase 6: preview text wraps to up to PREVIEW_MAX_LINES
-    // lines. Each line is rendered separately so long highlights
-    // communicate their content at a glance. Empty preview (= migrated
-    // v3 point bookmark or v4 without text) skipped so old-style
-    // bookmarks stay visually compact.
+    // CrumBLE: preview-first layout. Stack order top -> bottom:
+    //   line 1..N: italic preview (up to PREVIEW_MAX_LINES, wraps)
+    //   bottom row: "<Chapter title>  -  NN%"  (single line)
+    // Order swapped from the previous chapter-first layout so the user
+    // scans the actual quote at-a-glance and the metadata sits as a
+    // subtle caption underneath -- matches how the saved book progress
+    // dot reads on the home shelf.
+    const int previewMaxW = contentWidth - 40;
+    int yCursor = rowY + 6;
     if (bm.preview[0] != '\0') {
-      const int previewMaxW = contentWidth - 40;
       auto previewLines =
           renderer.wrappedText(SMALL_FONT_ID, bm.preview, previewMaxW, PREVIEW_MAX_LINES + 1);
       const int previewLineH = renderer.getLineHeight(SMALL_FONT_ID);
-      int previewY = rowY + 44;
       const int linesToDraw = std::min<int>(previewLines.size(), PREVIEW_MAX_LINES);
       for (int li = 0; li < linesToDraw; ++li) {
         std::string line = previewLines[li];
-        // Ellipsize the last visible line if there's more content beneath.
         if (li == PREVIEW_MAX_LINES - 1 && static_cast<int>(previewLines.size()) > PREVIEW_MAX_LINES) {
-          // Trim to fit "..." within the same width budget; truncatedText
-          // already handles measuring.
           line = renderer.truncatedText(SMALL_FONT_ID, (line + "...").c_str(), previewMaxW,
                                         EpdFontFamily::ITALIC);
         }
-        renderer.drawText(SMALL_FONT_ID, marginLeft, previewY, line.c_str(), !isSelected,
+        renderer.drawText(SMALL_FONT_ID, marginLeft, yCursor, line.c_str(), !isSelected,
                           EpdFontFamily::ITALIC);
-        previewY += previewLineH;
+        yCursor += previewLineH;
       }
+      yCursor += 4;  // breathing room between preview and metadata
     }
+
+    // Metadata caption: chapter title + percent, pinned near the row's
+    // bottom edge so it's always at the same baseline regardless of how
+    // many preview lines actually wrapped.
+    char metaBuf[BOOKMARK_CHAPTER_TITLE_MAX + 16];
+    snprintf(metaBuf, sizeof(metaBuf), "%s  -  %d%%", chapter,
+             static_cast<int>(std::lround(bm.progress * 100.0)));
+    const std::string metaTrunc = renderer.truncatedText(SMALL_FONT_ID, metaBuf, previewMaxW);
+    const int metaY = rowY + ROW_HEIGHT - renderer.getLineHeight(SMALL_FONT_ID) - 6;
+    renderer.drawText(SMALL_FONT_ID, marginLeft, metaY, metaTrunc.c_str(), !isSelected);
   }
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));

@@ -10,6 +10,7 @@
 #include <cstddef>
 
 #include "BluetoothHIDManager.h"
+#include "CrossPointState.h"
 #include "LibraryIndex.h"
 #include "MappedInputManager.h"
 #include "NetworkModeSelectionActivity.h"
@@ -84,8 +85,27 @@ void CrossPointWebServerActivity::onEnter() {
   // stale so it's rebuilt (and picks up any just-uploaded books) on the next
   // Recently Added / All Books visit.
   LibraryIndex::getInstance().releaseMemory();
-  LOG_DBG("WEBACT", "Free heap after index release: %d bytes (maxAlloc %d)",
+  LOG_INF("WEBACT", "Free heap after index release: %d bytes (maxAlloc %d)",
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
+  // CrumBLE: pre-flight heap check AFTER all reclamations. The FT path needs
+  // ~40 KB contiguous for WiFi TX buffers + TLS handshake (Hotspot mode is
+  // softAP + DNS + DNS server, all of which alloc), and even with NimBLE
+  // gone a fragmented heap from a long reading session can sit just above
+  // free=80KB but with maxAlloc=20KB, where softAP startup silently fails
+  // and the activity stalls on the mode-selection screen. Rather than
+  // freeze, raise the same low-memory alert as LOOKUP and bail out: user
+  // can close+reopen the book (full heap reset) or reboot.
+  constexpr uint32_t FT_MIN_MAX_ALLOC = 40000;
+  if (ESP.getMaxAllocHeap() < FT_MIN_MAX_ALLOC) {
+    LOG_ERR("WEBACT", "FT pre-flight: maxAlloc=%u below %u, refusing to start", ESP.getMaxAllocHeap(),
+            FT_MIN_MAX_ALLOC);
+    strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_FT_TITLE), sizeof(APP_STATE.pendingAlertTitle) - 1);
+    strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_FT_BODY), sizeof(APP_STATE.pendingAlertBody) - 1);
+    APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
+    exitToOrigin();
+    return;
+  }
 
   // Reset state
   state = WebServerActivityState::MODE_SELECTION;
