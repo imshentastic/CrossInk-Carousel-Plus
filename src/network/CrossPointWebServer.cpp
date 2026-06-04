@@ -412,12 +412,28 @@ static void applyClientSendTimeout(WebServer* server) {
 static void sendBufferGzip(WebServer* server, const char* mime, const char* data,
                            size_t len, const char* tag) {
   applyClientSendTimeout(server);
-  LOG_INF("WEB", "serve %s: %u B, pre free=%d maxAlloc=%d", tag, (unsigned)len,
-          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  // CrumBLE: defensive guard against the "device freezes when phone hits
+  // /files" pattern. WiFi connect drops maxAlloc by ~25 KB; serving a
+  // 30 KB gzipped page (FilesPage) costs another ~6 KB of contiguous
+  // heap. If we attempt that under heavy memory pressure, the render
+  // task starves and the eink stops updating. Refuse upfront with a
+  // tiny plaintext 503 instead -- the user sees an actionable error in
+  // the browser AND the device stays interactive. 14 KB free is the
+  // floor below which the FilesPage serve has historically wedged.
+  const uint32_t preFree = ESP.getFreeHeap();
+  const uint32_t preMax = ESP.getMaxAllocHeap();
+  LOG_INF("WEB", "serve %s: %u B, pre free=%u maxAlloc=%u", tag, (unsigned)len, preFree, preMax);
+  if (preFree < 14u * 1024u) {
+    LOG_ERR("WEB", "serve %s refused: free=%u below 14KB floor", tag, preFree);
+    server->send(503, "text/plain",
+                 "The device is low on memory and cannot serve this page right now.\n"
+                 "Close the book on the device and try again, or reboot the device.\n");
+    return;
+  }
   server->sendHeader("Content-Encoding", "gzip");
   server->send_P(200, mime, data, len);
-  LOG_INF("WEB", "serve %s done: post free=%d maxAlloc=%d", tag,
-          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  LOG_INF("WEB", "serve %s done: post free=%d maxAlloc=%d", tag, ESP.getFreeHeap(),
+          ESP.getMaxAllocHeap());
 }
 
 static void sendHtmlContent(WebServer* server, const char* data, size_t len) {

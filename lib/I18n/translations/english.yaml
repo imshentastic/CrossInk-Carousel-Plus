@@ -633,5 +633,5 @@ STR_DICT_INDEX_BUILDING_HINT: "This is a one-time scan. Please do not power off 
 STR_LOW_MEMORY_LOOKUP_TITLE: "Low memory for Lookup"
 STR_LOW_MEMORY_LOOKUP_BODY: "Lookup needs more free memory than is currently available. Close the book and reopen it, then try Lookup again."
 STR_LOW_MEMORY_FT_TITLE: "Low memory for File Transfer"
-STR_LOW_MEMORY_FT_BODY: "File Transfer needs more free memory than is currently available. Close the book (or reboot) and try File Transfer again."
+STR_LOW_MEMORY_FT_BODY: "File Transfer needs more free memory than is currently available. Reboot the device (long-press power, then short-press to turn back on) and try File Transfer again."
 STR_RECONNECT_BONDED: "Reconnect Bonded Remote"

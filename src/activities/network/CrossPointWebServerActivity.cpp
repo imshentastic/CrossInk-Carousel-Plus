@@ -88,15 +88,22 @@ void CrossPointWebServerActivity::onEnter() {
   LOG_INF("WEBACT", "Free heap after index release: %d bytes (maxAlloc %d)",
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
-  // CrumBLE: pre-flight heap check AFTER all reclamations. The FT path needs
-  // ~40 KB contiguous for WiFi TX buffers + TLS handshake (Hotspot mode is
-  // softAP + DNS + DNS server, all of which alloc), and even with NimBLE
-  // gone a fragmented heap from a long reading session can sit just above
-  // free=80KB but with maxAlloc=20KB, where softAP startup silently fails
-  // and the activity stalls on the mode-selection screen. Rather than
-  // freeze, raise the same low-memory alert as LOOKUP and bail out: user
-  // can close+reopen the book (full heap reset) or reboot.
-  constexpr uint32_t FT_MIN_MAX_ALLOC = 40000;
+  // CrumBLE: pre-flight heap check AFTER all reclamations.
+  //
+  // Threshold history:
+  //   40 KB -- original, scoped to WiFi softAP + DNS server startup. User
+  //            still hit "freezes when phone loads /files" because WiFi
+  //            connect alone consumed ~25 KB of maxAlloc after passing
+  //            this gate, and serving the 30 KB gzipped FilesPage burned
+  //            another 6 KB on top -- the device wound up at maxAlloc
+  //            ~6 KB with the render task starving.
+  //   55 KB -- current. Leaves ~30 KB headroom after WiFi connect so
+  //            the device can still render its own screens AND serve
+  //            the file manager pages. Stricter, but a long reading
+  //            session on a fragmented heap will now refuse FT
+  //            up-front (with a clear alert) instead of freezing in the
+  //            middle of a phone request.
+  constexpr uint32_t FT_MIN_MAX_ALLOC = 55000;
   if (ESP.getMaxAllocHeap() < FT_MIN_MAX_ALLOC) {
     LOG_ERR("WEBACT", "FT pre-flight: maxAlloc=%u below %u, refusing to start", ESP.getMaxAllocHeap(),
             FT_MIN_MAX_ALLOC);
