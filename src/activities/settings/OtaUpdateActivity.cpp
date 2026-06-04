@@ -116,10 +116,20 @@ void OtaUpdateActivity::render(RenderLock&&) {
     renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_CHECKING_UPDATE));
   } else if (state == WAITING_CONFIRMATION) {
     renderer.drawCenteredText(UI_10_FONT_ID, top, tr(STR_NEW_UPDATE), true, EpdFontFamily::BOLD);
+    // CrumBLE: show CrumBLE's own version (CRUMBLE_VERSION) since the
+    // update is being pulled from imshentastic/CrumBLE's releases.
+    // Strip the "crumble-" tag prefix off the new-version display so it
+    // reads as "4.1.0" not "crumble-v4.1.0".
+    const char* newVersionDisplay = updater.getLatestVersion().c_str();
+    constexpr char tagPrefix[] = "crumble-";
+    if (strncmp(newVersionDisplay, tagPrefix, sizeof(tagPrefix) - 1) == 0) {
+      newVersionDisplay += sizeof(tagPrefix) - 1;
+    }
+    if (*newVersionDisplay == 'v' || *newVersionDisplay == 'V') ++newVersionDisplay;
     renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, top + height + metrics.verticalSpacing,
-                      (std::string(tr(STR_CURRENT_VERSION)) + CROSSINK_VERSION).c_str());
+                      (std::string(tr(STR_CURRENT_VERSION)) + CRUMBLE_VERSION).c_str());
     renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, top + height * 2 + metrics.verticalSpacing * 2,
-                      (std::string(tr(STR_NEW_VERSION)) + updater.getLatestVersion()).c_str());
+                      (std::string(tr(STR_NEW_VERSION)) + newVersionDisplay).c_str());
 
     const auto labels = mappedInput.mapLabels(tr(STR_CANCEL), tr(STR_UPDATE), "", "");
     GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
