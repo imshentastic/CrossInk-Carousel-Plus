@@ -114,6 +114,23 @@ void EpubReaderBookmarkListActivity::loop() {
       return;
     }
     if (!bookmarks.empty() && selectedIndex >= 0 && selectedIndex < static_cast<int>(bookmarks.size())) {
+      // CrumBLE: if the selected row's preview spills past the visible
+      // limit AND isn't already expanded, treat the first Confirm tap
+      // as "expand the row so I can read the whole quote" -- the
+      // second tap jumps. If the preview already fits or the row is
+      // already expanded, jump immediately.
+      const auto pageWidth = renderer.getScreenWidth();
+      const auto orientation = renderer.getOrientation();
+      const bool isLandscapeCw = orientation == GfxRenderer::Orientation::LandscapeClockwise;
+      const bool isLandscapeCcw = orientation == GfxRenderer::Orientation::LandscapeCounterClockwise;
+      const int hintGutterWidth = (isLandscapeCw || isLandscapeCcw) ? 30 : 0;
+      const int contentWidth = pageWidth - hintGutterWidth;
+      const int lines = previewLineCount(bookmarks[selectedIndex], contentWidth);
+      if (lines > PREVIEW_MAX_LINES && expandedIndex_ != selectedIndex) {
+        expandedIndex_ = selectedIndex;
+        requestUpdate();
+        return;
+      }
       setResult(BookmarkResult{bookmarks[selectedIndex].spineIndex, bookmarks[selectedIndex].progress});
       finish();
     }
@@ -125,25 +142,42 @@ void EpubReaderBookmarkListActivity::loop() {
 
   const int pageItems = getPageItems();
 
-  buttonNavigator.onNextRelease([this, total] {
+  // CrumBLE: any navigation collapses the expanded row so the user
+  // doesn't lose their place when scrolling away from it.
+  auto collapseExpanded = [this]() { expandedIndex_ = -1; };
+
+  buttonNavigator.onNextRelease([this, total, collapseExpanded] {
+    collapseExpanded();
     selectedIndex = ButtonNavigator::nextIndex(selectedIndex, total);
     requestUpdate();
   });
 
-  buttonNavigator.onPreviousRelease([this, total] {
+  buttonNavigator.onPreviousRelease([this, total, collapseExpanded] {
+    collapseExpanded();
     selectedIndex = ButtonNavigator::previousIndex(selectedIndex, total);
     requestUpdate();
   });
 
-  buttonNavigator.onNextContinuous([this, total, pageItems] {
+  buttonNavigator.onNextContinuous([this, total, pageItems, collapseExpanded] {
+    collapseExpanded();
     selectedIndex = ButtonNavigator::nextPageIndex(selectedIndex, total, pageItems);
     requestUpdate();
   });
 
-  buttonNavigator.onPreviousContinuous([this, total, pageItems] {
+  buttonNavigator.onPreviousContinuous([this, total, pageItems, collapseExpanded] {
+    collapseExpanded();
     selectedIndex = ButtonNavigator::previousPageIndex(selectedIndex, total, pageItems);
     requestUpdate();
   });
+}
+
+int EpubReaderBookmarkListActivity::previewLineCount(const Bookmark& bm, int contentWidth) const {
+  if (bm.preview[0] == '\0') return 0;
+  const int previewMaxW = contentWidth - 40;
+  // Use a generous cap (32 lines) so we get the true wrap count for
+  // really long quotes -- the cap exists to bound the temp vector.
+  auto lines = renderer.wrappedText(SMALL_FONT_ID, bm.preview, previewMaxW, 32);
+  return static_cast<int>(lines.size());
 }
 
 void EpubReaderBookmarkListActivity::render(RenderLock&&) {
@@ -176,49 +210,75 @@ void EpubReaderBookmarkListActivity::render(RenderLock&&) {
   const int total = static_cast<int>(bookmarks.size());
   const int pageStartIndex = (selectedIndex / pageItems) * pageItems;
   const int marginLeft = contentX + 20;
+  const int previewMaxW = contentWidth - 40;
+  const int previewLineH = renderer.getLineHeight(SMALL_FONT_ID);
+  const int listStartY = LIST_START_Y + contentY;
+  const int bottomReserve = ROW_HEIGHT;  // matches getPageItems() reservation
+  const int listMaxY = renderer.getScreenHeight() - bottomReserve;
 
+  int rowY = listStartY;
   for (int i = 0; i < pageItems; i++) {
     const int itemIndex = pageStartIndex + i;
     if (itemIndex >= total) break;
+    if (rowY >= listMaxY) break;
 
-    const int rowY = LIST_START_Y + contentY + i * ROW_HEIGHT;
     const bool isSelected = (itemIndex == selectedIndex);
+    const Bookmark& bm = bookmarks[itemIndex];
+
+    // CrumBLE: size this row dynamically. When the row is expanded
+    // (first Confirm on a row whose preview overflows), grow it to
+    // fit the full wrapped preview instead of capping at
+    // PREVIEW_MAX_LINES. Other rows stay at the regular ROW_HEIGHT.
+    const bool expanded = (itemIndex == expandedIndex_);
+    std::vector<std::string> previewLines;
+    if (bm.preview[0] != '\0') {
+      previewLines = renderer.wrappedText(SMALL_FONT_ID, bm.preview, previewMaxW,
+                                          expanded ? 32 : (PREVIEW_MAX_LINES + 1));
+    }
+    int rowH = ROW_HEIGHT;
+    if (expanded) {
+      // metadata (6+lineH) + small gap (4) + N preview lines + bottom pad (6)
+      const int previewLinesShown = static_cast<int>(previewLines.size());
+      const int contentH = 6 + previewLineH + 4 + previewLinesShown * previewLineH + 6;
+      rowH = std::max(ROW_HEIGHT, contentH);
+    }
+    // Clip the last visible row's bottom to the list area so we don't
+    // bleed into the hint strip.
+    if (rowY + rowH > listMaxY) rowH = listMaxY - rowY;
+    if (rowH <= 0) break;
 
     if (isSelected) {
-      renderer.fillRect(contentX, rowY, contentWidth - 1, ROW_HEIGHT, true);
+      renderer.fillRect(contentX, rowY, contentWidth - 1, rowH, true);
     }
 
-    const Bookmark& bm = bookmarks[itemIndex];
     const char* chapter = (bm.chapterTitle[0] != '\0') ? bm.chapterTitle : tr(STR_UNKNOWN_CHAPTER);
-
-    // CrumBLE: small caption on top, then the italic preview. Stack:
-    //   line 1: "<Chapter title>  -  NN%"  (SMALL_FONT_ID, single line)
-    //   line 2..N: italic preview (up to PREVIEW_MAX_LINES, wraps)
-    const int previewMaxW = contentWidth - 40;
     char metaBuf[BOOKMARK_CHAPTER_TITLE_MAX + 16];
     snprintf(metaBuf, sizeof(metaBuf), "%s  -  %d%%", chapter,
              static_cast<int>(std::lround(bm.progress * 100.0)));
     const std::string metaTrunc = renderer.truncatedText(SMALL_FONT_ID, metaBuf, previewMaxW);
     renderer.drawText(SMALL_FONT_ID, marginLeft, rowY + 6, metaTrunc.c_str(), !isSelected);
 
-    if (bm.preview[0] != '\0') {
-      const int previewLineH = renderer.getLineHeight(SMALL_FONT_ID);
-      // Start preview just under the caption with a small gap.
+    if (!previewLines.empty()) {
       int yCursor = rowY + 6 + previewLineH + 4;
-      auto previewLines =
-          renderer.wrappedText(SMALL_FONT_ID, bm.preview, previewMaxW, PREVIEW_MAX_LINES + 1);
-      const int linesToDraw = std::min<int>(previewLines.size(), PREVIEW_MAX_LINES);
+      const int maxLines = expanded ? static_cast<int>(previewLines.size()) : PREVIEW_MAX_LINES;
+      const int linesToDraw = std::min<int>(previewLines.size(), maxLines);
       for (int li = 0; li < linesToDraw; ++li) {
         std::string line = previewLines[li];
-        if (li == PREVIEW_MAX_LINES - 1 && static_cast<int>(previewLines.size()) > PREVIEW_MAX_LINES) {
+        // Ellipsize the last visible line only when not expanded AND
+        // there's more underneath (the expansion path is meant to
+        // SHOW everything, so we never truncate when expanded).
+        if (!expanded && li == PREVIEW_MAX_LINES - 1 &&
+            static_cast<int>(previewLines.size()) > PREVIEW_MAX_LINES) {
           line = renderer.truncatedText(SMALL_FONT_ID, (line + "...").c_str(), previewMaxW,
                                         EpdFontFamily::ITALIC);
         }
+        if (yCursor + previewLineH > rowY + rowH) break;  // clip if row got shrunk
         renderer.drawText(SMALL_FONT_ID, marginLeft, yCursor, line.c_str(), !isSelected,
                           EpdFontFamily::ITALIC);
         yCursor += previewLineH;
       }
     }
+    rowY += rowH;
   }
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));

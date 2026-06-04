@@ -259,14 +259,17 @@ void DictionaryWordSelectActivity::loop() {
             std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, wordToLookup, cachePath, fontId),
             [this](const ActivityResult& result) { requestUpdate(); });
       } else if (mode_ == Mode::HighlightSingleWord) {
-        // One-tap mode for cross-page END pick. Emit start==end + just
-        // the raw word's text as preview; the reader combines this with
-        // the held start anchor to build the actual saved highlight.
+        // One-tap mode for cross-page END pick. Capture some lead-in
+        // context BEFORE the picked word so the saved preview reads
+        // like a passage ending here rather than a lonely word. The
+        // reader pairs this with the start anchor's trailing context
+        // to build the final preview.
         ActivityResult result;
         HighlightRangeResult hr;
         hr.startWordIndex = selectedWordIdx;
         hr.endWordIndex = selectedWordIdx;
-        hr.previewText = words[selectedWordIdx].text;
+        const int leadIn = std::max(0, selectedWordIdx - 8);
+        hr.previewText = buildPreviewBetween(leadIn, selectedWordIdx);
         result.data = hr;
         setResult(std::move(result));
         finish();
@@ -302,7 +305,13 @@ void DictionaryWordSelectActivity::loop() {
       HighlightRangeResult hr;
       hr.startWordIndex = highlightAnchorWordIdx_;
       hr.endWordIndex = -1;  // signal: anchor only
-      hr.previewText = words[highlightAnchorWordIdx_].text;
+      // CrumBLE: capture a trailing-context snippet starting at the
+      // anchor so the held preview ("Start saved...") and the eventual
+      // bookmark preview both read as a passage rather than a single
+      // word. Bounded by available words on this page.
+      const int trailingEnd =
+          std::min(static_cast<int>(words.size()) - 1, highlightAnchorWordIdx_ + 8);
+      hr.previewText = buildPreviewBetween(highlightAnchorWordIdx_, trailingEnd);
       result.data = hr;
     } else {
       result.isCancelled = true;

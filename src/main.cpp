@@ -87,6 +87,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
 #include "simulator/SimulatorSmokeTest.h"
 #endif
 #include "images/LoadingIcon.h"
+#include "images/Logo120.h"
 #include "util/ButtonNavigator.h"
 #include "util/ScreenshotUtil.h"
 
@@ -1133,7 +1134,11 @@ void setup() {
       if (loadSleepFrameBuffer()) {
         // Frame restored: swap the sleep moon for the loading icon.
         const auto pageHeight = renderer.getScreenHeight();
-        renderer.drawImage(LoadingIcon, 0, pageHeight - LOADINGICON_HEIGHT, LOADINGICON_WIDTH, LOADINGICON_HEIGHT);
+        // CrumBLE: use the brand cookie logo instead of the diagonal-
+        // dots LoadingIcon. Same bottom-left anchor, just a richer
+        // identity mark on the quick-resume overlay.
+        constexpr int kLogoSize = 120;
+        renderer.drawImage(Logo120, 0, pageHeight - kLogoSize, kLogoSize, kLogoSize);
         renderer.displayBuffer(HalDisplay::HALF_REFRESH);
       } else {
         activityManager.goToBoot();  // frame file missing, fall back to the splash
