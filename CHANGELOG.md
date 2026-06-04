@@ -13,6 +13,7 @@
 
 ### Fixed
 - **Optimizer preflight modal now includes SD-card fonts.** Users with a custom `.cpfont` family (e.g. the CharEink SD-card bundle, or any community font dropped into `/fonts/` on the SD card) can now confirm or change their font in the "Lock in reader settings?" dialog that fires before each EPUB optimization. Previously the dropdown hardcoded only the three built-in families (Lexend Deca / Bitter / CharEink) and silently dropped SD selections. The fix pulls the family list from `/api/fonts` at modal open and routes the saved selection through `sdFontFamilyName` when an SD font is picked.
+- **Chapter prebake uploads no longer fail with `HTTP 400 Access denied to protected path`.** The optimizer writes per-book prebake artifacts to `/.crosspoint/epub_<hash>/sections-prebake/` on the SD card. Because that path's leading `.crosspoint` segment starts with a dot, the `isProtectedPath` check (which blocks `.`-prefixed segments when `showHiddenFiles` is off, the default) was rejecting every single prebake upload. The check now whitelists `/.crosspoint/` as the device-managed cache directory — it stays writable regardless of the `showHiddenFiles` setting. Symptoms before the fix: "Chapter prebake done: 0/214 files in 58.8s" + a wall of `PRE-FAIL` log lines.
 
 ## [crumble-v4.0.1] - 2026-06-04
 
