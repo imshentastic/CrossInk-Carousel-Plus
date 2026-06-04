@@ -413,17 +413,18 @@ static void sendBufferGzip(WebServer* server, const char* mime, const char* data
                            size_t len, const char* tag) {
   applyClientSendTimeout(server);
   // CrumBLE: defensive guard against the "device freezes when phone hits
-  // /files" pattern. WiFi connect drops maxAlloc by ~25 KB; serving a
-  // 30 KB gzipped page (FilesPage) costs another ~6 KB of contiguous
-  // heap. If we attempt that under heavy memory pressure, the render
-  // task starves and the eink stops updating. Refuse upfront with a
-  // tiny plaintext 503 instead -- the user sees an actionable error in
-  // the browser AND the device stays interactive. 14 KB free is the
-  // floor below which the FilesPage serve has historically wedged.
+  // /files" pattern. Observed in a user serial dump: post-WiFi the
+  // device had 18.6 KB free / 15 KB maxAlloc; serving the 30 KB gzipped
+  // FilesPage dropped that to 12.4 KB free / 9 KB maxAlloc. The render
+  // task starved at 9 KB and the eink stopped updating. The original
+  // 14 KB free floor cleared this case (18.6 > 14) and still wedged.
+  // Bumped to 22 KB so a comparable session refuses up front and the
+  // user gets an actionable 503 in their browser instead of a hung
+  // device. Lower-pressure sessions still pass cleanly.
   const uint32_t preFree = ESP.getFreeHeap();
   const uint32_t preMax = ESP.getMaxAllocHeap();
   LOG_INF("WEB", "serve %s: %u B, pre free=%u maxAlloc=%u", tag, (unsigned)len, preFree, preMax);
-  if (preFree < 14u * 1024u) {
+  if (preFree < 22u * 1024u) {
     LOG_ERR("WEB", "serve %s refused: free=%u below 14KB floor", tag, preFree);
     server->send(503, "text/plain",
                  "The device is low on memory and cannot serve this page right now.\n"
