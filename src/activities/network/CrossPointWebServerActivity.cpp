@@ -110,13 +110,16 @@ void CrossPointWebServerActivity::onEnter() {
   //            this gate, and serving the 30 KB gzipped FilesPage burned
   //            another 6 KB on top -- the device wound up at maxAlloc
   //            ~6 KB with the render task starving.
-  //   55 KB -- current. Leaves ~30 KB headroom after WiFi connect so
-  //            the device can still render its own screens AND serve
-  //            the file manager pages. Stricter, but a long reading
-  //            session on a fragmented heap will now refuse FT
-  //            up-front (with a clear alert) instead of freezing in the
-  //            middle of a phone request.
-  constexpr uint32_t FT_MIN_MAX_ALLOC = 55000;
+  //   55 KB -- intermediate, refused users with ~51 KB maxAlloc whose
+  //            sessions would have actually worked. Too conservative.
+  //   45 KB -- current. Math from observed costs:
+  //              wifi connect : -25 KB maxAlloc
+  //              serve /files : -6 KB maxAlloc
+  //              render task  : ~14 KB floor
+  //              -> 25 + 6 + 14 = 45 KB minimum safe entry maxAlloc
+  //            The per-page-serve guard (sendBufferGzip < 14 KB free)
+  //            is the secondary net for any case that slips through.
+  constexpr uint32_t FT_MIN_MAX_ALLOC = 45000;
   if (ESP.getMaxAllocHeap() < FT_MIN_MAX_ALLOC) {
     LOG_ERR("WEBACT", "FT pre-flight: maxAlloc=%u below %u, refusing to start", ESP.getMaxAllocHeap(),
             FT_MIN_MAX_ALLOC);

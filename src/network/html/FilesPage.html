@@ -1646,18 +1646,11 @@
                building the chapter index, computing the manifest -- and
                ships a per-book cache directory to the device so the
                actual reading is butter smooth. -->
-          <div class="bt-friendly-option" id="btFriendlyOption">
-            <div class="bt-friendly-row">
-              <div class="bt-friendly-text">
-                <div class="setting-title">Pre-Cache for fast chapter turns <span class="recommended-pill">Highly Recommended</span></div>
-                <div class="setting-desc">Optimizes for instant chapter turns and accelerated book opening. Adds ~40 s to upload time per book in exchange for zero-delay reading!</div>
-              </div>
-              <label class="toggle-switch">
-                <input type="checkbox" id="optimize-for-device-checkbox" checked>
-                <span class="toggle-slider"></span>
-              </label>
-            </div>
-          </div>
+          <!-- CrumBLE: pre-cache was previously a user-toggleable option.
+               Removed -- there's no scenario where skipping prebake is
+               a better choice than running it (the only cost is ~40 s
+               of upload time, vastly outweighed by zero-delay reading).
+               Every EPUB upload now runs the prebake unconditionally. -->
 
           <div class="convert-settings" id="convertSettings" style="display:block;">
             <span>⚫ True-Grayscale</span>
@@ -2241,8 +2234,6 @@
     document.getElementById('convertBeforeUpload').checked = true;
     document.getElementById('convertInfo').style.display = 'none';
     document.getElementById('convertWarning').style.display = 'none';
-    const btFriendlyOption = document.getElementById('btFriendlyOption');
-    if (btFriendlyOption) btFriendlyOption.style.display = 'none';
     // Clear image picker cache and reset layout
     epubImagesCache = [];
     imageStates = {};
@@ -2286,9 +2277,6 @@
     if (checked) ensureOptimizer().catch(err => console.error('Optimizer preload failed:', err));
     document.getElementById('convertWarning').style.display = checked ? 'block' : 'none';
     document.getElementById('convertInfo').style.display = checked ? 'block' : 'none';
-    // Show the Bluetooth-friendly chapters option alongside Optimize EPUB.
-    const btFriendlyOption = document.getElementById('btFriendlyOption');
-    if (btFriendlyOption) btFriendlyOption.style.display = checked ? 'block' : 'none';
     // Update button text and style
     if (checked) {
       uploadBtn.textContent = 'Optimize & Upload';
@@ -2809,11 +2797,11 @@
     const hasEpub = Array.from(files).some(f => f.name.toLowerCase().endsWith('.epub'));
     if (files.length > 0 && hasEpub) {
       convertOptions.style.display = 'block';
-      // Sync sub-option visibility (btFriendlyOption + the Pre-cache row
-      // inside it) to the master toggle's CURRENT state. Without this
-      // call the sub-options stay display:none on first pick because the
-      // master's checked state was set declaratively and never fired a
-      // change event for toggleConvertOptions to react to.
+      // Sync the master Optimize-EPUB toggle state to its sub-UI
+      // (convertWarning / convertInfo). Without this call the sub-UI
+      // stays display:none on first pick because the master's checked
+      // state was set declaratively and never fired a change event for
+      // toggleConvertOptions to react to.
       toggleConvertOptions();
     } else {
       convertOptions.style.display = 'none';
@@ -3319,7 +3307,9 @@ async function uploadFile() {
     // file is an EPUB. The phase-end snaps are tracked below so a phase
     // that bails early hands off to the next one without rewinding.
     const isEpubUpload = file && file.name && /\.epub$/i.test(file.name);
-    const willPrebake = isEpubUpload && !!document.getElementById('optimize-for-device-checkbox')?.checked;
+    // CrumBLE: pre-cache is unconditional for EPUB uploads (the toggle
+    // was removed -- there's no use case for opting out).
+    const willPrebake = isEpubUpload;
     const convertEnd = needsConversion ? (willPrebake ? 25 : 50) : 0;
     const uploadEnd = willPrebake ? 80 : 100;
 
@@ -3393,9 +3383,10 @@ async function uploadFile() {
       // entire upload step for this file (no conversion, no upload, no
       // prebake) -- onError handles the bookkeeping.
       const isEpubFile = file && file.name && /\.epub$/i.test(file.name);
-      const preOptToggle = document.getElementById('optimize-for-device-checkbox');
-      const preOptOn = !!preOptToggle && preOptToggle.checked;
-      const willOptimize = isEpubFile && (needsConversion || preOptOn);
+      // CrumBLE: every EPUB upload runs the prebake step, so the
+      // SETTINGS-lock preflight is needed whenever the file is an EPUB
+      // -- not gated on the (removed) per-batch pre-cache toggle.
+      const willOptimize = isEpubFile;
       // Show preflight ONCE per batch -- the same SETTINGS lock applies
       // to every book in this upload session, so re-prompting per file
       // would feel like a confirmation gate the user has to clear over
@@ -3496,8 +3487,8 @@ async function uploadFile() {
       // optimisations live behind one user mental model. Only applies to
       // .epub uploads. Failure is non-fatal -- we still report the upload
       // as complete; only the chapter speed-up is missed.
-      const prebakeCheckbox = document.getElementById('optimize-for-device-checkbox');
-      if (prebakeCheckbox && prebakeCheckbox.checked && isEpubUpload) {
+      // CrumBLE: always run the prebake for EPUB uploads (toggle removed).
+      if (isEpubUpload) {
         try {
           progressText.textContent = `Optimizing chapter indexing for ${file.name}...`;
           // Single-colour bar: don't repaint here, keep green continuous.
