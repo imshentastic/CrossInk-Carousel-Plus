@@ -13,6 +13,7 @@
 #include "CrossPointSettings.h"
 #include "EpubReaderActivity.h"  // prewarmReaderTextBuffer
 #include "MappedInputManager.h"
+#include "SdCardFontSystem.h"  // sdFontSystem for SD-aware FONT_FAMILY / FONT_SIZE rows
 #include "SettingsList.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -29,8 +30,31 @@ std::string valueTextForSetting(const SettingInfo& info) {
   if (info.type == SettingType::TOGGLE && info.valuePtr != nullptr) {
     return SETTINGS.*(info.valuePtr) ? I18N.get(StrId::STR_STATE_ON) : I18N.get(StrId::STR_STATE_OFF);
   }
-  if (info.type == SettingType::ENUM && info.valuePtr != nullptr) {
-    const uint8_t cur = SETTINGS.*(info.valuePtr);
+  if (info.type == SettingType::ENUM) {
+    // CrumBLE: resolve the current option index. valueGetter wins -- it's
+    // what FONT_FAMILY uses to combine built-in entries with SD card font
+    // names (see buildFontFamilySetting in SettingsList.h). Fall back to
+    // valuePtr when no getter is set (the common built-in path). Without
+    // this branch, FONT_FAMILY always falls through to "" and the drawer
+    // shows a blank value.
+    uint8_t cur = 0;
+    bool haveCur = false;
+    if (info.valueGetter) {
+      cur = info.valueGetter();
+      haveCur = true;
+    } else if (info.valuePtr != nullptr) {
+      cur = SETTINGS.*(info.valuePtr);
+      haveCur = true;
+    }
+    if (!haveCur) return std::string{};
+    // Prefer enumStringValues over enumValues. SD-aware settings build
+    // the runtime string list (built-in label + SD family names for
+    // FONT_FAMILY, point-size labels for SD FONT_SIZE) and leave the
+    // StrId enumValues empty. Built-in-only settings use enumValues.
+    if (!info.enumStringValues.empty()) {
+      if (cur < info.enumStringValues.size()) return info.enumStringValues[cur];
+      return std::string{};
+    }
     if (cur < info.enumValues.size()) {
       return I18N.get(info.enumValues[cur]);
     }
@@ -43,14 +67,30 @@ std::string valueTextForSetting(const SettingInfo& info) {
 }
 
 void applyDeltaToSetting(const SettingInfo& info, int delta) {
+  // CrumBLE: handle valueGetter/valueSetter (used by SD-aware settings like
+  // FONT_FAMILY) BEFORE the valuePtr-only paths. Without this, left/right
+  // on the FONT_FAMILY row would silently no-op when an SD font was
+  // installed and the user expected to cycle through built-in + SD names.
+  if (info.type == SettingType::ENUM && info.valueGetter && info.valueSetter) {
+    int count = static_cast<int>(info.enumStringValues.size());
+    if (count == 0) count = static_cast<int>(info.enumValues.size());
+    if (count <= 0) return;
+    int next = static_cast<int>(info.valueGetter()) + delta;
+    next = ((next % count) + count) % count;
+    info.valueSetter(static_cast<uint8_t>(next));
+    return;
+  }
   if (info.valuePtr == nullptr) return;
   if (info.type == SettingType::TOGGLE) {
     SETTINGS.*(info.valuePtr) = (SETTINGS.*(info.valuePtr) == 0) ? 1 : 0;
     return;
   }
   if (info.type == SettingType::ENUM) {
-    if (info.enumValues.empty()) return;
-    const int count = static_cast<int>(info.enumValues.size());
+    // Prefer enumStringValues count when present (SD-aware FONT_SIZE list
+    // has its sizes there, not in enumValues).
+    int count = static_cast<int>(info.enumStringValues.size());
+    if (count == 0) count = static_cast<int>(info.enumValues.size());
+    if (count <= 0) return;
     int next = static_cast<int>(SETTINGS.*(info.valuePtr)) + delta;
     next = ((next % count) + count) % count;
     SETTINGS.*(info.valuePtr) = static_cast<uint8_t>(next);
@@ -162,7 +202,15 @@ void BookSettingsDrawerActivity::buildItems() {
   } else {
     const auto heap = MemoryBudget::snapshot();
     if (MemoryBudget::hasHeap(heap, 28u * 1024u, 14u * 1024u)) {
-      settingsList_ = getSettingsList();
+      // CrumBLE: pass the SD font registry so FONT_FAMILY's enumStringValues
+      // includes installed SD families AND FONT_SIZE uses the SD font's
+      // size list when one is active. Without the registry, both rows
+      // render blank when the user has an SD font selected: FONT_FAMILY
+      // because its valueGetter looks for the active name in an empty
+      // sdFamilyNames capture, and FONT_SIZE because the built-in size
+      // enum has fewer entries than the SD font's index.
+      sdFontSystem.refreshIfDirty();
+      settingsList_ = getSettingsList(&sdFontSystem.registry());
       for (size_t i = 0; i < settingsList_.size(); ++i) {
         const auto& info = settingsList_[i];
         if (info.category != StrId::STR_CAT_READER) continue;

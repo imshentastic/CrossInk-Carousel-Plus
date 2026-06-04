@@ -339,30 +339,40 @@ void DictionaryWordSelectActivity::render(RenderLock&&) {
       renderer.fillRect(boxX + boxWidth + 1, boxY - 3, 2, lineHeight + 8, true);
     };
 
-    // HighlightRange mode + anchor placed: render an underline across
-    // every word in the inclusive range [anchor, cursor]. Single-word
-    // box still used to mark the cursor itself so the user sees where
-    // the next Confirm will end the range.
+    // HighlightRange mode + anchor placed: render a filled black box
+    // behind every word in the inclusive range [anchor, cursor], then
+    // redraw each word in white over the box (reverse video). Skips
+    // continuation slots so hyphenated halves aren't double-stamped.
+    // The cursor's word-ring is suppressed inside the range -- the
+    // reverse-video selection already shows where the cursor sits.
     if (mode_ == Mode::HighlightRange && highlightAnchorWordIdx_ >= 0 &&
         highlightAnchorWordIdx_ < static_cast<int>(words.size())) {
       const int lo = std::min(highlightAnchorWordIdx_, selectedWordIdx);
       const int hi = std::max(highlightAnchorWordIdx_, selectedWordIdx);
+      const int padX = 1;
+      const int padTop = 2;
+      const int padBot = 2;
       for (int i = lo; i <= hi && i < static_cast<int>(words.size()); ++i) {
         const WordInfo& w = words[i];
-        // Thicker underline (3 px) under each in-range word; lets the
-        // selection be visually distinct from the cursor's box. Skips
-        // continuation slots to avoid double-marking hyphenated halves.
         if (w.continuationOf != -1) continue;
-        renderer.fillRect(w.screenX, w.screenY + lineHeight + 2, w.width, 3, true);
+        // Fill background black, then redraw word in white.
+        renderer.fillRect(w.screenX - padX, w.screenY - padTop, w.width + padX * 2,
+                          lineHeight + padTop + padBot, true);
+        // textBlack=false -> white text. Style defaults to REGULAR since
+        // we don't store per-word EpdFontFamily::Style in WordInfo yet;
+        // the original block's italic/bold render survives wherever the
+        // selection doesn't overlap, and within the selection the small
+        // visual difference is acceptable for v1.
+        renderer.drawText(fontId, w.screenX, w.screenY, w.text.c_str(), false);
       }
-    }
-
-    drawSingleWordBox(selectedWordIdx);
-    if (words[selectedWordIdx].continuationIndex != -1) {
-      drawSingleWordBox(words[selectedWordIdx].continuationIndex);
-    }
-    if (words[selectedWordIdx].continuationOf != -1) {
-      drawSingleWordBox(words[selectedWordIdx].continuationOf);
+    } else {
+      drawSingleWordBox(selectedWordIdx);
+      if (words[selectedWordIdx].continuationIndex != -1) {
+        drawSingleWordBox(words[selectedWordIdx].continuationIndex);
+      }
+      if (words[selectedWordIdx].continuationOf != -1) {
+        drawSingleWordBox(words[selectedWordIdx].continuationOf);
+      }
     }
   }
 

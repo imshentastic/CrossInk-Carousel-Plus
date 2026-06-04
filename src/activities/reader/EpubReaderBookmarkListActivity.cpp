@@ -12,9 +12,15 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 
-// CrumBLE phase 6: rows now show a 3rd line for the highlight preview
-// text when present, so the bumped row height accommodates it.
-static constexpr int ROW_HEIGHT = 64;
+// CrumBLE phase 6: rows show chapter + progress + up to 3 lines of
+// highlight preview, wrapping the preview text to the row width. 96 px
+// gives ~16 px per body line plus the chapter/% header at the top --
+// enough that long highlights communicate their content at a glance.
+// Rows without a preview keep the chapter/% on a tighter footprint by
+// drawing the same row but skipping the preview block; visually that's
+// just a slightly emptier card and is intentional.
+static constexpr int ROW_HEIGHT = 96;
+static constexpr int PREVIEW_MAX_LINES = 3;
 static constexpr int LIST_START_Y = 60;
 static constexpr unsigned long BOOKMARK_DELETE_HOLD_MS = 1000;
 
@@ -191,15 +197,31 @@ void EpubReaderBookmarkListActivity::render(RenderLock&&) {
     snprintf(pageBuf, sizeof(pageBuf), "%d%%", static_cast<int>(std::lround(bm.progress * 100.0)));
     renderer.drawText(SMALL_FONT_ID, marginLeft, rowY + 24, pageBuf, !isSelected);
 
-    // CrumBLE phase 6: preview text on the 3rd line when present.
-    // Empty preview (= migrated v3 point bookmark or v4 without text) is
-    // skipped so old-style bookmarks stay visually compact instead of
-    // showing a blank row.
+    // CrumBLE phase 6: preview text wraps to up to PREVIEW_MAX_LINES
+    // lines. Each line is rendered separately so long highlights
+    // communicate their content at a glance. Empty preview (= migrated
+    // v3 point bookmark or v4 without text) skipped so old-style
+    // bookmarks stay visually compact.
     if (bm.preview[0] != '\0') {
-      const std::string previewTrunc =
-          renderer.truncatedText(SMALL_FONT_ID, bm.preview, contentWidth - 40, EpdFontFamily::ITALIC);
-      renderer.drawText(SMALL_FONT_ID, marginLeft, rowY + 44, previewTrunc.c_str(), !isSelected,
-                        EpdFontFamily::ITALIC);
+      const int previewMaxW = contentWidth - 40;
+      auto previewLines =
+          renderer.wrappedText(SMALL_FONT_ID, bm.preview, previewMaxW, PREVIEW_MAX_LINES + 1);
+      const int previewLineH = renderer.getLineHeight(SMALL_FONT_ID);
+      int previewY = rowY + 44;
+      const int linesToDraw = std::min<int>(previewLines.size(), PREVIEW_MAX_LINES);
+      for (int li = 0; li < linesToDraw; ++li) {
+        std::string line = previewLines[li];
+        // Ellipsize the last visible line if there's more content beneath.
+        if (li == PREVIEW_MAX_LINES - 1 && static_cast<int>(previewLines.size()) > PREVIEW_MAX_LINES) {
+          // Trim to fit "..." within the same width budget; truncatedText
+          // already handles measuring.
+          line = renderer.truncatedText(SMALL_FONT_ID, (line + "...").c_str(), previewMaxW,
+                                        EpdFontFamily::ITALIC);
+        }
+        renderer.drawText(SMALL_FONT_ID, marginLeft, previewY, line.c_str(), !isSelected,
+                          EpdFontFamily::ITALIC);
+        previewY += previewLineH;
+      }
     }
   }
 
