@@ -130,6 +130,12 @@
 #endif
 #endif  // OMIT_CHAREINK_FONT
 
+// CrumBLE: OMIT_LEXENDDECA_FONT drops the entire Lexend Deca family. Saves
+// ~600 KB binary. Used in the slim "fits 6.25 MB legacy OTA partition"
+// build alongside OMIT_CHAREINK_FONT. With both off, only Bitter remains
+// as a built-in reading font; Lexend can be installed as an SD-card
+// .cpfont, and the picker hides the missing built-in.
+#ifndef OMIT_LEXENDDECA_FONT
 #ifndef OMIT_TEENSY_FONT
 #include BUILTIN_READING_FONT_HEADER(lexenddeca_8_bold)
 #include BUILTIN_READING_FONT_HEADER(lexenddeca_8_bolditalic)
@@ -178,6 +184,7 @@
 #include BUILTIN_READING_FONT_HEADER(lexenddeca_20_italic)
 #include BUILTIN_READING_FONT_HEADER(lexenddeca_20_regular)
 #endif
+#endif  // OMIT_LEXENDDECA_FONT
 
 #undef BUILTIN_READING_FONT_HEADER
 
