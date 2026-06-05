@@ -57,7 +57,14 @@ constexpr size_t MAX_SELECTOR_LENGTH = 256;
 // Grow selector storage in small chunks. Reserving MAX_RULES up front can
 // require one large contiguous heap block and abort on ESP32-C3.
 constexpr size_t RULE_RESERVE_CHUNK = 32;
-constexpr uint32_t MIN_HEAP_AFTER_RULE_GROW = 16 * 1024;
+// CrumBLE 4.2: relaxed from 16 KB -> 8 KB. The X3 enters reader with a
+// noticeably lower maxAllocHeap than the X4 (larger 528x792 frame buffer
+// + larger cover-pool allocations sit in heap longer), and a real-book
+// CSS parse on Iron Flame was bailing at maxAlloc ~35 KB even though the
+// rule-table reserve only needed ~20 KB. 8 KB cushion is still more than
+// enough for any single allocation downstream of CSS parsing (cover
+// thumb writes, glyph buffers all stay under ~8 KB contiguous).
+constexpr uint32_t MIN_HEAP_AFTER_RULE_GROW = 8 * 1024;
 
 // Check if character is CSS whitespace
 bool isCssWhitespace(const char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
