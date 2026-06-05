@@ -36,13 +36,18 @@ class SdCardFontManager {
   // 0 if nothing loaded.
   uint8_t currentPointSize() const { return loadedPointSize_; };
 
+  // CrumBLE 4.2: exposed for the off-device prebake WASM, which needs to
+  // compute the exact same fontId the device will derive at reader-open
+  // time so the manifest's baked-in fontId matches the runtime fontId
+  // and the prebake's sections/.pxc both pass the fingerprint check.
+  static int computeFontId(uint32_t contentHash, const char* familyName, uint8_t pointSize);
+
  private:
   struct LoadedFont {
     SdCardFont* font;  // heap-allocated, owned
     int fontId;
     uint8_t size;
   };
-  static int computeFontId(uint32_t contentHash, const char* familyName, uint8_t pointSize);
 
   std::string loadedFamilyName_;
   uint8_t loadedPointSize_ = 0;

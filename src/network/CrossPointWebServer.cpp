@@ -248,6 +248,8 @@ void CrossPointWebServer::begin() {
   // Font management endpoints
   server->on("/fonts", HTTP_GET, [this] { handleFontsPage(); });
   server->on("/api/fonts", HTTP_GET, [this] { handleFontList(); });
+  server->on("/api/builtin-fonts", HTTP_GET, [this] { handleBuiltinFontList(); });
+  server->on("/api/fonts/file", HTTP_GET, [this] { handleFontFile(); });
   server->on("/api/fonts/upload", HTTP_POST, [this] { handleFontUpload(); }, [this] { handleFontUploadData(); });
   server->on("/api/fonts/delete", HTTP_POST, [this] { handleFontDelete(); });
 
@@ -683,9 +685,19 @@ void CrossPointWebServer::handleFileListData() const {
       std::string fullPath = currentPath.c_str();
       if (fullPath.empty() || fullPath.back() != '/') fullPath += '/';
       fullPath += info.name.c_str();
-      const std::string manifestPath =
-          Epub::cachePathForFilePath(fullPath, "/.crosspoint") + "/prebake-manifest.json";
-      doc["prebaked"] = Storage.exists(manifestPath.c_str());
+      // CrumBLE 4.2: gate the "Pre-cached" badge on the v2 marker (written by
+      // the post-4.2 WASM optimizer) rather than the bare manifest file.
+      // Pre-4.2 bakes left only the manifest and used the old SD-font
+      // measurement path -- their per-section layouts disagree with device
+      // runtime once the SD-font fast-path landed, so showing them as
+      // "Pre-cached" would be misleading. The on-device "Use prepared layout?"
+      // prompt path still reads prebake-manifest.json (via
+      // tryLoadPrebakeManifest) regardless of the marker, so legacy bakes
+      // remain functionally restorable -- they just no longer flaunt the
+      // badge.
+      const std::string markerPath =
+          Epub::cachePathForFilePath(fullPath, "/.crosspoint") + "/prebake-v2.marker";
+      doc["prebaked"] = Storage.exists(markerPath.c_str());
     } else {
       doc["prebaked"] = false;
     }
@@ -1534,7 +1546,41 @@ void CrossPointWebServer::handleReaderRenderInfo() const {
   // Match render()'s non-auto-page-turn branch (the bake targets normal reading).
   marginBottom += std::max<int>(SETTINGS.screenMargin, statusBarHeight + STATUS_BAR_TEXT_PADDING);
 
+  // CrumBLE 4.2: ensure the SD-card font (if any) is loaded BEFORE asking
+  // SETTINGS for the fontId. Without this, sdFontIdResolver returns 0
+  // because the manager has no loaded font, getReaderFontId silently falls
+  // back to the built-in BITTER, the bake stores the BITTER fontId in the
+  // section file -- and then at reader-open time the device's
+  // ensureLoaded() finally runs, returns the SD font's real hash, and
+  // every section fails the fingerprint check ("indexing between pages").
+  const_cast<SdCardFontSystem&>(sdFontSystem).ensureLoaded(r);
   const int fontId = SETTINGS.getReaderFontId();
+  // CrumBLE 4.2 SD-font diagnostic: dump key glyph metrics for the
+  // currently-loaded SD font so they can be diffed against the WASM-side
+  // log of the same family (see tools/crumble-prebake/src/main.cpp,
+  // SDFONT_DIAG). The two logs should print identical numbers; any
+  // divergence is the source of jumbled-layout-but-fingerprint-passes.
+  if (SETTINGS.sdFontFamilyName[0] != '\0') {
+    auto it = r.getFontMap().find(fontId);
+    if (it != r.getFontMap().end()) {
+      const EpdFontData* d = it->second.getData(EpdFontFamily::REGULAR);
+      if (d) {
+        LOG_INF("SDFONT_DIAG", "DEV regular: advanceY=%u ascender=%d descender=%d intervalCount=%u groupCount=%u",
+                static_cast<unsigned>(d->advanceY), d->ascender, d->descender,
+                static_cast<unsigned>(d->intervalCount), static_cast<unsigned>(d->groupCount));
+        for (uint32_t cp : {static_cast<uint32_t>(0x41), static_cast<uint32_t>(0x61), static_cast<uint32_t>(0x20)}) {
+          const EpdGlyph* g = it->second.getGlyph(cp, EpdFontFamily::REGULAR);
+          if (g) {
+            LOG_INF("SDFONT_DIAG", "DEV U+%04X: w=%u h=%u advX=%u left=%d top=%d dataLen=%u",
+                    cp, g->width, g->height, g->advanceX, g->left, g->top,
+                    static_cast<unsigned>(g->dataLength));
+          } else {
+            LOG_INF("SDFONT_DIAG", "DEV U+%04X: NOT FOUND", cp);
+          }
+        }
+      }
+    }
+  }
   const int screenW = r.getScreenWidth();
   const int screenH = r.getScreenHeight();
   const int viewportWidth = screenW - marginLeft - marginRight;
@@ -1552,7 +1598,14 @@ void CrossPointWebServer::handleReaderRenderInfo() const {
   // them would mean every prebake'd section gets rejected on first device
   // open. v1 fields are unchanged so existing .pxc-only flows still work.
   doc["fitVersion"] = 2;
-  doc["device"] = "X4";
+  // CrumBLE 4.2 fix: was hardcoded "X4" -- the WASM optimizer + crumble-
+  // prebake CLI both branch on this string for device-specific layout
+  // metrics, so reporting "X4" on an actual X3 caused every prebake'd
+  // section to be baked with X4 positions. Symptom on X3: all text on
+  // every page rendered at y=0 (stacked at top), images positioned
+  // correctly. Mirrors the same detection used by /api/* elsewhere in
+  // this file (line ~573).
+  doc["device"] = gpio.deviceIsX3() ? "X3" : "X4";
   doc["orientation"] = static_cast<int>(SETTINGS.orientation);
   doc["screenMargin"] = static_cast<int>(SETTINGS.screenMargin);
   doc["imageRendering"] = static_cast<int>(SETTINGS.imageRendering);
@@ -1591,6 +1644,24 @@ void CrossPointWebServer::handleReaderRenderInfo() const {
   doc["embeddedStyle"] = static_cast<int>(SETTINGS.embeddedStyle);
   doc["bionicReadingEnabled"] = static_cast<int>(SETTINGS.bionicReadingEnabled);
   doc["guideReadingEnabled"] = static_cast<int>(SETTINGS.guideReadingEnabled);
+  // CrumBLE 4.2: report the font sizes this firmware actually supports.
+  // Slim builds OMIT Teensy/Itty-Bitty/Extra-Large/Huge from env:tiny,
+  // so the optimizer's font-size dropdown was offering selections that
+  // the device can't render (it would silently fall back to a different
+  // size, breaking the prebake fingerprint). Each entry's "value" is the
+  // SETTINGS.fontSize integer the device would store for that size --
+  // matches the API contract of /api/save-reader-settings -- and
+  // "pointSize" lets the JS render a readable "(NNpt)" label without
+  // needing to duplicate the enum-to-pt mapping client-side.
+  JsonArray availableSizes = doc["availableFontSizes"].to<JsonArray>();
+  for (uint8_t i = 0; i < static_cast<uint8_t>(CrossPointSettings::FONT_SIZE_COUNT); i++) {
+    const auto size = static_cast<CrossPointSettings::FONT_SIZE>(i);
+    const uint8_t stored = CrossPointSettings::getStoredReaderFontSize(size);
+    if (stored == 0xFF) continue;  // sentinel: not available in this build
+    JsonObject entry = availableSizes.add<JsonObject>();
+    entry["value"] = static_cast<int>(stored);
+    entry["pointSize"] = static_cast<int>(CrossPointSettings::getReaderFontPointSize(size));
+  }
   String json;
   serializeJson(doc, json);
   server->send(200, "application/json", json);
@@ -2090,8 +2161,15 @@ void CrossPointWebServer::handleFontsPage() const {
 }
 
 void CrossPointWebServer::handleFontList() const {
-  // Pick up any uploads/deletes that happened since the last reader load.
-  const_cast<SdCardFontSystem&>(sdFontSystem).refreshIfDirty();
+  // CrumBLE 4.2: force a rescan every call instead of only refreshIfDirty.
+  // The dirty flag only flips for /api/fonts/upload + /api/fonts/delete --
+  // a user who drops a .cpfont onto the SD card directly (pulled card,
+  // copied file, reinserted) doesn't trigger that path, so the optimizer
+  // preflight modal would keep showing the stale font list until the
+  // device next did an explicit upload/delete. One directory scan per
+  // /api/fonts call is cheap (~1-2 SD ops for typical font libraries)
+  // and removes the "why doesn't my new font show up" surprise.
+  const_cast<SdCardFontSystem&>(sdFontSystem).registry().discover();
   const auto& families = sdFontSystem.registry().getFamilies();
 
   JsonDocument doc;
@@ -2128,6 +2206,83 @@ void CrossPointWebServer::handleFontList() const {
   String json;
   serializeJson(doc, json);
   server->send(200, "application/json", json);
+}
+
+// CrumBLE 4.2: report which built-in reading fonts the firmware actually
+// ships. Values match CrossPointSettings::FONT_FAMILY enum so the optimizer
+// preflight modal can map "builtin:<value>" tags to the device-side
+// fontFamily field. OMIT_LEXENDDECA_FONT / OMIT_CHAREINK_FONT drop their
+// rows so the modal doesn't offer a font that isn't on this device.
+void CrossPointWebServer::handleBuiltinFontList() const {
+  JsonDocument doc;
+  JsonArray builtins = doc["builtins"].to<JsonArray>();
+#ifndef OMIT_LEXENDDECA_FONT
+  {
+    JsonObject e = builtins.add<JsonObject>();
+    e["value"] = static_cast<int>(CrossPointSettings::LEXENDDECA);
+    e["label"] = "Lexend Deca";
+  }
+#endif
+  {
+    JsonObject e = builtins.add<JsonObject>();
+    e["value"] = static_cast<int>(CrossPointSettings::BITTER);
+    e["label"] = "Bitter";
+  }
+#ifndef OMIT_CHAREINK_FONT
+  {
+    JsonObject e = builtins.add<JsonObject>();
+    e["value"] = static_cast<int>(CrossPointSettings::CHAREINK);
+    e["label"] = "CharE-Ink";
+  }
+#endif
+  String json;
+  serializeJson(doc, json);
+  server->send(200, "application/json", json);
+}
+
+// CrumBLE 4.2: serve a raw .cpfont file so the browser-side prebake
+// optimizer can ship the bytes to WASM and register the SD-card font
+// for layout. Query: ?family=<name>&size=<pt>. Forces a registry rescan
+// so a freshly-dropped .cpfont surfaces without the dirty-flag dance.
+void CrossPointWebServer::handleFontFile() const {
+  if (!server->hasArg("family") || !server->hasArg("size")) {
+    server->send(400, "text/plain", "Missing family or size");
+    return;
+  }
+  const String familyArg = server->arg("family");
+  const int pointSize = server->arg("size").toInt();
+  if (familyArg.isEmpty() || pointSize <= 0 || pointSize > 255) {
+    server->send(400, "text/plain", "Invalid family or size");
+    return;
+  }
+
+  const_cast<SdCardFontSystem&>(sdFontSystem).registry().discover();
+  for (const auto& family : sdFontSystem.registry().getFamilies()) {
+    if (family.name != familyArg.c_str()) continue;
+    const auto* file = family.findFile(static_cast<uint8_t>(pointSize));
+    if (!file) {
+      server->send(404, "text/plain", "No matching size in family");
+      return;
+    }
+    FsFile f;
+    if (!Storage.openFileForRead("WEB", file->path.c_str(), f)) {
+      server->send(500, "text/plain", "Could not open .cpfont");
+      return;
+    }
+    const size_t fileSize = f.size();
+    server->setContentLength(fileSize);
+    server->send(200, "application/octet-stream", "");
+    constexpr size_t kBufSize = 1024;
+    uint8_t buf[kBufSize];
+    while (true) {
+      const size_t n = f.read(buf, kBufSize);
+      if (n == 0) break;
+      server->client().write(buf, n);
+    }
+    f.close();
+    return;
+  }
+  server->send(404, "text/plain", "Family not found");
 }
 
 void CrossPointWebServer::handleFontUploadData() {

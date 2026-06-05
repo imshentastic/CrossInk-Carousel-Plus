@@ -27,15 +27,32 @@
 // against. Default reading font is LexendDeca Medium (14px). Add the four
 // styles a single family needs (regular, bold, italic, bold-italic) here
 // when expanding to more font sizes / variants.
-#include <builtinFonts/lexenddeca_14_regular.h>
-#include <builtinFonts/lexenddeca_14_bold.h>
-#include <builtinFonts/lexenddeca_14_italic.h>
-#include <builtinFonts/lexenddeca_14_bolditalic.h>
+// CrumBLE 4.2: Lexend_14 dropped from WASM (~140 KB gzipped) to keep the
+// embedded blob under the X3's web-serve heap-fluctuation tolerance.
+// Slim firmware doesn't ship Lexend as a built-in either; users with a
+// stale LEXENDDECA preference fall through to BITTER via
+// getReaderFontId's effectiveFamily mapping, and Lexend-via-SD-cpfont
+// (CrumBLE-LexendDeca-SDfont.zip) is the supported path going forward.
+// #include <builtinFonts/lexenddeca_14_regular.h>
+// #include <builtinFonts/lexenddeca_14_bold.h>
+// #include <builtinFonts/lexenddeca_14_italic.h>
+// #include <builtinFonts/lexenddeca_14_bolditalic.h>
 #include <builtinFonts/bitter_12_regular.h>
 #include <builtinFonts/bitter_12_bold.h>
 #include <builtinFonts/bitter_12_italic.h>
 #include <builtinFonts/bitter_12_bolditalic.h>
-#include "fontIds.h"  // LEXENDDECA_14_FONT_ID / BITTER_12_FONT_ID
+// CrumBLE 4.2: Bitter_14 is the slim build's default reader font after
+// dropping Lexend Deca built-in. WASM has to register it so prewarm /
+// layout calls with fontId=BITTER_14_FONT_ID don't return 0-height
+// lines (the symptom that produced "all text stacked at top" on X3).
+#include <builtinFonts/bitter_14_regular.h>
+#include <builtinFonts/bitter_14_bold.h>
+#include <builtinFonts/bitter_14_italic.h>
+#include <builtinFonts/bitter_14_bolditalic.h>
+#include "fontIds.h"  // LEXENDDECA_14_FONT_ID / BITTER_12_FONT_ID / BITTER_14_FONT_ID
+#include <SdCardFont.h>
+#include <SdCardFontManager.h>
+#include <EpdFontFamily.h>
 
 #include <ArduinoJson.h>
 #ifndef CRUMBLE_PREBAKE_WASM
@@ -364,6 +381,17 @@ struct Options {
                               // is a progressive JPEG (JPEGDEC crashes on
                               // those) or when batching books and you don't
                               // want a single bad cover to halt the run.
+  // CrumBLE 4.2: SD-card font input. When the user picks an SD .cpfont in
+  // the optimizer preflight modal, JS writes the raw font bytes to MEMFS
+  // and passes the path here, plus the family name (for fontId hashing)
+  // and the point size of the chosen variant. main() loads the file via
+  // SdCardFont::load, computes the fontId via SdCardFontManager's FNV
+  // hash, registers it in the renderer, and uses it for the section
+  // bake. The same fontId formula runs on-device, so the manifest's
+  // baked fontId matches whatever the reader resolves at open time.
+  std::string sdFontPath;
+  std::string sdFontFamilyName;
+  uint8_t sdFontPointSize = 0;
 };
 
 bool parseArgs(int argc, char** argv, Options& out) {
@@ -392,6 +420,12 @@ bool parseArgs(int argc, char** argv, Options& out) {
       out.check = true;
     } else if (a == "--verbose") {
       out.verbose = true;
+    } else if (a == "--sd-font-path" && i + 1 < argc) {
+      out.sdFontPath = argv[++i];
+    } else if (a == "--sd-font-family" && i + 1 < argc) {
+      out.sdFontFamilyName = argv[++i];
+    } else if (a == "--sd-font-size" && i + 1 < argc) {
+      out.sdFontPointSize = static_cast<uint8_t>(std::stoi(argv[++i]));
     } else if (a.rfind("--", 0) == 0) {
       std::fprintf(stderr, "Unknown option: %s\n", a.c_str());
       return false;
@@ -930,6 +964,30 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
     } else {
       LOG_ERR("PRE", "could not write prebake-manifest.json at %s", manifestPath.c_str());
     }
+
+    // CrumBLE 4.2: write a separate version-marker file. The File Transfer
+    // "Pre-cached" badge and the in-reader long-press menu's "Optimized"
+    // label both gate on this marker rather than on the manifest's
+    // existence. Older (pre-4.2) bakes have only the manifest -- they ran
+    // before the SD-font measurement fast-path landed in host_shim
+    // GfxRenderer, so their per-section layouts disagree with device runtime
+    // for any SD-font book, and at least for built-in-font books they're
+    // stale in subtle ways (different fontId hashing constants, missing
+    // SD-font support). Marking only v2-aware bakes avoids the misleading
+    // badge for users carrying stale prebakes from the old optimizer.
+    //
+    // Schema-versioned filename so a future v3 bake (or a v3-aware device
+    // build) can simply add prebake-v3.marker without touching the existing
+    // v2 detection path.
+    const std::string markerPath = realCacheDir + "/prebake-v2.marker";
+    std::ofstream marker(markerPath, std::ios::binary | std::ios::trunc);
+    if (marker) {
+      // Empty file -- presence is the only signal we need. (~0 SD bytes.)
+      marker.close();
+      LOG_INF("PRE", "wrote prebake-v2.marker");
+    } else {
+      LOG_ERR("PRE", "could not write prebake-v2.marker at %s", markerPath.c_str());
+    }
   }
 
   return failures;
@@ -979,22 +1037,85 @@ int main(int argc, char** argv) {
   // map; expanding to multiple sizes/families means more EpdFontFamily
   // instances + insertFont calls here. fontIds.h defines the integer
   // hash constants the device + host both bake into section headers.
-  EpdFont lexenddeca14Regular(&lexenddeca_14_regular);
-  EpdFont lexenddeca14Bold(&lexenddeca_14_bold);
-  EpdFont lexenddeca14Italic(&lexenddeca_14_italic);
-  EpdFont lexenddeca14BoldItalic(&lexenddeca_14_bolditalic);
-  EpdFontFamily lexenddeca14Family(&lexenddeca14Regular, &lexenddeca14Bold,
-                                   &lexenddeca14Italic, &lexenddeca14BoldItalic);
+  // Lexend_14 EpdFont declarations elided (see top-of-file note).
   EpdFont bitter12Regular(&bitter_12_regular);
   EpdFont bitter12Bold(&bitter_12_bold);
   EpdFont bitter12Italic(&bitter_12_italic);
   EpdFont bitter12BoldItalic(&bitter_12_bolditalic);
   EpdFontFamily bitter12Family(&bitter12Regular, &bitter12Bold,
                                &bitter12Italic, &bitter12BoldItalic);
+  EpdFont bitter14Regular(&bitter_14_regular);
+  EpdFont bitter14Bold(&bitter_14_bold);
+  EpdFont bitter14Italic(&bitter_14_italic);
+  EpdFont bitter14BoldItalic(&bitter_14_bolditalic);
+  EpdFontFamily bitter14Family(&bitter14Regular, &bitter14Bold,
+                               &bitter14Italic, &bitter14BoldItalic);
 
   GfxRenderer renderer;
-  renderer.insertFont(LEXENDDECA_14_FONT_ID, lexenddeca14Family);
+  // CrumBLE 4.2: Lexend_14 register call elided; see top-of-file rationale.
   renderer.insertFont(BITTER_12_FONT_ID, bitter12Family);
+  renderer.insertFont(BITTER_14_FONT_ID, bitter14Family);
+
+  // CrumBLE 4.2: load + register an SD-card .cpfont when the JS caller
+  // supplies one. The font lives at opts.sdFontPath inside MEMFS (the JS
+  // side writes the .cpfont bytes there before invoking main()).
+  // computeFontId here mirrors the device's hash exactly, so the
+  // manifest's fontId == reader's runtime fontId.
+  std::unique_ptr<SdCardFont> sdFontKeepalive;
+  if (!opts.sdFontPath.empty() && !opts.sdFontFamilyName.empty() && opts.sdFontPointSize > 0) {
+    auto font = std::make_unique<SdCardFont>();
+    if (!font->load(opts.sdFontPath.c_str())) {
+      LOG_ERR("CLI", "SD font load failed: %s -- aborting", opts.sdFontPath.c_str());
+      return 4;
+    }
+    const int sdFontId = SdCardFontManager::computeFontId(font->contentHash(),
+                                                          opts.sdFontFamilyName.c_str(),
+                                                          opts.sdFontPointSize);
+    // insertFont puts the EpdFontFamily wrapper in the renderer's
+    // fontMap so getData()/getKerning() lookups work. registerSdCardFont
+    // separately puts the SdCardFont* in the sdCardFonts_ map so
+    // ParsedText.cpp's isSdCardFont() check returns true and triggers
+    // ensureSdCardFontReady() -> buildAdvanceTable() per-paragraph,
+    // which populates the per-font persistent advance table that
+    // getTextAdvanceX / getTextWidth / getSpaceWidth read from. Both
+    // calls are necessary: without registerSdCardFont, ParsedText's
+    // isSdCardFont() returns false, ensureSdCardFontReady is skipped,
+    // hasAdvanceTable() stays false, and the renderer falls through to
+    // EpdFontFamily::findGlyph -- which finds nothing on an SD font
+    // (intervalCount=0 by design), so every glyph is "missing" and
+    // sections lay out jumbled.
+    EpdFontFamily sdFontFamily(font->getEpdFont(0), font->getEpdFont(1),
+                               font->getEpdFont(2), font->getEpdFont(3));
+    renderer.insertFont(sdFontId, sdFontFamily);
+    renderer.registerSdCardFont(sdFontId, font.get());
+    LOG_INF("CLI", "SD font registered: %s @ %u pt -> id=%d (contentHash=0x%08x)",
+            opts.sdFontFamilyName.c_str(), opts.sdFontPointSize, sdFontId, font->contentHash());
+    // CrumBLE 4.2 SD-font diagnostic: dump key glyph metrics so we can
+    // diff against the device-side equivalent log (handleReaderRenderInfo's
+    // SDFONT_DIAG) -- any divergence here means WASM and device parse the
+    // same .cpfont bytes into different metrics, which would explain the
+    // jumbled-layout-but-fingerprint-passes symptom.
+    {
+      EpdFont* ef = font->getEpdFont(0);  // regular
+      if (ef && ef->data) {
+        const auto* d = ef->data;
+        LOG_INF("SDFONT_DIAG", "WASM regular: advanceY=%u ascender=%d descender=%d intervalCount=%u groupCount=%u",
+                static_cast<unsigned>(d->advanceY), d->ascender, d->descender,
+                static_cast<unsigned>(d->intervalCount), static_cast<unsigned>(d->groupCount));
+        for (uint32_t cp : {static_cast<uint32_t>(0x41), static_cast<uint32_t>(0x61), static_cast<uint32_t>(0x20)}) {
+          const EpdGlyph* g = ef->findGlyph(cp);
+          if (g) {
+            LOG_INF("SDFONT_DIAG", "WASM U+%04X: w=%u h=%u advX=%u left=%d top=%d dataLen=%u",
+                    cp, g->width, g->height, g->advanceX, g->left, g->top,
+                    static_cast<unsigned>(g->dataLength));
+          } else {
+            LOG_INF("SDFONT_DIAG", "WASM U+%04X: NOT FOUND", cp);
+          }
+        }
+      }
+    }
+    sdFontKeepalive = std::move(font);  // keep alive for the lifetime of renderer
+  }
 
   // Resolve section settings. Section gen needs the same 12-field header
   // payload the device computes; we can get it from a live device fetch

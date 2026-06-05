@@ -1878,15 +1878,38 @@ async function showOptimizerPreflightModal(renderInfo, fileName) {
   // and SD-card fonts ("sd:<family-name>") in the same select. Built-in
   // tags map to numeric fontFamily on save; SD tags map to
   // sdFontFamilyName. See the confirm.onclick handler below.
-  const FONT_FAMILY = [
-    { v: 'builtin:0', label: 'Lexend Deca' },
-    { v: 'builtin:1', label: 'Bitter' },
-    { v: 'builtin:2', label: 'CharE-Ink' },
-  ];
+  // CrumBLE 4.2: built-in font list comes from /api/builtin-fonts so the
+  // slim binaries (which OMIT Lexend Deca and/or CharE-Ink) don't offer
+  // fonts that aren't actually on the device. Fallback to the legacy
+  // hardcoded list if the endpoint is missing (older firmware).
+  const FONT_FAMILY = [];
+  try {
+    const builtinsResp = await fetch('/api/builtin-fonts');
+    if (builtinsResp.ok) {
+      const builtinsData = await builtinsResp.json();
+      for (const b of (builtinsData.builtins || [])) {
+        if (b && typeof b.value === 'number' && typeof b.label === 'string') {
+          FONT_FAMILY.push({ v: `builtin:${b.value}`, label: b.label });
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('Preflight: /api/builtin-fonts unavailable; using legacy hardcoded list', e);
+  }
+  if (FONT_FAMILY.length === 0) {
+    FONT_FAMILY.push({ v: 'builtin:0', label: 'Lexend Deca' });
+    FONT_FAMILY.push({ v: 'builtin:1', label: 'Bitter' });
+    FONT_FAMILY.push({ v: 'builtin:2', label: 'CharE-Ink' });
+  }
 
   // CrumBLE 4.1.1: pull SD-card font families from the device so users
   // with a custom .cpfont can confirm / pick it in this dialog. Missing
   // or failed /api/fonts response just falls through to built-ins only.
+  // CrumBLE 4.2: also keep the per-family `sizes` array around for the
+  // reactive size-dropdown rebuild below -- each SD font has its own
+  // point-size list (whatever <Family>_<size>.cpfont files exist) and
+  // the size dropdown should reflect what the user actually has.
+  const SD_FONT_FAMILIES = {};  // name -> { sizes: [pt, pt, ...] }
   try {
     const fontsResp = await fetch('/api/fonts');
     if (fontsResp.ok) {
@@ -1894,21 +1917,49 @@ async function showOptimizerPreflightModal(renderInfo, fileName) {
       for (const family of (fontsData.families || [])) {
         if (family && typeof family.name === 'string' && family.name.length > 0) {
           FONT_FAMILY.push({ v: `sd:${family.name}`, label: `${family.name} (SD)` });
+          SD_FONT_FAMILIES[family.name] = {
+            sizes: Array.isArray(family.sizes) ? family.sizes.slice() : [],
+          };
         }
       }
     }
   } catch (e) {
     console.warn('Preflight: /api/fonts unavailable; SD-card font families will be missing from the picker', e);
   }
-  const FONT_SIZE = [
-    { v: 0, label: 'Tiny (8pt)' },
-    { v: 1, label: 'Small (10pt)' },
-    { v: 2, label: 'Medium (12pt)' },
-    { v: 3, label: 'Large (14pt)' },
-    { v: 4, label: 'Extra Large (16pt)' },
-    { v: 5, label: 'Teensy (6pt)' },
-    { v: 6, label: 'Huge (20pt)' },
-  ];
+  // CrumBLE 4.2: use the device-reported availableFontSizes so we don't
+  // offer sizes the firmware doesn't ship (env:tiny OMITs several --
+  // picking a missing one would silently fall back to a different size
+  // and break the prebake fingerprint). renderInfo.availableFontSizes
+  // arrives from /api/reader-render-info as
+  // [{value: <storage-index>, pointSize: <int>}, ...] sorted by
+  // smallest point size. Fall back to the legacy hardcoded list if the
+  // field is missing (older firmware).
+  let FONT_SIZE;
+  if (Array.isArray(renderInfo.availableFontSizes) && renderInfo.availableFontSizes.length > 0) {
+    const ptToName = (pt) => {
+      if (pt <= 8) return 'Tiny';
+      if (pt <= 10) return 'Small';
+      if (pt <= 12) return 'Medium';
+      if (pt <= 14) return 'Large';
+      if (pt <= 16) return 'Extra Large';
+      if (pt <= 18) return 'XL';
+      return 'Huge';
+    };
+    FONT_SIZE = renderInfo.availableFontSizes
+      .slice()
+      .sort((a, b) => (a.pointSize | 0) - (b.pointSize | 0))
+      .map((s) => ({ v: s.value | 0, label: `${ptToName(s.pointSize | 0)} (${s.pointSize | 0}pt)` }));
+  } else {
+    FONT_SIZE = [
+      { v: 0, label: 'Tiny (8pt)' },
+      { v: 1, label: 'Small (10pt)' },
+      { v: 2, label: 'Medium (12pt)' },
+      { v: 3, label: 'Large (14pt)' },
+      { v: 4, label: 'Extra Large (16pt)' },
+      { v: 5, label: 'Teensy (6pt)' },
+      { v: 6, label: 'Huge (20pt)' },
+    ];
+  }
   const ORIENTATION = [
     { v: 0, label: 'Portrait' },
     { v: 1, label: 'Landscape (CW)' },
@@ -2020,6 +2071,47 @@ async function showOptimizerPreflightModal(renderInfo, fileName) {
       : `builtin:${renderInfo.fontFamily | 0}`;
     makeSelect('Font family', 'fontFamily', FONT_FAMILY, currentFontTag);
     makeSelect('Font size', 'fontSize', FONT_SIZE, renderInfo.fontSize | 0);
+
+    // CrumBLE 4.2: when the user switches font family, repopulate the
+    // size dropdown with options appropriate for the new family. Built-in
+    // fonts share one shipped set (FONT_SIZE from /api/builtin-fonts);
+    // each SD-card family has its OWN size list (only the
+    // <Family>_<size>.cpfont files that actually exist). Without this,
+    // the size dropdown sticks with Bitter's sizes even after picking an
+    // SD font, and the user picks a "size" that doesn't have a .cpfont
+    // file -- prebake then fails or produces wrong-metric layout.
+    const familySel = form.querySelector('select[data-key="fontFamily"]');
+    const sizeSel = form.querySelector('select[data-key="fontSize"]');
+    const rebuildSizeOptions = (familyTag) => {
+      let opts = FONT_SIZE;  // default to built-in sizes
+      if (familyTag && familyTag.startsWith('sd:')) {
+        const familyName = familyTag.substring(3);
+        const family = SD_FONT_FAMILIES[familyName];
+        if (family && family.sizes.length > 0) {
+          opts = family.sizes
+            .slice()
+            .sort((a, b) => (a | 0) - (b | 0))
+            .map((pt, i) => ({ v: i, label: `${pt}pt` }));
+        }
+      }
+      const prevSelected = sizeSel.value;
+      while (sizeSel.firstChild) sizeSel.removeChild(sizeSel.firstChild);
+      let restored = false;
+      for (const opt of opts) {
+        const o = document.createElement('option');
+        o.value = opt.v;
+        o.textContent = opt.label;
+        if (String(opt.v) === String(prevSelected)) {
+          o.selected = true;
+          restored = true;
+        }
+        sizeSel.appendChild(o);
+      }
+      if (!restored && sizeSel.firstChild) sizeSel.firstChild.selected = true;
+    };
+    familySel.addEventListener('change', () => rebuildSizeOptions(familySel.value));
+    // Initial population may need to apply if device's saved font is SD.
+    rebuildSizeOptions(currentFontTag);
     makeSelect('Orientation', 'orientation', ORIENTATION, renderInfo.orientation | 0);
     makeNumber('Screen margin (px)', 'screenMargin', renderInfo.screenMargin | 0, 0, 50);
     makeSelect('Line spacing', 'lineSpacing', LINE_SPACING, renderInfo.lineSpacing | 0);
@@ -2083,6 +2175,21 @@ async function showOptimizerPreflightModal(renderInfo, fileName) {
         }
       });
       if (dirtyKeys.length === 0) {
+        // Same SD-pt-size attachment as the post-save branch -- the user
+        // may have opened the modal on an SD font, confirmed without
+        // changing anything, and we still need to tell the bake what
+        // point size .cpfont to load.
+        const familyVal = familySel.value;
+        const sizeVal = sizeSel.value;
+        if (familyVal.startsWith('sd:')) {
+          const sdName = familyVal.substring(3);
+          const family = SD_FONT_FAMILIES[sdName];
+          if (family && family.sizes.length > 0) {
+            const sorted = family.sizes.slice().sort((a, b) => (a | 0) - (b | 0));
+            const idx = Math.min(sorted.length - 1, Math.max(0, sizeVal | 0));
+            renderInfo.sdFontPickedPointSize = sorted[idx];
+          }
+        }
         close();
         resolve(renderInfo);
         return;
@@ -2100,6 +2207,23 @@ async function showOptimizerPreflightModal(renderInfo, fileName) {
           throw new Error('Save failed: ' + errText);
         }
         const fresh = await fetch('/api/reader-render-info').then(r => r.json());
+        // CrumBLE 4.2: surface the SD-card point size the user actually
+        // picked, so the bake step downstream knows what size .cpfont to
+        // ship to WASM. The device's stored fontSize is an enum index
+        // that doesn't carry the SD font's real point size; we look up
+        // the picked size's pt-value from the family.sizes array and
+        // attach it as a separate field on renderInfo.
+        const familyVal = familySel.value;
+        const sizeVal = sizeSel.value;
+        if (familyVal.startsWith('sd:')) {
+          const sdName = familyVal.substring(3);
+          const family = SD_FONT_FAMILIES[sdName];
+          if (family && family.sizes.length > 0) {
+            const sorted = family.sizes.slice().sort((a, b) => (a | 0) - (b | 0));
+            const idx = Math.min(sorted.length - 1, Math.max(0, sizeVal | 0));
+            fresh.sdFontPickedPointSize = sorted[idx];
+          }
+        }
         close();
         resolve(fresh);
       } catch (e) {
@@ -2276,9 +2400,11 @@ async function prebakeChapters(epubBlob, deviceFilePath, progressCallback) {
   const inputPath = '/input.epub';
   const settingsPath = '/settings.json';
   const outDir = '/out';
+  const sdFontPath = '/sd_font.cpfont';
   try { Module.FS.unlink(inputPath); } catch (e) {}
   try { Module.FS.unlink(settingsPath); } catch (e) {}
   try { Module.FS.unlink(outDir); } catch (e) {}
+  try { Module.FS.unlink(sdFontPath); } catch (e) {}
   Module.FS.writeFile(inputPath, epubBytes);
   Module.FS.writeFile(settingsPath, JSON.stringify(renderInfo));
   Module.FS.mkdir(outDir);
@@ -2291,13 +2417,78 @@ async function prebakeChapters(epubBlob, deviceFilePath, progressCallback) {
   // fall back defensively so we don't quietly hash a relative path.
   let devicePath = deviceFilePath || '';
   if (!devicePath.startsWith('/')) devicePath = '/' + devicePath;
+  // CrumBLE 4.2: --skip-thumbs flag dropped. WASM-side prebakeAllThumbs
+  // can decode the cover JPEG/PNG, dither it for e-ink, and ship the
+  // resulting BMPs alongside the section files. The device's first
+  // home-render no longer has to do the heap-pressured decode itself,
+  // which is the difference between a snappy carousel and a "loading"
+  // placeholder on first cover view post-upload. Adds ~5-30 KB per
+  // thumb size × 3 sizes to the upload payload; covers that fail to
+  // decode (e.g. progressive JPEGs the vendored JPEGDEC chokes on)
+  // fall through to the device-side generator -- same fallback that
+  // existed before, just hit less often.
   const cliArgs = [
     '--settings-file', settingsPath,
     '--output-dir', outDir,
     '--device-path', devicePath,
-    '--skip-thumbs',
     inputPath,
   ];
+
+  // CrumBLE 4.2: when the user picked an SD-card font in the preflight
+  // modal, fetch that font's .cpfont bytes from the device and pass them
+  // into WASM via MEMFS. The CLI loads the font, computes the same fontId
+  // the device-side reader will resolve (FNV hash over contentHash +
+  // family + pt-size), and registers it in the renderer so layout calls
+  // for that fontId produce real glyph metrics instead of zero-height
+  // lines. Without this path, an SD-font prebake bakes layouts against
+  // whichever default font the WASM happened to have, and the device's
+  // section-load fingerprint check fails on every open.
+  log(`SD font fetch check: sdFontFamilyName='${renderInfo.sdFontFamilyName || ''}' sdFontPickedPointSize=${renderInfo.sdFontPickedPointSize | 0}`, '', 'PRE');
+  if (renderInfo.sdFontFamilyName && renderInfo.sdFontFamilyName.length > 0) {
+    const fname = renderInfo.sdFontFamilyName;
+    // CrumBLE 4.2: fall back to fetching the font list and guessing the
+    // best size if sdFontPickedPointSize wasn't surfaced (e.g. modal
+    // opened on an SD font already selected and the per-modal reactive
+    // dropdown didn't fire because the user didn't change anything).
+    let pt = renderInfo.sdFontPickedPointSize | 0;
+    if (!pt) {
+      try {
+        const fontsData = await fetch('/api/fonts').then(r => r.json());
+        const family = (fontsData.families || []).find(f => f.name === fname);
+        if (family && family.sizes && family.sizes.length > 0) {
+          const sorted = family.sizes.slice().sort((a, b) => (a | 0) - (b | 0));
+          // Try to pick the size closest to the device's stored fontSize
+          // interpreted as an index into the SD family. If fontSize is
+          // larger than the array, clamp to the last entry.
+          const idx = Math.min(sorted.length - 1, Math.max(0, renderInfo.fontSize | 0));
+          pt = sorted[idx];
+          log(`SD font fallback: guessed pt=${pt} from family.sizes[${idx}] (fontSize=${renderInfo.fontSize})`, '', 'PRE');
+        }
+      } catch (e) {
+        log(`SD font fallback fetch failed: ${e.message || e}`, '', 'WARN');
+      }
+    }
+    if (pt > 0) {
+      log(`Chapter prebake: fetching SD font ${fname} @ ${pt}pt`, '', 'PRE');
+      try {
+        const fontResp = await fetch(`/api/fonts/file?family=${encodeURIComponent(fname)}&size=${pt}`);
+        if (!fontResp.ok) {
+          throw new Error(`/api/fonts/file ${fontResp.status}`);
+        }
+        const fontBytes = new Uint8Array(await fontResp.arrayBuffer());
+        Module.FS.writeFile(sdFontPath, fontBytes);
+        cliArgs.unshift('--sd-font-path', sdFontPath,
+                        '--sd-font-family', fname,
+                        '--sd-font-size', String(pt));
+        log(`SD font passed to WASM: path=${sdFontPath} family=${fname} pt=${pt}`, '', 'PRE');
+      } catch (e) {
+        log(`SD font fetch failed (${e.message || e}) -- bake will use default font; prebake will not load cleanly`,
+            '', 'WARN');
+      }
+    } else {
+      log(`SD font: no point size resolved -- bake will use default font`, '', 'WARN');
+    }
+  }
   log(`Chapter prebake: callMain(${JSON.stringify(cliArgs)})`, '', 'PRE');
   // Clear the print/printErr capture buffer right before we run so any
   // earlier session output doesn't pollute this run's diagnostics.
