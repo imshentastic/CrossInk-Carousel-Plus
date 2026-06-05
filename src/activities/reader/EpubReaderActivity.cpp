@@ -31,6 +31,7 @@
 #include "util/LookupHistory.h"
 #include "BookStatsActivity.h"
 #include "CollectionsStore.h"
+#include "SeriesIndex.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "EpubReaderBookmarkListActivity.h"
@@ -73,6 +74,19 @@ constexpr int MAX_PAGE_LOAD_RETRIES = 3;
 // translation unit that touches the manifest struct). Keep the two copies
 // behaviourally identical if you change one.
 std::string enumLabelOf(const SettingInfo& info, uint8_t value) {
+  // CrumBLE 4.2: honor enumRawValues when set. Settings that use
+  // .withEnumRawValues({...}) (e.g. fontFamily on slim builds where the
+  // displayed enum is a subset of the raw enum) need a raw-value -> display-
+  // index lookup, otherwise the raw value silently indexes off the end of
+  // the (now-shorter) enumValues vector and the label comes back blank.
+  if (!info.enumRawValues.empty()) {
+    for (size_t i = 0; i < info.enumRawValues.size() && i < info.enumValues.size(); i++) {
+      if (info.enumRawValues[i] == value) {
+        return std::string(I18N.get(info.enumValues[i]));
+      }
+    }
+    return std::string{};
+  }
   if (value < info.enumValues.size()) {
     return std::string(I18N.get(info.enumValues[value]));
   }
@@ -335,6 +349,19 @@ void EpubReaderActivity::onEnter() {
   // auto-rebuilds from the on-disk JSON on the next Recently Added / All Books
   // visit, so the only cost is a one-time rewalk back at Home.
   LibraryIndex::getInstance().releaseMemory();
+
+  // CrumBLE 4.2: also free CollectionsStore and SeriesIndex string pools
+  // for the reader session. Same reasoning as the FT entry release
+  // (55dc28c2): the per-book metadata strings sit scattered across the
+  // heap and prevent the CSS parser's rule-table grow from finding the
+  // ~60 KB contiguous block a real-book stylesheet ends up needing. On
+  // the X3 (which already has a tighter contiguous-heap budget thanks to
+  // its larger 528x792 frame buffer + cover-pool blocks) this was the
+  // difference between CSS parsing completing and bailing at ~30 KB
+  // maxAlloc with "Skipping remaining CSS rules". Both stores rebuild
+  // from JSON on the next Home visit.
+  CollectionsStore::getInstance().releaseMemory();
+  SeriesIndex::getInstance().releaseMemory();
 
   // BT No Images Quick Connect is session-scoped: always start a freshly opened
   // (or reopened-after-reboot) book with images enabled. If the user picked the
@@ -774,6 +801,17 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
         SETTINGS.guideReadingEnabled = pm2.guideReadingEnabled;
         SETTINGS.saveToFile();
         ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
+        // CrumBLE 4.2 fix: reload the SD-font manager so getReaderFontId()
+        // recomputes the SD font hash against the JUST-restored sdFontFamilyName /
+        // sdFontSizeRange / fontSize. Without this the manager keeps whatever
+        // SD font it loaded at boot, and the per-section fingerprint check
+        // (SETTINGS.getReaderFontId() vs sections-prebake/N.bin) keeps failing
+        // because the live fontId still comes from the stale loaded family
+        // -- producing the "Use prepared layout, but indexing every chapter"
+        // symptom even though the user accepted the prepared layout. The
+        // built-in-font path doesn't need this because its fontId is purely
+        // a switch on (fontFamily, fontSize), no runtime side-state.
+        sdFontSystem.ensureLoaded(renderer);
         // Snapshot the now-reverted SETTINGS as the new baseline.
         prebakeLastSnapshot_.orientation = SETTINGS.orientation;
         prebakeLastSnapshot_.screenMargin = SETTINGS.screenMargin;
@@ -1104,8 +1142,34 @@ void EpubReaderActivity::loop() {
               SETTINGS.orientation = mm.orientation;
               SETTINGS.screenMargin = mm.screenMargin;
               SETTINGS.imageRendering = mm.imageRendering;
+              // CrumBLE 4.2 fix: also restore font selection when the
+              // manifest carries the new font fields. Older manifests left
+              // these at default (fontId == 0), so we gate on a real fontId
+              // to avoid clobbering the user's font with all-zero values
+              // when an old manifest is loaded. Mirrors the prebake-restore
+              // handler -- without restoring font + reloading the SD-font
+              // system, getReaderFontId() returns the live (pre-restore)
+              // fontId and every section fingerprint check fails on the
+              // restored layout. See the prebake-prompt restore at line
+              // ~786 for the longer-form comment.
+              if (mm.fontId != 0) {
+                SETTINGS.fontFamily = mm.fontFamily;
+                SETTINGS.fontSize = mm.fontSize;
+                SETTINGS.sdFontSizeRange = mm.sdFontSizeRange;
+                strncpy(SETTINGS.sdFontFamilyName, mm.sdFontFamilyName.c_str(),
+                        sizeof(SETTINGS.sdFontFamilyName) - 1);
+                SETTINGS.sdFontFamilyName[sizeof(SETTINGS.sdFontFamilyName) - 1] = '\0';
+              }
               SETTINGS.saveToFile();
               ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
+              if (mm.fontId != 0) {
+                // Reload the SD-font manager so getReaderFontId() recomputes
+                // from the freshly-restored sdFontFamilyName / sdFontSizeRange
+                // / fontSize triple. Without this the manager keeps whatever
+                // family it loaded at boot and the per-section fingerprint
+                // check would keep failing on the restored manifest's fontId.
+                sdFontSystem.ensureLoaded(renderer);
+              }
               // Force a re-layout: SETTINGS may now differ from what the
               // section was built with.
               pendingBleQuickConnectSettingsChanged_ = true;
@@ -1678,6 +1742,21 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       break;
     }
     case EpubReaderMenuActivity::MenuAction::LOOKUP: {
+      // CrumBLE 4.2: Lookup is always reachable from the menu now (the
+      // gate was removed from EpubReaderMenuActivity::buildMainMenuItems).
+      // First check: do the StarDict files actually exist? If not, show
+      // an info screen with install instructions instead of running the
+      // full BT-teardown + heap-preflight gauntlet for a flow that's
+      // guaranteed to fail at the dictionary read.
+      if (!Dictionary::exists()) {
+        startActivityForResult(
+            std::make_unique<ChoicePromptActivity>(
+                renderer, mappedInput, tr(STR_DICT_NOT_FOUND_TITLE), tr(STR_DICT_NOT_FOUND_BODY),
+                std::vector<std::string>{tr(STR_OK_BUTTON)},
+                /*ignoreInitialConfirmRelease=*/true),
+            [this](const ActivityResult& /*result*/) { requestUpdate(); });
+        break;
+      }
       // CrumBLE: auto-disable BT for the duration of the dictionary flow.
       // NimBLE holds ~58 KB of stack state while connected, which leaves
       // heap too fragmented for DictionaryWordSelect::extractWords to
