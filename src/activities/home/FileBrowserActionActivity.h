@@ -101,6 +101,15 @@ enum class FileBrowserAction : int {
   // the collection's sortMode is forced to Manual (otherwise the manual
   // order would be overridden by whichever sort was active).
   ReorderBooksInCollection = 24,
+  // CrumBLE 4.2: opens PrebakeManifestViewerActivity over the book whose
+  // long-press menu surfaced the "Optimized" header. Fired when the user
+  // navigates UP from the first menu item onto the header label (only
+  // selectable when headerRightLabel == "Optimized" -- the bolt is the
+  // visual cue) and presses Confirm. The viewer is read-only: it shows
+  // every reader setting baked into prebake-manifest.json so the user can
+  // verify what their saved layout actually looks like without restoring
+  // it.
+  ViewOptimizedDetails = 25,
 };
 
 class FileBrowserActionActivity final : public Activity {
@@ -134,9 +143,10 @@ class FileBrowserActionActivity final : public Activity {
 
   FileBrowserActionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string title,
                             std::vector<MenuItem> items, bool ignoreInitialConfirmRelease = false,
-                            std::string headerRightLabel = {})
+                            std::string headerRightLabel = {}, std::string subtitle = {})
       : Activity("FileBrowserAction", renderer, mappedInput),
         title(std::move(title)),
+        subtitle(std::move(subtitle)),
         headerRightLabel(std::move(headerRightLabel)),
         items(std::move(items)),
         ignoreConfirmRelease(ignoreInitialConfirmRelease) {}
@@ -148,6 +158,13 @@ class FileBrowserActionActivity final : public Activity {
  private:
   ButtonNavigator buttonNavigator;
   std::string title;
+  // CrumBLE 4.2: optional second-line subtitle (typically the book author).
+  // When present, the header reserves two rows: title (bold) on line 1,
+  // subtitle (regular) on line 2, and the right-justified header label
+  // moves to line 2 so it can't collide with the title text. Empty =
+  // current behavior: title may word-wrap up to two lines and the right
+  // label rides on line 1.
+  std::string subtitle;
   // CrumBLE: optional right-justified secondary label rendered in the header
   // row next to the title (e.g. the current sort mode on the shelf-header
   // action menu, so "Favorites    Title (A-Z)"). Empty = nothing drawn.

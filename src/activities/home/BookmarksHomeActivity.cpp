@@ -4,6 +4,7 @@
 #include <I18n.h>
 
 #include "../reader/EpubReaderBookmarkListActivity.h"
+#include "BookActions.h"
 #include "BookmarkStore.h"
 #include "CrossPointState.h"
 #include "FileBrowserActionActivity.h"
@@ -121,8 +122,9 @@ void BookmarksHomeActivity::showBookmarkBookActionMenu(int bookIndex, bool ignor
   items.reserve(1);
   items.push_back({FileBrowserAction::Delete, StrId::STR_DELETE});
 
-  startActivityForResult(std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, entry.bookTitle,
-                                                                     std::move(items), ignoreInitialConfirmRelease),
+  startActivityForResult(std::make_unique<FileBrowserActionActivity>(
+                             renderer, mappedInput, entry.bookTitle, std::move(items), ignoreInitialConfirmRelease,
+                             BookActions::optimizedHeaderLabel(entry.bookPath), entry.bookAuthor),
                          [this, entry](const ActivityResult& result) {
                            longPressOpenHandled = false;
                            const auto* actionResult = std::get_if<FileBrowserActionResult>(&result.data);

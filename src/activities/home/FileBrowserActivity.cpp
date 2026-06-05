@@ -1,6 +1,7 @@
 #include "FileBrowserActivity.h"
 
 #include <Arduino.h>
+#include <Epub.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -8,6 +9,8 @@
 
 #include <algorithm>
 
+#include "../reader/PrebakeManifest.h"
+#include "../reader/PrebakeManifestViewerActivity.h"
 #include "BookActions.h"
 #include "BookMetadataViewerActivity.h"
 #include "BookmarkStore.h"
@@ -268,32 +271,39 @@ bool FileBrowserActivity::isPinnedSleepFavorite(const std::string& fullPath) con
 
 void FileBrowserActivity::showFileActionMenu(const std::string& entry, bool ignoreInitialConfirmRelease) {
   const std::string fullPath = buildFullPath(basepath, entry);
-  std::vector<FileBrowserActionActivity::MenuItem> items = BookActions::buildBookActionItems(fullPath, false);
-
-  // CrumBLE Collections (phase 2): single picker entry that drills into a
-  // checklist of every collection. The picker handles the per-membership
-  // toggle and the "+ New collection..." flow itself, so the action menu
-  // doesn't need separate add/remove items per collection anymore.
-  const bool isBookFile = FsHelpers::hasEpubExtension(fullPath) || FsHelpers::hasXtcExtension(fullPath) ||
-                          FsHelpers::hasTxtExtension(fullPath) || FsHelpers::hasMarkdownExtension(fullPath);
-  if (isBookFile) {
-    items.push_back({FileBrowserAction::AddToCollection, StrId::STR_ADD_TO_COLLECTION});
-    // Show-metadata debug inspector — same on both home and file-
-    // browser long-press paths so the user can verify metadata from
-    // either context.
-    items.push_back({FileBrowserAction::ShowMetadata, StrId::STR_SHOW_METADATA});
-  }
+  // CrumBLE 4.2: file-browser long-press uses the canonical ordering --
+  // Add to/remove collection (book files only), then ToggleCompleted (epub),
+  // ShowMetadata, DeleteCache, Delete. PinFavorite stays appended below
+  // because it's a sleep-image-only affordance the canonical menu doesn't
+  // know about; inserted before Delete so the destructive item stays last.
+  BookActions::BookActionMenuOptions opts;
+  opts.addToCollection = true;
+  opts.showMetadata = true;
+  std::vector<FileBrowserActionActivity::MenuItem> items = BookActions::buildBookActionItems(fullPath, opts);
 
   const bool canPinFavorite = isSleepFolderPath(basepath) && isSleepImageFile(entry);
   if (canPinFavorite) {
-    items.push_back(
-        {isPinnedSleepFavorite(fullPath) ? FileBrowserAction::UnpinFavorite : FileBrowserAction::PinFavorite,
-         isPinnedSleepFavorite(fullPath) ? StrId::STR_UNPIN_AS_FAVORITE : StrId::STR_PIN_AS_FAVORITE});
+    // Splice in before the final Delete row so the destructive item stays
+    // last in the menu.
+    const auto deleteIt = std::find_if(items.begin(), items.end(),
+                                        [](const FileBrowserActionActivity::MenuItem& it) {
+                                          return it.action == FileBrowserAction::Delete;
+                                        });
+    items.insert(deleteIt,
+                 {isPinnedSleepFavorite(fullPath) ? FileBrowserAction::UnpinFavorite : FileBrowserAction::PinFavorite,
+                  isPinnedSleepFavorite(fullPath) ? StrId::STR_UNPIN_AS_FAVORITE : StrId::STR_PIN_AS_FAVORITE});
   }
 
+  // CrumBLE 4.2: prefer the book's real (title, author) over the raw
+  // filename. resolveBookHeaderText falls back to the filename if no
+  // metadata is discoverable, so non-book entries (sleep images, PDFs,
+  // etc.) still render with their filename and the header collapses to
+  // its single-line word-wrap layout (no author shown).
+  const BookActions::BookHeaderText header = BookActions::resolveBookHeaderText(fullPath);
   startActivityForResult(
-      std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, getFileName(entry), std::move(items),
-                                                  ignoreInitialConfirmRelease),
+      std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, header.title, std::move(items),
+                                                  ignoreInitialConfirmRelease,
+                                                  BookActions::optimizedHeaderLabel(fullPath), header.author),
       [this, fullPath, entry](const ActivityResult& result) {
         longPressConfirmHandled = false;
         if (result.isCancelled) {
@@ -354,6 +364,21 @@ void FileBrowserActivity::showFileActionMenu(const std::string& entry, bool igno
             startActivityForResult(
                 std::make_unique<BookMetadataViewerActivity>(renderer, mappedInput, fullPath),
                 [this](const ActivityResult&) { requestUpdate(); });
+            return;
+          }
+          case FileBrowserAction::ViewOptimizedDetails: {
+            // CrumBLE 4.2: user activated the Optimized header (UP from
+            // item 0 then Confirm). Load the prebake manifest sidecar
+            // and push the read-only viewer.
+            PrebakeManifest pm;
+            const std::string cachePath = Epub::cachePathForFilePath(fullPath, "/.crosspoint");
+            if (tryLoadPrebakeManifest(cachePath, pm)) {
+              BookActions::BookHeaderText header = BookActions::resolveBookHeaderText(fullPath);
+              startActivityForResult(
+                  std::make_unique<PrebakeManifestViewerActivity>(renderer, mappedInput, header.title,
+                                                                  std::move(pm)),
+                  [this](const ActivityResult&) { requestUpdate(); });
+            }
             return;
           }
           case FileBrowserAction::RemoveFromRecentBooks:

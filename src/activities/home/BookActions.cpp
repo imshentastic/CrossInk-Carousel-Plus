@@ -48,25 +48,117 @@ std::string buildReadFolderDestination(const std::string& srcPath) {
 namespace BookActions {
 
 std::vector<FileBrowserActionActivity::MenuItem> buildBookActionItems(const std::string& fullPath,
-                                                                      const bool includeRemoveFromRecents) {
+                                                                      const BookActionMenuOptions& options) {
+  // Item order is documented on BookActionMenuOptions in BookActions.h --
+  // benign -> destructive, top to bottom. Don't reorder casually: the
+  // file-browser, home carousel, recent-books list/grid, and bookmarks-home
+  // long-press menus all share this ordering so users get the same row
+  // layout everywhere.
+  const bool isEpub = FsHelpers::hasEpubExtension(fullPath);
+  const bool isBookFile = isEpub || FsHelpers::hasXtcExtension(fullPath) ||
+                          FsHelpers::hasTxtExtension(fullPath) || FsHelpers::hasMarkdownExtension(fullPath);
+
   std::vector<FileBrowserActionActivity::MenuItem> items;
-  items.reserve(includeRemoveFromRecents ? 4 : 3);
-  items.push_back({FileBrowserAction::Delete, StrId::STR_DELETE});
-  if (hasClearableBookCache(fullPath)) {
-    items.push_back({FileBrowserAction::DeleteCache, StrId::STR_DELETE_CACHE});
+  items.reserve(6);
+
+  // 1. Add to / remove from collection
+  if (options.addToCollection && isBookFile) {
+    items.push_back({FileBrowserAction::AddToCollection, StrId::STR_ADD_TO_COLLECTION});
   }
-  if (FsHelpers::hasEpubExtension(fullPath)) {
+  // 2. Remove from Recent Books (caller picks which dispatch enum)
+  if (options.removeFromRecents) {
+    const FileBrowserAction action = *options.removeFromRecents;
+    // Same display label for both -- behavior differs in which handler
+    // fires, but the user-facing prompt reads identically.
+    const StrId label = (action == FileBrowserAction::RemoveFromRecentBooks) ? StrId::STR_REMOVE_FROM_RECENT_BOOKS
+                                                                             : StrId::STR_REMOVE_FROM_RECENTS_ACTION;
+    items.push_back({action, label});
+  }
+  // 3. Mark as finished / unfinished
+  if (isEpub) {
     items.push_back({FileBrowserAction::ToggleCompleted,
                      isEpubCompleted(fullPath) ? StrId::STR_MARK_UNFINISHED : StrId::STR_MARK_FINISHED});
   }
-  if (includeRemoveFromRecents) {
-    items.push_back({FileBrowserAction::RemoveFromRecents, StrId::STR_REMOVE_FROM_RECENTS_ACTION});
+  // 4. Show metadata (debug inspector for book files)
+  if (options.showMetadata && isBookFile) {
+    items.push_back({FileBrowserAction::ShowMetadata, StrId::STR_SHOW_METADATA});
   }
+  // 5. Delete book cache
+  if (hasClearableBookCache(fullPath)) {
+    items.push_back({FileBrowserAction::DeleteCache, StrId::STR_DELETE_CACHE});
+  }
+  // 6. Delete file -- always last as the most destructive.
+  items.push_back({FileBrowserAction::Delete, StrId::STR_DELETE});
+
   return items;
 }
 
 bool hasClearableBookCache(const std::string& path) {
   return FsHelpers::hasEpubExtension(path) || FsHelpers::hasXtcExtension(path);
+}
+
+std::string optimizedHeaderLabel(const std::string& fullPath) {
+  // Only EPUB carries a prebake. Skip the SD lookup for non-EPUB paths.
+  if (!FsHelpers::hasEpubExtension(fullPath)) return "";
+  // Marker file -- written by the 4.2+ WASM optimizer alongside
+  // prebake-manifest.json. Storage.exists is a fast inode lookup
+  // (no read), cheap enough to call from a long-press path that runs
+  // once per book open.
+  const std::string markerPath = Epub::cachePathForFilePath(fullPath, "/.crosspoint") + "/prebake-v2.marker";
+  return Storage.exists(markerPath.c_str()) ? "Optimized" : "";
+}
+
+BookHeaderText resolveBookHeaderText(const std::string& fullPath) {
+  BookHeaderText out;
+
+  // Filename is the last-resort title -- always populated even when
+  // metadata lookups fail or the path isn't a book file at all.
+  const size_t lastSlash = fullPath.find_last_of('/');
+  out.title = (lastSlash != std::string::npos) ? fullPath.substr(lastSlash + 1) : fullPath;
+
+  // Step 1: RecentBooksStore is in-RAM (we read it at boot from
+  // .crosspoint/recent-books.bin). If the user has opened this book
+  // recently the cached title/author beat anything we'd parse from disk.
+  // BUT -- if the recents row is missing the author (older entries
+  // sometimes were saved with empty author when OPF parse failed at
+  // open time), we fall through to the OPF parse below so the long-press
+  // menu can still show the author line. Title from recents wins because
+  // it's almost always populated (filename-derived if nothing else) and
+  // we want a stable display name.
+  bool recentsHadAuthor = false;
+  for (const auto& rb : RECENT_BOOKS.getBooks()) {
+    if (rb.path == fullPath) {
+      if (!rb.title.empty()) out.title = rb.title;
+      if (!rb.author.empty()) {
+        out.author = rb.author;
+        recentsHadAuthor = true;
+      }
+      break;
+    }
+  }
+  if (recentsHadAuthor) return out;
+
+  // Step 2: not in recents (or recents lacked author) -- if it's an EPUB
+  // or XTC we can open it and parse OPF metadata for title/author. ~50-
+  // 100 ms cold; acceptable on long-press (runs once per menu open, not
+  // on a render loop). For anything else (PDF, TXT, MD, sleep images,
+  // etc.) the filename is the best we have and we leave author empty so
+  // the header collapses to the original single-line layout.
+  if (FsHelpers::hasEpubExtension(fullPath)) {
+    Epub epub(fullPath, "/.crosspoint");
+    const std::string& t = epub.getTitle();
+    const std::string& a = epub.getAuthor();
+    if (!t.empty()) out.title = t;
+    if (!a.empty()) out.author = a;
+  } else if (FsHelpers::hasXtcExtension(fullPath)) {
+    Xtc xtc(fullPath, "/.crosspoint");
+    const std::string t = xtc.getTitle();
+    const std::string a = xtc.getAuthor();
+    if (!t.empty()) out.title = t;
+    if (!a.empty()) out.author = a;
+  }
+
+  return out;
 }
 
 void clearFileMetadata(const std::string& fullPath) {
