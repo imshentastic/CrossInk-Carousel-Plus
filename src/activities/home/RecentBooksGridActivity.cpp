@@ -24,6 +24,8 @@
 #include "MappedInputManager.h"
 #include "RecentBookProgress.h"
 #include "RecentBooksStore.h"
+#include "activities/reader/PrebakeManifest.h"
+#include "activities/reader/PrebakeManifestViewerActivity.h"
 #include "activities/util/ConfirmationActivity.h"
 #include "components/UITheme.h"
 #include "components/icons/book.h"
@@ -1045,20 +1047,18 @@ void RecentBooksGridActivity::showBookActionMenu(const int bookIndex, const bool
   if (bookIndex < 0 || bookIndex >= static_cast<int>(recentBooks.size())) return;
 
   const RecentBook book = recentBooks[bookIndex].book;
-  std::vector<FileBrowserActionActivity::MenuItem> items =
-      BookActions::buildBookActionItems(book.path, /*includeRemoveFromRecents=*/true);
-  // CrumBLE #123: expose the "Add to / Remove from collection..." picker
-  // from inside the Bookshelf so users can curate without bouncing back
-  // to home + carousel. Matches the carousel center book's long-press
-  // menu (HomeActivity::showHomeBookActionMenu).
-  const bool isBookFile = FsHelpers::hasEpubExtension(book.path) || FsHelpers::hasXtcExtension(book.path) ||
-                          FsHelpers::hasTxtExtension(book.path) || FsHelpers::hasMarkdownExtension(book.path);
-  if (isBookFile) {
-    items.push_back({FileBrowserAction::AddToCollection, StrId::STR_ADD_TO_COLLECTION});
-  }
+  // CrumBLE #123 / 4.2 reorder: bookshelf long-press includes the
+  // collection picker (parity with the home carousel) plus the
+  // remove-from-recents dispatch. buildBookActionItems emits everything in
+  // the canonical order documented in BookActionMenuOptions.
+  BookActions::BookActionMenuOptions opts;
+  opts.addToCollection = true;
+  opts.removeFromRecents = FileBrowserAction::RemoveFromRecents;
+  std::vector<FileBrowserActionActivity::MenuItem> items = BookActions::buildBookActionItems(book.path, opts);
 
-  startActivityForResult(std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, book.title,
-                                                                     std::move(items), ignoreInitialConfirmRelease),
+  startActivityForResult(std::make_unique<FileBrowserActionActivity>(
+                             renderer, mappedInput, book.title, std::move(items), ignoreInitialConfirmRelease,
+                             BookActions::optimizedHeaderLabel(book.path), book.author),
                          [this, book](const ActivityResult& result) {
                            if (result.isCancelled) {
                              return;
@@ -1110,6 +1110,22 @@ void RecentBooksGridActivity::showBookActionMenu(const int bookIndex, const bool
                                    [this](const ActivityResult&) {
                                      reloadAfterBookAction();
                                    });
+                               return;
+                             }
+                             case FileBrowserAction::ViewOptimizedDetails: {
+                               // CrumBLE 4.2: user activated the Optimized
+                               // header. Load + show the manifest viewer.
+                               PrebakeManifest pm;
+                               const std::string cachePath =
+                                   Epub::cachePathForFilePath(book.path, "/.crosspoint");
+                               if (tryLoadPrebakeManifest(cachePath, pm)) {
+                                 BookActions::BookHeaderText header =
+                                     BookActions::resolveBookHeaderText(book.path);
+                                 startActivityForResult(
+                                     std::make_unique<PrebakeManifestViewerActivity>(
+                                         renderer, mappedInput, header.title, std::move(pm)),
+                                     [this](const ActivityResult&) { requestUpdate(); });
+                               }
                                return;
                              }
                              case FileBrowserAction::PinFavorite:

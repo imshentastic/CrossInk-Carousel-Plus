@@ -20,10 +20,34 @@
 
 #include <EpdFont.h>
 #include <EpdFontData.h>  // brings in fp4::toPixel (already provided by the firmware tree)
+#include <SdCardFont.h>
 #include <Utf8.h>
+
+namespace {
+// Mirrors lib/GfxRenderer/GfxRenderer.cpp's static resolveSdCardStyle:
+// asks the SdCardFont to fall back gracefully when the requested style
+// (e.g. bold-italic) is absent from the .cpfont.
+uint8_t resolveSdCardStyleHost(const SdCardFont& font, const EpdFontFamily::Style style) {
+  return font.resolveStyle(static_cast<uint8_t>(style));
+}
+}  // namespace
 
 int GfxRenderer::getTextWidth(int fontId, const char* text,
                               EpdFontFamily::Style style) const {
+  // SD-card fonts can measure from their persistent advance table during
+  // layout. ParsedText.cpp calls ensureSdCardFontReady() to populate the
+  // table before getTextWidth runs, mirroring device GfxRenderer.cpp:558.
+  auto sdIt = sdCardFonts_.find(fontId);
+  if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
+    int32_t widthFP = 0;
+    const uint8_t styleIdx = resolveSdCardStyleHost(*sdIt->second, style);
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(text);
+    while (uint32_t cp = utf8NextCodepoint(&p)) {
+      widthFP += sdIt->second->getAdvance(cp, styleIdx);
+    }
+    return fp4::toPixel(widthFP);
+  }
+
   const auto fontIt = fontMap.find(fontId);
   if (fontIt == fontMap.end()) return 0;
   int w = 0, h = 0;
@@ -33,6 +57,24 @@ int GfxRenderer::getTextWidth(int fontId, const char* text,
 
 int GfxRenderer::getTextAdvanceX(int fontId, const char* text,
                                  EpdFontFamily::Style style) const {
+  // SD-card font fast-path. Mirrors device GfxRenderer.cpp:2447-2458 --
+  // SD fonts NEVER populate stubData.intervals on load (intervalCount is
+  // 0 by design; the device uses lazy onGlyphMiss + a per-font persistent
+  // advance table). Without this branch host-side measurement would fall
+  // through to font.getGlyph() which returns nullptr for every codepoint,
+  // every line wraps at width 0, and the prebaked sections lay out
+  // jumbled.
+  auto sdIt = sdCardFonts_.find(fontId);
+  if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
+    int32_t widthFP = 0;
+    const uint8_t styleIdx = resolveSdCardStyleHost(*sdIt->second, style);
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(text);
+    while (uint32_t cp = utf8NextCodepoint(&p)) {
+      widthFP += sdIt->second->getAdvance(cp, styleIdx);
+    }
+    return fp4::toPixel(widthFP);
+  }
+
   const auto fontIt = fontMap.find(fontId);
   if (fontIt == fontMap.end()) return 0;
 
@@ -66,6 +108,13 @@ int GfxRenderer::getTextAdvanceX(int fontId, const char* text,
 }
 
 int GfxRenderer::getSpaceWidth(int fontId, EpdFontFamily::Style style) const {
+  // SD-card fast-path mirrors device GfxRenderer.cpp:2397-2403.
+  auto sdIt = sdCardFonts_.find(fontId);
+  if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
+    const uint8_t styleIdx = resolveSdCardStyleHost(*sdIt->second, style);
+    return fp4::toPixel(sdIt->second->getAdvance(' ', styleIdx));
+  }
+
   // Device path (lib/GfxRenderer/GfxRenderer.cpp:2405-2412): get space
   // glyph advance and snap via fp4. Reproducing here.
   const auto fontIt = fontMap.find(fontId);
@@ -79,12 +128,19 @@ int GfxRenderer::getSpaceAdvance(int fontId, uint32_t /*leftCp*/, uint32_t /*rig
   // Device comment (line 2418): "Kern data is not loaded during layout
   // (consistent with previous metadataOnly behavior), so we return just
   // the space advance without kerning." Returning getSpaceWidth here
-  // matches the no-kern device behavior verbatim.
+  // matches the no-kern device behavior verbatim -- which also takes
+  // care of the SD-card font fast-path because getSpaceWidth already
+  // handles it.
   return getSpaceWidth(fontId, style);
 }
 
 int GfxRenderer::getKerning(int fontId, uint32_t leftCp, uint32_t rightCp,
                             EpdFontFamily::Style style) const {
+  // Device GfxRenderer.cpp:2438-2444 doesn't special-case SD fonts here
+  // because layout's "metadataOnly" prewarm skips kern/lig loading
+  // entirely -- the SD font would return 0 from getKerning at this
+  // stage anyway. Falling through to the fontMap lookup is harmless:
+  // it returns 0 for unknown fontIds.
   const auto fontIt = fontMap.find(fontId);
   if (fontIt == fontMap.end()) return 0;
   const int kernFP = fontIt->second.getKerning(leftCp, rightCp, style);
@@ -92,6 +148,9 @@ int GfxRenderer::getKerning(int fontId, uint32_t leftCp, uint32_t rightCp,
 }
 
 int GfxRenderer::getFontAscenderSize(int fontId) const {
+  // SD fonts have valid ascender in stubData even when intervalCount=0
+  // (load() copies the per-style header values), so we can use either
+  // path. Keep the EpdFontFamily route for symmetry with non-SD fonts.
   const auto fontIt = fontMap.find(fontId);
   if (fontIt == fontMap.end()) return 0;
   return fontIt->second.getData(EpdFontFamily::REGULAR)->ascender;

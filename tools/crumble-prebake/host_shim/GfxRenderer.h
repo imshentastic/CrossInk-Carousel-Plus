@@ -41,6 +41,7 @@
 //      next investigation focuses.
 
 #include <EpdFontFamily.h>
+#include <SdCardFont.h>
 
 #include <cstdint>
 #include <map>
@@ -105,12 +106,41 @@ class GfxRenderer {
   void markImageRepaintUnsafe() const {}
   void markRenderStarved() const {}
   bool releaseSdCardFontForLowMemory(int) const { return false; }
-  // Both ensureSdCardFontReady overloads (single string + vector<string>)
-  // are no-ops on host -- we never use SD-resident fonts.
-  void ensureSdCardFontReady(int, const char*, uint8_t) const {}
-  void ensureSdCardFontReady(int, const std::vector<std::string>&, bool, uint8_t) const {}
-  // No SD fonts on host -> no font is an SD font.
-  bool isSdCardFont(int) const { return false; }
+  // CrumBLE 4.2: SD-card font lifecycle. The device's GfxRenderer keeps
+  // a map of fontId -> SdCardFont* so layout measurement can hit the
+  // per-font persistent advance table (built on demand by buildAdvanceTable
+  // via ensureSdCardFontReady) instead of going through stubData /
+  // findGlyph. stubData on an SdCardFont has intervalCount == 0 by design
+  // -- the device's runtime path is lazy via onGlyphMiss, not via the
+  // EpdFont fast path -- so without this map host-side measurement would
+  // see "every glyph missing" and the EPUB pipeline would lay out
+  // jumbled garbage even though the .cpfont parses cleanly.
+  //
+  // ensureSdCardFontReady(fontId, text) and ensureSdCardFontReady(fontId,
+  // words, ...) are called by ParsedText.cpp (line ~314) and the device
+  // GfxRenderer; the WASM build hits the same code path because it
+  // compile-shares lib/Epub. Wiring them through here is what makes SD
+  // font prebake produce identical layouts to device.
+  bool isSdCardFont(int fontId) const { return sdCardFonts_.count(fontId) > 0; }
+  void registerSdCardFont(int fontId, void* sdFont) const {
+    sdCardFonts_[fontId] = static_cast<SdCardFont*>(sdFont);
+  }
+  void clearSdCardFonts() const { sdCardFonts_.clear(); }
+  void removeFont(int fontId) const {
+    fontMap.erase(fontId);
+    sdCardFonts_.erase(fontId);
+  }
+  void ensureSdCardFontReady(int fontId, const char* utf8Text, uint8_t styleMask = 0x0F) const {
+    auto it = sdCardFonts_.find(fontId);
+    if (it == sdCardFonts_.end() || !utf8Text) return;
+    it->second->buildAdvanceTable(utf8Text, styleMask);
+  }
+  void ensureSdCardFontReady(int fontId, const std::vector<std::string>& words, bool includeHyphen,
+                             uint8_t styleMask = 0x0F) const {
+    auto it = sdCardFonts_.find(fontId);
+    if (it == sdCardFonts_.end()) return;
+    it->second->buildAdvanceTable(words, includeHyphen, styleMask);
+  }
 
   // --- Drawing (permanent no-ops -- section build doesn't rasterize) ---
   // We declare these inline-no-op so the linker is satisfied when
@@ -125,7 +155,11 @@ class GfxRenderer {
   // ... add more no-op draw stubs as the linker complains about them.
 
  private:
-  std::map<int, EpdFontFamily> fontMap;
+  mutable std::map<int, EpdFontFamily> fontMap;
+  // mutable because registerSdCardFont/ensureSdCardFontReady are const
+  // to mirror the device GfxRenderer surface (layout paths call into
+  // them through const refs).
+  mutable std::map<int, SdCardFont*> sdCardFonts_;
   int screenWidth_ = 800;   // X4 landscape default; --viewport overrides
   int screenHeight_ = 480;
 };

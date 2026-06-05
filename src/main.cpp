@@ -104,6 +104,7 @@ static unsigned long allowSleepAt = 0;
 static bool gBluetoothReaderContext = false;
 
 // Fonts
+#ifndef OMIT_LEXENDDECA_FONT
 #ifndef OMIT_MEDIUM_FONT
 EpdFont lexenddeca14RegularFont(&lexenddeca_14_regular);
 EpdFont lexenddeca14BoldFont(&lexenddeca_14_bold);
@@ -112,6 +113,7 @@ EpdFont lexenddeca14BoldItalicFont(&lexenddeca_14_bolditalic);
 EpdFontFamily lexenddeca14FontFamily(&lexenddeca14RegularFont, &lexenddeca14BoldFont, &lexenddeca14ItalicFont,
                                      &lexenddeca14BoldItalicFont);
 #endif
+#endif  // OMIT_LEXENDDECA_FONT
 // CrumBLE: OMIT_CHAREINK_FONT drops the entire CharEink family (see all.h).
 #ifndef OMIT_CHAREINK_FONT
 #ifndef OMIT_TEENSY_FONT
@@ -177,6 +179,8 @@ EpdFontFamily charein20FontFamily(&charein20RegularFont, &charein20BoldFont, &ch
                                   &charein20BoldItalicFont);
 #endif
 #endif  // OMIT_CHAREINK_FONT
+// CrumBLE: OMIT_LEXENDDECA_FONT drops the entire Lexend Deca family (see all.h).
+#ifndef OMIT_LEXENDDECA_FONT
 #ifndef OMIT_TEENSY_FONT
 EpdFont lexenddeca8RegularFont(&lexenddeca_8_regular);
 EpdFont lexenddeca8BoldFont(&lexenddeca_8_bold);
@@ -233,6 +237,7 @@ EpdFont lexenddeca20BoldItalicFont(&lexenddeca_20_bolditalic);
 EpdFontFamily lexenddeca20FontFamily(&lexenddeca20RegularFont, &lexenddeca20BoldFont, &lexenddeca20ItalicFont,
                                      &lexenddeca20BoldItalicFont);
 #endif
+#endif  // OMIT_LEXENDDECA_FONT
 
 #ifndef OMIT_TEENSY_FONT
 EpdFont bitter8RegularFont(&bitter_8_regular);
@@ -897,6 +902,7 @@ void setupDisplayAndFonts(bool seamless = false) {
 #endif
 #endif  // OMIT_CHAREINK_FONT
 
+#ifndef OMIT_LEXENDDECA_FONT
 #ifndef OMIT_TEENSY_FONT
   renderer.insertFont(LEXENDDECA_8_FONT_ID, lexenddeca8FontFamily);
 #endif
@@ -921,6 +927,7 @@ void setupDisplayAndFonts(bool seamless = false) {
 #ifndef OMIT_HUGE_FONT
   renderer.insertFont(LEXENDDECA_20_FONT_ID, lexenddeca20FontFamily);
 #endif
+#endif  // OMIT_LEXENDDECA_FONT
 
 #ifndef OMIT_TEENSY_FONT
   renderer.insertFont(BITTER_8_FONT_ID, bitter8FontFamily);
@@ -1017,6 +1024,48 @@ void setup() {
   HalSystem::checkPanic();
 
   SETTINGS.loadFromFile();
+
+  // CrumBLE 4.2 one-shot migration: the slim-binary prebake crash that
+  // forced optimizeChapterIndexing default=OFF in 4.1.0/4.1.1 is fixed
+  // (dropped Lexend Deca instead of emoji, see release notes). Force ON
+  // for users whose NVS still has the 4.1.x crisis-fix value, marked
+  // via a small SD sentinel so we only run once per device.
+  constexpr const char* kPrebake42MigrationFlag = "/.crosspoint/migrated_42_prebake";
+  if (!Storage.exists(kPrebake42MigrationFlag)) {
+    SETTINGS.optimizeChapterIndexing = 1;
+    SETTINGS.saveToFile();
+    FsFile mf;
+    if (Storage.openFileForWrite("MAIN", kPrebake42MigrationFlag, mf)) {
+      mf.print("4.2");
+      mf.close();
+    }
+    LOG_INF("MAIN", "4.2 migration: optimizeChapterIndexing forced ON (prebake crash fixed)");
+  }
+
+  // Always clamp the reader font family to an available built-in. The
+  // settings.json on SD persists across firmware flavours, so a user
+  // who downgraded LEXENDDECA -> slim (which OMITs Lexend) keeps a
+  // stale fontFamily=LEXENDDECA value -- the picker's withEnumRawValues
+  // gate filters that out, rendering the family slot blank. Falling
+  // back to BITTER (the always-available built-in) gives the picker
+  // something to draw and stops the "select Bitter -> mismatch prompt"
+  // surprise. Runs every boot so re-installs / SD swaps self-heal.
+  bool fontFamilyClamped = false;
+#ifdef OMIT_LEXENDDECA_FONT
+  if (SETTINGS.fontFamily == CrossPointSettings::LEXENDDECA) {
+    SETTINGS.fontFamily = CrossPointSettings::BITTER;
+    LOG_INF("MAIN", "Font family clamp: LEXENDDECA -> BITTER (Lexend not built-in this build)");
+    fontFamilyClamped = true;
+  }
+#endif
+#ifdef OMIT_CHAREINK_FONT
+  if (SETTINGS.fontFamily == CrossPointSettings::CHAREINK) {
+    SETTINGS.fontFamily = CrossPointSettings::BITTER;
+    LOG_INF("MAIN", "Font family clamp: CHAREINK -> BITTER (CharEink not built-in this build)");
+    fontFamilyClamped = true;
+  }
+#endif
+  if (fontFamilyClamped) SETTINGS.saveToFile();
   APP_STATE.loadFromFile();
   RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));

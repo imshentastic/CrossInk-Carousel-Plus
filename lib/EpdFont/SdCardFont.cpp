@@ -1,5 +1,9 @@
 #include "SdCardFont.h"
 
+#include <Arduino.h>  // CrumBLE 4.2: millis() lives here; transitively pulled
+                      // in on-device through HalStorage but the host_shim
+                      // version doesn't include it, so the WASM build needs
+                      // it explicit.
 #include <HalStorage.h>
 #include <Logging.h>
 #include <Utf8.h>

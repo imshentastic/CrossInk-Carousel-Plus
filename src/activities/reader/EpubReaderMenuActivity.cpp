@@ -142,12 +142,17 @@ std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMainM
   if (hasFootnotes) {
     items.push_back({MenuAction::FOOTNOTES, StrId::STR_FOOTNOTES});
   }
-  if (hasDictionary) {
-    items.push_back({MenuAction::LOOKUP, StrId::STR_LOOKUP});
-    if (hasLookupHistory) {
-      items.push_back({MenuAction::LOOKED_UP_WORDS, StrId::STR_LOOKED_UP_WORDS});
-    }
+  // CrumBLE 4.2: Lookup is ALWAYS shown so users with no dictionary
+  // installed still see the entry point. The handler in EpubReaderActivity
+  // detects the missing .idx/.dict and shows a "drop StarDict files on
+  // the SD card" info screen instead of launching the word-select flow.
+  // LOOKED_UP_WORDS stays gated -- the history list only makes sense
+  // when a dictionary is actually present and has been used.
+  items.push_back({MenuAction::LOOKUP, StrId::STR_LOOKUP});
+  if (hasDictionary && hasLookupHistory) {
+    items.push_back({MenuAction::LOOKED_UP_WORDS, StrId::STR_LOOKED_UP_WORDS});
   }
+  (void)hasDictionary;
   // Highlight quick action. Pending-hold state replaces Add with the
   // Finish/Cancel pair so the menu doesn't dangle two ways to start.
   if (hasPendingHighlight) {

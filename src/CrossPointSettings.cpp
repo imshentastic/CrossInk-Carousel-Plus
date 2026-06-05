@@ -184,6 +184,13 @@ int getFallbackReaderFontIdForFamily(const CrossPointSettings::FONT_FAMILY famil
 #endif
     case CrossPointSettings::LEXENDDECA:
     default:
+#ifdef OMIT_LEXENDDECA_FONT
+      // Lexend Deca family is OMIT'd; fall back to BITTER for users with
+      // a stale LEXENDDECA preference (silent migration, no crash). Also
+      // catches the default: case so any unrecognized family lands on
+      // Bitter when Lexend isn't present.
+      return getFallbackReaderFontIdForFamily(CrossPointSettings::BITTER);
+#else
 #ifndef OMIT_TINY_FONT
       return LEXENDDECA_10_FONT_ID;
 #elif !defined(OMIT_SMALL_FONT)
@@ -203,6 +210,7 @@ int getFallbackReaderFontIdForFamily(const CrossPointSettings::FONT_FAMILY famil
 #else
 #error "No reader fonts enabled for LEXENDDECA"
 #endif
+#endif  // OMIT_LEXENDDECA_FONT
   }
 }
 
@@ -725,9 +733,28 @@ int CrossPointSettings::getReaderFontId() const {
     // Fall through to built-in if SD font not found
   }
 
-  switch (fontFamily) {
+  // CrumBLE 4.2: collapse OMIT'd built-in families onto BITTER BEFORE the
+  // switch, so the size-respecting size-switch fires. Using the family's
+  // getFallbackReaderFontIdForFamily() below would lose the user's size
+  // preference (returns the family's first-available size).
+  uint8_t effectiveFamily = fontFamily;
+#ifdef OMIT_LEXENDDECA_FONT
+  if (effectiveFamily == LEXENDDECA) effectiveFamily = BITTER;
+#endif
+#ifdef OMIT_CHAREINK_FONT
+  if (effectiveFamily == CHAREINK) effectiveFamily = BITTER;
+#endif
+
+  switch (effectiveFamily) {
     case LEXENDDECA:
     default:
+#ifdef OMIT_LEXENDDECA_FONT
+      // Unreachable: the OMIT_LEXENDDECA collapse above mapped LEXENDDECA
+      // to BITTER before reaching the switch. Kept as a defensive guard
+      // in case the collapse logic ever drifts out of sync with the OMIT
+      // gating below.
+      return getFallbackReaderFontIdForFamily(BITTER);
+#else
       switch (effectiveSize) {
 #ifndef OMIT_TEENSY_FONT
         case TEENSY:
@@ -767,6 +794,7 @@ int CrossPointSettings::getReaderFontId() const {
 #endif
       }
       return getFallbackReaderFontIdForFamily(LEXENDDECA);
+#endif  // OMIT_LEXENDDECA_FONT
     case CHAREINK:
 #ifdef OMIT_CHAREINK_FONT
       // CharEink family is OMIT'd; fall back to BITTER for users with

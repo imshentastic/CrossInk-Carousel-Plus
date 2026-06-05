@@ -26,7 +26,10 @@
 #include "activities/util/ChoicePromptActivity.h"
 #include "activities/util/ConfirmationActivity.h"
 #include "activities/util/KeyboardEntryActivity.h"
+#include "../reader/PrebakeManifest.h"
+#include "../reader/PrebakeManifestViewerActivity.h"
 #include "AddBooksToCollectionActivity.h"
+#include "BookActions.h"
 #include "BookMetadataViewerActivity.h"
 #include "BookmarkStore.h"
 #include "BookmarksHomeActivity.h"
@@ -1262,59 +1265,39 @@ std::string HomeActivity::getFocusedBookPath() {
 }
 
 void HomeActivity::showHomeBookActionMenu(const std::string& bookPath) {
-  // Build a menu tailored to the home screen. Compared to the file
-  // browser's version we drop PinFavorite (sleep-image-only, irrelevant
-  // here) and add RemoveFromRecentBooks when the book is currently in the
-  // recents list.
-  std::vector<FileBrowserActionActivity::MenuItem> items;
-  items.reserve(6);
-
-  // Delete (file-level) is destructive — keep it as the first item to
-  // match the file browser's ordering so user muscle memory transfers.
-  items.push_back({FileBrowserAction::Delete, StrId::STR_DELETE});
-
-  const bool isEpub = FsHelpers::hasEpubExtension(bookPath);
-  const bool isXtc = FsHelpers::hasXtcExtension(bookPath);
-  if (isEpub || isXtc) {
-    items.push_back({FileBrowserAction::DeleteCache, StrId::STR_DELETE_CACHE});
-  }
-  if (isEpub) {
-    const Epub epub(bookPath, "/.crosspoint");
-    const bool completed = BookReadingStats::load(epub.getCachePath()).isCompleted;
-    items.push_back({FileBrowserAction::ToggleCompleted,
-                     completed ? StrId::STR_MARK_UNFINISHED : StrId::STR_MARK_FINISHED});
-  }
-
-  const bool isBookFile = isEpub || isXtc || FsHelpers::hasTxtExtension(bookPath) ||
-                          FsHelpers::hasMarkdownExtension(bookPath);
-  if (isBookFile) {
-    // Phase 2: single entry that drills into a per-book picker.
-    items.push_back({FileBrowserAction::AddToCollection, StrId::STR_ADD_TO_COLLECTION});
-  }
-
-  // Only show "Remove from Recent Books" if the book is actually in the
-  // recents — otherwise the option is meaningless (e.g. a Favorites-only
-  // book that was never opened).
+  // CrumBLE 4.2: route the home carousel long-press through the shared
+  // BookActions::buildBookActionItems so the item order matches every
+  // other long-press menu (file browser, recent-books list/grid). Order is
+  // documented on BookActionMenuOptions: Add-to-collection, Remove-from-
+  // recents, Mark-finished, Show-metadata, Delete-cache, Delete. The home
+  // path uses the RemoveFromRecentBooks dispatch (action enum 7), distinct
+  // from the recent-books-list activities' RemoveFromRecents (enum 16) --
+  // same UX label, different handler.
+  BookActions::BookActionMenuOptions opts;
+  opts.addToCollection = true;
+  opts.showMetadata = true;
+  // Only emit Remove from Recent Books if the book is actually in the
+  // recents list -- otherwise the option is meaningless (e.g. a
+  // Favorites-only book that was never opened).
   const auto& recents = RECENT_BOOKS.getBooks();
   const bool inRecents =
       std::find_if(recents.begin(), recents.end(), [&](const RecentBook& r) { return r.path == bookPath; }) !=
       recents.end();
   if (inRecents) {
-    items.push_back({FileBrowserAction::RemoveFromRecentBooks, StrId::STR_REMOVE_FROM_RECENT_BOOKS});
+    opts.removeFromRecents = FileBrowserAction::RemoveFromRecentBooks;
   }
-  // Show metadata: debug inspector. Always offered for any book file
-  // so user can verify what OPF / file metadata is actually present.
-  if (isBookFile) {
-    items.push_back({FileBrowserAction::ShowMetadata, StrId::STR_SHOW_METADATA});
-  }
+  std::vector<FileBrowserActionActivity::MenuItem> items = BookActions::buildBookActionItems(bookPath, opts);
 
-  // Title for the picker = the book's filename (matches file browser UX).
-  const size_t lastSlash = bookPath.find_last_of('/');
-  const std::string title = (lastSlash != std::string::npos) ? bookPath.substr(lastSlash + 1) : bookPath;
+  // CrumBLE 4.2: resolve title + author via BookActions (free in-memory
+  // RecentBooks lookup, fallback to OPF parse, last-resort fallback to
+  // filename). Passing author as subtitle moves the "Optimized" header
+  // label to the second line so it can't collide with a long title.
+  const BookActions::BookHeaderText header = BookActions::resolveBookHeaderText(bookPath);
 
   startActivityForResult(
-      std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, title, std::move(items),
-                                                  /*ignoreInitialConfirmRelease=*/true),
+      std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, header.title, std::move(items),
+                                                  /*ignoreInitialConfirmRelease=*/true,
+                                                  BookActions::optimizedHeaderLabel(bookPath), header.author),
       [this, bookPath](const ActivityResult& result) {
         longPressConfirmHandled = false;
         if (result.isCancelled) {
@@ -1481,6 +1464,20 @@ void HomeActivity::showHomeBookActionMenu(const std::string& bookPath) {
             startActivityForResult(
                 std::make_unique<BookMetadataViewerActivity>(renderer, mappedInput, bookPath),
                 [this](const ActivityResult&) { requestUpdate(); });
+            return;
+          }
+          case FileBrowserAction::ViewOptimizedDetails: {
+            // CrumBLE 4.2: user activated the Optimized header. Load the
+            // prebake manifest sidecar and push the read-only viewer.
+            PrebakeManifest pm;
+            const std::string cachePath = Epub::cachePathForFilePath(bookPath, "/.crosspoint");
+            if (tryLoadPrebakeManifest(cachePath, pm)) {
+              BookActions::BookHeaderText header = BookActions::resolveBookHeaderText(bookPath);
+              startActivityForResult(
+                  std::make_unique<PrebakeManifestViewerActivity>(renderer, mappedInput, header.title,
+                                                                  std::move(pm)),
+                  [this](const ActivityResult&) { requestUpdate(); });
+            }
             return;
           }
           case FileBrowserAction::PinFavorite:
@@ -1974,6 +1971,17 @@ void HomeActivity::showShelfHeaderActionMenu() {
 
 void HomeActivity::onEnter() {
   Activity::onEnter();
+
+  // CrumBLE 4.2: rehydrate the in-RAM collection / series stores if a
+  // previous activity (reader, File Transfer) called releaseMemory() to
+  // free up contiguous heap. Without this, the collections strip on
+  // Home renders empty until the next full boot. Both begin() calls are
+  // cheap when the store is already populated (idempotent JSON load)
+  // and free when it isn't (~milliseconds reading the small JSON files).
+  if (CollectionsStore::getInstance().getCollections().empty()) {
+    CollectionsStore::getInstance().begin();
+  }
+  SeriesIndex::getInstance().begin();
 
   // ActivityManager::loop() releases the render lock *before* calling onEnter
   // (so each activity decides whether it needs it). HomeActivity::onEnter

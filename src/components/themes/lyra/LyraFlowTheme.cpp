@@ -673,10 +673,14 @@ void LyraFlowTheme::drawBookshelfStrip(GfxRenderer& renderer, Rect rect, const c
   // without dominating the strip vs. the cover thumbs.
   constexpr int kTabFontId = UI_10_FONT_ID;
   if (collectionName != nullptr && *collectionName != '\0') {
-    // Bold + flanking left/right arrow glyphs when the header itself is
-    // the focus, so the user has an obvious visual cue that L/R cycles
-    // collections (and not, say, books within a row).
-    const auto style = headerFocused ? EpdFontFamily::BOLD : EpdFontFamily::REGULAR;
+    // Bold + underline + flanking arrow glyphs when the header is focused,
+    // so the user has an obvious visual cue. CrumBLE 4.2: the underline is
+    // also the only focus cue when there's a single collection (and so the
+    // arrows below are suppressed). Bold alone was too subtle on short
+    // labels like "All Books".
+    const auto style = headerFocused
+                           ? static_cast<EpdFontFamily::Style>(EpdFontFamily::BOLD | EpdFontFamily::UNDERLINE)
+                           : EpdFontFamily::REGULAR;
     const int nw = renderer.getTextWidth(kTabFontId, collectionName, style);
     const int nameX = rect.x + (rect.width - nw) / 2;
     renderer.drawText(kTabFontId, nameX, tabY, collectionName, true, style);

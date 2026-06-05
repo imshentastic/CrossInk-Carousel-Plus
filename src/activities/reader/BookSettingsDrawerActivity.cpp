@@ -55,6 +55,18 @@ std::string valueTextForSetting(const SettingInfo& info) {
       if (cur < info.enumStringValues.size()) return info.enumStringValues[cur];
       return std::string{};
     }
+    // CrumBLE 4.2: when the setting uses .withEnumRawValues({...}), the
+    // raw stored value is NOT the display index -- map raw -> display
+    // index first. Otherwise SETTINGS.fontFamily=1 (BITTER) silently
+    // indexes off the end of a 1-element enumValues vector when
+    // LEXENDDECA + CHAREINK are OMIT'd, and the in-book drawer renders a
+    // blank font label.
+    if (!info.enumRawValues.empty()) {
+      for (size_t i = 0; i < info.enumRawValues.size() && i < info.enumValues.size(); i++) {
+        if (info.enumRawValues[i] == cur) return I18N.get(info.enumValues[i]);
+      }
+      return std::string{};
+    }
     if (cur < info.enumValues.size()) {
       return I18N.get(info.enumValues[cur]);
     }
@@ -86,6 +98,29 @@ void applyDeltaToSetting(const SettingInfo& info, int delta) {
     return;
   }
   if (info.type == SettingType::ENUM) {
+    // CrumBLE 4.2: cycle through enumRawValues when set -- the stored
+    // value is raw, but the display order is encoded by enumRawValues
+    // index. Treating raw value as display index (the old behaviour)
+    // would land on raw values that aren't even in the displayed set
+    // (e.g. cycling past Bitter would set fontFamily=0 == LEXENDDECA,
+    // which the slim build no longer ships, and then the picker would
+    // need the boot-time clamp to undo the damage).
+    if (!info.enumRawValues.empty()) {
+      const int count = static_cast<int>(info.enumRawValues.size());
+      if (count <= 0) return;
+      const uint8_t curRaw = SETTINGS.*(info.valuePtr);
+      int curDisplay = 0;
+      for (int i = 0; i < count; i++) {
+        if (info.enumRawValues[i] == curRaw) {
+          curDisplay = i;
+          break;
+        }
+      }
+      int next = curDisplay + delta;
+      next = ((next % count) + count) % count;
+      SETTINGS.*(info.valuePtr) = info.enumRawValues[next];
+      return;
+    }
     // Prefer enumStringValues count when present (SD-aware FONT_SIZE list
     // has its sizes there, not in enumValues).
     int count = static_cast<int>(info.enumStringValues.size());
@@ -397,8 +432,19 @@ void BookSettingsDrawerActivity::activateSelected() {
 
 namespace {
 // CrumBLE: Resolve a SettingInfo's enum value to a user-visible label string.
-// Returns empty if the value is out of range.
+// Returns empty if the value is out of range. Honors enumRawValues when
+// set, so settings that map a subset of the raw enum (e.g. fontFamily on
+// slim builds with OMIT_LEXENDDECA / OMIT_CHAREINK) resolve correctly
+// instead of indexing off the end of the trimmed enumValues vector.
 std::string enumLabelOf(const SettingInfo& info, uint8_t value) {
+  if (!info.enumRawValues.empty()) {
+    for (size_t i = 0; i < info.enumRawValues.size() && i < info.enumValues.size(); i++) {
+      if (info.enumRawValues[i] == value) {
+        return std::string(I18N.get(info.enumValues[i]));
+      }
+    }
+    return std::string{};
+  }
   if (value < info.enumValues.size()) {
     return std::string(I18N.get(info.enumValues[value]));
   }

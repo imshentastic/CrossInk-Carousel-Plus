@@ -134,14 +134,23 @@ void CrossPointWebServerActivity::onEnter() {
   //            ~6 KB with the render task starving.
   //   55 KB -- intermediate, refused users with ~51 KB maxAlloc whose
   //            sessions would have actually worked. Too conservative.
-  //   45 KB -- current. Math from observed costs:
+  //   45 KB -- current X4 threshold. Math from observed costs:
   //              wifi connect : -25 KB maxAlloc
   //              serve /files : -6 KB maxAlloc
   //              render task  : ~14 KB floor
   //              -> 25 + 6 + 14 = 45 KB minimum safe entry maxAlloc
   //            The per-page-serve guard (sendBufferGzip < 14 KB free)
   //            is the secondary net for any case that slips through.
-  constexpr uint32_t FT_MIN_MAX_ALLOC = 45000;
+  //   32 KB -- X3 threshold. The X3's 528x792 frame buffer (52 KB vs the
+  //            X4's 48 KB) plus its larger e-ink controller buffers leave
+  //            ~10 KB less contiguous heap at home. Observed FT-entry
+  //            maxAlloc on a fresh-boot X3 lands at 36-40 KB; the 45 KB
+  //            gate was permanently refusing FT entry. The secondary
+  //            per-serve guard + silentRestart auto-recovery already
+  //            catch the failure mode the higher threshold was guarding
+  //            against, so the lower X3 gate trades a small mid-session
+  //            recovery risk for the ability to actually use FT at all.
+  const uint32_t FT_MIN_MAX_ALLOC = gpio.deviceIsX3() ? 32000U : 45000U;
   if (ESP.getMaxAllocHeap() < FT_MIN_MAX_ALLOC) {
     LOG_ERR("WEBACT", "FT pre-flight: maxAlloc=%u below %u, refusing to start", ESP.getMaxAllocHeap(),
             FT_MIN_MAX_ALLOC);

@@ -1,5 +1,37 @@
 # Changelog
 
+## [crumble-v4.2.0] - 2026-06-05
+
+### Fixed
+- **SD-card font prebake produces device-identical layouts.** The WASM-based `crumble-prebake` ran without an SD-card font measurement path -- ParsedText checked `renderer.isSdCardFont(fontId)` and always got false because the host_shim GfxRenderer hardcoded the answer, so `ensureSdCardFontReady` never fired and `getTextAdvanceX` fell through to `EpdFontFamily::findGlyph()` (which always returns nullptr on an SD font; intervalCount is 0 by design). Every word measured at width 0 → jumbled layout, every section's fingerprint mismatched even though the .cpfont parsed cleanly. The host_shim now wires the full SD-font lifecycle (`sdCardFonts_` map, `registerSdCardFont`, `ensureSdCardFontReady` → `buildAdvanceTable`, advance-table fast-path in `getTextWidth` / `getTextAdvanceX` / `getSpaceWidth`) -- byte-matching the device's runtime measurement path.
+- **"Use prepared layout?" actually restores SD font settings.** Both the prebake-mismatch prompt and the BT-connect prompt restored SETTINGS from the manifest but never reloaded the SD-font manager, so `getReaderFontId()` kept returning the stale boot-time fontId and every section fingerprint failed → "use prepared layout, but indexing every chapter" symptom. Both handlers now call `sdFontSystem.ensureLoaded(renderer)` after the SETTINGS restore. The BT path additionally restores font fields (`fontFamily`/`fontSize`/`sdFontSizeRange`/`sdFontFamilyName`) when the manifest carries them (gated on `mm.fontId != 0` so old manifests don't clobber the user's current font with zeroed values).
+- **Optimized-reading prebake no longer corrupts on-page text layout on the slim OTA binary.** 4.0.0/4.1.0/4.1.1 slim builds (the only variant that fits the 6.25 MB legacy OTA partition) shipped with `OMIT_EMOJI_FONTS`, which silently swaps the built-in font binaries for `noemoji` variants. The browser-side prebake optimizer (`crumble-prebake.wasm`) bakes glyph positions using full-fat font metrics; the device then renders with noemoji metrics, and the mismatch produced "text stuck at the top of the page" symptoms and (with prior SD-card cache fragmentation in play) intermittent crashes on chapter load. 4.2 keeps the emoji/symbol/CJK fallback glyphs and pays the resulting ~470 KB by dropping the Lexend Deca + CharEink built-in families instead. Slim binary now 5.97 MB, well within the 6.25 MB OTA budget.
+- **`optimizeChapterIndexing` re-enabled by default for everyone.** 4.1.0/4.1.1 shipped default OFF as a crisis workaround for the slim-binary crash. With that crash now fixed, the setting defaults to ON for fresh installs, and existing users (whose NVS still carries the 4.1.x crisis value) are auto-migrated to ON via a one-shot marker file (`/.crosspoint/migrated_42_prebake`). Anyone who actively prefers live-parse can still toggle it off from Settings → Library → Optimize Chapter Indexing.
+- **`/api/reader-render-info` reports the correct device.** The endpoint was hardcoded to `device: "X4"` which broke prebake on X3 — the .pxc manifest viewport math used the wrong screen geometry (X4's 800×480 instead of X3's 792×528) and per-section fingerprint checks failed on otherwise-identical settings. Now reports based on `gpio.deviceIsX3()`.
+- **CSS rule-grow safety margin** loosened slightly to stop X3 OOM-crashes on margins-toggled-tight EPUBs (~10 KB less contiguous heap than X4 at the same boot point).
+- **File Transfer heap gate** is now device-aware: 45 KB on X4, 32 KB on X3. The X3's larger frame buffer + e-ink controller buffers left fresh-boot devices stuck above the 45 KB threshold; secondary per-serve guards already catch the failure mode the higher threshold guarded against.
+
+### Added
+- **Read-only "Optimized" inspector in the long-press menu.** Long-press a book that's been pre-baked → the menu header shows the title, author, and an `Optimized ⚡` badge right-justified on the second line. Navigate UP from the first menu item to focus the badge; Confirm opens a read-only viewer showing the 15 reader settings baked into `prebake-manifest.json` (Font + step/range, Orientation, Screen margin, Line spacing, Paragraph alignment, Hyphenation, Embedded style, Bionic / Guide reading, Image rendering, Viewport, Font ID hash). Back returns to the menu. Useful for troubleshooting "use prepared layout, but indexing every chapter" — eyeball the saved fontId / size combo and cross-reference with the in-reader settings drawer without restoring.
+- **`prebake-v2.marker`** sentinel file written alongside `prebake-manifest.json`. The File Transfer "Pre-cached" badge and the on-device "Optimized" header label both gate on this marker so they only flaunt status for 4.2+ bakes (which actually deliver device-matching layouts for SD fonts). Pre-4.2 bakes still load via `tryLoadPrebakeManifest` for the "Use prepared layout?" prompt — they just no longer claim a status the toolchain at the time couldn't deliver.
+- **`/api/builtin-fonts`** endpoint reports which built-in font families the device's current firmware actually ships, so the optimizer preflight modal can hide families that were stripped at build time (CharEink and/or Lexend Deca). Older firmware that lacks this endpoint continues to work via a hardcoded fallback in the optimizer JS.
+- **`/api/font-file?family=X&size=Y`** endpoint serves raw `.cpfont` bytes so the WASM optimizer can MEMFS-mount them for SD-font prebakes. Combined with the WASM host_shim SD-font fast-path, the browser bake now hashes against the same `(contentHash, family, pointSize)` triple the device computes at open time.
+- **"Lookup" is always visible in the in-book menu**, even when no StarDict dictionary is installed. Selecting Lookup without a dictionary now shows an info screen pointing the user at the GitHub releases for the bundled `.ifo/.idx/.dict` set, instead of silently hiding the feature.
+- **Animated `...` beacon during the one-time dictionary index build.** Cycles 1→4 dots throttled to ≥2.5 s between redraws (~3-4 s overhead on a 20 s scan) so the user can see the device is alive without doubling the scan time.
+
+### Changed
+- **Long-press menu canonical order** applied uniformly across all 5 entry points (file browser, home carousel, recent-books list + grid, bookmarks home):
+  1. Add to / remove from collection
+  2. Remove from Recent Books
+  3. Mark as Finished / Unfinished
+  4. Show metadata
+  5. Delete book cache
+  6. Delete
+  Benign navigation/curation up top, destructive deletes last — the cursor has to travel past safe options before reaching anything that can wipe data.
+- **Long-press menu header now shows title + author on two lines** (bold title, regular author) when the book's metadata is available, instead of word-wrapping the filename. Falls back to filename for non-book entries (PDFs, sleep images, etc.) with single-line layout. Resolution chain: in-memory `RECENT_BOOKS` → OPF parse (~50-100 ms) → filename last-resort.
+- **Lexend Deca + CharEink no longer bundled in the slim built-in font set.** Both families remain installable as SD-card `.cpfont` bundles (`CrumBLE-LexendDeca-SDfont.zip`, `CrumBLE-ChareInk-SDfont.zip`). The device-side font picker hides them in the slim build; users with `LEXENDDECA` or `CHAREINK` saved as their preference are silently clamped to Bitter at boot.
+- **Bitter** becomes the default reading font for fresh installs on the slim binary.
+
 ## [crumble-v4.1.0] - 2026-06-04
 
 ### Added

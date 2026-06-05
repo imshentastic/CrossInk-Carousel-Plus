@@ -1,6 +1,7 @@
 #include "RecentBooksActivity.h"
 
 #include <Arduino.h>
+#include <Epub.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <I18n.h>
@@ -12,6 +13,8 @@
 #include "FileBrowserActionActivity.h"
 #include "MappedInputManager.h"
 #include "RecentBooksStore.h"
+#include "activities/reader/PrebakeManifest.h"
+#include "activities/reader/PrebakeManifestViewerActivity.h"
 #include "activities/util/ConfirmationActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -172,11 +175,13 @@ void RecentBooksActivity::showBookActionMenu(const size_t bookIndex, const bool 
   if (bookIndex >= recentBooks.size()) return;
 
   const RecentBook book = recentBooks[bookIndex];
-  std::vector<FileBrowserActionActivity::MenuItem> items =
-      BookActions::buildBookActionItems(book.path, /*includeRemoveFromRecents=*/true);
+  BookActions::BookActionMenuOptions opts;
+  opts.removeFromRecents = FileBrowserAction::RemoveFromRecents;
+  std::vector<FileBrowserActionActivity::MenuItem> items = BookActions::buildBookActionItems(book.path, opts);
 
-  startActivityForResult(std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, book.title,
-                                                                     std::move(items), ignoreInitialConfirmRelease),
+  startActivityForResult(std::make_unique<FileBrowserActionActivity>(
+                             renderer, mappedInput, book.title, std::move(items), ignoreInitialConfirmRelease,
+                             BookActions::optimizedHeaderLabel(book.path), book.author),
                          [this, book](const ActivityResult& result) {
                            if (result.isCancelled) {
                              return;
@@ -216,8 +221,30 @@ void RecentBooksActivity::showBookActionMenu(const size_t bookIndex, const bool 
                              case FileBrowserAction::RemoveFromRecents:
                                promptRemoveBook(book.path, book.title);
                                return;
+                             case FileBrowserAction::ViewOptimizedDetails: {
+                               // CrumBLE 4.2: user picked the Optimized header
+                               // (long-pressed UP from item 0). Load the .json
+                               // sidecar and push the read-only viewer. If
+                               // load fails (manifest got deleted between menu
+                               // open + selection -- unlikely, possible) we
+                               // just no-op and let the menu close.
+                               PrebakeManifest pm;
+                               const std::string cachePath =
+                                   Epub::cachePathForFilePath(book.path, "/.crosspoint");
+                               if (tryLoadPrebakeManifest(cachePath, pm)) {
+                                 BookActions::BookHeaderText header =
+                                     BookActions::resolveBookHeaderText(book.path);
+                                 startActivityForResult(
+                                     std::make_unique<PrebakeManifestViewerActivity>(
+                                         renderer, mappedInput, header.title, std::move(pm)),
+                                     [this](const ActivityResult&) { requestUpdate(); });
+                               }
+                               return;
+                             }
                              case FileBrowserAction::PinFavorite:
                              case FileBrowserAction::UnpinFavorite:
+                               return;
+                             default:
                                return;
                            }
                          });
