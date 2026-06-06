@@ -58,12 +58,12 @@ constexpr uint32_t HEADER_SIZE_V38 = sizeof(SECTION_CACHE_MAGIC) + sizeof(uint8_
 // v39 adds 3 uint32_t trailer fields after the liLutOffset.
 constexpr uint32_t HEADER_SIZE = HEADER_SIZE_V38 + 3 * sizeof(uint32_t);
 
-// CrumBLE 4.3: glyph subset block header. Sits at embeddedGlyphSubsetOffset
-// in the section file. Magic is just a sanity check; on mismatch the loader
-// ignores the embedded subset and falls back to the SD-font miss-handler path.
-// "LGSB" = "Local Glyph SubsetBlock" in little-endian byte order.
-constexpr uint32_t SECTION_GLYPH_BLOCK_MAGIC = 0x4253474C;
-constexpr uint16_t SECTION_GLYPH_BLOCK_VERSION = 1;
+// The embedded glyph subset block format constants live in
+// EmbeddedGlyphSubset.h (namespace embeddedGlyphSubset) so the on-device
+// loader, the prebake CLI emitter, and any future tooling share a single
+// source of truth. Section.cpp itself doesn't reference the magic / version
+// directly -- the install path reads them through the same header it'll
+// use to drive deserialisation.
 
 struct PageLutEntry {
   uint32_t fileOffset;
