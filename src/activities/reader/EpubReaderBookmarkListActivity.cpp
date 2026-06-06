@@ -188,11 +188,11 @@ void EpubReaderBookmarkListActivity::loop() {
 }
 
 int EpubReaderBookmarkListActivity::previewLineCount(const Bookmark& bm, int contentWidth) const {
-  if (bm.preview[0] == '\0') return 0;
+  if (bm.preview.empty()) return 0;
   const int previewMaxW = contentWidth - 40;
   // Use a generous cap (32 lines) so we get the true wrap count for
   // really long quotes -- the cap exists to bound the temp vector.
-  auto lines = renderer.wrappedText(SMALL_FONT_ID, bm.preview, previewMaxW, 32);
+  auto lines = renderer.wrappedText(SMALL_FONT_ID, bm.preview.c_str(), previewMaxW, 32);
   return static_cast<int>(lines.size());
 }
 
@@ -247,7 +247,7 @@ void EpubReaderBookmarkListActivity::render(RenderLock&&) {
     // PREVIEW_MAX_LINES. Other rows stay at the regular ROW_HEIGHT.
     const bool expanded = (itemIndex == expandedIndex_);
     std::vector<std::string> previewLines;
-    if (bm.preview[0] != '\0') {
+    if (!bm.preview.empty()) {
       // CrumBLE 4.2: with BOOKMARK_PREVIEW_MAX bumped from 160 -> 1024 for
       // the QuoteViewer, running wrappedText over the full preview string
       // for every visible row turned list scrolling visibly laggy. The
@@ -260,12 +260,12 @@ void EpubReaderBookmarkListActivity::render(RenderLock&&) {
       // the full preview because the user explicitly asked to see all of
       // it.
       if (expanded) {
-        previewLines = renderer.wrappedText(SMALL_FONT_ID, bm.preview, previewMaxW, 32);
+        previewLines = renderer.wrappedText(SMALL_FONT_ID, bm.preview.c_str(), previewMaxW, 32);
       } else {
         constexpr size_t kCollapsedScanCap = 200;
         char trimmed[kCollapsedScanCap + 1];
-        const size_t copyLen = std::min(kCollapsedScanCap, std::strlen(bm.preview));
-        std::memcpy(trimmed, bm.preview, copyLen);
+        const size_t copyLen = std::min(kCollapsedScanCap, bm.preview.size());
+        std::memcpy(trimmed, bm.preview.data(), copyLen);
         trimmed[copyLen] = '\0';
         previewLines = renderer.wrappedText(SMALL_FONT_ID, trimmed, previewMaxW, PREVIEW_MAX_LINES + 1);
       }

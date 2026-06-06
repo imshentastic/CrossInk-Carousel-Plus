@@ -2327,8 +2327,8 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
         snprintf(header, sizeof(header), "[%s, %d%%]\n", chap,
                  static_cast<int>(std::lround(bm.progress * 100.0)));
         writeStr(header);
-        if (bm.preview[0] != '\0') {
-          writeLine(bm.preview);
+        if (!bm.preview.empty()) {
+          writeLine(bm.preview.c_str());
         } else {
           writeLine("(page bookmark)");
         }

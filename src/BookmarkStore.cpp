@@ -108,7 +108,7 @@ BookmarkStore::AddResult BookmarkStore::addBookmark(uint16_t spineIndex, float p
   bm.endProgress = progress;
   bm.startWord = 0;
   bm.endWord = 0;
-  bm.preview[0] = '\0';
+  bm.preview.clear();
 
   bookmarks.push_back(bm);
   dirty = true;
@@ -131,7 +131,7 @@ BookmarkStore::AddResult BookmarkStore::addHighlight(uint16_t startSpine, float 
     const float pageEnd = startProgress + pageSlice;
     std::erase_if(bookmarks, [&](const Bookmark& b) {
       return b.spineIndex == startSpine && b.progress >= pageStart && b.progress < pageEnd &&
-             b.startWord == 0 && b.endWord == 0 && b.endSpineIndex == b.spineIndex && b.preview[0] == '\0';
+             b.startWord == 0 && b.endWord == 0 && b.endSpineIndex == b.spineIndex && b.preview.empty();
     });
   }
 
@@ -149,7 +149,16 @@ BookmarkStore::AddResult BookmarkStore::addHighlight(uint16_t startSpine, float 
   bm.endProgress = endProgress;
   bm.startWord = startWord;
   bm.endWord = endWord;
-  snprintf(bm.preview, sizeof(bm.preview), "%s", preview ? preview : "");
+  // Cap the in-memory preview at BOOKMARK_PREVIEW_MAX-1 chars; the on-disk
+  // write path will zero-pad to the full slot.
+  if (preview) {
+    bm.preview = preview;
+    if (bm.preview.size() > BOOKMARK_PREVIEW_MAX - 1) {
+      bm.preview.resize(BOOKMARK_PREVIEW_MAX - 1);
+    }
+  } else {
+    bm.preview.clear();
+  }
 
   bookmarks.push_back(bm);
   dirty = true;
@@ -301,40 +310,33 @@ bool BookmarkStore::readFromFile() {
       serialization::readPod(f, bm.startWord);
       serialization::readPod(f, bm.endWord);
 
-      if (version == V4_VERSION) {
-        // CrumBLE 4.2: v4 file has a 160-byte preview slot. Read it into a
-        // scratch buffer sized for the legacy layout, then copy into the
-        // (larger) bm.preview field. NUL-terminate at the v4 boundary so
-        // any stale bytes beyond it in the larger buffer don't read as
-        // garbage. The next saveToFile() persists this bookmark as v5 with
-        // the full preview slot.
-        char v4Preview[BOOKMARK_PREVIEW_MAX_V4];
-        const int prevRead = f.read(reinterpret_cast<uint8_t*>(v4Preview), sizeof(v4Preview));
-        if (prevRead != static_cast<int>(sizeof(v4Preview))) {
-          LOG_ERR("BKS", "Bookmark file truncated at v4 preview, record %u", i);
-          f.close();
-          return false;
-        }
-        v4Preview[sizeof(v4Preview) - 1] = '\0';
-        std::memset(bm.preview, 0, sizeof(bm.preview));
-        std::strncpy(bm.preview, v4Preview, sizeof(bm.preview) - 1);
-        bm.preview[sizeof(bm.preview) - 1] = '\0';
-      } else {
-        const int prevRead = f.read(reinterpret_cast<uint8_t*>(bm.preview), sizeof(bm.preview));
-        bm.preview[sizeof(bm.preview) - 1] = '\0';
-        if (prevRead != static_cast<int>(sizeof(bm.preview))) {
-          LOG_ERR("BKS", "Bookmark file truncated at v5 preview, record %u", i);
-          f.close();
-          return false;
-        }
+      // CrumBLE 4.2.1: read the on-disk preview slot into a stack scratch
+      // buffer, then assign into bm.preview as a std::string sized to the
+      // actual NUL-terminated content. This avoids holding 1024 zero-padded
+      // bytes per Bookmark in RAM when the typical highlight is ~100-400
+      // chars; the bookmark-list activity used to OOM at the by-value
+      // copy of the bookmarks vector under tight heap.
+      const size_t onDiskPreviewSize =
+          (version == V4_VERSION) ? BOOKMARK_PREVIEW_MAX_V4 : BOOKMARK_PREVIEW_MAX;
+      char scratch[BOOKMARK_PREVIEW_MAX];
+      const int prevRead = f.read(reinterpret_cast<uint8_t*>(scratch), onDiskPreviewSize);
+      if (prevRead != static_cast<int>(onDiskPreviewSize)) {
+        LOG_ERR("BKS", "Bookmark file truncated at v%u preview, record %u", version, i);
+        f.close();
+        return false;
       }
+      // Force NUL at the disk-slot boundary so a corrupt/unterminated slot
+      // doesn't run past it. Then assign — std::string finds the NUL itself,
+      // so the resulting in-memory size matches the actual content length.
+      scratch[onDiskPreviewSize - 1] = '\0';
+      bm.preview.assign(scratch);
     } else {
       // v2/v3 migration: degenerate (zero-length) highlight at the point.
       bm.endSpineIndex = bm.spineIndex;
       bm.endProgress = bm.progress;
       bm.startWord = 0;
       bm.endWord = 0;
-      bm.preview[0] = '\0';
+      bm.preview.clear();
     }
 
     bookmarks.push_back(bm);
@@ -376,7 +378,15 @@ bool BookmarkStore::writeToFile() const {
     serialization::writePod(f, bm.endProgress);
     serialization::writePod(f, bm.startWord);
     serialization::writePod(f, bm.endWord);
-    f.write(reinterpret_cast<const uint8_t*>(bm.preview), sizeof(bm.preview));
+    // CrumBLE 4.2.1: write the preview into the fixed-size on-disk slot
+    // (BOOKMARK_PREVIEW_MAX bytes), zero-padded after the actual content.
+    // Truncates at MAX-1 chars to leave room for the trailing NUL the
+    // reader's std::string::assign(const char*) relies on. Using a stack
+    // buffer keeps the heap state predictable across save() calls.
+    char slot[BOOKMARK_PREVIEW_MAX] = {0};
+    const size_t copyLen = std::min(bm.preview.size(), static_cast<size_t>(BOOKMARK_PREVIEW_MAX - 1));
+    if (copyLen > 0) std::memcpy(slot, bm.preview.data(), copyLen);
+    f.write(reinterpret_cast<const uint8_t*>(slot), sizeof(slot));
   }
 
   f.close();

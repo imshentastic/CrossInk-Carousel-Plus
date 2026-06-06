@@ -3,21 +3,28 @@
 #include <string>
 #include <vector>
 
-// chapterTitle / preview are always NUL-terminated within their MAX bytes.
-// These sizes are part of the on-disk format — do not change without
-// incrementing the file version.
+// chapterTitle has a NUL-terminated fixed-size field on disk; preview's
+// on-disk slot is also fixed-size (zero-padded), but the IN-MEMORY
+// representation is a std::string sized only to the actual content.
+// On-disk slot sizes are part of the file format — do not change
+// without incrementing the file version.
 inline constexpr size_t BOOKMARK_CHAPTER_TITLE_MAX = 48;
-// CrumBLE 4.2: bumped from 160 -> 1024. Earlier cap clipped highlights at
-// ~25-30 words which made the new QuoteViewer feel pointless for longer
-// passages (the user explicitly asked for 100+ word quotes). 1024 chars
-// covers ~170 words at typical word length. Existing v4 bookmark files
-// (160-byte preview field) read fine via the version-gated path in
-// BookmarkStore::readFromFile -- they just won't grow until the user
-// re-highlights. In-RAM cost: ~1.1 KB per Bookmark; a typical 50-
-// bookmark book holds ~55 KB in the in-memory vector. Bookmark cap
-// (MAX_BOOKMARKS = 1024 in .cpp) bounds the worst-case at ~1.1 MB on
-// disk but that's only paid by power users; the in-RAM working set
-// for one open book is what matters for heap.
+// CrumBLE 4.2: bumped from 160 -> 1024 on disk. Earlier cap clipped
+// highlights at ~25-30 words which made the new QuoteViewer feel pointless
+// for longer passages (the user explicitly asked for 100+ word quotes).
+// 1024 chars covers ~170 words at typical word length. Existing v4
+// bookmark files (160-byte preview field) read fine via the version-gated
+// path in BookmarkStore::readFromFile -- they just won't grow until the
+// user re-highlights.
+//
+// CrumBLE 4.2.1 hotfix: the in-memory representation is now a std::string
+// (was char[1024]). The flat-buffer struct was ~1092 bytes, so opening a
+// bookmark list on a book with 50+ highlights triggered a 55 KB
+// contiguous allocation during the activity's by-value copy of the
+// bookmarks vector -- which OOM-terminated after a heap-fragmenting BT
+// session (observed at maxAlloc=12 KB). With std::string the working set
+// scales with actual preview length (typical highlight ~100-400 chars);
+// the 1024-byte field is now just the on-disk write cap.
 inline constexpr size_t BOOKMARK_PREVIEW_MAX = 1024;
 // CrumBLE 4.2: legacy size for v4 bookmark files. BookmarkStore reads
 // these via a fixed 160-byte scratch buffer when loading a v4 file, then
@@ -46,10 +53,11 @@ struct Bookmark {
   uint16_t startWord;        // word index within the start page
   uint16_t endWord;          // word index within the end page (inclusive)
 
-  // User-facing preview of the selected text. Up to BOOKMARK_PREVIEW_MAX-1
-  // chars + NUL; longer selections truncate with a trailing ellipsis.
+  // User-facing preview of the selected text. Heap-allocated string, sized
+  // to actual content; on-disk slot is fixed at BOOKMARK_PREVIEW_MAX bytes
+  // (zero-padded), and writes truncate at BOOKMARK_PREVIEW_MAX-1 chars.
   // Empty for migrated v3 records (user can re-select to populate).
-  char preview[BOOKMARK_PREVIEW_MAX];
+  std::string preview;
 };
 
 struct BookmarkedBookEntry {

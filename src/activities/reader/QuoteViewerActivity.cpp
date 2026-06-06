@@ -58,7 +58,7 @@ void QuoteViewerActivity::rewrapForCurrent() {
   // Empty preview = legacy v3-format bookmark (pre-highlight) that never
   // had selected text. Show a placeholder so the viewer still renders
   // chapter context + "no preview available" without crashing.
-  const char* preview = (bm.preview[0] != '\0') ? bm.preview : "[no preview saved for this bookmark]";
+  const char* preview = !bm.preview.empty() ? bm.preview.c_str() : "[no preview saved for this bookmark]";
 
   const int sidePad = UITheme::getInstance().getMetrics().contentSidePadding;
   const int contentWidth = renderer.getScreenWidth() - sidePad * 2;
