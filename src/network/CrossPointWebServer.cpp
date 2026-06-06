@@ -2216,8 +2216,10 @@ void CrossPointWebServer::handleFontList() const {
 // CrumBLE 4.2: report which built-in reading fonts the firmware actually
 // ships. Values match CrossPointSettings::FONT_FAMILY enum so the optimizer
 // preflight modal can map "builtin:<value>" tags to the device-side
-// fontFamily field. OMIT_LEXENDDECA_FONT / OMIT_CHAREINK_FONT drop their
-// rows so the modal doesn't offer a font that isn't on this device.
+// fontFamily field. OMIT_BITTER_FONT / OMIT_LEXENDDECA_FONT /
+// OMIT_CHAREINK_FONT drop their rows so the modal only offers fonts that
+// are actually in this variant binary (tiny-bitter / tiny-lexend /
+// tiny-chareink).
 void CrossPointWebServer::handleBuiltinFontList() const {
   JsonDocument doc;
   JsonArray builtins = doc["builtins"].to<JsonArray>();
@@ -2228,11 +2230,13 @@ void CrossPointWebServer::handleBuiltinFontList() const {
     e["label"] = "Lexend Deca";
   }
 #endif
+#ifndef OMIT_BITTER_FONT
   {
     JsonObject e = builtins.add<JsonObject>();
     e["value"] = static_cast<int>(CrossPointSettings::BITTER);
     e["label"] = "Bitter";
   }
+#endif
 #ifndef OMIT_CHAREINK_FONT
   {
     JsonObject e = builtins.add<JsonObject>();

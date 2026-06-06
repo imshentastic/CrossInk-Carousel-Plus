@@ -134,13 +134,21 @@ CrossPointSettings::FONT_SIZE firstAvailableReaderFontSize() {
 }
 
 int getFallbackReaderFontIdForFamily(const CrossPointSettings::FONT_FAMILY family) {
+  // CrumBLE 4.2.1: each "OMIT'd family" branch routes to whichever family IS
+  // compiled in via BUILTIN_DEFAULT_FONT_FAMILY (BITTER > LEXENDDECA >
+  // CHAREINK precedence). This replaces the v4.2.0 always-BITTER fallback
+  // pattern, which broke when OMIT_BITTER_FONT shipped in tiny-lexend and
+  // tiny-chareink variants. To avoid an infinite recursion when the called
+  // family is itself the default (e.g. BITTER recurses to BITTER), each
+  // OMIT'd-family branch routes to a *different* family explicitly chosen
+  // by the variant-time macro.
   switch (family) {
     case CrossPointSettings::CHAREINK:
 #ifdef OMIT_CHAREINK_FONT
-      // CharEink family is OMIT'd; fall through to the BITTER case below
-      // so users with CHAREINK saved as their preference still get a
-      // legible reader font instead of a missing-font crash.
-      [[fallthrough]];
+      // CharEink family is OMIT'd; fall back to whichever family this build
+      // ships with so users with CHAREINK saved as their preference still
+      // get a legible reader font instead of a missing-font crash.
+      return getFallbackReaderFontIdForFamily(CrossPointSettings::BUILTIN_DEFAULT_FONT_FAMILY);
 #else
 #ifndef OMIT_TINY_FONT
       return CHAREINK_10_FONT_ID;
@@ -163,6 +171,11 @@ int getFallbackReaderFontIdForFamily(const CrossPointSettings::FONT_FAMILY famil
 #endif
 #endif  // OMIT_CHAREINK_FONT
     case CrossPointSettings::BITTER:
+#ifdef OMIT_BITTER_FONT
+      // Bitter family is OMIT'd (tiny-lexend / tiny-chareink variant); fall
+      // back to whichever family this build ships with.
+      return getFallbackReaderFontIdForFamily(CrossPointSettings::BUILTIN_DEFAULT_FONT_FAMILY);
+#else
 #ifndef OMIT_TINY_FONT
       return BITTER_10_FONT_ID;
 #elif !defined(OMIT_SMALL_FONT)
@@ -182,14 +195,14 @@ int getFallbackReaderFontIdForFamily(const CrossPointSettings::FONT_FAMILY famil
 #else
 #error "No reader fonts enabled for BITTER"
 #endif
+#endif  // OMIT_BITTER_FONT
     case CrossPointSettings::LEXENDDECA:
     default:
 #ifdef OMIT_LEXENDDECA_FONT
-      // Lexend Deca family is OMIT'd; fall back to BITTER for users with
-      // a stale LEXENDDECA preference (silent migration, no crash). Also
-      // catches the default: case so any unrecognized family lands on
-      // Bitter when Lexend isn't present.
-      return getFallbackReaderFontIdForFamily(CrossPointSettings::BITTER);
+      // Lexend Deca family is OMIT'd; fall back to whichever family this
+      // build ships with. Also catches the default: case so any
+      // unrecognized family lands on the variant's built-in font.
+      return getFallbackReaderFontIdForFamily(CrossPointSettings::BUILTIN_DEFAULT_FONT_FAMILY);
 #else
 #ifndef OMIT_TINY_FONT
       return LEXENDDECA_10_FONT_ID;
@@ -733,16 +746,24 @@ int CrossPointSettings::getReaderFontId() const {
     // Fall through to built-in if SD font not found
   }
 
-  // CrumBLE 4.2: collapse OMIT'd built-in families onto BITTER BEFORE the
-  // switch, so the size-respecting size-switch fires. Using the family's
-  // getFallbackReaderFontIdForFamily() below would lose the user's size
-  // preference (returns the family's first-available size).
+  // CrumBLE 4.2: collapse OMIT'd built-in families onto whichever family
+  // this build ships with BEFORE the switch, so the size-respecting
+  // size-switch fires. Using the family's getFallbackReaderFontIdForFamily()
+  // below would lose the user's size preference (returns the family's
+  // first-available size).
+  // 4.2.1: route through BUILTIN_DEFAULT_FONT_FAMILY (BITTER > LEXENDDECA >
+  // CHAREINK in precedence) rather than hardcoded BITTER, so the tiny-lexend
+  // and tiny-chareink variants (which OMIT_BITTER) collapse to whichever
+  // family they ship with instead of an unavailable Bitter.
   uint8_t effectiveFamily = fontFamily;
 #ifdef OMIT_LEXENDDECA_FONT
-  if (effectiveFamily == LEXENDDECA) effectiveFamily = BITTER;
+  if (effectiveFamily == LEXENDDECA) effectiveFamily = BUILTIN_DEFAULT_FONT_FAMILY;
 #endif
 #ifdef OMIT_CHAREINK_FONT
-  if (effectiveFamily == CHAREINK) effectiveFamily = BITTER;
+  if (effectiveFamily == CHAREINK) effectiveFamily = BUILTIN_DEFAULT_FONT_FAMILY;
+#endif
+#ifdef OMIT_BITTER_FONT
+  if (effectiveFamily == BITTER) effectiveFamily = BUILTIN_DEFAULT_FONT_FAMILY;
 #endif
 
   switch (effectiveFamily) {
@@ -750,10 +771,10 @@ int CrossPointSettings::getReaderFontId() const {
     default:
 #ifdef OMIT_LEXENDDECA_FONT
       // Unreachable: the OMIT_LEXENDDECA collapse above mapped LEXENDDECA
-      // to BITTER before reaching the switch. Kept as a defensive guard
-      // in case the collapse logic ever drifts out of sync with the OMIT
-      // gating below.
-      return getFallbackReaderFontIdForFamily(BITTER);
+      // to BUILTIN_DEFAULT_FONT_FAMILY before reaching the switch. Kept
+      // as a defensive guard in case the collapse logic ever drifts out
+      // of sync with the OMIT gating below.
+      return getFallbackReaderFontIdForFamily(BUILTIN_DEFAULT_FONT_FAMILY);
 #else
       switch (effectiveSize) {
 #ifndef OMIT_TEENSY_FONT
@@ -797,9 +818,11 @@ int CrossPointSettings::getReaderFontId() const {
 #endif  // OMIT_LEXENDDECA_FONT
     case CHAREINK:
 #ifdef OMIT_CHAREINK_FONT
-      // CharEink family is OMIT'd; fall back to BITTER for users with
-      // a stale CHAREINK preference (silent migration, no crash).
-      return getFallbackReaderFontIdForFamily(BITTER);
+      // CharEink family is OMIT'd; fall back to whichever family is
+      // compiled into this variant build (BITTER on tiny-bitter,
+      // LEXENDDECA on tiny-lexend) for users with a stale CHAREINK
+      // preference (silent migration, no crash).
+      return getFallbackReaderFontIdForFamily(BUILTIN_DEFAULT_FONT_FAMILY);
 #else
       switch (effectiveSize) {
 #ifndef OMIT_TEENSY_FONT
@@ -842,6 +865,13 @@ int CrossPointSettings::getReaderFontId() const {
       return getFallbackReaderFontIdForFamily(CHAREINK);
 #endif  // OMIT_CHAREINK_FONT
     case BITTER:
+#ifdef OMIT_BITTER_FONT
+      // Unreachable: the OMIT_BITTER collapse above mapped BITTER to
+      // BUILTIN_DEFAULT_FONT_FAMILY before reaching the switch. Kept as a
+      // defensive guard for variants that drop Bitter (tiny-lexend,
+      // tiny-chareink).
+      return getFallbackReaderFontIdForFamily(BUILTIN_DEFAULT_FONT_FAMILY);
+#else
       switch (effectiveSize) {
 #ifndef OMIT_TEENSY_FONT
         case TEENSY:
@@ -881,6 +911,7 @@ int CrossPointSettings::getReaderFontId() const {
 #endif
       }
       return getFallbackReaderFontIdForFamily(BITTER);
+#endif  // OMIT_BITTER_FONT
   }
   return getFallbackReaderFontIdForFamily(static_cast<FONT_FAMILY>(fontFamily));
 }

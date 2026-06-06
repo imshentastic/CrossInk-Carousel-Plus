@@ -24,6 +24,13 @@
 #define BUILTIN_READING_FONT_HEADER(name) <builtinFonts/name.h>
 #endif
 
+// CrumBLE 4.2.1: OMIT_BITTER_FONT drops the entire Bitter family. Used by
+// the tiny-lexend and tiny-chareink variant builds where Lexend or CharEink
+// is the only built-in reader font and Bitter is omitted to free OTA-partition
+// space. With Bitter omitted, the picker hides the BITTER option and the
+// fallback chain in CrossPointSettings.cpp routes to whichever family IS
+// compiled in (LEXENDDECA or CHAREINK) via BUILTIN_DEFAULT_FONT_FAMILY.
+#ifndef OMIT_BITTER_FONT
 #ifndef OMIT_TEENSY_FONT
 #include BUILTIN_READING_FONT_HEADER(bitter_8_bold)
 #include BUILTIN_READING_FONT_HEADER(bitter_8_bolditalic)
@@ -72,6 +79,7 @@
 #include BUILTIN_READING_FONT_HEADER(bitter_20_italic)
 #include BUILTIN_READING_FONT_HEADER(bitter_20_regular)
 #endif
+#endif  // OMIT_BITTER_FONT
 
 // CrumBLE: OMIT_CHAREINK_FONT drops the entire CharEink family. Saves
 // ~700-900 KB binary -- used in the OTA-fit "slim" release build so

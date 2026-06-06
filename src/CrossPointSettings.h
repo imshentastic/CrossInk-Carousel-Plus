@@ -129,6 +129,23 @@ class CrossPointSettings {
   // Font family options (built-in fonts only; SD card fonts use sdFontFamilyName)
   enum FONT_FAMILY { LEXENDDECA = 0, BITTER = 1, CHAREINK = 2, FONT_FAMILY_COUNT };
   static constexpr uint8_t BUILTIN_FONT_COUNT = FONT_FAMILY_COUNT;
+
+  // CrumBLE 4.2.1: per-variant default built-in family. Exactly one of the
+  // three families is compiled in by the tiny-{bitter,lexend,chareink}
+  // variants; this constant routes fallbacks (stale-preference clamp,
+  // getFallbackReaderFontIdForFamily, getReaderFontId collapse) to whichever
+  // one IS available. Resolution order: BITTER > LEXENDDECA > CHAREINK
+  // (matches v4.2.0 behaviour, which always landed on BITTER as the universal
+  // fallback). A compile-time error fires if all three families are omitted.
+#if !defined(OMIT_BITTER_FONT)
+  static constexpr FONT_FAMILY BUILTIN_DEFAULT_FONT_FAMILY = BITTER;
+#elif !defined(OMIT_LEXENDDECA_FONT)
+  static constexpr FONT_FAMILY BUILTIN_DEFAULT_FONT_FAMILY = LEXENDDECA;
+#elif !defined(OMIT_CHAREINK_FONT)
+  static constexpr FONT_FAMILY BUILTIN_DEFAULT_FONT_FAMILY = CHAREINK;
+#else
+#error "All built-in reader font families omitted (OMIT_BITTER_FONT + OMIT_LEXENDDECA_FONT + OMIT_CHAREINK_FONT). At least one must be compiled in."
+#endif
   // Font size options
   enum FONT_SIZE {
     TINY = 0,
@@ -360,9 +377,11 @@ class CrossPointSettings {
   uint8_t readerFrontButtonLeft = FRONT_HW_LEFT;
   uint8_t readerFrontButtonRight = FRONT_HW_RIGHT;
   // Reader font settings. CrumBLE: when Lexend Deca is OMIT'd from the
-  // slim build, default to Bitter (the only remaining built-in).
+  // slim build, default to whichever family is compiled in
+  // (BUILTIN_DEFAULT_FONT_FAMILY resolves at compile time: BITTER on
+  // tiny-bitter, LEXENDDECA on tiny-lexend, CHAREINK on tiny-chareink).
 #ifdef OMIT_LEXENDDECA_FONT
-  uint8_t fontFamily = BITTER;
+  uint8_t fontFamily = BUILTIN_DEFAULT_FONT_FAMILY;
 #else
   uint8_t fontFamily = LEXENDDECA;
 #endif

@@ -239,6 +239,9 @@ EpdFontFamily lexenddeca20FontFamily(&lexenddeca20RegularFont, &lexenddeca20Bold
 #endif
 #endif  // OMIT_LEXENDDECA_FONT
 
+// CrumBLE 4.2.1: OMIT_BITTER_FONT drops the entire Bitter family (see all.h).
+// Used by the tiny-lexend and tiny-chareink variant builds.
+#ifndef OMIT_BITTER_FONT
 #ifndef OMIT_TEENSY_FONT
 EpdFont bitter8RegularFont(&bitter_8_regular);
 EpdFont bitter8BoldFont(&bitter_8_bold);
@@ -295,6 +298,7 @@ EpdFont bitter20ItalicFont(&bitter_20_italic);
 EpdFont bitter20BoldItalicFont(&bitter_20_bolditalic);
 EpdFontFamily bitter20FontFamily(&bitter20RegularFont, &bitter20BoldFont, &bitter20ItalicFont, &bitter20BoldItalicFont);
 #endif
+#endif  // OMIT_BITTER_FONT
 
 EpdFont smallFont(&inter_8_regular);
 EpdFontFamily smallFontFamily(&smallFont);
@@ -929,6 +933,8 @@ void setupDisplayAndFonts(bool seamless = false) {
 #endif
 #endif  // OMIT_LEXENDDECA_FONT
 
+// CrumBLE 4.2.1: OMIT_BITTER_FONT drops the entire Bitter family (see all.h).
+#ifndef OMIT_BITTER_FONT
 #ifndef OMIT_TEENSY_FONT
   renderer.insertFont(BITTER_8_FONT_ID, bitter8FontFamily);
 #endif
@@ -953,6 +959,7 @@ void setupDisplayAndFonts(bool seamless = false) {
 #ifndef OMIT_HUGE_FONT
   renderer.insertFont(BITTER_20_FONT_ID, bitter20FontFamily);
 #endif
+#endif  // OMIT_BITTER_FONT
   renderer.insertFont(UI_10_FONT_ID, ui10FontFamily);
   renderer.insertFont(UI_12_FONT_ID, ui12FontFamily);
   renderer.insertFont(SMALL_FONT_ID, smallFontFamily);
@@ -1047,21 +1054,32 @@ void setup() {
   // who downgraded LEXENDDECA -> slim (which OMITs Lexend) keeps a
   // stale fontFamily=LEXENDDECA value -- the picker's withEnumRawValues
   // gate filters that out, rendering the family slot blank. Falling
-  // back to BITTER (the always-available built-in) gives the picker
+  // back to the variant's BUILTIN_DEFAULT_FONT_FAMILY gives the picker
   // something to draw and stops the "select Bitter -> mismatch prompt"
   // surprise. Runs every boot so re-installs / SD swaps self-heal.
+  // 4.2.1: also clamp stale BITTER for the tiny-lexend / tiny-chareink
+  // variant builds. Routing target is now BUILTIN_DEFAULT_FONT_FAMILY
+  // (resolves at compile time per variant: BITTER on tiny-bitter,
+  // LEXENDDECA on tiny-lexend, CHAREINK on tiny-chareink).
   bool fontFamilyClamped = false;
 #ifdef OMIT_LEXENDDECA_FONT
   if (SETTINGS.fontFamily == CrossPointSettings::LEXENDDECA) {
-    SETTINGS.fontFamily = CrossPointSettings::BITTER;
-    LOG_INF("MAIN", "Font family clamp: LEXENDDECA -> BITTER (Lexend not built-in this build)");
+    SETTINGS.fontFamily = CrossPointSettings::BUILTIN_DEFAULT_FONT_FAMILY;
+    LOG_INF("MAIN", "Font family clamp: LEXENDDECA -> built-in default (Lexend not in this build)");
     fontFamilyClamped = true;
   }
 #endif
 #ifdef OMIT_CHAREINK_FONT
   if (SETTINGS.fontFamily == CrossPointSettings::CHAREINK) {
-    SETTINGS.fontFamily = CrossPointSettings::BITTER;
-    LOG_INF("MAIN", "Font family clamp: CHAREINK -> BITTER (CharEink not built-in this build)");
+    SETTINGS.fontFamily = CrossPointSettings::BUILTIN_DEFAULT_FONT_FAMILY;
+    LOG_INF("MAIN", "Font family clamp: CHAREINK -> built-in default (CharEink not in this build)");
+    fontFamilyClamped = true;
+  }
+#endif
+#ifdef OMIT_BITTER_FONT
+  if (SETTINGS.fontFamily == CrossPointSettings::BITTER) {
+    SETTINGS.fontFamily = CrossPointSettings::BUILTIN_DEFAULT_FONT_FAMILY;
+    LOG_INF("MAIN", "Font family clamp: BITTER -> built-in default (Bitter not in this build)");
     fontFamilyClamped = true;
   }
 #endif

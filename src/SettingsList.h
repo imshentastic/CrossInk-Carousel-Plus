@@ -139,16 +139,18 @@ inline uint8_t closestBuiltinFontSizeIndex(const uint8_t targetPointSize) {
 // Build the font family setting dynamically. When registry is non-null, SD card fonts
 // are appended after the built-in fonts. Otherwise only built-in fonts are listed.
 inline SettingInfo buildFontFamilySetting(const SdCardFontRegistry* registry) {
-  // Built-in font labels (StrId). CrumBLE: OMIT_CHAREINK_FONT and
-  // OMIT_LEXENDDECA_FONT drop their respective family options from the
-  // picker so the slim OTA build doesn't show fonts that aren't embedded.
-  // Users can install either as an SD-card .cpfont and the picker
-  // appends them from the registry.
+  // Built-in font labels (StrId). CrumBLE: OMIT_BITTER_FONT,
+  // OMIT_CHAREINK_FONT and OMIT_LEXENDDECA_FONT drop their respective
+  // family options from the picker so each tiny-* variant only shows
+  // fonts that are embedded. Users can install any of the three as an
+  // SD-card .cpfont and the picker appends them from the registry.
   std::vector<StrId> enumValues = {
 #ifndef OMIT_LEXENDDECA_FONT
       StrId::STR_LEXEND_DECA,
 #endif
+#ifndef OMIT_BITTER_FONT
       StrId::STR_BITTER,
+#endif
 #ifndef OMIT_CHAREINK_FONT
       StrId::STR_CHAREINK,
 #endif
@@ -176,7 +178,9 @@ inline SettingInfo buildFontFamilySetting(const SdCardFontRegistry* registry) {
 #ifndef OMIT_LEXENDDECA_FONT
     allStringValues.push_back(I18N.get(StrId::STR_LEXEND_DECA));
 #endif
+#ifndef OMIT_BITTER_FONT
     allStringValues.push_back(I18N.get(StrId::STR_BITTER));
+#endif
 #ifndef OMIT_CHAREINK_FONT
     allStringValues.push_back(I18N.get(StrId::STR_CHAREINK));
 #endif
@@ -204,17 +208,22 @@ inline SettingInfo buildFontFamilySetting(const SdCardFontRegistry* registry) {
                    [](const SdCardFontFamilyInfo& f) { return f.availableSizes(); });
   }
 
-  // CrumBLE 4.2: built-in slots are gated by OMIT_LEXENDDECA_FONT and
-  // OMIT_CHAREINK_FONT. The slim build's display order is just whichever
-  // families survive the OMITs (in fontFamily-enum order) followed by SD
-  // families. The picker addresses by DISPLAY INDEX, but
-  // SETTINGS.fontFamily stores the RAW enum value -- so getter/setter
-  // need a mapping that respects OMIT.
+  // CrumBLE 4.2: built-in slots are gated by OMIT_BITTER_FONT,
+  // OMIT_LEXENDDECA_FONT and OMIT_CHAREINK_FONT. Each tiny-* variant's
+  // display order is whichever families survive the OMITs (in
+  // fontFamily-enum order) followed by SD families. The picker addresses
+  // by DISPLAY INDEX, but SETTINGS.fontFamily stores the RAW enum value
+  // -- so getter/setter need a mapping that respects OMIT. The unknown-
+  // value fallback routes through BUILTIN_DEFAULT_FONT_FAMILY so each
+  // variant (tiny-bitter, tiny-lexend, tiny-chareink) lands on whichever
+  // family it ships with rather than a hardcoded Bitter that may be OMIT'd.
   constexpr uint8_t kAvailableBuiltinCount = 0
 #ifndef OMIT_LEXENDDECA_FONT
                                              + 1
 #endif
-                                             + 1  // BITTER (always)
+#ifndef OMIT_BITTER_FONT
+                                             + 1
+#endif
 #ifndef OMIT_CHAREINK_FONT
                                              + 1
 #endif
@@ -225,8 +234,10 @@ inline SettingInfo buildFontFamilySetting(const SdCardFontRegistry* registry) {
     if (ff == CrossPointSettings::LEXENDDECA) return pos;
     pos++;
 #endif
+#ifndef OMIT_BITTER_FONT
     if (ff == CrossPointSettings::BITTER) return pos;
     pos++;
+#endif
 #ifndef OMIT_CHAREINK_FONT
     if (ff == CrossPointSettings::CHAREINK) return pos;
 #endif
@@ -237,11 +248,13 @@ inline SettingInfo buildFontFamilySetting(const SdCardFontRegistry* registry) {
 #ifndef OMIT_LEXENDDECA_FONT
     if (d == pos++) return CrossPointSettings::LEXENDDECA;
 #endif
+#ifndef OMIT_BITTER_FONT
     if (d == pos++) return CrossPointSettings::BITTER;
+#endif
 #ifndef OMIT_CHAREINK_FONT
     if (d == pos++) return CrossPointSettings::CHAREINK;
 #endif
-    return CrossPointSettings::BITTER;
+    return CrossPointSettings::BUILTIN_DEFAULT_FONT_FAMILY;
   };
 
   s.valueGetter = [sdFamilyNames, fontFamilyRawToDisplay]() -> uint8_t {
@@ -393,7 +406,9 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
 #ifndef OMIT_LEXENDDECA_FONT
                               StrId::STR_LEXEND_DECA,
 #endif
+#ifndef OMIT_BITTER_FONT
                               StrId::STR_BITTER,
+#endif
 #ifndef OMIT_CHAREINK_FONT
                               StrId::STR_CHAREINK,
 #endif
@@ -404,7 +419,9 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
 #ifndef OMIT_LEXENDDECA_FONT
                 static_cast<uint8_t>(CrossPointSettings::LEXENDDECA),
 #endif
+#ifndef OMIT_BITTER_FONT
                 static_cast<uint8_t>(CrossPointSettings::BITTER),
+#endif
 #ifndef OMIT_CHAREINK_FONT
                 static_cast<uint8_t>(CrossPointSettings::CHAREINK),
 #endif

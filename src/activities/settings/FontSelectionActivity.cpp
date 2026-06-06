@@ -75,9 +75,20 @@ void FontSelectionActivity::onEnter() {
   fonts_.clear();
   fonts_.reserve(CrossPointSettings::BUILTIN_FONT_COUNT + (registry_ ? registry_->getFamilyCount() : 0));
 
-  fonts_.push_back({I18N.get(StrId::STR_LEXEND_DECA), true, 0});
-  fonts_.push_back({I18N.get(StrId::STR_BITTER), true, 1});
-  fonts_.push_back({I18N.get(StrId::STR_CHAREINK), true, 2});
+  // CrumBLE 4.2.1: skip families that aren't compiled into this variant
+  // (tiny-bitter omits Lexend+CharEink, tiny-lexend omits Bitter+CharEink,
+  // tiny-chareink omits Bitter+Lexend). The third tuple value is the
+  // CrossPointSettings::FONT_FAMILY enum value, not a display index, so
+  // OMIT'd entries stay aligned with the enum the rest of the code uses.
+#ifndef OMIT_LEXENDDECA_FONT
+  fonts_.push_back({I18N.get(StrId::STR_LEXEND_DECA), true, CrossPointSettings::LEXENDDECA});
+#endif
+#ifndef OMIT_BITTER_FONT
+  fonts_.push_back({I18N.get(StrId::STR_BITTER), true, CrossPointSettings::BITTER});
+#endif
+#ifndef OMIT_CHAREINK_FONT
+  fonts_.push_back({I18N.get(StrId::STR_CHAREINK), true, CrossPointSettings::CHAREINK});
+#endif
 
   if (registry_) {
     const auto& families = registry_->getFamilies();
