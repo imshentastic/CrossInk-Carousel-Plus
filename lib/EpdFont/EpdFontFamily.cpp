@@ -182,6 +182,41 @@ void EpdFontFamily::getTextDimensions(const char* string, int* w, int* h, const 
 const EpdFontData* EpdFontFamily::getData(const Style style) const { return getFont(style)->data; }
 
 EpdFontFamily::GlyphData EpdFontFamily::findGlyphData(const uint32_t cp, const Style style) const {
+  // CrumBLE 4.3: per-section embedded glyph subset takes precedence over
+  // the per-font interval search. When the active Section has installed a
+  // glyph subset block for this style, search the embedded intervals for
+  // cp; if found, return its glyph directly from the in-RAM block (zero SD
+  // reads, zero SdCardFont miniData allocation). When NOT found in the
+  // embedded subset OR no embedded data installed, fall through to the
+  // existing per-font lookup (and its REGULAR-style + miss-handler
+  // fallbacks). Style mask preserves UNDERLINE / STRIKETHROUGH bits via
+  // the lower 2 bits, matching the rest of the family selection logic.
+  const uint8_t styleIdx = static_cast<uint8_t>(style) & 0x03;
+  if (const EpdFontData* embeddedData = embeddedDataByStyle_[styleIdx]) {
+    const auto* intervals = embeddedData->intervals;
+    const uint32_t intervalCount = embeddedData->intervalCount;
+    if (intervals && intervalCount > 0) {
+      // upper_bound: find the first interval with first > cp; the one
+      // immediately before it is the only candidate that could contain cp.
+      const EpdUnicodeInterval* end = intervals + intervalCount;
+      const auto it = std::upper_bound(intervals, end, cp, [](uint32_t v, const EpdUnicodeInterval& iv) {
+        return v < iv.first;
+      });
+      if (it != intervals) {
+        const auto& iv = *(it - 1);
+        if (cp <= iv.last) {
+          return {embeddedData, &embeddedData->glyph[iv.offset + (cp - iv.first)]};
+        }
+      }
+    }
+    // Not in this style's embedded subset -- fall through to per-font path
+    // BUT skip the REGULAR-style fallback below for this case (the embedded
+    // subset deliberately did NOT include cp for this style, so falling
+    // back to regular would visually misrepresent it just like the SD-font
+    // miss-handler case does). The miss handler the SD font sets up will
+    // still load the bitmap on demand if cp is in the .cpfont at all.
+  }
+
   const EpdFont* font = getFont(style);
   if (const EpdGlyph* glyph = font->findGlyph(cp)) {
     return {font->data, glyph};

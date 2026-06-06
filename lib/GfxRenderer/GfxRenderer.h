@@ -237,6 +237,36 @@ class GfxRenderer {
   void unregisterSdCardFont(int fontId) { removeFont(fontId); }
   void clearSdCardFonts() { sdCardFonts_.clear(); }
   const std::map<int, SdCardFont*>& getSdCardFonts() const { return sdCardFonts_; }
+
+  // CrumBLE 4.3: per-section embedded glyph subset routing. Forwards to
+  // EpdFontFamily::setEmbeddedGlyphData() on the matching font entry. The
+  // reader calls this after a successful section.tryInstallEmbeddedGlyphSubset()
+  // so the next render's glyph lookups consult the section's in-RAM block
+  // before falling through to the SD-font miss handler. Always pass the
+  // current section's full per-style data (nullptr for styles that weren't
+  // in the embedded block); subsequent calls overwrite any prior state, so
+  // a section change to one without an embedded block automatically clears
+  // the previous section's pointers by passing nullptr everywhere.
+  //
+  // Lifetime contract: the EpdFontData pointers are owned by Section's
+  // embeddedStyles_ array. They stay valid as long as the Section object
+  // lives, which spans from loadSectionFile until the next section change
+  // (Section is unique_ptr-owned by EpubReaderActivity). Reader is
+  // responsible for clearing (passing all nullptr) before destroying the
+  // owning Section.
+  void setEmbeddedGlyphData(int fontId, const EpdFontData* regularData, const EpdFontData* boldData,
+                              const EpdFontData* italicData, const EpdFontData* boldItalicData) {
+    auto it = fontMap.find(fontId);
+    if (it != fontMap.end()) {
+      it->second.setEmbeddedGlyphData(regularData, boldData, italicData, boldItalicData);
+    }
+  }
+  void clearEmbeddedGlyphData(int fontId) {
+    auto it = fontMap.find(fontId);
+    if (it != fontMap.end()) {
+      it->second.clearEmbeddedGlyphData();
+    }
+  }
   bool isSdCardFont(int fontId) const { return sdCardFonts_.count(fontId) > 0; }
   // Ensure SD card font glyph data is loaded for the given text. Called from layout code
   // (which holds a const GfxRenderer&) before measuring word widths. Safe to call on non-SD fonts (no-op).

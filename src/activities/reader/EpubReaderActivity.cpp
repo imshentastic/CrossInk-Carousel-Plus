@@ -3497,21 +3497,26 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 
     // CrumBLE 4.3: install the embedded glyph subset block (when this is a
     // prebaked v39 section AND the loaded SD font's contentHash matches
-    // what the section was baked against). Lookup is skipped silently for
-    // built-in-font reads and for v38 / no-block v39 sections, so this
-    // costs a single fontId map lookup in the common case. EpdFontFamily's
-    // section-aware glyph router (task #17) consults the installed block
-    // before falling through to the SD-font miss handler, so prebaked
-    // sections skip the SdCardFont miniData heap allocation entirely --
-    // the architectural fix for BT + SD-font heap fragmentation.
+    // what the section was baked against). After install -- successful or
+    // not -- always thread the current per-style EpdFontData pointers
+    // (nullptr for unprebaked styles, or all nullptr for sections without
+    // any embedded subset) into the renderer's matching EpdFontFamily.
+    // That overwrites any stale state left by the PRIOR section so a
+    // chapter change away from a prebaked section automatically clears
+    // the routing; no separate clear-on-exit hook needed.
+    const int curFontId = SETTINGS.getReaderFontId();
     if (section && section->hasEmbeddedGlyphSubset()) {
-      const int curFontId = SETTINGS.getReaderFontId();
       const auto& sdFontMap = renderer.getSdCardFonts();
       auto it = sdFontMap.find(curFontId);
       if (it != sdFontMap.end() && it->second != nullptr) {
         section->tryInstallEmbeddedGlyphSubset(it->second->contentHash());
       }
     }
+    renderer.setEmbeddedGlyphData(curFontId,
+                                  section ? section->embeddedFontDataForStyle(0) : nullptr,
+                                  section ? section->embeddedFontDataForStyle(1) : nullptr,
+                                  section ? section->embeddedFontDataForStyle(2) : nullptr,
+                                  section ? section->embeddedFontDataForStyle(3) : nullptr);
 
     if (pendingPageJump.has_value()) {
       if (*pendingPageJump >= section->pageCount && section->pageCount > 0) {
