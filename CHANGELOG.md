@@ -1,5 +1,34 @@
 # Changelog
 
+## [crumble-v4.2.1] - 2026-06-05
+
+### Three firmware variants
+v4.2.1 ships as **three slim variants**, each with a different built-in reader font: `crumble-firmware-4.2.1-tiny-bitter.bin`, `crumble-firmware-4.2.1-tiny-lexend.bin`, and `crumble-firmware-4.2.1-tiny-chareink.bin`. This pivot is the v4.2.1 answer to the Bluetooth + SD-card font heap-fragmentation issue: NimBLE's ~50 KB init scatters allocations that shatter contiguous heap below the 25 KB Page DOM threshold — but only the SD-font code path triggers this (built-in fonts use FontDecompressor, much smaller heap profile). By shipping a binary per font choice, users who want Bluetooth + their preferred font get a stable experience without touching the SD-font code path. Flash whichever variant matches your preferred font; switching fonts means re-flashing.
+
+### Fixed
+- **WASM serving no longer mismatches MIME on every book upload.** `CrossPointWebServer::sendBufferGzip` was substituting an empty `text/html` body under low-heap conditions for *all* MIME types, which broke `WebAssembly.compile`'s strict MIME check. The substitution now fires only for `text/html` content; non-HTML responses (including `application/wasm`) return 503 if free heap is below 6 KB or stream from PROGMEM normally otherwise. Symptom before fix: "Incorrect response MIME type" on every book upload + optimize action.
+- **Bluetooth + SD-card font (.cpfont) book combo.** Connecting a Bluetooth remote on a book using an SD-card custom font crashed inside `TextBlock::deserialize` (`vector<string>::resize` → bad_alloc → terminate, because the firmware is `-fno-exceptions`). Multiple defenses landed:
+  - Activity-level Page DOM cache in `EpubReaderActivity` — steady-state re-renders (status bar refresh, drawer toggle, BT enable popup, focus changes) now reuse the previously-deserialized page DOM instead of allocating a fresh 25-40 KB each frame.
+  - 25 KB pre-flight in `Section::loadPageFromSectionFile` — refuses with a logged error and lets the activity retry/recover instead of bad_alloc-terminating when contiguous heap is below the deserialize threshold.
+  - Option 2 lazy non-REGULAR SD-font prewarm: when a Bluetooth controller is bonded, `FontCacheManager::prewarmCache` only eagerly loads REGULAR-style glyphs (~14 KB); BOLD / ITALIC / BOLDITALIC styles load on-demand through the overflow ring buffer. Trades ~100-200 ms per fresh page for ~30-45 KB of heap headroom for NimBLE.
+  - BT-connect block releases page DOM cache + reader-settings cache before NimBLE init, and explicitly warms the page DOM cache during the post-enable / pre-subscribe window so post-connect re-renders are cache hits.
+  - The three-variant build above is the real fix for the common case; these defenses keep the SD-font path graceful for users on the small cohort using a font outside the three built-ins.
+- **File Transfer auto-recovers from low heap** instead of dead-ending at a "Reboot the device" alert. When `CrossPointWebServerActivity::onEnter` pre-flight fails because BT/SD-font residue left maxAlloc below threshold, it now silent-restarts directly into FT (~3-5 s loading popup, lands in fresh FT). A loop guard (sentinel mode hint = 99) prevents infinite restart if the pre-flight is still failing after the recovery boot (falls back to the original alert in that genuine-failure case).
+- **`bookmarks.bin` v5 — bookmark preview expanded from 160 → 1024 bytes.** Multi-page quote viewer needs the full quote context; the old 160-byte cap truncated meaningful highlights mid-sentence. v4 files load forward-compatibly (read with the legacy 160-byte ceiling, transparently re-saved as v5 on next mutation).
+- **Bookmark list scroll lag fixed.** Collapsed-row preview rendering ran `wrappedText` over the full 1024-char preview to find the first ~3 lines; now caps the scan at 200 chars (3-4 lines worth) so scrolling stays interactive on long preview lists.
+
+### Added
+- **Bookmark Quote Viewer.** Pressing Confirm on a bookmark in the bookmark list now opens a dedicated viewer activity. Up/Down walks between bookmarks (wraps around at top/bottom), Left/Right pages through long quotes, Confirm jumps to that location in the book, Back returns to the bookmark list with cursor preserved. Uses the built-in UI_12 font for the viewer chrome so the activity itself doesn't depend on SD-font availability.
+- **Multi-page quote capture** for highlights that span 100+ words across page breaks. The FINISH_HIGHLIGHT path now walks intervening pages within the same chapter under RenderLock to capture text across the page boundary, instead of capping at "12 words before … and 3 words after" from the start/end anchors alone.
+
+### Changed
+- **BT Quick Connect ordering swapped.** In the in-reader settings drawer (BookSettingsDrawerActivity), regular `BT Quick Connect` now sits *above* `BT No Images Quick Connect`. The image-suppressed variant is a fallback for image-heavy books that starve renders under NimBLE pressure, so it makes more sense as the second option.
+- **`OMIT_BITTER_FONT` build flag added**, mirroring the existing `OMIT_LEXENDDECA_FONT` and `OMIT_CHAREINK_FONT`. Tied to a new `CrossPointSettings::BUILTIN_DEFAULT_FONT_FAMILY` compile-time constant (resolution order: Bitter > Lexend > CharEink) that every fallback path now chains through, so the tiny-lexend / tiny-chareink variants gracefully clamp stale Bitter preferences to whichever font ships in the binary.
+- **`platformio.ini` env restructure.** Old `[env:tiny]` kept as a backward-compat alias for `pio run -e tiny` workflows. Three new canonical envs: `[env:tiny-bitter]`, `[env:tiny-lexend]`, `[env:tiny-chareink]`. Each variant's `CROSSPOINT_FIRMWARE_VARIANT` string carries the font name so the device's About screen and File Transfer banner show which font this binary ships with.
+
+### Known limitations
+- **Bluetooth + SD-card font (.cpfont) books may still fail render after NimBLE connect on this hardware.** NimBLE consumes ~50-68 KB during init and scatter-allocates across the heap, dropping contiguous heap to ~13 KB — well below the 25 KB Page DOM allocation threshold. The v4.2.1 defenses above make this graceful (page cache held when possible, page-load pre-flight catches the failure cleanly), but the SD-font path cannot reliably support an active NimBLE host on the ESP32-C3 heap budget. **Workaround:** flash a `tiny-bitter` / `tiny-lexend` / `tiny-chareink` variant matching your preferred font and use the built-in font instead of the SD .cpfont. Per-section glyph subset baking — which embeds each section's glyph data into its `sections-prebake/*.bin` so the SD-font runtime overhead drops out — is on the v4.3 roadmap as the architectural fix.
+
 ## [crumble-v4.2.0] - 2026-06-05
 
 ### Fixed
