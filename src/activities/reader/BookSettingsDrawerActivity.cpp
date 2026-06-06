@@ -777,7 +777,11 @@ void BookSettingsDrawerActivity::renderDrawer() {
   const auto labels = mi.mapLabels(I18N.get(StrId::STR_BACK), I18N.get(StrId::STR_TOGGLE),
                                     I18N.get(StrId::STR_DIR_UP), I18N.get(StrId::STR_DIR_DOWN));
   const int hintY = drawerY + drawerH - hintsHeight + 16;
-  std::string hintLine = std::string(labels.btn3) + "/" + labels.btn4 + " · " + labels.btn2 + " · " + labels.btn1;
+  // CrumBLE 4.2.1: hint order reversed to match the physical button layout:
+  // Back sits to the LEFT of the dpad on every supported chassis, Toggle in
+  // the middle, dpad Up/Down on the RIGHT. Reading the hint left-to-right
+  // now mirrors the user's eye as it scans across the bottom of the device.
+  std::string hintLine = std::string(labels.btn1) + " · " + labels.btn2 + " · " + labels.btn3 + "/" + labels.btn4;
   renderer.drawCenteredText(SMALL_FONT_ID, hintY, hintLine.c_str(), true);
 }
 
