@@ -16,11 +16,16 @@
 #include <ZipFile.h>
 
 #include <Epub/BookMetadataCache.h>
+#include <Epub/Page.h>
 #include <Epub/Section.h>
+#include <Epub/blocks/TextBlock.h>
 #include <Epub/parsers/ContainerParser.h>
 #include <Epub/parsers/ContentOpfParser.h>
 #include <Epub/parsers/TocNavParser.h>
 #include <Epub/parsers/TocNcxParser.h>
+#include <Utf8.h>
+
+#include <unordered_set>
 
 // Phase 2C font tables. Pure-data PROGMEM headers; including them on host
 // pulls in the same uint8_t[] bitmaps + metadata tables the device links
@@ -753,8 +758,7 @@ bool prebakeCoverThumb(const std::string& epubPath, const std::string& cacheDir,
 //    of the prebake pipeline continues unchanged.
 //  - next commit(s): codepoint collection + prewarm + block serialisation
 //    + trailer patching.
-bool emitEmbeddedGlyphSubsetForSection(const std::string& sectionFilePath, SdCardFont& font, int spineIdx,
-                                       uint16_t pageCount);
+bool emitEmbeddedGlyphSubsetForSection(Section& section, SdCardFont& font, int spineIdx);
 
 // EPUB, byte-targeting the device's section file format. Loads an Epub
 // instance from the same on-disk cache Phase 1 just wrote, then loops
@@ -888,9 +892,7 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
       // bakes -- they don't benefit from embedding; the .rodata on-device
       // already holds the full glyph set).
       if (emitGlyphSubsets && sdFontForSubset != nullptr) {
-        const std::string sectionPath = shadowCacheDir + "/sections/" + std::to_string(spineIdx) + ".bin";
-        const bool subsetOk =
-            emitEmbeddedGlyphSubsetForSection(sectionPath, *sdFontForSubset, spineIdx, section.pageCount);
+        const bool subsetOk = emitEmbeddedGlyphSubsetForSection(section, *sdFontForSubset, spineIdx);
         if (!subsetOk) {
           // Don't fail the whole prebake on a subset-emit failure -- the
           // section file itself is valid v39 with the trailer fields at
@@ -1091,20 +1093,105 @@ int prebakeAllThumbs(const std::string& epubPath, const std::string& cacheDir,
   return failures;
 }
 
-// CrumBLE 4.3: stub for the per-section glyph subset emit. Full
-// implementation is multi-step (codepoint collection from page DOMs,
-// prewarm SdCardFont with the union, serialise the prewarmed mini-data
-// into an EmbeddedGlyphSubset block, append to the section file, patch
-// the v39 trailer fields). This stub only logs the call shape so the
-// dispatch + CLI flag plumbing can land independently and be tested in
-// isolation. Returns true so the prebake pipeline continues unchanged.
-bool emitEmbeddedGlyphSubsetForSection(const std::string& sectionFilePath, SdCardFont& font, int spineIdx,
-                                       uint16_t pageCount) {
+// CrumBLE 4.3: per-section glyph subset emit. Implementation in stages:
+//
+//   Stage 1 (this commit): walk the just-written section file's pages,
+//     extract codepoints actually used in PageLine TextBlocks, bucket by
+//     EpdFontFamily::Style (REGULAR / BOLD / ITALIC / BOLD_ITALIC). Log
+//     summary; return true so the pipeline continues. Block serialisation
+//     + trailer patching land in subsequent commits, each layered on top
+//     of the collected codepoint sets.
+//
+//   Stage 2 (next): prewarm SdCardFont with the union of codepoints per
+//     style (so SdCardFont's miniData / miniIntervals / miniGlyphs /
+//     miniBitmap are populated with exactly the section's working set).
+//
+//   Stage 3 (next): serialise the prewarmed mini-data into an
+//     EmbeddedGlyphSubset block, append it to the section file, patch
+//     the v39 trailer fields (offset / size / cpfontHash).
+//
+// Each stage is gated on the previous stage's data so a partial commit
+// can't produce a corrupt section file -- the trailer fields only get
+// patched once the block bytes are fully written.
+bool emitEmbeddedGlyphSubsetForSection(Section& section, SdCardFont& font, int spineIdx) {
+  // Bucket codepoints per resolved style. EpdFontFamily::Style values are
+  // 0=REGULAR, 1=BOLD, 2=ITALIC, 3=BOLD_ITALIC; higher bits (UNDERLINE,
+  // STRIKETHROUGH) are decoration-only and don't pick a different font,
+  // so we mask them off before indexing.
+  std::unordered_set<uint32_t> codepointsByStyle[4];
+  const uint16_t pageCount = section.pageCount;
+  uint32_t totalGlyphSlotsScanned = 0;
+  // Stash + temporarily override currentPage so we can iterate without
+  // disturbing the caller's expectation (createSectionFile leaves it at
+  // 0; we restore it before returning anyway, but be explicit).
+  const int savedCurrentPage = section.currentPage;
+  for (uint16_t pageIdx = 0; pageIdx < pageCount; ++pageIdx) {
+    section.currentPage = static_cast<int>(pageIdx);
+    auto page = section.loadPageFromSectionFile();
+    if (!page) {
+      LOG_ERR("PRE", "  section %d: failed to load page %u for codepoint scan -- aborting subset emit", spineIdx,
+              static_cast<unsigned>(pageIdx));
+      section.currentPage = savedCurrentPage;
+      return false;
+    }
+    // Walk page elements; only PageLine matters for text glyph coverage.
+    // Other element types (PageImage, PageHorizontalRule, PageTableFragment)
+    // don't render glyphs through the SD-font path so we don't need to
+    // include their characters in the embedded subset.
+    for (const auto& element : page->elements) {
+      if (!element || element->getTag() != TAG_PageLine) continue;
+      const auto* line = static_cast<const PageLine*>(element.get());
+      const auto& blockPtr = line->getBlock();
+      if (!blockPtr) continue;
+      const TextBlock& block = *blockPtr;
+      const auto& words = block.getWords();
+      const auto& styles = block.getWordStyles();
+      const size_t wordCount = words.size();
+      // styles is parallel to words but defensively bail if they ever
+      // diverge -- a malformed section file would otherwise UB on the
+      // styles[i] access.
+      if (styles.size() < wordCount) {
+        LOG_ERR("PRE", "  section %d page %u: TextBlock has %zu words but %zu styles -- skipping",
+                spineIdx, static_cast<unsigned>(pageIdx), wordCount, styles.size());
+        continue;
+      }
+      for (size_t i = 0; i < wordCount; ++i) {
+        const uint8_t fontStyle = static_cast<uint8_t>(styles[i]) & 0x03;  // mask off decoration bits
+        const std::string& word = words[i];
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(word.c_str());
+        uint32_t cp = 0;
+        while ((cp = utf8NextCodepoint(&p)) != 0) {
+          codepointsByStyle[fontStyle].insert(cp);
+          ++totalGlyphSlotsScanned;
+        }
+        // TODO(v4.3 follow-up): bionic reading bolds the first N bytes of
+        // word[i]. Those codepoints would need to live in the BOLD bucket
+        // of the embedded subset for the on-device renderer to pick them
+        // up without falling back to the SD-font miss handler. Skipped
+        // here because wordBionicBoundary is private on TextBlock; adding
+        // a getter is a one-line change but lives in a follow-up so the
+        // first-cut codepoint-collection stage stays narrow.
+      }
+    }
+  }
+  section.currentPage = savedCurrentPage;
+
+  // Sanity check: log per-style unique-codepoint counts so we can eyeball
+  // whether a section actually used the BOLD/ITALIC styles before we go
+  // through the trouble of serialising empty style buckets.
+  uint32_t totalUnique = 0;
+  for (int s = 0; s < 4; ++s) totalUnique += codepointsByStyle[s].size();
   LOG_INF("PRE",
-          "  section %d (%u pages): would emit embedded glyph subset (cpfontHash=0x%08x, styles=%u) -- emit stub, no-op",
-          spineIdx, static_cast<unsigned>(pageCount), font.contentHash(),
-          static_cast<unsigned>(font.styleCount()));
-  (void)sectionFilePath;
+          "  section %d (%u pages): scanned %u glyph slots, %u unique codepoints "
+          "(R=%zu, B=%zu, I=%zu, BI=%zu) -- cpfontHash=0x%08x, styles=%u",
+          spineIdx, static_cast<unsigned>(pageCount), totalGlyphSlotsScanned, totalUnique,
+          codepointsByStyle[0].size(), codepointsByStyle[1].size(), codepointsByStyle[2].size(),
+          codepointsByStyle[3].size(), font.contentHash(), static_cast<unsigned>(font.styleCount()));
+
+  // Stage 2/3 (prewarm + serialise + trailer patch) lands in follow-up
+  // commits. For now the section file stays at v39 with the trailer
+  // fields at 0/0/0, which on-device load treats as "no embedded subset"
+  // and falls back to the existing SdCardFont miss-handler path.
   return true;
 }
 
