@@ -1188,10 +1188,58 @@ bool emitEmbeddedGlyphSubsetForSection(Section& section, SdCardFont& font, int s
           codepointsByStyle[0].size(), codepointsByStyle[1].size(), codepointsByStyle[2].size(),
           codepointsByStyle[3].size(), font.contentHash(), static_cast<unsigned>(font.styleCount()));
 
-  // Stage 2/3 (prewarm + serialise + trailer patch) lands in follow-up
-  // commits. For now the section file stays at v39 with the trailer
-  // fields at 0/0/0, which on-device load treats as "no embedded subset"
-  // and falls back to the existing SdCardFont miss-handler path.
+  // Stage 2: prewarm SdCardFont per style with the union of codepoints
+  // we just collected. SdCardFont::prewarm reads the .cpfont file and
+  // populates the per-style miniData / miniIntervals / miniGlyphs /
+  // miniBitmap with exactly the requested codepoints. After this loop
+  // returns, the stage-3 serialiser pulls those buffers via the public
+  // miniIntervalsPtr() / miniGlyphsPtr() / miniBitmapPtr() accessors.
+  //
+  // Encoding: prewarm takes UTF-8 text, so for each style we build a
+  // string by concatenating the UTF-8 encoding of every codepoint in
+  // its set. Order doesn't matter -- prewarm walks the string with
+  // utf8NextCodepoint and dedupes internally.
+  auto appendUtf8 = [](std::string& out, uint32_t cp) {
+    if (cp < 0x80u) {
+      out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800u) {
+      out.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+      out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp < 0x10000u) {
+      out.push_back(static_cast<char>(0xE0u | (cp >> 12)));
+      out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+      out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp < 0x110000u) {
+      out.push_back(static_cast<char>(0xF0u | (cp >> 18)));
+      out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+      out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+      out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    }
+    // codepoints >= 0x110000 are out of range; ignore.
+  };
+
+  for (uint8_t styleIdx = 0; styleIdx < 4; ++styleIdx) {
+    const auto& cpset = codepointsByStyle[styleIdx];
+    if (cpset.empty()) continue;
+    std::string utf8Text;
+    utf8Text.reserve(cpset.size() * 4);  // upper bound (4 bytes per cp)
+    for (uint32_t cp : cpset) appendUtf8(utf8Text, cp);
+    // styleMask: 1 bit per EpdFontFamily::Style (REGULAR=bit0, BOLD=bit1,
+    // ITALIC=bit2, BOLD_ITALIC=bit3). One call per style so each style's
+    // miniData ends up with EXACTLY this section's working set for that
+    // style (vs a broader-mask call which would over-allocate).
+    const int missed = font.prewarm(utf8Text.c_str(), static_cast<uint8_t>(1u << styleIdx), /*metadataOnly=*/false);
+    LOG_INF("PRE",
+            "  section %d style %u prewarmed: %zu requested cp, %u miss(es) -- "
+            "miniIntervalCount=%u miniGlyphCount=%u miniBitmapSize=%u",
+            spineIdx, static_cast<unsigned>(styleIdx), cpset.size(), missed, font.miniIntervalCount(styleIdx),
+            font.miniGlyphCount(styleIdx), font.miniBitmapSize(styleIdx));
+  }
+
+  // Stage 3 (block serialise + trailer patch) lands in the next commit.
+  // For now the section file stays at v39 with the trailer fields at
+  // 0/0/0, which on-device load treats as "no embedded subset" and
+  // falls back to the existing SdCardFont miss-handler path.
   return true;
 }
 
