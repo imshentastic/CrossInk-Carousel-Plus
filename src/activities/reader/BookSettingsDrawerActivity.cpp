@@ -319,18 +319,21 @@ void BookSettingsDrawerActivity::buildBluetoothItems() {
   }
 
   // Not linked: surface BOTH connect rows (regular + no-images variant).
+  // Regular Quick Connect is the primary action (most users want images
+  // on); no-images variant is the fallback for image-heavy books that
+  // starve renders under NimBLE pressure, so it sits below.
 
-  // Bluetooth quick-action, no-images variant. Sets MenuResult flags so the
-  // reader can sequence: (1) drain any pending re-layout first (settings just
-  // toggled), (2) run the .pxc manifest-mismatch check and prompt if needed,
-  // (3) finally enable BLE and connect. Doing this synchronously here used to
-  // race the NimBLE handshake against a heap-heavy section rebuild and brick
-  // the connect.
+  // Bluetooth quick-action. Sets MenuResult flags so the reader can
+  // sequence: (1) drain any pending re-layout first (settings just
+  // toggled), (2) run the .pxc manifest-mismatch check and prompt if
+  // needed, (3) finally enable BLE and connect. Doing this synchronously
+  // here used to race the NimBLE handshake against a heap-heavy section
+  // rebuild and brick the connect.
   {
-    Item btNoImg;
-    btNoImg.nameId = StrId::STR_BT_NO_IMAGES_QUICK_CONNECT;
-    btNoImg.isAction = true;
-    btNoImg.activate = [this]() {
+    Item bt;
+    bt.nameId = StrId::STR_BT_QUICK_CONNECT;
+    bt.isAction = true;
+    bt.activate = [this]() {
       const bool hasBonded = SETTINGS.bleBondedDeviceAddr[0] != '\0';
       MenuResult result;
       result.settingsChanged = settingsChanged;
@@ -341,21 +344,22 @@ void BookSettingsDrawerActivity::buildBluetoothItems() {
         result.requestBluetoothFlow = true;
       } else {
         result.bleConnectRequested = true;
-        result.bleConnectNoImages = true;
+        result.bleConnectNoImages = false;
       }
       setResult(ActivityResult{result});
       finish();
     };
-    items.push_back(std::move(btNoImg));
+    items.push_back(std::move(bt));
   }
 
-  // Bluetooth quick-action. Same deferred flow as the No Images variant
-  // above, minus image suppression.
+  // Bluetooth quick-action, no-images variant. Same deferred flow as the
+  // regular variant above, plus image suppression for books whose pages
+  // can't survive the NimBLE handshake with images enabled.
   {
-    Item bt;
-    bt.nameId = StrId::STR_BT_QUICK_CONNECT;
-    bt.isAction = true;
-    bt.activate = [this]() {
+    Item btNoImg;
+    btNoImg.nameId = StrId::STR_BT_NO_IMAGES_QUICK_CONNECT;
+    btNoImg.isAction = true;
+    btNoImg.activate = [this]() {
       const bool hasBonded = SETTINGS.bleBondedDeviceAddr[0] != '\0';
       MenuResult result;
       result.settingsChanged = settingsChanged;
@@ -363,12 +367,12 @@ void BookSettingsDrawerActivity::buildBluetoothItems() {
         result.requestBluetoothFlow = true;
       } else {
         result.bleConnectRequested = true;
-        result.bleConnectNoImages = false;
+        result.bleConnectNoImages = true;
       }
       setResult(ActivityResult{result});
       finish();
     };
-    items.push_back(std::move(bt));
+    items.push_back(std::move(btNoImg));
   }
 }
 
