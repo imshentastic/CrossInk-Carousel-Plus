@@ -388,6 +388,7 @@ void EpubReaderActivity::onEnter() {
   prebakeManifest_.reset();
   prebakeLastSnapshot_ = {};
   prebakePromptShowing_ = false;
+  prebakePromptDiagLogged_ = false;
   deferredOnEnterPending_ = true;
   firstRenderCompleted_ = false;
 
@@ -436,6 +437,13 @@ void EpubReaderActivity::onEnter() {
 
   epub->setupCacheDir();
   BOOKMARKS.loadForBook(epub->getPath(), epub->getTitle(), epub->getAuthor(), "epub");
+
+  // CrumBLE 4.2.1: book is already loaded with metadata at this point; cache
+  // its author key into LibraryIndex so AuthorAlpha sort doesn't need to
+  // load the EPUB again. Idempotent: a no-op when the key was already
+  // identical (which is the common case for books that booted with v2
+  // index). Persists to disk so the cache survives reboots.
+  LibraryIndex::getInstance().setAuthorFromRaw(epub->getPath(), epub->getAuthor());
 
   if (APP_STATE.pendingBookmarkSpine != UINT16_MAX && APP_STATE.pendingBookmarkProgress >= 0.0f) {
     // Resume from a bookmark selected on the Home screen
@@ -724,8 +732,21 @@ void EpubReaderActivity::runDeferredOnEnter() {
 bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
   // SETTINGS gate first so flipping the toggle off mid-session quiets the
   // prompt path even though the manifest is still parsed in memory.
-  if (!SETTINGS.optimizeChapterIndexing) return false;
-  if (!prebakeManifest_.has_value() || prebakePromptShowing_) return false;
+  if (!SETTINGS.optimizeChapterIndexing) {
+    if (!prebakePromptDiagLogged_) {
+      LOG_DBG("ERA", "Prebake prompt skipped: optimizeChapterIndexing=false");
+      prebakePromptDiagLogged_ = true;
+    }
+    return false;
+  }
+  if (!prebakeManifest_.has_value()) {
+    if (!prebakePromptDiagLogged_) {
+      LOG_DBG("ERA", "Prebake prompt skipped: no manifest loaded (book has no prebake)");
+      prebakePromptDiagLogged_ = true;
+    }
+    return false;
+  }
+  if (prebakePromptShowing_) return false;
   const PrebakeManifest& pm = *prebakeManifest_;
   const int32_t curFontId = SETTINGS.getReaderFontId();
   const float curLineComp = SETTINGS.getReaderLineCompression();
@@ -782,7 +803,13 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
       prebakeLastSnapshot_.guideReadingEnabled != SETTINGS.guideReadingEnabled;
 
   if (!prebakeLastSnapshot_.initialised) snapshotCurrent();
-  if (!snapChanged) return false;
+  if (!snapChanged) {
+    if (!prebakePromptDiagLogged_) {
+      LOG_DBG("ERA", "Prebake prompt skipped: snapshot unchanged since last call (no settings drift)");
+      prebakePromptDiagLogged_ = true;
+    }
+    return false;
+  }
 
   const bool mismatch =
       (pm.fontId != curFontId) ||
@@ -799,6 +826,12 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
       (pm.guideReadingEnabled != SETTINGS.guideReadingEnabled);
 
   if (!mismatch) {
+    if (!prebakePromptDiagLogged_) {
+      LOG_INF("ERA",
+              "Prebake prompt skipped: settings match prebake (fontId=%ld viewport=%ux%u) -- no prompt needed",
+              static_cast<long>(curFontId), static_cast<unsigned>(curViewportW), static_cast<unsigned>(curViewportH));
+      prebakePromptDiagLogged_ = true;
+    }
     snapshotCurrent();  // user-driven drift but still valid; accept silently
     return false;
   }

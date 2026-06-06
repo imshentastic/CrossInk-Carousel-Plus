@@ -1,6 +1,7 @@
 #include "LibraryIndex.h"
 
-#include <Arduino.h>  // millis()
+#include <Arduino.h>  // millis(), ESP.getMaxAllocHeap()
+#include <Epub.h>
 #include <FsHelpers.h>
 #include <HalStorage.h>
 #include <Logging.h>
@@ -8,6 +9,7 @@
 #include "CollectionsStore.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,7 +28,18 @@ constexpr char LIBRARY_INDEX_FILE[] = "/.crosspoint/library_index.json";
 // filenames so no escaping is needed. An older single-blob JSON index starts
 // with '{' (≠ the marker's 'C'), so loadFromFile rejects it and a rescan
 // rewrites it in this format.
-constexpr char LIBRARY_INDEX_HEADER[] = "CRUMBLE-LIBIDX v1";
+// CrumBLE 4.2.1: bumped to v2 to add a per-entry cached "last name" author
+// key for fast AuthorAlpha sort without loading each EPUB. v1 indices still
+// load -- their entries come back with empty authorKey, which
+// populateAuthorKeysIfNeeded fills lazily on next ensureWalked() and saves
+// out as v2. Format per entry line:
+//   v1:  "<firstSeen>\t<size>\t<path>"
+//   v2:  "<firstSeen>\t<size>\t<authorKey>\t<path>"
+// authorKey comes BEFORE path so the existing "everything after the last
+// tab" path parser keeps working untouched on v1 lines while the v2 parser
+// pulls authorKey from between tab2 and tab3.
+constexpr char LIBRARY_INDEX_HEADER_V1[] = "CRUMBLE-LIBIDX v1";
+constexpr char LIBRARY_INDEX_HEADER[] = "CRUMBLE-LIBIDX v2";
 constexpr int MAX_WALK_DEPTH = 8;
 
 // Buffered line reader over a HalFile/FsFile. Reads in chunks (one HAL call
@@ -64,6 +77,33 @@ class LineReader {
   }
 };
 
+// CrumBLE 4.2.1: extract a lowercase "last name" sort key from a raw author
+// string. Mirrors CollectionsStore's lastNameLower exactly so the keys we
+// cache here are byte-identical to what the v4.2.0 sort comparator would
+// have produced. Returns empty for empty input -- caller uses that as the
+// "sort to end" sentinel.
+std::string lastNameLowerForKey(const std::string& author) {
+  size_t l = author.find_first_not_of(" \t\r\n");
+  if (l == std::string::npos) return {};
+  size_t r = author.find_last_not_of(" \t\r\n");
+  std::string s = author.substr(l, r - l + 1);
+  const size_t comma = s.find(',');
+  if (comma != std::string::npos) {
+    s = s.substr(0, comma);
+    size_t rr = s.find_last_not_of(" \t\r\n");
+    if (rr != std::string::npos) s = s.substr(0, rr + 1);
+  } else {
+    const size_t sp = s.find_last_of(" \t");
+    if (sp != std::string::npos) s = s.substr(sp + 1);
+  }
+  std::transform(s.begin(), s.end(), s.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  // Also strip any embedded tabs -- they'd corrupt our on-disk format. (Author
+  // strings should never contain tabs in practice; this is defense-in-depth.)
+  s.erase(std::remove(s.begin(), s.end(), '\t'), s.end());
+  return s;
+}
+
 bool iLess(const std::string& a, const std::string& b) {
   // Case-insensitive less-than for the default "All Books" sort order.
   const size_t n = std::min(a.size(), b.size());
@@ -82,6 +122,22 @@ uint32_t LibraryIndex::appendPath(std::string_view path) {
   const uint32_t offset = static_cast<uint32_t>(pathPool.size());
   pathPool.insert(pathPool.end(), path.begin(), path.end());
   pathPool.push_back('\0');
+  return offset;
+}
+
+// CrumBLE 4.2.1: ensure offset 0 of authorKeyPool is a NUL byte so any
+// LibraryEntry whose authorKeyOffset = 0 reads back as "" via authorKeyOf().
+// Called inline by appendAuthorKey() the first time the pool is empty.
+static void ensureAuthorKeyPoolSentinel(std::vector<char>& pool) {
+  if (pool.empty()) pool.push_back('\0');
+}
+
+uint32_t LibraryIndex::appendAuthorKey(std::string_view key) {
+  ensureAuthorKeyPoolSentinel(authorKeyPool);
+  if (key.empty()) return 0;  // map back to the seeded sentinel
+  const uint32_t offset = static_cast<uint32_t>(authorKeyPool.size());
+  authorKeyPool.insert(authorKeyPool.end(), key.begin(), key.end());
+  authorKeyPool.push_back('\0');
   return offset;
 }
 
@@ -173,15 +229,31 @@ void LibraryIndex::rescan(const std::function<void(int)>& progress) {
   // instead of a stream of incremental grows.
   std::vector<LibraryEntry> newEntries;
   std::vector<char> newPool;
+  // CrumBLE 4.2.1: authorKeyPool is rebuilt in parallel with pathPool so the
+  // per-entry authorKeyOffset values stay valid after the swap. Seed the new
+  // pool with a NUL byte at offset 0 so any entry that didn't carry forward
+  // a key (or didn't have one in the old pool) reads back as "" via
+  // authorKeyOf().
+  std::vector<char> newAuthorKeyPool;
+  newAuthorKeyPool.push_back('\0');
   newEntries.reserve(discovered.size());
   // Reserve a rough first-cut for the pool so it doesn't realloc on every
   // append. Average path ~80 chars; round up generously.
   newPool.reserve(discovered.size() * 96);
+  // Average lowercase last name ~10 chars; round up generously.
+  newAuthorKeyPool.reserve(1 + discovered.size() * 16);
 
   auto appendIntoNewPool = [&newPool](std::string_view path) -> uint32_t {
     const uint32_t offset = static_cast<uint32_t>(newPool.size());
     newPool.insert(newPool.end(), path.begin(), path.end());
     newPool.push_back('\0');
+    return offset;
+  };
+  auto appendIntoNewAuthorKeyPool = [&newAuthorKeyPool](std::string_view key) -> uint32_t {
+    if (key.empty()) return 0;  // sentinel
+    const uint32_t offset = static_cast<uint32_t>(newAuthorKeyPool.size());
+    newAuthorKeyPool.insert(newAuthorKeyPool.end(), key.begin(), key.end());
+    newAuthorKeyPool.push_back('\0');
     return offset;
   };
 
@@ -197,19 +269,29 @@ void LibraryIndex::rescan(const std::function<void(int)>& progress) {
       e.pathOffset = appendIntoNewPool(p);
       e.firstSeenMillis = old.firstSeenMillis;
       e.fileSize = discoveredSizes[i];
+      // CrumBLE 4.2.1: carry forward the cached author key into the new pool
+      // so a rescan triggered by a wifi-upload / hotspot exit doesn't lose
+      // the user's accumulated cache. authorKeyOf() reads from the OLD pool
+      // here because we haven't swapped yet; copy the bytes into the new
+      // pool and record the new offset on the new entry.
+      e.authorKeyOffset = appendIntoNewAuthorKeyPool(std::string_view{authorKeyOf(old)});
       // A known path whose size changed = the file was replaced -> re-date it.
       // Skip when the stored size is unknown (0, legacy entry) so the first
       // scan after upgrade doesn't reshuffle the whole library.
       if (old.fileSize != 0 && old.fileSize != discoveredSizes[i]) {
         e.firstSeenMillis = nextSeq++;
+        // A replaced file may have a different author; invalidate the cache
+        // entry so populateAuthorKeysIfNeeded refreshes it on next pass.
+        e.authorKeyOffset = 0;
       }
       newEntries.push_back(e);
     } else {
-      // Brand-new book -> newest.
+      // Brand-new book -> newest. Author key starts empty; populated lazily.
       LibraryEntry e{};
       e.pathOffset = appendIntoNewPool(p);
       e.firstSeenMillis = nextSeq++;
       e.fileSize = discoveredSizes[i];
+      e.authorKeyOffset = 0;
       newEntries.push_back(e);
     }
   }
@@ -228,10 +310,13 @@ void LibraryIndex::rescan(const std::function<void(int)>& progress) {
   // the allocator stitched into it).
   entries.swap(newEntries);
   pathPool.swap(newPool);
+  authorKeyPool.swap(newAuthorKeyPool);
   newEntries.clear();
   newEntries.shrink_to_fit();
   newPool.clear();
   newPool.shrink_to_fit();
+  newAuthorKeyPool.clear();
+  newAuthorKeyPool.shrink_to_fit();
 
   walkPerformed = true;
   saveToFile();
@@ -240,6 +325,11 @@ void LibraryIndex::rescan(const std::function<void(int)>& progress) {
   // virtuals (Finished, New) might be stale relative to the new path set.
   // Invalidate so the next access rescans.
   CollectionsStore::getInstance().invalidateScannedVirtuals();
+  // CrumBLE 4.2.1: lazily populate any missing author keys (typical on the
+  // first walk after a v1 -> v2 upgrade, or whenever new books were added).
+  // Heap-aware + watchdog-safe; gracefully stops if heap pressure rises
+  // and resumes on the next walk.
+  populateAuthorKeysIfNeeded();
   if (progress) progress(100);
 }
 
@@ -368,14 +458,24 @@ bool LibraryIndex::loadFromFile() {
   // and let a rescan rewrite it — without ever slurping the huge old file.
   entries.clear();
   pathPool.clear();
+  authorKeyPool.clear();
+  authorKeyPool.push_back('\0');  // seed sentinel so offset 0 reads back as ""
   LineReader reader(file);
   std::string line;
-  bool headerOk = false;
+  // CrumBLE 4.2.1: 0 = no header read yet, 1 = v1, 2 = v2. Header v1 and v2
+  // share the same entry parser code path except for the optional author
+  // field tucked between size and path.
+  int formatVersion = 0;
   size_t lineNo = 0;
   while (reader.next(line)) {
     if (lineNo++ == 0) {
-      headerOk = (line == LIBRARY_INDEX_HEADER);
-      if (!headerOk) break;
+      if (line == LIBRARY_INDEX_HEADER) {
+        formatVersion = 2;
+      } else if (line == LIBRARY_INDEX_HEADER_V1) {
+        formatVersion = 1;
+      } else {
+        break;  // unknown header -> force rescan
+      }
       continue;
     }
     if (line.empty()) continue;
@@ -385,30 +485,55 @@ bool LibraryIndex::loadFromFile() {
     const uint64_t firstSeen = strtoull(line.c_str(), nullptr, 10);
     const size_t tab2 = line.find('\t', tab1 + 1);
     uint32_t fileSize = 0;
+    std::string_view authorKey;
     std::string_view path;
     if (tab2 == std::string::npos) {
       // Legacy 2-field line: "<firstSeen>\t<path>" (pre-size index).
       path = std::string_view{line}.substr(tab1 + 1);
     } else {
       fileSize = static_cast<uint32_t>(strtoul(line.c_str() + tab1 + 1, nullptr, 10));
-      path = std::string_view{line}.substr(tab2 + 1);
+      if (formatVersion >= 2) {
+        // v2 has authorKey between tab2 and tab3, then path after tab3.
+        const size_t tab3 = line.find('\t', tab2 + 1);
+        if (tab3 == std::string::npos) {
+          // No third tab on a v2 line -> author key is empty, path follows tab2.
+          path = std::string_view{line}.substr(tab2 + 1);
+        } else {
+          authorKey = std::string_view{line}.substr(tab2 + 1, tab3 - tab2 - 1);
+          path = std::string_view{line}.substr(tab3 + 1);
+        }
+      } else {
+        // v1: path follows tab2, no author field.
+        path = std::string_view{line}.substr(tab2 + 1);
+      }
     }
     if (path.empty()) continue;
     LibraryEntry e{};
     e.pathOffset = appendPath(path);
     e.firstSeenMillis = firstSeen;
     e.fileSize = fileSize;
+    e.authorKeyOffset = appendAuthorKey(authorKey);
     entries.push_back(e);
   }
   file.close();
 
-  if (!headerOk) {
+  if (formatVersion == 0) {
     // Legacy/corrupt file — treat as no index, force a rescan.
     entries.clear();
     pathPool.clear();
+    authorKeyPool.clear();
     return false;
   }
-  LOG_DBG("LIB", "Loaded library index with %zu entries", entries.size());
+  if (formatVersion == 1) {
+    // v1 -> v2 upgrade pass: the entries loaded with empty authorKey offsets;
+    // populateAuthorKeysIfNeeded() (driven by ensureWalked) will fill them
+    // lazily and a saveToFile() will rewrite the index in v2 format. No
+    // immediate work needed here -- the v2 read path already handled the
+    // missing field gracefully.
+    LOG_INF("LIB", "Loaded v1 library index with %zu entries -- will upgrade to v2 on next walk", entries.size());
+  } else {
+    LOG_DBG("LIB", "Loaded v%d library index with %zu entries", formatVersion, entries.size());
+  }
   return true;
 }
 
@@ -419,10 +544,11 @@ bool LibraryIndex::saveToFile() const {
     LOG_ERR("LIB", "Could not open library index for writing");
     return false;
   }
-  // Stream entries one line at a time ("<firstSeen>\t<size>\t<path>") so we never
-  // build a JsonDocument + serialized String copy of the whole index in RAM
-  // (the OOM-on-save that boot-looped large libraries). Legacy 2-field lines
-  // (no size) still load fine.
+  // CrumBLE 4.2.1: v2 always. Stream entries one line at a time
+  // ("<firstSeen>\t<size>\t<authorKey>\t<path>") so we never build a
+  // JsonDocument + serialized String copy of the whole index in RAM
+  // (the OOM-on-save that boot-looped large libraries). v1 lines without
+  // the size field still load fine via the v1 read fallback.
   file.print(LIBRARY_INDEX_HEADER);
   file.print("\n");
   char numbuf[48];
@@ -431,9 +557,91 @@ bool LibraryIndex::saveToFile() const {
              static_cast<unsigned long>(e.fileSize));
     file.print(numbuf);
     file.print("\t");
+    file.print(authorKeyOf(e));  // empty string when no key cached yet
+    file.print("\t");
     file.print(pathOf(e));
     file.print("\n");
   }
   file.close();
   return true;
+}
+
+// CrumBLE 4.2.1: cached author key accessors. See header for semantics.
+std::string_view LibraryIndex::getAuthorKey(const std::string& path) const {
+  for (const auto& e : entries) {
+    if (path == pathOf(e)) return std::string_view{authorKeyOf(e)};
+  }
+  return std::string_view{};
+}
+
+void LibraryIndex::setAuthorFromRaw(const std::string& path, const std::string& rawAuthor) {
+  const std::string key = lastNameLowerForKey(rawAuthor);
+  bool changed = false;
+  for (auto& e : entries) {
+    if (path == pathOf(e)) {
+      const std::string_view existing{authorKeyOf(e)};
+      if (existing == key) return;  // no-op, key unchanged
+      // appendAuthorKey() never reuses offsets -- the old key's bytes stay in
+      // the pool as orphan data until the next rescan rebuilds. For ~30-100
+      // books with ~10-char keys, this is at most ~1 KB of churn between
+      // rescans (rare event), so the simpler "append-only" path stays well
+      // within budget. A bookmark-style compaction can land in v4.3 if the
+      // numbers grow.
+      e.authorKeyOffset = appendAuthorKey(std::string_view{key});
+      changed = true;
+      break;
+    }
+  }
+  if (changed) saveToFile();
+}
+
+void LibraryIndex::populateAuthorKeysIfNeeded() {
+  // CrumBLE 4.2.1 hotfix: for any entry whose author key is still empty
+  // (typical right after a v1 -> v2 upgrade, or after a new book is added by
+  // a rescan), open the book's metadata cache and extract the author. We
+  // intentionally avoid Epub::load(buildIfMissing=true) so an uncached EPUB
+  // does NOT trigger a full content.opf rebuild here -- that would block
+  // begin() for minutes on first boot after upgrade. Books without a cached
+  // book.bin (never opened by the reader) keep an empty key and stay
+  // sorted to the end of AuthorAlpha until the user opens them once.
+  //
+  // Heap-aware: pre-flight per book at 30 KB maxAllocHeap (matches the
+  // v4.2.1 AuthorAlpha sort fix) and yield every 8 books so we don't trip
+  // the IDLE WDT on large libraries. Saves the index once at the end.
+  constexpr size_t kYieldEvery = 8;
+  constexpr uint32_t kPopulateMinMaxAlloc = 30 * 1024;
+  size_t populated = 0;
+  for (size_t i = 0; i < entries.size(); ++i) {
+    LibraryEntry& e = entries[i];
+    // Already cached -> skip (this is what makes the method cheap on warm
+    // boots: only books that were added since the last walk need work).
+    if (e.authorKeyOffset != 0) continue;
+    const std::string path{pathOf(e)};
+    if (!FsHelpers::hasEpubExtension(path)) continue;  // only EPUBs have author metadata here
+
+    if (ESP.getMaxAllocHeap() < kPopulateMinMaxAlloc) {
+      LOG_INF("LIB",
+              "populateAuthorKeysIfNeeded: stopping at %zu/%zu (maxAlloc=%u below %u) -- retry on next walk",
+              i, entries.size(), ESP.getMaxAllocHeap(), static_cast<unsigned>(kPopulateMinMaxAlloc));
+      break;
+    }
+    {
+      Epub epub(path, "/.crosspoint");
+      // buildIfMissing=false: skip books with no cached metadata.
+      // skipLoadingCss=true: we only need the author string.
+      if (epub.load(/*buildIfMissing=*/false, /*skipLoadingCss=*/true)) {
+        const std::string key = lastNameLowerForKey(epub.getAuthor());
+        if (!key.empty()) {
+          e.authorKeyOffset = appendAuthorKey(std::string_view{key});
+          populated++;
+        }
+      }
+    }  // Force Epub dtor before the yield so freed allocations are visible
+       // to the heap consolidator on the next tick.
+    if ((i & (kYieldEvery - 1)) == 0) vTaskDelay(1);
+  }
+  if (populated > 0) {
+    LOG_INF("LIB", "populateAuthorKeysIfNeeded: cached %zu new author key(s), saving index", populated);
+    saveToFile();
+  }
 }

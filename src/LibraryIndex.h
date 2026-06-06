@@ -40,6 +40,13 @@ struct LibraryEntry {
   // File size in bytes at last index (capped to uint32). Lets a rescan notice a
   // same-path file was replaced and re-date it. 0 = unknown (legacy entry).
   uint32_t fileSize = 0;
+  // CrumBLE 4.2.1: persisted lower-cased "last name" key for AuthorAlpha sort.
+  // Offset into LibraryIndex::authorKeyPool (null-terminated). 0 / "" means
+  // "not yet populated" — the sort path falls back to filename for those.
+  // Populated by populateAuthorKeys() (called from ensureWalked) and by
+  // every successful EpubReaderActivity::onEnter (cheap once the book is
+  // already loaded), so the cache fills both proactively and lazily.
+  uint32_t authorKeyOffset = 0;
 };
 
 class LibraryIndex {
@@ -98,6 +105,7 @@ class LibraryIndex {
   void releaseMemory() {
     std::vector<LibraryEntry>().swap(entries);
     std::vector<char>().swap(pathPool);
+    std::vector<char>().swap(authorKeyPool);
     jsonLoaded = false;
     walkPerformed = false;
   }
@@ -114,6 +122,26 @@ class LibraryIndex {
   // walked yet — the unknown books sort to the end / start depending
   // on Asc/Desc).
   uint64_t getFirstSeen(const std::string& path) const;
+
+  // CrumBLE 4.2.1: lower-cased "last name" author key for AuthorAlpha sort.
+  // Returns an empty view when the path isn't indexed or the key hasn't been
+  // populated yet. Callers should fall back to a basename-derived key for
+  // unknown paths so the sort still produces a stable order on uncached books.
+  std::string_view getAuthorKey(const std::string& path) const;
+  // Sets the author key for `path`. Lower-cases / extracts the last name
+  // internally so callers can pass the raw `epub.getAuthor()` string.
+  // Triggers a saveToFile() so the cache survives a reboot. No-op if the
+  // path isn't currently indexed (caller should trigger a rescan first).
+  void setAuthorFromRaw(const std::string& path, const std::string& rawAuthor);
+  // Walk the index and lazily populate any entries whose authorKey is still
+  // empty by load()-ing the EPUB's metadata cache (no full re-index). Heap-
+  // and watchdog-safe: yields every N books, breaks early if maxAllocHeap
+  // drops below a safe threshold (remaining books stay empty and retry on a
+  // future call). Idempotent — books that already have a cached key are
+  // skipped. Called from ensureWalked and rescan; safe to call manually
+  // (e.g. from a "Reindex authors" debug action). Saves the index when any
+  // new keys were populated.
+  void populateAuthorKeysIfNeeded();
 
   // Bookkeeping after a destructive action elsewhere (e.g. file delete).
   // The next ensureWalked() would pick this up, but for instant UI
@@ -150,4 +178,17 @@ class LibraryIndex {
   // The pool may reallocate; callers must not hold raw c_str() / pathOf()
   // pointers across calls to appendPath().
   uint32_t appendPath(std::string_view path);
+
+  // CrumBLE 4.2.1: parallel pool + helpers for the cached author key. Same
+  // shape as the path pool (single contiguous std::vector<char> of NUL-
+  // terminated strings) so it survives releaseMemory() / rebuilds with the
+  // same lifetime rules. Offset 0 is reserved as the "empty string"
+  // sentinel — newly-constructed LibraryEntry::authorKeyOffset defaults
+  // to 0 and the pool is seeded with a single '\0' byte so authorKeyOf()
+  // on an uncached entry returns "" cheaply.
+  std::vector<char> authorKeyPool;
+  const char* authorKeyOf(const LibraryEntry& e) const { return authorKeyPool.data() + e.authorKeyOffset; }
+  // Append `key` to authorKeyPool with a trailing '\0' and return the offset.
+  // 0-offset entry (the seeded sentinel '\0') means "no key cached".
+  uint32_t appendAuthorKey(std::string_view key);
 };

@@ -252,44 +252,21 @@ void applySort(std::vector<std::string>& paths, CollectionSort mode) {
       // a vTaskDelay(1) every kYieldEvery books (resets IDLE WDT and
       // lets BT / WiFi tasks breathe). Worst-case overhead at the
       // happy path: ~16 * 1 ms = ~16 ms per 256 books, negligible.
-      constexpr size_t kYieldEvery = 8;
-      // CrumBLE 4.2.1 hotfix v2: bumped the per-book pre-flight to 30 KB
-      // and made it BREAK rather than CONTINUE. Field reports showed the
-      // 20 KB threshold + per-iter skip still let the loop run far enough
-      // to fragment maxAllocHeap down to ~12 KB before resolveShelfEntries
-      // (called right after applySort) bad_alloc-ed inside its
-      // series-collapse vector::push_back. Stopping early leaves the
-      // remaining books unkeyed (they sort to the bottom like genuine
-      // no-author books) but preserves enough contiguous heap for the
-      // downstream shelf build to complete cleanly.
-      //
-      // Additionally: yield every 8 books (was 16) and also yield after
-      // each ESP.getMaxAllocHeap() drop step so the heap consolidator
-      // has more chances to coalesce freed Epub::load() allocations
-      // between iterations.
-      constexpr uint32_t kAuthorLoadMinMaxAlloc = 30 * 1024;
+      // CrumBLE 4.2.1 hotfix v3: read author keys from LibraryIndex's
+      // persisted cache instead of loading each Epub. populateAuthorKeysIfNeeded
+      // (called from ensureWalked) and EpubReaderActivity::onEnter together
+      // keep the cache filled, so this loop is O(N) hashed-string lookups
+      // with no per-iteration Epub::load -- the source of the previous
+      // hotfix's residual heap fragmentation. Books whose key isn't cached
+      // yet get an empty string here and sort to the end of the list,
+      // matching the v4.2.0 fallback behaviour. They self-heal on the next
+      // populateAuthorKeysIfNeeded pass.
+      const auto& libIdx = LibraryIndex::getInstance();
       std::vector<std::string> keys(paths.size());
       for (size_t i = 0; i < paths.size(); ++i) {
         if (!FsHelpers::hasEpubExtension(paths[i])) continue;
-        if (ESP.getMaxAllocHeap() < kAuthorLoadMinMaxAlloc) {
-          LOG_INF("CLN",
-                  "AuthorAlpha sort: stopping at %zu/%zu (maxAlloc=%u below %u) -- remaining books sort to end",
-                  i, paths.size(), ESP.getMaxAllocHeap(), static_cast<unsigned>(kAuthorLoadMinMaxAlloc));
-          break;  // empty keys -> remaining books sort to end (see comparator below)
-        }
-        {
-          Epub epub(paths[i], "/.crosspoint");
-          epub.load(/*buildIfMissing=*/false, /*skipLoadingCss=*/true);
-          keys[i] = lastNameLower(epub.getAuthor());
-        }  // Force Epub dtor before the yield so the freed allocations are
-           // visible to the heap consolidator on the next tick.
-        if ((i & (kYieldEvery - 1)) == 0) vTaskDelay(1);
+        keys[i] = std::string{libIdx.getAuthorKey(paths[i])};
       }
-      // Two extra yields after the loop to let the heap consolidator
-      // coalesce all the per-Epub free blocks before resolveShelfEntries
-      // continues into its series-collapse vector growth.
-      vTaskDelay(pdMS_TO_TICKS(20));
-      vTaskDelay(pdMS_TO_TICKS(20));
       std::vector<size_t> order(paths.size());
       for (size_t i = 0; i < order.size(); ++i) order[i] = i;
       const bool desc = mode == CollectionSort::AuthorAlphaDesc;
