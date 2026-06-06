@@ -264,6 +264,36 @@ class EpubReaderActivity final : public Activity {
   // reader menu, and other reader-context activities can all reach it
   // without an instance pointer.
   static void prewarmReaderTextBuffer(GfxRenderer& renderer);
+  // CrumBLE 4.2: passive heap recovery for the WordInfo-vector pre-flight
+  // checks in LOOKUP / ADD_HIGHLIGHT / FINISH_HIGHLIGHT. Drops the
+  // FontCacheManager hot-group buffer + per-style SD-font miniData
+  // (heaviest reusable allocations) and the parsed Section DOM (frees
+  // ~10-20 KB of EPUB blocks), then yields to FreeRTOS so the heap
+  // consolidator gets a tick. The next render rebuilds the section
+  // against a compacted heap. Callers still raise the "memory tight,
+  // try again" alert -- the recovery is a best-effort cleanup that
+  // makes the user's retry far more likely to succeed than the previous
+  // "close + reopen the book" friction. Non-static because we touch
+  // `section` and `renderer`.
+  void tryRecoverLowHeapForLookup();
+  // CrumBLE 4.2: pre-load the current page's DOM into cachedRenderPage_
+  // immediately after btMgr.enable() returns, before the async
+  // connect / HID-subscribe burst fragments the post-NimBLE heap.
+  //
+  // Timeline at BT-connect: enable() returns sync (~13 ms), then NimBLE
+  // host runs the connect handshake (~2.7 s) and subscribes to 6 HID
+  // characteristics (~1.5 s). During the connect phase, contiguous free
+  // heap sits at ~30 KB -- enough to allocate a 25 KB Page DOM. By the
+  // time the subscriptions finish, maxAllocHeap has dropped to ~6 KB
+  // and any cache-miss render fails. The "Connecting" popup suppresses
+  // renderContents during this whole window, so the natural cache
+  // refill we'd otherwise get on next render never fires -- the
+  // post-connect re-render hits a cold cache against the worst possible
+  // heap. This helper does the page-DOM load explicitly during the
+  // friendly window, without drawing, so the post-connect render is a
+  // cache hit and needs zero allocation. No-op if the cache is already
+  // valid for the current (section, spine, page).
+  void warmPageCacheForBtTransition();
   // Edge tracker: set true when a remote actually links (NimBLE handshake
   // completes), false when it drops. Manifest mismatch check fires on the
   // 0 -> 1 transition + stability window. Distinct from btWasEnabled --
@@ -320,7 +350,29 @@ class EpubReaderActivity final : public Activity {
   // onExit, onBeforeDeepSleep, and the incremental save tick.
   void commitReadingSession();
 
-  void renderContents(std::unique_ptr<Page> page, int orientedMarginTop, int orientedMarginRight,
+  // CrumBLE 4.2: page DOM cache. The render path used to drop and
+  // re-allocate the Page (~25-40 KB of vector<string> for words +
+  // PageLine elements) every render tick because
+  // Section::loadPageFromSectionFile returns a fresh unique_ptr<Page>
+  // and renderContents consumed it. Under BT-connect heap pressure
+  // (NimBLE takes 58 KB) the next render's TextBlock::deserialize would
+  // bad_alloc inside vector<string>::resize and terminate the device.
+  //
+  // Caching the page here lets BT connect against an already-allocated
+  // page DOM: the render before the connect populates the cache, BT
+  // eats its 58 KB, the post-connect re-render reuses the cached page
+  // (no allocation) and only the FontCacheManager prewarm has to fit
+  // into whatever heap is left. Invalidation is driven by pointer
+  // identity comparison against `section.get()` plus the (spine, page)
+  // index pair: page turns, chapter advances, settings-driven section
+  // rebuilds, and Section::reset all cause natural cache misses without
+  // explicit invalidate() calls scattered across the file.
+  std::unique_ptr<Page> cachedRenderPage_;
+  void* cachedRenderSection_ = nullptr;  // raw Section* identity for cache validity
+  int cachedRenderSpine_ = -1;
+  int cachedRenderPageIndex_ = -1;
+
+  void renderContents(const Page& page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
   void renderStatusBar() const;
   void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);

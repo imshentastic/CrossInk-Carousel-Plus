@@ -390,6 +390,19 @@ void EpubReaderActivity::onEnter() {
   prebakePromptShowing_ = false;
   deferredOnEnterPending_ = true;
   firstRenderCompleted_ = false;
+
+  // CrumBLE 4.2 Option 2: switch SD-font prewarm to REGULAR-only iff this
+  // user has actually paired a BT controller. They're trading per-glyph
+  // SD reads for bold/italic for enough free heap to survive a BT enable
+  // + post-connect page reload. Users with no bonded controller never pay
+  // that cost and stay on the original eager-all-styles prewarm. Re-check
+  // on every book open so a mid-session pair / unpair takes effect on the
+  // next book.
+  if (auto* fcm = renderer.getFontCacheManager()) {
+    fcm->setSdFontLazyNonRegular(SETTINGS.bleBondedDeviceAddr[0] != '\0');
+    LOG_DBG("ERA", "SD-font lazy non-REGULAR prewarm: %d (bonded=%s)", fcm->sdFontLazyNonRegular() ? 1 : 0,
+            SETTINGS.bleBondedDeviceAddr[0] != '\0' ? SETTINGS.bleBondedDeviceAddr : "(none)");
+  }
   // Eager prebake-manifest load: the switch-back prompt has to fire
   // BEFORE the first render's section.loadSectionFile path falls through
   // to createSectionFile (the "indexing" screen), otherwise the device
@@ -509,8 +522,23 @@ void EpubReaderActivity::onEnter() {
 void EpubReaderActivity::prewarmReaderTextBuffer(GfxRenderer& renderer) {
   auto* fcm = renderer.getFontCacheManager();
   if (!fcm) return;
-  fcm->prewarmCache(SETTINGS.getReaderFontId(),
-                    "etaoinshrdlucmfwypvbgkjqxzETAOINSHRDLUCMFWYP.,;:'\"!?-0123456789", 0x0F);
+  // CrumBLE 4.2: skip the pre-grow for SD-card fonts. The pattern works
+  // for compressed built-in fonts because the FontDecompressor's hot-
+  // group buffer survives clearCache via invalidateHotGroup -- the
+  // capacity grown here persists into NimBLE's 58 KB allocation pass.
+  // SD-card fonts have no equivalent persistent buffer; SdCardFont::
+  // clearCache fully frees the per-style miniData (intervals/glyphs/
+  // bitmaps, ~40-60 KB across 4 styles). The prewarm-then-clear ends up
+  // allocating that much, freeing it, and fragmenting the heap right
+  // before NimBLE grabs 58 KB contiguous. Symptoms in the field: words
+  // resolve to REPLACEMENT_GLYPH on the next page render because the
+  // SD font's interval reallocation fails under pressure, and BT
+  // disconnects shortly after.
+  const int readerFontId = SETTINGS.getReaderFontId();
+  if (renderer.isSdCardFont(readerFontId)) {
+    return;
+  }
+  fcm->prewarmCache(readerFontId, "etaoinshrdlucmfwypvbgkjqxzETAOINSHRDLUCMFWYP.,;:'\"!?-0123456789", 0x0F);
   // Drop the prewarm's page-slot buffers immediately. We only need the
   // prewarm to grow the *shared glyph-group buffer* to its high-water
   // mark -- clearCache keeps that capacity via invalidateHotGroup.
@@ -518,6 +546,83 @@ void EpubReaderActivity::prewarmReaderTextBuffer(GfxRenderer& renderer) {
   // would fragment the heap right before NimBLE's allocation pass and
   // partially defeat the protection we're trying to add.
   fcm->clearCache();
+}
+
+void EpubReaderActivity::tryRecoverLowHeapForLookup() {
+  // Drop the cheapest re-buildable allocations first: font caches and the
+  // parsed section DOM. Together that's ~30-50 KB of mid-size blocks
+  // that get reconstructed lazily on the next render. The section pointer
+  // going null also forces renderContents to re-enter the scan-then-
+  // prewarm-then-render cycle, which is when miniData / hot-group
+  // buffers are repopulated from a freshly compacted heap.
+  LOG_INF("ERS", "Heap recovery: before maxAlloc=%u free=%u", ESP.getMaxAllocHeap(), ESP.getFreeHeap());
+  auto* fcm = renderer.getFontCacheManager();
+  if (fcm) fcm->clearCache();
+  if (section) section.reset();
+  // Yield twice -- once to let any pending render task drain, once for
+  // the heap consolidator. 80 ms total is well under the perceived-
+  // latency floor on the next user interaction.
+  vTaskDelay(pdMS_TO_TICKS(40));
+  vTaskDelay(pdMS_TO_TICKS(40));
+  LOG_INF("ERS", "Heap recovery: after  maxAlloc=%u free=%u", ESP.getMaxAllocHeap(), ESP.getFreeHeap());
+  // Trigger the re-render that fills section back in. The user's next
+  // tap on Lookup / Highlight then runs against the freshly-allocated
+  // section DOM + prewarmed font cache instead of the stale fragmented
+  // state the previous attempt failed against.
+  requestUpdate();
+}
+
+void EpubReaderActivity::warmPageCacheForBtTransition() {
+  // Pre-condition checks mirror renderContents's guards: without a valid
+  // section + in-bounds page, loadPageFromSectionFile would just refuse.
+  if (!section || section->pageCount <= 0) {
+    LOG_DBG("ERA", "warmPageCacheForBtTransition: no section/pages, skipping");
+    return;
+  }
+  if (section->currentPage < 0 || section->currentPage >= section->pageCount) {
+    LOG_DBG("ERA", "warmPageCacheForBtTransition: page %d out of bounds (count %d), skipping",
+            section->currentPage, section->pageCount);
+    return;
+  }
+
+  // If the cache is already valid for the current (section, spine, page),
+  // there's nothing to do. This also handles the case where renderContents
+  // ran between the caller's last drop and this call.
+  const bool cacheHit = cachedRenderPage_ && cachedRenderSection_ == static_cast<void*>(section.get()) &&
+                        cachedRenderSpine_ == currentSpineIndex && cachedRenderPageIndex_ == section->currentPage;
+  if (cacheHit) {
+    LOG_DBG("ERA", "warmPageCacheForBtTransition: cache already valid for spine=%d page=%d", currentSpineIndex,
+            section->currentPage);
+    return;
+  }
+
+  const uint32_t freeBefore = ESP.getFreeHeap();
+  const uint32_t maxAllocBefore = ESP.getMaxAllocHeap();
+
+  // Mirror the assignment in renderContents (lines ~3491-3506). Done here
+  // explicitly because the "Connecting" popup suppresses renderContents
+  // for the entire 2.7 s connect + ~1.5 s subscribe window; by the time a
+  // natural render happens the heap is fragmented to ~6 KB maxAlloc and
+  // the load refuses.
+  cachedRenderPage_ = section->loadPageFromSectionFile();
+  if (cachedRenderPage_) {
+    cachedRenderSection_ = static_cast<void*>(section.get());
+    cachedRenderSpine_ = currentSpineIndex;
+    cachedRenderPageIndex_ = section->currentPage;
+    currentPageFootnotes = cachedRenderPage_->footnotes;
+    LOG_INF("ERA", "warmPageCacheForBtTransition: loaded spine=%d page=%d (free %u->%u, maxAlloc %u->%u)",
+            currentSpineIndex, section->currentPage, freeBefore, ESP.getFreeHeap(), maxAllocBefore,
+            ESP.getMaxAllocHeap());
+  } else {
+    // Load refused (loadPageFromSectionFile's own 25 KB pre-flight, or
+    // the section binary is missing). Cache stays empty -- the post-BT
+    // render will fail the same way the old code did, but we tried.
+    cachedRenderSection_ = nullptr;
+    cachedRenderSpine_ = -1;
+    cachedRenderPageIndex_ = -1;
+    LOG_ERR("ERA", "warmPageCacheForBtTransition: load refused (free=%u maxAlloc=%u); post-BT render may fail",
+            ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  }
 }
 
 // CrumBLE Phase 1 fast-open: ran from loop() once the first render has
@@ -1225,7 +1330,47 @@ void EpubReaderActivity::loop() {
       // NimBLE eats heap. Cost (~20 ms) hides inside the Connecting
       // popup window we just drew.
       prewarmReaderTextBuffer(renderer);
+      // CrumBLE 4.2: drop the cached page DOM right before BT enable.
+      // The cache normally holds ~30 KB across renders so post-BT renders
+      // skip the deserialize, but the cache ALSO keeps that 30 KB out of
+      // BT's pre-flight budget. Without this release, NimBLE's enable()
+      // refuses when free heap dips below 67.5 KB (observed: free=62 KB
+      // with cache held, would be ~92 KB with cache dropped). Releasing
+      // here lets BT pass its own pre-flight; the first post-connect
+      // render takes a one-time cache miss (page reloads against the
+      // post-BT heap, which is now stable rather than mid-fragmentation)
+      // and subsequent renders are cache hits again.
+      cachedRenderPage_.reset();
+      cachedRenderSection_ = nullptr;
+      cachedRenderSpine_ = -1;
+      cachedRenderPageIndex_ = -1;
+      // Also release the reader-settings cache (~25 KB of SettingInfo
+      // entries the drawer reads). It's rebuilt lazily the next time the
+      // user opens the drawer; the rebuild is ~50-100 ms inline at drawer
+      // open. Dropping it here turns out to be the difference between
+      // "BT connects + page reload succeeds" and "BT connects + Page
+      // Load error". Observed: post-BT heap stays at ~14 KB without this
+      // release; freeing the settings cache brings it back to ~40 KB
+      // which fits the 25 KB Section deserialize budget.
+      const size_t prevSettingsCacheCount = readerSettingsCache_.size();
+      readerSettingsCache_.clear();
+      readerSettingsCache_.shrink_to_fit();
+      if (prevSettingsCacheCount > 0) {
+        LOG_INF("ERA", "BT connect: dropped reader-settings cache (%zu entries) to free heap for NimBLE",
+                prevSettingsCacheCount);
+      }
       if (!btMgr.isEnabled()) btMgr.enable();
+      // CrumBLE 4.2: at this point NimBLE init has consumed ~50 KB (sync,
+      // ~13 ms), but the async connect handshake hasn't started running its
+      // per-connection allocations yet, and the 6 HID-subscription buffers
+      // are still 2-4 s away. Free heap sits at ~30 KB, mostly contiguous.
+      // This is the only window we get to re-allocate the 25 KB Page DOM
+      // we dropped above -- once connectToDevice() kicks the async stack
+      // running, MaxAllocHeap falls to ~6 KB and the deserialize refuses.
+      // The "Connecting" popup will suppress renderContents for the entire
+      // window, so a natural cache refill never fires; we have to do it
+      // explicitly here so the post-connect re-render is a cache hit.
+      if (btMgr.isEnabled()) warmPageCacheForBtTransition();
       btMgr.connectToDevice(SETTINGS.bleBondedDeviceAddr);
     }
     btManifestPromptAnsweredThisSession_ = true;  // we handled the manifest decision
@@ -1787,9 +1932,13 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       // each of which is correct (better than a reboot).
       constexpr uint32_t LOOKUP_MIN_MAX_ALLOC = 32000;
       if (ESP.getMaxAllocHeap() < LOOKUP_MIN_MAX_ALLOC) {
-        LOG_INF("ERS", "Lookup pre-flight: maxAlloc=%u below %u even after BT off, raising alert",
+        LOG_INF("ERS", "Lookup pre-flight: maxAlloc=%u below %u even after BT off, attempting recovery",
                 ESP.getMaxAllocHeap(), LOOKUP_MIN_MAX_ALLOC);
         if (bleWasOnForLookup) btMgr.requestEnableLater();
+        // CrumBLE 4.2: passive heap recovery. Drop reusable allocations
+        // and yield -- the next user tap on Lookup runs against the
+        // recovered heap. Alert text guides them through that retry.
+        tryRecoverLowHeapForLookup();
         strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_LOOKUP_TITLE),
                 sizeof(APP_STATE.pendingAlertTitle) - 1);
         strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_LOOKUP_BODY),
@@ -1984,9 +2133,12 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       }
       constexpr uint32_t HIGHLIGHT_MIN_MAX_ALLOC = 32000;
       if (ESP.getMaxAllocHeap() < HIGHLIGHT_MIN_MAX_ALLOC) {
-        LOG_INF("ERS", "AddHighlight pre-flight: maxAlloc=%u below %u, raising alert",
+        LOG_INF("ERS", "AddHighlight pre-flight: maxAlloc=%u below %u, attempting recovery",
                 ESP.getMaxAllocHeap(), HIGHLIGHT_MIN_MAX_ALLOC);
         if (bleWasOnForHighlight) btMgrH.requestEnableLater();
+        // CrumBLE 4.2: passive heap recovery before the alert -- see
+        // tryRecoverLowHeapForLookup for the rationale.
+        tryRecoverLowHeapForLookup();
         strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_LOOKUP_TITLE),
                 sizeof(APP_STATE.pendingAlertTitle) - 1);
         strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_LOOKUP_BODY),
@@ -2206,9 +2358,12 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       }
       constexpr uint32_t FINISH_MIN_MAX_ALLOC = 32000;
       if (ESP.getMaxAllocHeap() < FINISH_MIN_MAX_ALLOC) {
-        LOG_INF("ERS", "FinishHighlight pre-flight: maxAlloc=%u below %u, raising alert",
+        LOG_INF("ERS", "FinishHighlight pre-flight: maxAlloc=%u below %u, attempting recovery",
                 ESP.getMaxAllocHeap(), FINISH_MIN_MAX_ALLOC);
         if (bleWasOnForFinish) btMgrF.requestEnableLater();
+        // CrumBLE 4.2: passive heap recovery -- see tryRecoverLowHeapForLookup
+        // for the rationale and matching LOOKUP / ADD_HIGHLIGHT sites.
+        tryRecoverLowHeapForLookup();
         strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_LOOKUP_TITLE),
                 sizeof(APP_STATE.pendingAlertTitle) - 1);
         strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_LOOKUP_BODY),
@@ -2273,17 +2428,90 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
               return;
             }
             const auto& start = *pendingHighlightStart_;
-            // Build preview as "<start word>... <end word>" so the user
-            // gets a sense of both anchors even across pages/chapters.
-            // The single-page Phase 2 path produces a full joined string;
-            // multi-anchor path can't easily walk intervening text without
-            // loading every page in between, so we approximate.
-            std::string preview = start.startWordText;
-            preview += "... ";
-            preview += hr->previewText;
-            if (preview.size() > BOOKMARK_PREVIEW_MAX - 1) {
-              preview.resize(BOOKMARK_PREVIEW_MAX - 4);
-              preview += "...";
+            // CrumBLE 4.2: walk the actual pages of the highlight so the
+            // bookmark preview captures the WHOLE quote, not just the
+            // start anchor's 14-word trailing snippet + the end page's
+            // selection. Previously a multi-page highlight surfaced as
+            // "<words 0..13 from start anchor> ... <selection on end
+            // page>" -- everything in between (entire pages of body
+            // text) was dropped, which made the QuoteViewer mostly
+            // useless for the long passages it was added for.
+            //
+            // Same-chapter (start.spineIndex == endSpine) is handled
+            // inline by reusing the open Section and iterating each page
+            // from startPage..endPage. We take RenderLock so the render
+            // task doesn't race us mutating section->currentPage. Each
+            // page load is ~50 ms; for a typical 3-5 page highlight
+            // that's a 150-250 ms blip while finishing the highlight --
+            // user-initiated action, no surprise.
+            //
+            // Cross-chapter (endSpine > start.spineIndex) would require
+            // loading the other Section objects too. That's a bigger
+            // change; for now we fall back to the old approximation and
+            // log so it's visible in the field.
+            std::string preview;
+            const bool sameChapter = (start.spineIndex == endSpine);
+            if (sameChapter && section && start.pageCount > 0) {
+              RenderLock lock(*this);
+              const int totalPages = static_cast<int>(start.pageCount);
+              auto pageFromProgress = [&](float pr) {
+                const int idx = static_cast<int>(pr * totalPages);
+                return std::clamp(idx, 0, totalPages - 1);
+              };
+              const int startPage = pageFromProgress(start.progress);
+              const int endPage = pageFromProgress(endProgressVal);
+              const int savedPage = section->currentPage;
+              const size_t kPreviewBudget = BOOKMARK_PREVIEW_MAX - 4;
+              preview.reserve(kPreviewBudget);
+              bool overflowed = false;
+              for (int p = startPage; p <= endPage && !overflowed; p++) {
+                section->currentPage = p;
+                auto pg = section->loadPageFromSectionFile();
+                if (!pg) continue;
+                const size_t firstWord = (p == startPage) ? static_cast<size_t>(start.wordIndex) : 0;
+                const size_t lastWord =
+                    (p == endPage) ? static_cast<size_t>(hr->endWordIndex) : std::numeric_limits<size_t>::max();
+                size_t wordIdx = 0;
+                for (const auto& element : pg->elements) {
+                  if (!element || element->getTag() != TAG_PageLine) continue;
+                  const auto& line = static_cast<const PageLine&>(*element);
+                  auto block = line.getBlock();
+                  if (!block) continue;
+                  const auto& lineWords = block->getWords();
+                  for (const auto& w : lineWords) {
+                    if (wordIdx >= firstWord && wordIdx <= lastWord) {
+                      if (!preview.empty()) preview += ' ';
+                      // Skip empty word slots (continuation rows, hyphen
+                      // halves) so the output reads cleanly.
+                      if (!w.empty()) preview += w;
+                      if (preview.size() >= kPreviewBudget) {
+                        preview.resize(kPreviewBudget);
+                        preview += "...";
+                        overflowed = true;
+                        break;
+                      }
+                    }
+                    wordIdx++;
+                  }
+                  if (overflowed) break;
+                }
+              }
+              section->currentPage = savedPage;
+            }
+            // Fallback: cross-chapter highlight, or the same-chapter walk
+            // produced nothing (e.g. all words were empty slots). Surface
+            // both anchors so the bookmark isn't a blank.
+            if (preview.empty()) {
+              if (!sameChapter) {
+                LOG_INF("ERS", "Cross-chapter highlight: preview falls back to anchor concatenation");
+              }
+              preview = start.startWordText;
+              preview += "... ";
+              preview += hr->previewText;
+              if (preview.size() > BOOKMARK_PREVIEW_MAX - 1) {
+                preview.resize(BOOKMARK_PREVIEW_MAX - 4);
+                preview += "...";
+              }
             }
             const auto addResult = BOOKMARKS.addHighlight(
                 start.spineIndex, start.progress, start.wordIndex, endSpine, endProgressVal,
@@ -3315,8 +3543,34 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   }
 
   {
-    auto p = section->loadPageFromSectionFile();
-    if (!p) {
+    // CrumBLE 4.2: serve the page DOM from the activity-level cache when
+    // (section pointer, spine, page index) match the cached values.
+    // Otherwise reload from disk. Caching trims the per-render
+    // ~25-40 KB allocation churn that previously crashed under BT
+    // heap pressure (TextBlock::deserialize -> vector<string>::resize
+    // -> bad_alloc -> terminate). The first render after each page turn
+    // or chapter change still pays the load cost (~50-80 ms); steady-
+    // state re-renders (BT enable popup, focus changes, status bar
+    // refreshes) reuse the cached page for free.
+    const bool cacheHit = cachedRenderPage_ && cachedRenderSection_ == static_cast<void*>(section.get()) &&
+                          cachedRenderSpine_ == currentSpineIndex && cachedRenderPageIndex_ == section->currentPage;
+    if (!cacheHit) {
+      cachedRenderPage_ = section->loadPageFromSectionFile();
+      if (cachedRenderPage_) {
+        cachedRenderSection_ = static_cast<void*>(section.get());
+        cachedRenderSpine_ = currentSpineIndex;
+        cachedRenderPageIndex_ = section->currentPage;
+        // Footnotes are owned by the page; copy (not move) so the cache
+        // still has them on subsequent re-renders that read them.
+        currentPageFootnotes = cachedRenderPage_->footnotes;
+      } else {
+        cachedRenderSection_ = nullptr;
+        cachedRenderSpine_ = -1;
+        cachedRenderPageIndex_ = -1;
+      }
+    }
+
+    if (!cachedRenderPage_) {
       pageLoadRetryCount++;
       if (pageLoadRetryCount < MAX_PAGE_LOAD_RETRIES) {
         LOG_ERR("ERS", "Failed to load page from SD (retry %d) - clearing section cache", pageLoadRetryCount);
@@ -3344,12 +3598,10 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 
     pageLoadRetryCount = 0;
 
-    // Collect footnotes from the loaded page
-    currentPageFootnotes = std::move(p->footnotes);
-
     const auto start = millis();
-    renderContents(std::move(p), orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft);
-    LOG_DBG("ERS", "Rendered page in %dms", millis() - start);
+    renderContents(*cachedRenderPage_, orientedMarginTop, orientedMarginRight, orientedMarginBottom,
+                   orientedMarginLeft);
+    LOG_DBG("ERS", "Rendered page in %dms (cache %s)", millis() - start, cacheHit ? "hit" : "miss");
   }
   silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
   if (!saveProgress(currentSpineIndex, section->currentPage, section->pageCount)) {
@@ -3416,7 +3668,7 @@ void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportW
 bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageCount) {
   return EpubReaderUtils::saveProgress(*epub, spineIndex, currentPage, pageCount);
 }
-void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int orientedMarginTop,
+void EpubReaderActivity::renderContents(const Page& page, const int orientedMarginTop,
                                         const int orientedMarginRight, const int orientedMarginBottom,
                                         const int orientedMarginLeft) {
   const auto t0 = millis();
@@ -3426,7 +3678,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   fcm->resetStats();
   const uint32_t heapBefore = esp_get_free_heap_size();
   auto scope = fcm->createPrewarmScope();
-  page->renderText(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);  // scan pass
+  page.renderText(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);  // scan pass
   scope.endScanAndPrewarm();
   const uint32_t heapAfter = esp_get_free_heap_size();
   fcm->logStats("prewarm");
@@ -3437,7 +3689,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
   (void)heapBefore;
   (void)heapAfter;
 
-  const bool pageHasImages = page->hasImages();
+  const bool pageHasImages = page.hasImages();
   // CrumBLE: NimBLE holds ~90 KB while the remote is up, leaving ~24 KB
   // contiguous -- not enough for the grayscale re-render pass (it would starve
   // glyphs, the "5% of characters" bug). Gate the AA re-render on the remote
@@ -3458,7 +3710,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
 
   renderer.takeRenderStarved();        // clear stale; capture only this render's failures
   renderer.takeImageRepaintUnsafe();   // clear stale; capture only this render's uncached images
-  page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+  page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
 
   // Note when the BLE remote came up. The connect handshake makes NimBLE grab
   // its ~58 KB and churn temporary buffers, which briefly spikes heap pressure
@@ -3584,7 +3836,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     // Step 1: Display page with image area blanked (text appears, image area white)
     // Step 2: Re-render with images and display again (images appear clean)
     int16_t imgX, imgY, imgW, imgH;
-    if (page->getImageBoundingBox(imgX, imgY, imgW, imgH)) {
+    if (page.getImageBoundingBox(imgX, imgY, imgW, imgH)) {
       renderer.fillRect(imgX + orientedMarginLeft, imgY + orientedMarginTop, imgW, imgH, false);
       const auto tImageBlankDisplay = millis();
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
@@ -3593,7 +3845,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       // Re-render page content to restore images into the blanked area
       // Status bar is not re-rendered here to avoid reading stale dynamic values (e.g. battery %)
       const auto tImageRestoreRender = millis();
-      page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+      page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
       const uint32_t imageRestoreRenderMs = millis() - tImageRestoreRender;
       const auto tImageFinalDisplay = millis();
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
@@ -3649,9 +3901,9 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
     if (needsTextGrayscale) {
-      page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+      page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
     } else {
-      page->renderImages(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+      page.renderImages(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
     }
     renderer.copyGrayscaleLsbBuffers();
     const auto tGrayLsb = millis();
@@ -3660,9 +3912,9 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
     if (needsTextGrayscale) {
-      page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+      page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
     } else {
-      page->renderImages(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+      page.renderImages(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
     }
     renderer.copyGrayscaleMsbBuffers();
     const auto tGrayMsb = millis();
@@ -3686,7 +3938,7 @@ void EpubReaderActivity::renderContents(std::unique_ptr<Page> page, const int or
       // of the heavy ghosting — the panel kept the 4-level grayscale RAM
       // and the next refresh smeared against it.
       renderer.clearScreen();
-      page->render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+      page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
       renderStatusBar();
       renderer.cleanupGrayscaleWithFrameBuffer();
     }

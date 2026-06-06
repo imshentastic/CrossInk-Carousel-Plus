@@ -541,6 +541,31 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
 }
 
 std::unique_ptr<Page> Section::loadPageFromSectionFile() {
+  // CrumBLE 4.2: heap pre-flight. Page deserialization runs `std::vector
+  // <std::string>::resize()` on the per-word arrays inside
+  // TextBlock::deserialize (words, wordXpos, wordStyles,
+  // wordBackgroundBlack). Under heap pressure that allocation throws
+  // std::bad_alloc, which -- because the firmware is built with
+  // -fno-exceptions -- terminates the device instead of being catchable.
+  // Observed in the field: connecting Bluetooth on a page with a heavy
+  // text block ate 58 KB for NimBLE, left ~10-15 KB maxAlloc, the next
+  // render's loadPageFromSectionFile entered TextBlock::deserialize and
+  // crashed inside vector<string>::_M_default_append.
+  //
+  // Returning nullptr here routes the caller (EpubReaderActivity render
+  // loop) into its existing retry-then-error-screen path
+  // (MAX_PAGE_LOAD_RETRIES + drawCenteredText(STR_PAGE_LOAD_ERROR)),
+  // so the user sees "Page load error -- close + reopen" instead of a
+  // hard reboot. 25 KB threshold covers a typical 150-300 word page
+  // with overhead headroom; the original crash had maxAlloc well below
+  // this floor.
+  constexpr uint32_t PAGE_LOAD_MIN_MAX_ALLOC = 25000;
+  if (ESP.getMaxAllocHeap() < PAGE_LOAD_MIN_MAX_ALLOC) {
+    LOG_ERR("SCT", "loadPageFromSectionFile: maxAlloc=%u below %u, refusing load to avoid bad_alloc terminate",
+            ESP.getMaxAllocHeap(), PAGE_LOAD_MIN_MAX_ALLOC);
+    return nullptr;
+  }
+
   if (!Storage.openFileForRead("SCT", activeFilePath, file)) {
     return nullptr;
   }

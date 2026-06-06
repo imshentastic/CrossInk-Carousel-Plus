@@ -20,12 +20,41 @@ void FontCacheManager::clearCache() {
 }
 
 void FontCacheManager::prewarmCache(int fontId, const char* utf8Text, uint8_t styleMask) {
-  // SD card font prewarm path: prewarm all requested styles in one call
+  // SD card font prewarm path.
+  //
+  // CrumBLE 4.2 Option 2: only eagerly prewarm REGULAR for SD-card fonts.
+  // BOLD / ITALIC / BOLDITALIC styles' miniData stays empty; their glyphs
+  // load on demand via the overflow ring buffer when drawText resolves
+  // them through EpdFontFamily::getGlyphData -> EpdFont::getGlyph ->
+  // glyphMissHandler -> SdCardFont::onGlyphMiss.
+  //
+  // Why: eagerly prewarming all 4 styles allocates ~10-15 KB of miniData
+  // per style (intervals + glyph metadata + bitmaps), so a page mixing
+  // regular/bold/italic text used to hold ~40-60 KB during the render
+  // scope. With NimBLE's 58 KB allocation pass landing in the middle of
+  // a heap that's already churning that much per page, BT enable was
+  // failing its 67.5 KB free-heap pre-flight. Trimming to REGULAR-only
+  // (~14 KB) frees ~30-45 KB of headroom for BT.
+  //
+  // Trade-off: each bold/italic glyph hit triggers a per-glyph SD read
+  // (~1-2 ms) the first time it's needed. Typical book pages have
+  // <20 bold/italic words = <100 bold glyphs, so the per-render cost is
+  // ~100-200 ms. The overflow ring buffer caches loaded glyphs so
+  // repeated re-renders of the same page reuse them at no SD cost.
   auto it = sdCardFonts_.find(fontId);
   if (it != sdCardFonts_.end()) {
-    int missed = it->second->prewarm(utf8Text, styleMask);
+    // CrumBLE 4.2 Option 2 gate. The lazy-non-REGULAR path is only on when
+    // the user has a Bluetooth controller bonded (see
+    // EpubReaderActivity::onEnter): they're willing to pay the per-glyph SD
+    // read for bold/italic in exchange for enough free heap to survive a
+    // BT enable + page reload. Users without a bonded BT controller stay
+    // on the original eager-all-styles prewarm.
+    constexpr uint8_t kRegularOnlyMask = 0x01;
+    const uint8_t sdMask = sdFontLazyNonRegular_ ? (styleMask & kRegularOnlyMask) : styleMask;
+    int missed = it->second->prewarm(utf8Text, sdMask);
     if (missed > 0) {
-      LOG_DBG("FCM", "prewarmCache(SD): %d glyph(s) not found (styleMask=0x%02X)", missed, styleMask);
+      LOG_DBG("FCM", "prewarmCache(SD): %d glyph(s) not found (styleMask=0x%02X, originalMask=0x%02X, lazy=%d)", missed,
+              sdMask, styleMask, sdFontLazyNonRegular_);
     }
     return;
   }

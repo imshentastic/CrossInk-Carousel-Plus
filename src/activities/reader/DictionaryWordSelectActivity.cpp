@@ -3,6 +3,7 @@
 #include <Arduino.h>  // ESP.getMaxAllocHeap()
 #include <Epub/Page.h>
 #include <Epub/blocks/TextBlock.h>
+#include <FontCacheManager.h>  // PrewarmScope (forward-declared in GfxRenderer.h)
 #include <GfxRenderer.h>
 #include <I18n.h>
 #include <Logging.h>
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <optional>
 
 #include "BookmarkStore.h"  // BOOKMARK_PREVIEW_MAX
 #include "DictionaryDefinitionActivity.h"
@@ -333,6 +335,34 @@ void DictionaryWordSelectActivity::loop() {
 
 void DictionaryWordSelectActivity::render(RenderLock&&) {
   renderer.clearScreen();
+
+  // CrumBLE 4.2: prewarm the font cache before page->render. The parent
+  // EpubReaderActivity::renderContents wraps its own page render in a
+  // FontCacheManager::PrewarmScope whose dtor clearCache()'s the SD-font
+  // miniData on the way out -- so by the time this activity runs, the
+  // SD font has no intervals/glyphs cached. EpdFontFamily::getGlyph (the
+  // path drawText uses) only consults findGlyph; it never falls back to
+  // the glyphMissHandler / overflow ring buffer (only EpdFont::getGlyph
+  // does that). With no prewarm, every codepoint resolves to
+  // REPLACEMENT_GLYPH and the overlay renders as a wall of '?'. The
+  // built-in compressed-font path didn't notice because its findGlyph
+  // works against the always-resident interval table -- only SD fonts
+  // are affected.
+  //
+  // Mirroring the reader's scan-then-prewarm-then-render pattern populates
+  // the SD-font miniData for every codepoint on the current page. The scope
+  // is held in an std::optional at function scope so it stays alive past
+  // page->render -- the HighlightRange reverse-video pass below also calls
+  // drawText for the selected words and would otherwise hit the same
+  // wall-of-?'s problem. Scope dtor wipes the cache when render() returns
+  // so we don't leak cached state past this activity.
+  auto* fcm = renderer.getFontCacheManager();
+  std::optional<FontCacheManager::PrewarmScope> prewarmScope;
+  if (fcm) {
+    prewarmScope.emplace(fcm->createPrewarmScope());
+    page->renderText(renderer, fontId, marginLeft, marginTop);  // scan pass: records text, doesn't draw
+    prewarmScope->endScanAndPrewarm();
+  }
   page->render(renderer, fontId, marginLeft, marginTop);
 
   // CrumBLE: belt and suspenders -- extractWords now skips empty rows,

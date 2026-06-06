@@ -188,8 +188,19 @@ EpdFontFamily::GlyphData EpdFontFamily::findGlyphData(const uint32_t cp, const S
   }
 
   if (font != regular) {
-    if (const EpdGlyph* glyph = regular->findGlyph(cp)) {
-      return {regular->data, glyph};
+    // CrumBLE 4.2 Option 2: skip the REGULAR-style fallback for SD-card
+    // fonts. SD fonts set `data->glyphMissHandler` on their stubData; the
+    // outer getGlyphData fallback (via font->getGlyph) will invoke that
+    // handler to lazy-load the bold / italic / bolditalic glyph from SD
+    // through the overflow ring buffer. Falling back to REGULAR here
+    // would silently render bold/italic text in the regular style, which
+    // is the wrong visual result. Built-in compressed fonts (no
+    // glyphMissHandler) keep the original REGULAR fallback so existing
+    // builtin behaviour is unchanged.
+    if (font->data->glyphMissHandler == nullptr) {
+      if (const EpdGlyph* glyph = regular->findGlyph(cp)) {
+        return {regular->data, glyph};
+      }
     }
   }
 
@@ -199,6 +210,21 @@ EpdFontFamily::GlyphData EpdFontFamily::findGlyphData(const uint32_t cp, const S
 EpdFontFamily::GlyphData EpdFontFamily::getGlyphData(const uint32_t cp, const Style style) const {
   if (const GlyphData glyphData = findGlyphData(cp, style); glyphData.glyph) {
     return glyphData;
+  }
+
+  // CrumBLE 4.2 Option 2: SD-card lazy-load fallback. findGlyphData
+  // failed for `style` -- for SD-card fonts that's the expected case for
+  // BOLD / ITALIC / BOLDITALIC under lazy prewarm (only REGULAR is
+  // eagerly prewarmed; non-REGULAR styles' miniData stays empty). Invoke
+  // EpdFont::getGlyph, which: (1) tries findGlyph (still null for the
+  // SD-font miss case), then (2) calls data->glyphMissHandler ->
+  // SdCardFont::onGlyphMiss, which reads the glyph from the .cpfont file
+  // on SD and caches it in the per-style overflow ring buffer for
+  // subsequent draws on the same page. For built-in compressed fonts
+  // glyphMissHandler is nullptr so this is a no-op fall through.
+  const EpdFont* font = getFont(style);
+  if (const EpdGlyph* glyph = font->getGlyph(cp)) {
+    return {font->data, glyph};
   }
 
   if (cp != REPLACEMENT_GLYPH) {

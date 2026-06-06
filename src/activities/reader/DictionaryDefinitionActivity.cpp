@@ -1,7 +1,10 @@
 #include "DictionaryDefinitionActivity.h"
 
+#include <FontCacheManager.h>  // PrewarmScope (forward-declared in GfxRenderer.h)
+#include <GfxRenderer.h>
 #include <I18n.h>
 
+#include <optional>
 #include <sstream>
 
 #include "CrossPointSettings.h"
@@ -145,6 +148,47 @@ void DictionaryDefinitionActivity::render(RenderLock&&) {
   renderer.clearScreen();
 
   const int margin = 20;
+
+  // CrumBLE 4.2: same SD-font prewarm gymnastics as
+  // DictionaryWordSelectActivity::render. The reader font (`fontId`) is
+  // the user's chosen reader font, which when it's an SD-card .cpfont
+  // has an empty miniData unless a PrewarmScope is active --
+  // EpdFontFamily::getGlyph never falls back to the glyphMissHandler so
+  // every codepoint renders as REPLACEMENT_GLYPH otherwise. The target
+  // word at the top renders with UI_12 (Inter built-in) which always
+  // has its intervals resident, so only the definition body was
+  // showing question marks.
+  //
+  // The scan pass below issues drawText calls for every visible string
+  // with the renderer in scanning mode -- FontCacheManager::recordText
+  // accumulates the codepoints without rendering. After
+  // endScanAndPrewarm the SD-font miniData is populated and the real
+  // draw loop below renders correctly. Scope dtor wipes the cache when
+  // render() returns.
+  auto* fcm = renderer.getFontCacheManager();
+  std::optional<FontCacheManager::PrewarmScope> prewarmScope;
+  if (fcm) {
+    prewarmScope.emplace(fcm->createPrewarmScope());
+    // y/x positions don't matter during the scan pass -- drawText is a
+    // no-op visually when scanning. Just walk the same strings the real
+    // draw will use.
+    if (isLoading) {
+      renderer.drawText(fontId, 0, 0, tr(STR_LOOKING_UP));
+    } else if (notFound) {
+      const std::string notFoundMsg = std::string(tr(STR_WORD_NOT_FOUND)) + targetWord;
+      renderer.drawText(fontId, 0, 0, notFoundMsg.c_str());
+      renderer.drawText(fontId, 0, 0, tr(STR_PRESS_CONFIRM_SUGGESTIONS));
+    } else {
+      const int linesToScan = std::min(linesPerPage, static_cast<int>(wrappedLines.size()) - scrollOffset);
+      for (int i = 0; i < linesToScan; ++i) {
+        renderer.drawText(fontId, 0, 0, wrappedLines[scrollOffset + i].c_str());
+      }
+      if (scrollOffset > 0) renderer.drawText(fontId, 0, 0, "^");
+      if (scrollOffset < maxScroll) renderer.drawText(fontId, 0, 0, "v");
+    }
+    prewarmScope->endScanAndPrewarm();
+  }
+
   int currentY = margin;
 
   if (isLoading) {
