@@ -79,6 +79,12 @@ class HomeActivity final : public Activity {
   // entry). Navigation indexes ShelfEntries 1:1 with cells on the
   // shelf row.
   std::vector<ShelfEntry> shelfEntriesCache;
+  // CrumBLE 4.2.1: consecutive count of cachedShelfEntries() calls that hit
+  // a heap-pressure-empty result from resolveShelfEntries(). Bounded retry
+  // (cap is kMaxHeapPressureRetries in the .cpp) so a permanently low heap
+  // doesn't drive an infinite render loop. Reset to 0 the moment a real
+  // result lands or the retry cap is reached.
+  int shelfHeapRetryCount_ = 0;
   // Snapshot of the shelf-relevant state at the moment the cached
   // framebuffer (coverBuffer) was last filled. When this matches the
   // live state AND we successfully restored the framebuffer, the

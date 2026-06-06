@@ -77,6 +77,9 @@ class CollectionsStore {
 
   std::vector<Collection> collections;
   std::string activeId;
+  // CrumBLE 4.2.1: see lastResolveHitHeapPressure() below. mutable so it
+  // can be updated from the const resolveShelfEntries() method.
+  mutable bool lastResolveHitHeapPressure_ = false;
 
  public:
   // Default collection id created on first boot when no JSON exists.
@@ -192,6 +195,16 @@ class CollectionsStore {
   // identified series, become 1-member ShelfEntries. Used by the
   // shelf renderer; navigation indexes ShelfEntries 1:1.
   std::vector<ShelfEntry> resolveShelfEntries(const std::string& collectionId) const;
+  // CrumBLE 4.2.1: true iff the most recent resolveShelfEntries() call
+  // returned an empty vector because its heap pre-flight refused the
+  // build (heap-pressure-empty), as opposed to a legitimately empty
+  // collection. Callers (HomeActivity::cachedShelfEntries) use this to
+  // skip caching the empty result and schedule a retry on the next
+  // render, so the shelf doesn't stay empty waiting on the next user
+  // input to invalidate the cache. Reset to false at the START of each
+  // resolveShelfEntries call so a stale "true" from a prior call can't
+  // mislead the caller.
+  bool lastResolveHitHeapPressure() const { return lastResolveHitHeapPressure_; }
   // Convenience: returns the count for the active collection without
   // building the full vector. Still triggers a walk for virtuals on
   // first access. Use sparingly — pulls fresh data each call.

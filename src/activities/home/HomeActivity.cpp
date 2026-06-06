@@ -1216,11 +1216,33 @@ const std::vector<ShelfEntry>& HomeActivity::cachedShelfEntries() {
   }
   // Cache miss — resolve entries (does the path sort + series collapse
   // in one pass) and derive the path list as one firstPath per entry.
-  shelfEntriesCache = CollectionsStore::getInstance().resolveShelfEntries(activeId);
+  auto& store = CollectionsStore::getInstance();
+  shelfEntriesCache = store.resolveShelfEntries(activeId);
   shelfPathsCache.clear();
   shelfPathsCache.reserve(shelfEntriesCache.size());
   for (const auto& e : shelfEntriesCache) shelfPathsCache.push_back(e.firstPath);
-  shelfPathsCacheKey = activeId;
+  // CrumBLE 4.2.1: if resolveShelfEntries returned empty because its heap
+  // pre-flight refused the build (heap-pressure-empty, not a legitimately
+  // empty collection), DON'T commit the empty result as the cached value.
+  // Without this, the shelf would render empty until the next action
+  // invalidated shelfPathsCacheKey -- producing the "select sort,
+  // collections show empty, click anything, then they appear" symptom.
+  // Trigger one retry now via requestUpdate(); the next render typically
+  // sees recovered heap (the previous render's transient allocations have
+  // freed). Bound the retry count so an actually-stuck heap doesn't drive
+  // an infinite render loop -- after kMaxRetries consecutive failures, we
+  // commit the empty cache and the user can recover with a click.
+  constexpr int kMaxHeapPressureRetries = 5;
+  if (store.lastResolveHitHeapPressure() && shelfHeapRetryCount_ < kMaxHeapPressureRetries) {
+    shelfHeapRetryCount_++;
+    LOG_DBG("HOM", "cachedShelfEntries: heap-pressure empty, retry %d/%d", shelfHeapRetryCount_,
+            kMaxHeapPressureRetries);
+    shelfPathsCacheKey.clear();  // keep cache invalid so next render re-resolves
+    requestUpdate();             // schedule that render
+  } else {
+    shelfHeapRetryCount_ = 0;  // either a real result or we've given up retrying
+    shelfPathsCacheKey = activeId;
+  }
   return shelfEntriesCache;
 }
 

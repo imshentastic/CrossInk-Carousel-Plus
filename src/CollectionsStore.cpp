@@ -613,23 +613,59 @@ void CollectionsStore::setTwoRowShelf(const std::string& collectionId, bool on) 
 }
 
 std::vector<ShelfEntry> CollectionsStore::resolveShelfEntries(const std::string& collectionId) const {
+  // CrumBLE 4.2.1: clear the heap-pressure flag at the START of every call
+  // so a stale "true" from a prior call can't poison the caller's retry
+  // logic. The flag flips back to true below if and only if the pre-flight
+  // refuses to build the shelf.
+  lastResolveHitHeapPressure_ = false;
   const Collection* c = findCollection(collectionId);
   if (c == nullptr) return {};
   const std::vector<std::string> paths = resolveBookPaths(collectionId);
 
-  // CrumBLE 4.2.1 hotfix: if heap is critically fragmented after the
-  // applySort call above (especially the AuthorAlpha path which loads each
-  // Epub's metadata transiently), the series-collapse logic below would
-  // bad_alloc inside its vector growth. Skip collapse-series when
-  // maxAllocHeap is below a safe threshold; user sees their books
-  // un-grouped on this render but the device doesn't crash. The next
-  // render after the heap recovers gets the grouped view back.
+  // CrumBLE 4.2.1 hotfix v3: gate the WHOLE function on a heap pre-flight,
+  // not just the series-collapse path. The fast path below still does ~3
+  // small heap allocations per ShelfEntry (firstPath string content,
+  // memberPaths vector buffer, memberPaths[0] string content) -- for a
+  // 31-book All Books that's ~93 sub-100-byte allocations, which fragment
+  // and eventually fail on a heap already squeezed to maxAlloc=2 KB. Field
+  // log showed exactly that pattern: my v2 pre-flight skipped series-
+  // collapse correctly, the fast path entered, allocations ran the heap
+  // down to 2 KB, then push_back triggered a bad_alloc → terminate.
+  //
+  // The required headroom scales with the input size: reserve(N) costs
+  // N * sizeof(ShelfEntry) bytes contiguous, plus ~100 bytes per iteration
+  // of cumulative loop allocations. Plus a generic 2 KB safety margin. If
+  // maxAllocHeap is below the computed need, return an empty vector --
+  // shelf renders empty for THIS frame, next render after the heap
+  // recovers retries from scratch (HomeActivity's shelfPathsCacheKey
+  // stays unmatched so the rebuild fires again, and an empty-result
+  // assignment doesn't poison its cache state).
+  const uint32_t curMaxAlloc = ESP.getMaxAllocHeap();
+  const uint32_t pathCount = static_cast<uint32_t>(paths.size());
+  const uint32_t neededForAnyBuild =
+      pathCount * (sizeof(ShelfEntry) + 128u) + 2048u;
+  if (pathCount > 0 && curMaxAlloc < neededForAnyBuild) {
+    LOG_ERR("CLN",
+            "resolveShelfEntries: maxAlloc=%u below %u needed for %u entries -- returning empty shelf this render",
+            curMaxAlloc, neededForAnyBuild, pathCount);
+    // Signal the caller that this empty came from heap pressure, not from
+    // a legitimately empty collection -- so it can skip cache commit + retry.
+    lastResolveHitHeapPressure_ = true;
+    return {};
+  }
+
+  // Even when there's enough room for the fast-path 1:1 build, the
+  // series-collapse path's std::unordered_set<std::string> seenKeys +
+  // per-series memberPaths vectors need substantially more (~25 KB
+  // empirical floor). Below that, skip the collapse but try the fast
+  // path; user sees ungrouped books for this render and the grouped
+  // view returns on the next render once heap recovers.
   constexpr uint32_t kSeriesCollapseMinMaxAlloc = 25 * 1024;
-  const bool heapTooTightForCollapse = (ESP.getMaxAllocHeap() < kSeriesCollapseMinMaxAlloc);
+  const bool heapTooTightForCollapse = (curMaxAlloc < kSeriesCollapseMinMaxAlloc);
   if (heapTooTightForCollapse) {
     LOG_INF("CLN",
             "resolveShelfEntries: maxAlloc=%u below %u, skipping series-collapse this render",
-            ESP.getMaxAllocHeap(), static_cast<unsigned>(kSeriesCollapseMinMaxAlloc));
+            curMaxAlloc, static_cast<unsigned>(kSeriesCollapseMinMaxAlloc));
   }
 
   // Fast path: global series-detection opt-in is off, per-collection
