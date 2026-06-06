@@ -1,9 +1,12 @@
 #pragma once
+#include <array>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
+#include "../../EpdFont/EpdFontData.h"  // EpdFontData / EpdUnicodeInterval / EpdGlyph
 #include "Epub.h"
 
 class Page;
@@ -54,6 +57,35 @@ class Section {
   uint32_t embeddedGlyphSubsetOffset_ = 0;
   uint32_t embeddedGlyphSubsetSize_ = 0;
   uint32_t embeddedGlyphSubsetCpfontHash_ = 0;
+
+  // CrumBLE 4.3: parsed in-memory representation of one style's slice of the
+  // embedded glyph subset block. Populated by tryInstallEmbeddedGlyphSubset()
+  // when the block is present AND its cpfontHash matches the active
+  // SdCardFont. The fontData member is a fully-populated EpdFontData whose
+  // intervals / glyph / bitmap pointers reference the std::vectors below, so
+  // it can be returned directly to the renderer. styleId == 0xFF marks the
+  // slot as unused (this style wasn't in the block).
+  struct EmbeddedStyleSlot {
+    uint8_t styleId = 0xFF;     // 0/1/2/3 when populated; 0xFF = unused
+    uint8_t flags = 0;          // bit 0: is2Bit
+    std::vector<EpdUnicodeInterval> intervals;
+    std::vector<EpdGlyph> glyphs;
+    std::vector<uint8_t> bitmap;
+    EpdFontData fontData{};      // pointers patched to vectors above + metrics
+  };
+  // Slots indexed by styleId (REGULAR=0, BOLD=1, ITALIC=2, BOLDITALIC=3).
+  // We use a fixed-size array (~270 bytes overhead when no subset is
+  // installed) rather than a unique_ptr<vector> indirection so the
+  // accessor path stays branch-light. embeddedSubsetInstalled_ flips true
+  // when at least one slot was populated.
+  std::array<EmbeddedStyleSlot, 4> embeddedStyles_;
+  bool embeddedSubsetInstalled_ = false;
+  // Re-patches each populated slot's fontData pointers (intervals / glyph /
+  // bitmap) to point at the slot's std::vector storage. Called once after
+  // tryInstallEmbeddedGlyphSubset() builds the slots, and any time the
+  // slot vectors might move (in practice, only at install time -- the
+  // vectors are stable after install).
+  void patchEmbeddedFontDataPointers();
 
   bool writeSectionFileHeader(int fontId, float lineCompression, bool extraParagraphSpacing, bool forceParagraphIndents,
                               uint8_t paragraphAlignment, uint16_t viewportWidth, uint16_t viewportHeight,
@@ -125,6 +157,23 @@ class Section {
   uint32_t embeddedGlyphSubsetOffset() const { return embeddedGlyphSubsetOffset_; }
   uint32_t embeddedGlyphSubsetSize() const { return embeddedGlyphSubsetSize_; }
   uint32_t embeddedGlyphSubsetCpfontHash() const { return embeddedGlyphSubsetCpfontHash_; }
+  // CrumBLE 4.3: read the embedded glyph subset block from the section file
+  // and populate embeddedStyles_. Validates against the caller's
+  // cpfontContentHash (which they get from SdCardFont::contentHash()) before
+  // touching anything; mismatch leaves embeddedStyles_ untouched and
+  // returns false so the renderer can fall back to the SD-font miss
+  // handler. Returns true iff at least one style slot was populated.
+  // Idempotent: calling twice with the same hash re-installs cleanly.
+  bool tryInstallEmbeddedGlyphSubset(uint32_t cpfontContentHash);
+  // True after a successful tryInstallEmbeddedGlyphSubset(); false on a
+  // section that didn't carry a block or that failed hash validation.
+  bool embeddedSubsetInstalled() const { return embeddedSubsetInstalled_; }
+  // Returns an EpdFontData* for the requested style (REGULAR=0/BOLD=1/
+  // ITALIC=2/BOLDITALIC=3) iff that style was in the embedded block,
+  // else nullptr. The EpdFontFamily glyph router consults this before
+  // falling through to the SD-font miss handler so prebaked sections
+  // skip the SD-font miniData heap allocation entirely.
+  const EpdFontData* embeddedFontDataForStyle(uint8_t styleId) const;
   // Path to the section file that was actually loaded (live cache or
   // prebake fallback). Needed by the embedded-glyph-subset install code so
   // it can re-open the file to read the block contents on demand without

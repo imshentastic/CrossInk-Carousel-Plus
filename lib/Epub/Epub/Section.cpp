@@ -6,6 +6,9 @@
 #include <MemoryBudget.h>
 #include <Serialization.h>
 
+#include <cstring>
+
+#include "EmbeddedGlyphSubset.h"
 #include "Epub/css/CssParser.h"
 #include "Page.h"
 #include "hyphenation/Hyphenator.h"
@@ -869,4 +872,170 @@ std::optional<uint16_t> Section::getPageForListItemIndex(const uint16_t liIndex)
   }
 
   return resultPage;
+}
+
+// CrumBLE 4.3: read the embedded glyph subset block at
+// embeddedGlyphSubsetOffset_ and populate embeddedStyles_. Block layout
+// is fully owned by EmbeddedGlyphSubset.h (BlockHeader + per-style
+// StyleHeader + intervals + glyphs + bitmaps); we validate the magic +
+// cpfontContentHash here before allocating any of the per-style vectors.
+//
+// On any failure (no block, hash mismatch, truncated read, etc.),
+// embeddedSubsetInstalled_ stays false and the renderer's lookup
+// fast-path falls through to the existing SdCardFont miss-handler.
+bool Section::tryInstallEmbeddedGlyphSubset(uint32_t cpfontContentHash) {
+  embeddedSubsetInstalled_ = false;
+  for (auto& slot : embeddedStyles_) {
+    slot.styleId = 0xFF;
+    slot.intervals.clear();
+    slot.glyphs.clear();
+    slot.bitmap.clear();
+    slot.fontData = EpdFontData{};
+  }
+  if (!hasEmbeddedGlyphSubset()) return false;
+  if (embeddedGlyphSubsetCpfontHash_ != cpfontContentHash) {
+    LOG_INF("SCT",
+            "Embedded glyph subset hash mismatch: section baked against 0x%08x, loaded SD font is 0x%08x -- falling "
+            "back to miss-handler",
+            embeddedGlyphSubsetCpfontHash_, cpfontContentHash);
+    return false;
+  }
+  if (!Storage.openFileForRead("SCT", activeFilePath, file)) {
+    LOG_ERR("SCT", "Embedded glyph subset install: cannot open %s for read", activeFilePath.c_str());
+    return false;
+  }
+  if (!file.seek(embeddedGlyphSubsetOffset_)) {
+    LOG_ERR("SCT", "Embedded glyph subset install: seek to offset %u failed", embeddedGlyphSubsetOffset_);
+    file.close();
+    return false;
+  }
+  embeddedGlyphSubset::BlockHeader hdr{};
+  static_assert(sizeof(hdr) == 16, "EmbeddedGlyphSubset BlockHeader size drift");
+  if (file.read(reinterpret_cast<uint8_t*>(&hdr), sizeof(hdr)) != static_cast<int>(sizeof(hdr))) {
+    LOG_ERR("SCT", "Embedded glyph subset install: truncated BlockHeader read");
+    file.close();
+    return false;
+  }
+  if (hdr.magic != embeddedGlyphSubset::BLOCK_MAGIC) {
+    LOG_ERR("SCT", "Embedded glyph subset install: bad block magic 0x%08x (expected 0x%08x)", hdr.magic,
+            embeddedGlyphSubset::BLOCK_MAGIC);
+    file.close();
+    return false;
+  }
+  if (hdr.version != embeddedGlyphSubset::BLOCK_VERSION) {
+    LOG_INF("SCT", "Embedded glyph subset install: block version %u, runtime supports %u -- skipping",
+            static_cast<unsigned>(hdr.version), static_cast<unsigned>(embeddedGlyphSubset::BLOCK_VERSION));
+    file.close();
+    return false;
+  }
+  if (hdr.cpfontContentHash != cpfontContentHash) {
+    LOG_ERR("SCT", "Embedded glyph subset install: in-block cpfontHash 0x%08x != caller's 0x%08x", hdr.cpfontContentHash,
+            cpfontContentHash);
+    file.close();
+    return false;
+  }
+  uint8_t populated = 0;
+  for (uint8_t i = 0; i < hdr.styleCount; ++i) {
+    embeddedGlyphSubset::StyleHeader sh{};
+    static_assert(sizeof(sh) == 24, "EmbeddedGlyphSubset StyleHeader size drift");
+    if (file.read(reinterpret_cast<uint8_t*>(&sh), sizeof(sh)) != static_cast<int>(sizeof(sh))) {
+      LOG_ERR("SCT", "Embedded glyph subset install: truncated StyleHeader at style %u", static_cast<unsigned>(i));
+      file.close();
+      return false;
+    }
+    if (sh.styleId >= embeddedStyles_.size()) {
+      LOG_ERR("SCT", "Embedded glyph subset install: invalid styleId %u", static_cast<unsigned>(sh.styleId));
+      file.close();
+      return false;
+    }
+    EmbeddedStyleSlot& slot = embeddedStyles_[sh.styleId];
+    slot.styleId = sh.styleId;
+    slot.flags = sh.flags;
+    slot.intervals.resize(sh.intervalCount);
+    slot.glyphs.resize(sh.glyphCount);
+    slot.bitmap.resize(sh.bitmapDataSize);
+    if (sh.intervalCount > 0) {
+      const size_t bytes = sh.intervalCount * sizeof(EpdUnicodeInterval);
+      if (file.read(reinterpret_cast<uint8_t*>(slot.intervals.data()), bytes) != static_cast<int>(bytes)) {
+        LOG_ERR("SCT", "Embedded glyph subset install: truncated intervals at style %u",
+                static_cast<unsigned>(sh.styleId));
+        file.close();
+        return false;
+      }
+    }
+    if (sh.glyphCount > 0) {
+      const size_t bytes = sh.glyphCount * sizeof(EpdGlyph);
+      if (file.read(reinterpret_cast<uint8_t*>(slot.glyphs.data()), bytes) != static_cast<int>(bytes)) {
+        LOG_ERR("SCT", "Embedded glyph subset install: truncated glyphs at style %u",
+                static_cast<unsigned>(sh.styleId));
+        file.close();
+        return false;
+      }
+    }
+    if (sh.bitmapDataSize > 0) {
+      if (file.read(slot.bitmap.data(), sh.bitmapDataSize) != static_cast<int>(sh.bitmapDataSize)) {
+        LOG_ERR("SCT", "Embedded glyph subset install: truncated bitmap at style %u",
+                static_cast<unsigned>(sh.styleId));
+        file.close();
+        return false;
+      }
+    }
+    slot.fontData.advanceY = sh.advanceY;
+    slot.fontData.ascender = sh.ascender;
+    slot.fontData.descender = sh.descender;
+    slot.fontData.is2Bit = (sh.flags & embeddedGlyphSubset::STYLE_FLAG_IS_2BIT) != 0;
+    slot.fontData.intervalCount = sh.intervalCount;
+    populated++;
+  }
+  file.close();
+  if (populated == 0) {
+    LOG_INF("SCT", "Embedded glyph subset install: block was empty (styleCount=0)");
+    return false;
+  }
+  patchEmbeddedFontDataPointers();
+  embeddedSubsetInstalled_ = true;
+  LOG_INF("SCT", "Embedded glyph subset installed: %u style(s), cpfontHash=0x%08x", static_cast<unsigned>(populated),
+          cpfontContentHash);
+  return true;
+}
+
+void Section::patchEmbeddedFontDataPointers() {
+  // Re-point each populated slot's EpdFontData at its std::vector storage.
+  // Called once after install; the vectors don't move afterwards because
+  // Section never resizes them again.
+  for (auto& slot : embeddedStyles_) {
+    if (slot.styleId == 0xFF) continue;
+    slot.fontData.intervals = slot.intervals.empty() ? nullptr : slot.intervals.data();
+    slot.fontData.glyph = slot.glyphs.empty() ? nullptr : slot.glyphs.data();
+    slot.fontData.bitmap = slot.bitmap.empty() ? nullptr : slot.bitmap.data();
+    // Kerning + ligatures aren't carried by EmbeddedGlyphSubset v1 --
+    // renderer falls back to "no kerning" for embedded-subset draws.
+    slot.fontData.kernLeftClasses = nullptr;
+    slot.fontData.kernRightClasses = nullptr;
+    slot.fontData.kernMatrix = nullptr;
+    slot.fontData.ligaturePairs = nullptr;
+    slot.fontData.kernLeftEntryCount = 0;
+    slot.fontData.kernRightEntryCount = 0;
+    slot.fontData.kernLeftClassCount = 0;
+    slot.fontData.kernRightClassCount = 0;
+    slot.fontData.ligaturePairCount = 0;
+    // Embedded subset is fully resident in RAM; no miss handler needed
+    // for the covered codepoints. EpdFontFamily's section-aware router
+    // (task #17) consults the embedded subset first and falls back to
+    // the SD-font miss handler for codepoints NOT in the embedded set.
+    slot.fontData.glyphMissHandler = nullptr;
+    slot.fontData.glyphMissCtx = nullptr;
+    // Uncompressed -- no FontDecompressor groups.
+    slot.fontData.groups = nullptr;
+    slot.fontData.groupCount = 0;
+    slot.fontData.glyphToGroup = nullptr;
+  }
+}
+
+const EpdFontData* Section::embeddedFontDataForStyle(uint8_t styleId) const {
+  if (!embeddedSubsetInstalled_) return nullptr;
+  if (styleId >= embeddedStyles_.size()) return nullptr;
+  const auto& slot = embeddedStyles_[styleId];
+  if (slot.styleId == 0xFF) return nullptr;
+  return &slot.fontData;
 }
