@@ -252,21 +252,44 @@ void applySort(std::vector<std::string>& paths, CollectionSort mode) {
       // a vTaskDelay(1) every kYieldEvery books (resets IDLE WDT and
       // lets BT / WiFi tasks breathe). Worst-case overhead at the
       // happy path: ~16 * 1 ms = ~16 ms per 256 books, negligible.
-      constexpr size_t kYieldEvery = 16;
-      constexpr uint32_t kAuthorLoadMinMaxAlloc = 20 * 1024;
+      constexpr size_t kYieldEvery = 8;
+      // CrumBLE 4.2.1 hotfix v2: bumped the per-book pre-flight to 30 KB
+      // and made it BREAK rather than CONTINUE. Field reports showed the
+      // 20 KB threshold + per-iter skip still let the loop run far enough
+      // to fragment maxAllocHeap down to ~12 KB before resolveShelfEntries
+      // (called right after applySort) bad_alloc-ed inside its
+      // series-collapse vector::push_back. Stopping early leaves the
+      // remaining books unkeyed (they sort to the bottom like genuine
+      // no-author books) but preserves enough contiguous heap for the
+      // downstream shelf build to complete cleanly.
+      //
+      // Additionally: yield every 8 books (was 16) and also yield after
+      // each ESP.getMaxAllocHeap() drop step so the heap consolidator
+      // has more chances to coalesce freed Epub::load() allocations
+      // between iterations.
+      constexpr uint32_t kAuthorLoadMinMaxAlloc = 30 * 1024;
       std::vector<std::string> keys(paths.size());
       for (size_t i = 0; i < paths.size(); ++i) {
         if (!FsHelpers::hasEpubExtension(paths[i])) continue;
         if (ESP.getMaxAllocHeap() < kAuthorLoadMinMaxAlloc) {
-          LOG_DBG("CLN", "AuthorAlpha sort: skipping load %zu/%zu (maxAlloc=%u below %u)", i, paths.size(),
-                  ESP.getMaxAllocHeap(), static_cast<unsigned>(kAuthorLoadMinMaxAlloc));
-          continue;  // empty key -> book sorts to end
+          LOG_INF("CLN",
+                  "AuthorAlpha sort: stopping at %zu/%zu (maxAlloc=%u below %u) -- remaining books sort to end",
+                  i, paths.size(), ESP.getMaxAllocHeap(), static_cast<unsigned>(kAuthorLoadMinMaxAlloc));
+          break;  // empty keys -> remaining books sort to end (see comparator below)
         }
-        Epub epub(paths[i], "/.crosspoint");
-        epub.load(/*buildIfMissing=*/false, /*skipLoadingCss=*/true);
-        keys[i] = lastNameLower(epub.getAuthor());
+        {
+          Epub epub(paths[i], "/.crosspoint");
+          epub.load(/*buildIfMissing=*/false, /*skipLoadingCss=*/true);
+          keys[i] = lastNameLower(epub.getAuthor());
+        }  // Force Epub dtor before the yield so the freed allocations are
+           // visible to the heap consolidator on the next tick.
         if ((i & (kYieldEvery - 1)) == 0) vTaskDelay(1);
       }
+      // Two extra yields after the loop to let the heap consolidator
+      // coalesce all the per-Epub free blocks before resolveShelfEntries
+      // continues into its series-collapse vector growth.
+      vTaskDelay(pdMS_TO_TICKS(20));
+      vTaskDelay(pdMS_TO_TICKS(20));
       std::vector<size_t> order(paths.size());
       for (size_t i = 0; i < order.size(); ++i) order[i] = i;
       const bool desc = mode == CollectionSort::AuthorAlphaDesc;
@@ -617,10 +640,26 @@ std::vector<ShelfEntry> CollectionsStore::resolveShelfEntries(const std::string&
   if (c == nullptr) return {};
   const std::vector<std::string> paths = resolveBookPaths(collectionId);
 
+  // CrumBLE 4.2.1 hotfix: if heap is critically fragmented after the
+  // applySort call above (especially the AuthorAlpha path which loads each
+  // Epub's metadata transiently), the series-collapse logic below would
+  // bad_alloc inside its vector growth. Skip collapse-series when
+  // maxAllocHeap is below a safe threshold; user sees their books
+  // un-grouped on this render but the device doesn't crash. The next
+  // render after the heap recovers gets the grouped view back.
+  constexpr uint32_t kSeriesCollapseMinMaxAlloc = 25 * 1024;
+  const bool heapTooTightForCollapse = (ESP.getMaxAllocHeap() < kSeriesCollapseMinMaxAlloc);
+  if (heapTooTightForCollapse) {
+    LOG_INF("CLN",
+            "resolveShelfEntries: maxAlloc=%u below %u, skipping series-collapse this render",
+            ESP.getMaxAllocHeap(), static_cast<unsigned>(kSeriesCollapseMinMaxAlloc));
+  }
+
   // Fast path: global series-detection opt-in is off, per-collection
-  // collapse is off, or the path list is empty. Skip the SeriesIndex
-  // lookups entirely and 1:1-wrap into single-book entries.
-  if (!SETTINGS.seriesDetectionEnabled || !c->collapseSeries || paths.empty()) {
+  // collapse is off, the path list is empty, OR heap is too tight to
+  // safely build the collapsed grouping. Skip the SeriesIndex lookups
+  // entirely and 1:1-wrap into single-book entries.
+  if (!SETTINGS.seriesDetectionEnabled || !c->collapseSeries || paths.empty() || heapTooTightForCollapse) {
     std::vector<ShelfEntry> out;
     out.reserve(paths.size());
     for (const auto& p : paths) {
