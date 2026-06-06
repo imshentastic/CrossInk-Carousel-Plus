@@ -114,6 +114,29 @@ class SdCardFont {
   // Used to generate deterministic font IDs for section cache invalidation.
   uint32_t contentHash() const { return contentHash_; }
 
+  // CrumBLE 4.3: read-only views into the prewarmed mini-data for a single
+  // style. Intended for the off-device prebake CLI that needs to serialize
+  // the prewarmed glyph subset (intervals + glyphs + bitmaps) into a v39
+  // section file's embedded-glyph-subset block. On-device callers don't
+  // currently need these -- they reach the same data via the EpdFont*
+  // returned by getEpdFont() -- but the explicit getters keep the prebake
+  // side from depending on internal struct layout.
+  //
+  // Returns nullptr / zero counts when the style hasn't been prewarmed yet
+  // or the styleIdx is out of range. The returned pointers are stable
+  // between prewarm() calls and freed by clearCache() / dtor.
+  uint32_t miniIntervalCount(uint8_t styleIdx) const;
+  uint32_t miniGlyphCount(uint8_t styleIdx) const;
+  uint32_t miniBitmapSize(uint8_t styleIdx) const;
+  const EpdUnicodeInterval* miniIntervalsPtr(uint8_t styleIdx) const;
+  const EpdGlyph* miniGlyphsPtr(uint8_t styleIdx) const;
+  const uint8_t* miniBitmapPtr(uint8_t styleIdx) const;
+  // Per-style font metrics needed for the embedded subset's StyleHeader.
+  uint8_t miniAdvanceY(uint8_t styleIdx) const;
+  int16_t miniAscender(uint8_t styleIdx) const;
+  int16_t miniDescender(uint8_t styleIdx) const;
+  bool miniIs2Bit(uint8_t styleIdx) const;
+
  private:
   // Per-style metadata (parsed from file header/TOC)
   struct CpFontHeader {

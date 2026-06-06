@@ -1409,3 +1409,61 @@ const uint8_t* SdCardFont::getOverflowBitmap(const EpdGlyph* glyph) const {
 }
 
 SdCardFont* SdCardFont::fromMissCtx(void* ctx) { return static_cast<OverflowContext*>(ctx)->self; }
+
+// CrumBLE 4.3: prebake-CLI-facing read-only views into the prewarmed
+// per-style mini-data. Implementations are trivial -- they just return
+// stored fields -- but live in the .cpp so the public header doesn't need
+// to expose PerStyle. All accessors return safe defaults (nullptr / 0)
+// for an out-of-range styleIdx so callers can iterate 0..MAX_STYLES
+// blindly.
+namespace {
+constexpr uint8_t kMaxStylesForAccessor = 4;  // matches MAX_STYLES in the class
+}
+
+uint32_t SdCardFont::miniIntervalCount(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return 0;
+  return styles_[styleIdx].miniIntervalCount;
+}
+uint32_t SdCardFont::miniGlyphCount(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return 0;
+  return styles_[styleIdx].miniGlyphCount;
+}
+uint32_t SdCardFont::miniBitmapSize(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return 0;
+  // Sum the dataLength of every prewarmed glyph; bitmap layout is
+  // contiguous so sum == total bytes used in miniBitmap.
+  const PerStyle& s = styles_[styleIdx];
+  uint32_t total = 0;
+  for (uint32_t i = 0; i < s.miniGlyphCount; ++i) {
+    total += s.miniGlyphs[i].dataLength;
+  }
+  return total;
+}
+const EpdUnicodeInterval* SdCardFont::miniIntervalsPtr(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return nullptr;
+  return styles_[styleIdx].miniIntervals;
+}
+const EpdGlyph* SdCardFont::miniGlyphsPtr(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return nullptr;
+  return styles_[styleIdx].miniGlyphs;
+}
+const uint8_t* SdCardFont::miniBitmapPtr(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return nullptr;
+  return styles_[styleIdx].miniBitmap;
+}
+uint8_t SdCardFont::miniAdvanceY(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return 0;
+  return styles_[styleIdx].miniData.advanceY;
+}
+int16_t SdCardFont::miniAscender(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return 0;
+  return static_cast<int16_t>(styles_[styleIdx].miniData.ascender);
+}
+int16_t SdCardFont::miniDescender(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return 0;
+  return static_cast<int16_t>(styles_[styleIdx].miniData.descender);
+}
+bool SdCardFont::miniIs2Bit(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return false;
+  return styles_[styleIdx].miniData.is2Bit;
+}
