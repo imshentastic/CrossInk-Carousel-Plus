@@ -194,8 +194,10 @@ void QuoteViewerActivity::render(RenderLock&&) {
   // is always meaningful (wraparound).
   const bool hasMoreUp = pageOffset_ > 0;
   const bool hasMoreDown = pageOffset_ + linesPerPage_ < static_cast<int>(wrappedLines_.size());
-  const char* leftHint = hasMoreUp ? "< Prev page" : "";
-  const char* rightHint = hasMoreDown ? "Next page >" : "";
+  // CrumBLE 4.2.1: the angle-bracket decorations overflowed the button hint
+  // container at typical sidebar widths; the dpad already implies direction.
+  const char* leftHint = hasMoreUp ? "Prev page" : "";
+  const char* rightHint = hasMoreDown ? "Next page" : "";
   const auto labels =
       mappedInput.mapLabels(I18N.get(StrId::STR_BACK), I18N.get(StrId::STR_OPEN), leftHint, rightHint);
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
