@@ -1,6 +1,6 @@
 # Changelog
 
-## [crumble-v4.2.1] - 2026-06-05
+## [crumble-v4.2.1] - 2026-06-06
 
 ### Three firmware variants
 v4.2.1 ships as **three slim variants**, each with a different built-in reader font: `crumble-firmware-4.2.1-tiny-bitter.bin`, `crumble-firmware-4.2.1-tiny-lexend.bin`, and `crumble-firmware-4.2.1-tiny-chareink.bin`. This pivot is the v4.2.1 answer to the Bluetooth + SD-card font heap-fragmentation issue: NimBLE's ~50 KB init scatters allocations that shatter contiguous heap below the 25 KB Page DOM threshold — but only the SD-font code path triggers this (built-in fonts use FontDecompressor, much smaller heap profile). By shipping a binary per font choice, users who want Bluetooth + their preferred font get a stable experience without touching the SD-font code path. Flash whichever variant matches your preferred font; switching fonts means re-flashing.
