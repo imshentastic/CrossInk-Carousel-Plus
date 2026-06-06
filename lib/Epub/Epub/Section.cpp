@@ -17,15 +17,53 @@ constexpr uint32_t SECTION_CACHE_MAGIC = 0x535843FF;  // bytes: 0xFF, "CXS"
 // with images dropped under low heap can be rebuilt with images once memory
 // recovers. The bump also invalidates any v37 cache that was silently cached
 // imageless (it will rebuild fresh on next open).
-constexpr uint8_t SECTION_FILE_VERSION = 38;
+//
+// v39 (CrumBLE 4.3): added three trailer offsets at the end of the header
+// for an OPTIONAL embedded glyph subset block:
+//   embeddedGlyphSubsetOffset      uint32_t  file offset of the block, 0 = no block
+//   embeddedGlyphSubsetSize        uint32_t  byte size of the block, 0 = no block
+//   embeddedGlyphSubsetCpfontHash  uint32_t  matches SdCardFont::contentHash() for
+//                                            the .cpfont this section was baked
+//                                            against; 0 = no block. Used at load
+//                                            time to validate that the user
+//                                            didn't swap fonts since the bake.
+// The block itself sits between the trailing LUTs and EOF (start offset is
+// recorded in the header so the loader can seek directly to it). Sections
+// without an embedded subset (device-built sections, or prebakes for built-in
+// fonts where embedding adds no value) leave all three fields at 0 and the
+// existing SD-font lazy-miss-handler path takes over for SD-font books, same
+// as v4.2.x. The motivation for this format: NimBLE init shatters contiguous
+// heap to ~13 KB after BT enable, below the ~14 KB miniData footprint of an
+// SD font; embedding the section's working glyph set into the section file
+// lets the runtime skip the miniData allocation entirely for that section.
+constexpr uint8_t SECTION_FILE_VERSION = 39;
+// Oldest section file version this firmware can still read (forward-compat
+// window). v38 sections produced by v4.2.x prebakes / live caches still load
+// cleanly; their embedded glyph subset offsets default to 0 (no subset).
+// Older versions trigger a rebuild as before.
+constexpr uint8_t MIN_READABLE_SECTION_FILE_VERSION = 38;
 // How much the largest free block must have grown since a degraded build before
 // we bother rebuilding it for images (avoids rebuild churn on tiny variations).
 constexpr uint32_t SECTION_DEGRADED_REBUILD_MARGIN = 12 * 1024;
-constexpr uint32_t HEADER_SIZE = sizeof(SECTION_CACHE_MAGIC) + sizeof(uint8_t) + sizeof(int) + sizeof(float) +
-                                 sizeof(bool) + sizeof(bool) + sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint16_t) +
-                                 sizeof(uint16_t) + sizeof(bool) + sizeof(bool) + sizeof(uint8_t) + sizeof(bool) +
-                                 sizeof(bool) + sizeof(bool) /*imagesSuppressed*/ + sizeof(uint32_t) /*buildMaxAlloc*/ +
-                                 sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t);
+// v38 header byte count (all fields up to and including the liLut trailer
+// offset). Kept as a named constant because v38 sections are still readable
+// after the v39 bump; the loader uses this to know when to stop reading
+// trailer offsets for legacy files.
+constexpr uint32_t HEADER_SIZE_V38 = sizeof(SECTION_CACHE_MAGIC) + sizeof(uint8_t) + sizeof(int) + sizeof(float) +
+                                     sizeof(bool) + sizeof(bool) + sizeof(uint8_t) + sizeof(uint16_t) +
+                                     sizeof(uint16_t) + sizeof(uint16_t) + sizeof(bool) + sizeof(bool) +
+                                     sizeof(uint8_t) + sizeof(bool) + sizeof(bool) +
+                                     sizeof(bool) /*imagesSuppressed*/ + sizeof(uint32_t) /*buildMaxAlloc*/ +
+                                     sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t);
+// v39 adds 3 uint32_t trailer fields after the liLutOffset.
+constexpr uint32_t HEADER_SIZE = HEADER_SIZE_V38 + 3 * sizeof(uint32_t);
+
+// CrumBLE 4.3: glyph subset block header. Sits at embeddedGlyphSubsetOffset
+// in the section file. Magic is just a sanity check; on mismatch the loader
+// ignores the embedded subset and falls back to the SD-font miss-handler path.
+// "LGSB" = "Local Glyph SubsetBlock" in little-endian byte order.
+constexpr uint32_t SECTION_GLYPH_BLOCK_MAGIC = 0x4253474C;
+constexpr uint16_t SECTION_GLYPH_BLOCK_VERSION = 1;
 
 struct PageLutEntry {
   uint32_t fileOffset;
@@ -68,8 +106,12 @@ bool Section::writeSectionFileHeader(const int fontId, const float lineCompressi
                                    sizeof(viewportHeight) + sizeof(pageCount) + sizeof(hyphenationEnabled) +
                                    sizeof(embeddedStyle) + sizeof(imageRendering) + sizeof(bionicReadingEnabled) +
                                    sizeof(guideReadingEnabled) + sizeof(bool) /*imagesSuppressed*/ +
-                                   sizeof(uint32_t) /*buildMaxAlloc*/ + sizeof(uint32_t) + sizeof(uint32_t) +
-                                   sizeof(uint32_t) + sizeof(uint32_t),
+                                   sizeof(uint32_t) /*buildMaxAlloc*/ + sizeof(uint32_t) /*lutOffset*/ +
+                                   sizeof(uint32_t) /*anchorMapOffset*/ + sizeof(uint32_t) /*paragraphLutOffset*/ +
+                                   sizeof(uint32_t) /*liLutOffset*/ +
+                                   sizeof(uint32_t) /*embeddedGlyphSubsetOffset (v39)*/ +
+                                   sizeof(uint32_t) /*embeddedGlyphSubsetSize (v39)*/ +
+                                   sizeof(uint32_t) /*embeddedGlyphSubsetCpfontHash (v39)*/,
                 "Header size mismatch");
   return serialization::tryWritePod(file, SECTION_CACHE_MAGIC) &&
          serialization::tryWritePod(file, SECTION_FILE_VERSION) && serialization::tryWritePod(file, fontId) &&
@@ -90,7 +132,13 @@ bool Section::writeSectionFileHeader(const int fontId, const float lineCompressi
          serialization::tryWritePod(
              file,
              static_cast<uint32_t>(0)) &&  // Placeholder for paragraph LUT offset (patched later)
-         serialization::tryWritePod(file, static_cast<uint32_t>(0));  // Placeholder for li LUT offset (patched later)
+         serialization::tryWritePod(file, static_cast<uint32_t>(0)) &&  // Placeholder for li LUT offset (patched later)
+         // v39 trailer: three uint32_t fields for the optional embedded glyph
+         // subset block. All zero on device-built sections (no embedding) and
+         // patched by the prebake CLI when it emits a subset block at finalize.
+         serialization::tryWritePod(file, static_cast<uint32_t>(0)) &&  // embeddedGlyphSubsetOffset
+         serialization::tryWritePod(file, static_cast<uint32_t>(0)) &&  // embeddedGlyphSubsetSize
+         serialization::tryWritePod(file, static_cast<uint32_t>(0));    // embeddedGlyphSubsetCpfontHash
 }
 
 bool Section::loadSectionFile(const int fontId, const float lineCompression, const bool extraParagraphSpacing,
@@ -165,12 +213,18 @@ bool Section::tryLoadFromPath(const std::string& path, const int fontId, const f
       LOG_ERR("SCT", "Deserialization failed: could not read version (%s)", path.c_str());
       return false;
     }
-    if (version != SECTION_FILE_VERSION) {
+    // CrumBLE 4.3: accept any version within the forward-compat window so v38
+    // sections produced by older firmware / prebakes keep loading after the
+    // v39 bump. Older versions still trigger a rebuild as before. fileVersion_
+    // is cached so the trailer reader below knows whether to expect the v39
+    // embedded-glyph-subset offsets.
+    if (version < MIN_READABLE_SECTION_FILE_VERSION || version > SECTION_FILE_VERSION) {
       // Explicit close() required: member variable persists beyond function scope
       file.close();
       LOG_ERR("SCT", "Deserialization failed: Unknown version %u (%s)", version, path.c_str());
       return false;
     }
+    fileVersion_ = version;
 
     int fileFontId;
     uint16_t fileViewportWidth, fileViewportHeight;
@@ -274,6 +328,31 @@ bool Section::tryLoadFromPath(const std::string& path, const int fontId, const f
   // image-recovery that doesn't re-index right as the remote connects.)
   (void)fileImagesSuppressed;
   (void)fileBuildMaxAlloc;
+
+  // CrumBLE 4.3: read the v39 embedded-glyph-subset trailer fields. Seek
+  // directly to HEADER_SIZE_V38 because the 4 LUT offsets that v38 wrote
+  // (lutOffset, anchorMapOffset, paragraphLutOffset, liLutOffset) come
+  // BEFORE these fields in the header; tryLoadFromPath doesn't need the
+  // LUT offsets here (they're consumed by loadPageFromSectionFile via its
+  // own seek), so skipping past them is fine. v38 sections fall through
+  // with the embedded* fields at their default 0/0/0 -- "no subset".
+  embeddedGlyphSubsetOffset_ = 0;
+  embeddedGlyphSubsetSize_ = 0;
+  embeddedGlyphSubsetCpfontHash_ = 0;
+  if (fileVersion_ >= 39) {
+    if (!file.seek(HEADER_SIZE_V38)) {
+      file.close();
+      LOG_ERR("SCT", "Deserialization failed: could not seek to v39 trailer (%s)", path.c_str());
+      return false;
+    }
+    if (!serialization::tryReadPod(file, embeddedGlyphSubsetOffset_) ||
+        !serialization::tryReadPod(file, embeddedGlyphSubsetSize_) ||
+        !serialization::tryReadPod(file, embeddedGlyphSubsetCpfontHash_)) {
+      file.close();
+      LOG_ERR("SCT", "Deserialization failed: truncated v39 embedded-glyph-subset trailer (%s)", path.c_str());
+      return false;
+    }
+  }
 
   // Explicit close() required: member variable persists beyond function scope
   file.close();
@@ -501,7 +580,12 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   // Patch header with final imagesSuppressed, buildMaxAlloc, pageCount, lutOffset,
   // anchorMapOffset, paragraphLutOffset, and liLutOffset (all written as
   // placeholders by writeSectionFileHeader, in this exact order).
-  if (!file.seek(HEADER_SIZE - sizeof(uint32_t) * 4 - sizeof(pageCount) - sizeof(uint32_t) - sizeof(bool)) ||
+  // CrumBLE 4.3: the seek arithmetic targets fields within the v38-shaped
+  // portion of the header, so use HEADER_SIZE_V38 instead of HEADER_SIZE
+  // (which now includes the v39 embedded-glyph-subset trailer fields).
+  // The v39 trailer is patched separately by the prebake CLI after the
+  // glyph subset block is emitted; device-built sections leave it at 0.
+  if (!file.seek(HEADER_SIZE_V38 - sizeof(uint32_t) * 4 - sizeof(pageCount) - sizeof(uint32_t) - sizeof(bool)) ||
       !serialization::tryWritePod(file, builtImagesSuppressed) ||
       !serialization::tryWritePod(file, buildStartMaxAlloc) || !serialization::tryWritePod(file, pageCount) ||
       !serialization::tryWritePod(file, lutOffset) || !serialization::tryWritePod(file, anchorMapOffset) ||
@@ -570,7 +654,7 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
     return nullptr;
   }
 
-  if (!file.seek(HEADER_SIZE - sizeof(uint32_t) * 4)) {
+  if (!file.seek(HEADER_SIZE_V38 - sizeof(uint32_t) * 4)) {
     file.close();
     return nullptr;
   }
@@ -598,7 +682,7 @@ std::optional<uint16_t> Section::getPageForAnchor(const std::string& anchor) con
   }
 
   const uint32_t fileSize = f.size();
-  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 3)) {
+  if (!f.seek(HEADER_SIZE_V38 - sizeof(uint32_t) * 3)) {
     return std::nullopt;
   }
   uint32_t anchorMapOffset;
@@ -637,7 +721,7 @@ std::optional<uint16_t> Section::getPageForParagraphIndex(const uint16_t pIndex)
   }
 
   const uint32_t fileSize = f.size();
-  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 2)) {
+  if (!f.seek(HEADER_SIZE_V38 - sizeof(uint32_t) * 2)) {
     return std::nullopt;
   }
   uint32_t paragraphLutOffset;
@@ -686,7 +770,7 @@ std::optional<uint16_t> Section::getParagraphIndexForPage(const uint16_t page) c
   }
 
   const uint32_t fileSize = f.size();
-  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 2)) {
+  if (!f.seek(HEADER_SIZE_V38 - sizeof(uint32_t) * 2)) {
     return std::nullopt;
   }
   uint32_t paragraphLutOffset;
@@ -730,7 +814,7 @@ std::optional<uint16_t> Section::getPageForListItemIndex(const uint16_t liIndex)
   }
 
   const uint32_t fileSize = f.size();
-  if (!f.seek(HEADER_SIZE - sizeof(uint32_t))) {
+  if (!f.seek(HEADER_SIZE_V38 - sizeof(uint32_t))) {
     return std::nullopt;
   }
   uint32_t liLutOffset;
@@ -742,7 +826,7 @@ std::optional<uint16_t> Section::getPageForListItemIndex(const uint16_t liIndex)
   }
 
   // The li LUT shares count with the paragraph LUT; read count from paragraphLutOffset
-  if (!f.seek(HEADER_SIZE - sizeof(uint32_t) * 2)) {
+  if (!f.seek(HEADER_SIZE_V38 - sizeof(uint32_t) * 2)) {
     return std::nullopt;
   }
   uint32_t paragraphLutOffset;

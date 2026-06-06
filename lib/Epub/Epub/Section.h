@@ -36,6 +36,25 @@ class Section {
   std::string activeFilePath;
   FsFile file;
 
+  // CrumBLE 4.3: section file format version actually read from disk. Set
+  // by tryLoadFromPath on success; 0 means "no section loaded yet". Used by
+  // loadPageFromSectionFile and the embedded-glyph-subset accessors below
+  // to know whether to expect v39's trailer fields. v38 sections always
+  // report 0/0/0 for the subset triple.
+  uint8_t fileVersion_ = 0;
+  // CrumBLE 4.3: embedded glyph subset trailer (v39+). All three default to 0
+  // and stay that way for v38 sections (no embedded subset) and for v39
+  // sections written without a glyph block (device-built sections; prebakes
+  // for built-in fonts where embedding adds no value). When non-zero the
+  // block lives at embeddedGlyphSubsetOffset_ with byte size
+  // embeddedGlyphSubsetSize_, and embeddedGlyphSubsetCpfontHash_ identifies
+  // the .cpfont it was baked against -- runtime validates against
+  // SdCardFont::contentHash() before installing the block, so a font swap
+  // since bake falls back to the existing SD-font miss-handler path.
+  uint32_t embeddedGlyphSubsetOffset_ = 0;
+  uint32_t embeddedGlyphSubsetSize_ = 0;
+  uint32_t embeddedGlyphSubsetCpfontHash_ = 0;
+
   bool writeSectionFileHeader(int fontId, float lineCompression, bool extraParagraphSpacing, bool forceParagraphIndents,
                               uint8_t paragraphAlignment, uint16_t viewportWidth, uint16_t viewportHeight,
                               bool hyphenationEnabled, bool embeddedStyle, uint8_t imageRendering,
@@ -92,4 +111,23 @@ class Section {
 
   // Look up the synthetic paragraph index for the given rendered page.
   std::optional<uint16_t> getParagraphIndexForPage(uint16_t page) const;
+
+  // CrumBLE 4.3: embedded glyph subset accessors. Surface the trailer fields
+  // read from the section file so the font system (EpdFontFamily +
+  // SdCardFont) can install a section-scoped EpdFontData when one was baked
+  // in. hasEmbeddedGlyphSubset() returns true iff the section actually
+  // carries a block (offset and size both non-zero). The cpfontHash is the
+  // SdCardFont::contentHash() of the .cpfont this section was baked
+  // against; install code MUST compare against the currently-loaded
+  // SdCardFont's hash before consuming the block (otherwise glyph indices
+  // would point at the wrong font's bitmaps).
+  bool hasEmbeddedGlyphSubset() const { return embeddedGlyphSubsetOffset_ != 0 && embeddedGlyphSubsetSize_ != 0; }
+  uint32_t embeddedGlyphSubsetOffset() const { return embeddedGlyphSubsetOffset_; }
+  uint32_t embeddedGlyphSubsetSize() const { return embeddedGlyphSubsetSize_; }
+  uint32_t embeddedGlyphSubsetCpfontHash() const { return embeddedGlyphSubsetCpfontHash_; }
+  // Path to the section file that was actually loaded (live cache or
+  // prebake fallback). Needed by the embedded-glyph-subset install code so
+  // it can re-open the file to read the block contents on demand without
+  // disturbing the rest of Section's file state.
+  const std::string& activeFilePathForGlyphSubset() const { return activeFilePath; }
 };
