@@ -354,6 +354,16 @@ void usage(const char* argv0) {
                "                         JSON into MEMFS and points at it via this flag.\n"
                "  --check                Skip books whose existing book.bin is fresh against\n"
                "                         the input EPUB's mtime.\n"
+               "  --emit-section-glyph-subsets\n"
+               "                         CrumBLE 4.3: after each section is baked, append an\n"
+               "                         embedded glyph subset block (intervals + glyphs +\n"
+               "                         bitmaps for the codepoints actually used in this\n"
+               "                         section) and patch the section file's v39 trailer\n"
+               "                         to point at it. Lets on-device load skip the\n"
+               "                         SD-font miniData allocation for prebaked sections,\n"
+               "                         which is the architectural fix for BT + SD-font\n"
+               "                         heap fragmentation. No-op unless --sd-font-path\n"
+               "                         is also supplied (built-in fonts don't benefit).\n"
                "  --verbose              Per-step timing on stderr.\n"
                "  -h, --help             Show this help.\n",
                argv0);
@@ -392,6 +402,17 @@ struct Options {
   std::string sdFontPath;
   std::string sdFontFamilyName;
   uint8_t sdFontPointSize = 0;
+  // CrumBLE 4.3: emit per-section embedded glyph subset blocks (v39 section
+  // file format). Opt-in because the work is only meaningful when an SD
+  // font is also supplied AND every section is being baked; without those
+  // the block is empty / mismatched. Plan: when set, the section loop
+  // walks each just-written section's pages, accumulates the codepoints
+  // actually used per style, prewarms SdCardFont with that exact set,
+  // and serialises SdCardFont's prewarmed mini-data into a glyph subset
+  // block appended to the section file. Section trailer's three
+  // embeddedGlyphSubsetOffset / Size / CpfontHash uint32_t fields then
+  // point at the block so on-device load can validate + install it.
+  bool emitSectionGlyphSubsets = false;
 };
 
 bool parseArgs(int argc, char** argv, Options& out) {
@@ -426,6 +447,8 @@ bool parseArgs(int argc, char** argv, Options& out) {
       out.sdFontFamilyName = argv[++i];
     } else if (a == "--sd-font-size" && i + 1 < argc) {
       out.sdFontPointSize = static_cast<uint8_t>(std::stoi(argv[++i]));
+    } else if (a == "--emit-section-glyph-subsets") {
+      out.emitSectionGlyphSubsets = true;
     } else if (a.rfind("--", 0) == 0) {
       std::fprintf(stderr, "Unknown option: %s\n", a.c_str());
       return false;
@@ -715,6 +738,24 @@ bool prebakeCoverThumb(const std::string& epubPath, const std::string& cacheDir,
 }
 
 // Phase 2C: emit sections/<spineIdx>.bin for every spine entry in the
+// CrumBLE 4.3: after a section file is written by Section::createSectionFile,
+// walk its pages, collect the codepoints actually used per style, prewarm
+// the SD font with that exact set, and serialise the prewarmed mini-data
+// into a glyph subset block appended to the section file. Then patch the
+// section's v39 trailer fields (embeddedGlyphSubsetOffset / Size /
+// CpfontHash) to point at the block. Returns true on success; on failure
+// the section file is left intact (trailer fields stay at 0/0/0, which
+// on-device load treats as "no embedded subset" and falls back to the
+// existing SdCardFont miss-handler path -- harmless degradation).
+//
+// Implementation lands incrementally:
+//  - this commit: stub that logs the call shape; returns true so the rest
+//    of the prebake pipeline continues unchanged.
+//  - next commit(s): codepoint collection + prewarm + block serialisation
+//    + trailer patching.
+bool emitEmbeddedGlyphSubsetForSection(const std::string& sectionFilePath, SdCardFont& font, int spineIdx,
+                                       uint16_t pageCount);
+
 // EPUB, byte-targeting the device's section file format. Loads an Epub
 // instance from the same on-disk cache Phase 1 just wrote, then loops
 // the spine and calls Section::createSectionFile per chapter.
@@ -730,7 +771,17 @@ bool prebakeCoverThumb(const std::string& epubPath, const std::string& cacheDir,
 // Returns the number of spine entries that failed to emit (0 = clean).
 int prebakeSections(const std::string& epubPath, const std::string& realCacheDir,
                     const std::string& /*cacheDirParent*/, GfxRenderer& renderer,
-                    const SectionSettings& s) {
+                    const SectionSettings& s, SdCardFont* sdFontForSubset,
+                    bool emitGlyphSubsets) {
+  // CrumBLE 4.3: when emitGlyphSubsets is true AND sdFontForSubset is
+  // non-null, the post-createSectionFile step walks each section's pages,
+  // collects the codepoints actually used per style, prewarms the
+  // SD-card font with those codepoints, and serialises the prewarmed
+  // mini-data into an embedded glyph subset block appended to the section
+  // file. Section trailer's three v39 fields then point at the block.
+  // The flag is silently ignored if no SD font is loaded (no point in
+  // baking subsets for built-in fonts, which already live entirely in
+  // .rodata on-device).
   // Epub computes cachePath as cacheDir + "/epub_" + fnvHash(filepath).
   // The HOST has output at "<outputDir>/.crosspoint/epub_<deviceHash>", but
   // the DEVICE will see the same files at "/.crosspoint/epub_<deviceHash>"
@@ -831,6 +882,23 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
     } else {
       LOG_INF("PRE", "section %d wrote %u pages%s", spineIdx, static_cast<unsigned>(section.pageCount),
               imagesWereSuppressed ? " (images suppressed)" : "");
+      // CrumBLE 4.3: emit the embedded glyph subset block for this section
+      // when the CLI was invoked with --emit-section-glyph-subsets AND an
+      // SD font is loaded. Silently skips otherwise (e.g. built-in-font
+      // bakes -- they don't benefit from embedding; the .rodata on-device
+      // already holds the full glyph set).
+      if (emitGlyphSubsets && sdFontForSubset != nullptr) {
+        const std::string sectionPath = shadowCacheDir + "/sections/" + std::to_string(spineIdx) + ".bin";
+        const bool subsetOk =
+            emitEmbeddedGlyphSubsetForSection(sectionPath, *sdFontForSubset, spineIdx, section.pageCount);
+        if (!subsetOk) {
+          // Don't fail the whole prebake on a subset-emit failure -- the
+          // section file itself is valid v39 with the trailer fields at
+          // 0/0/0, which the on-device load path falls back to (existing
+          // SdCardFont miss-handler path). Log + continue.
+          LOG_ERR("PRE", "section %d: glyph subset emit FAILED (section file stays v39 with no subset)", spineIdx);
+        }
+      }
     }
   }
 
@@ -1021,6 +1089,23 @@ int prebakeAllThumbs(const std::string& epubPath, const std::string& cacheDir,
     if (!prebakeCoverThumb(epubPath, cacheDir, coverItemHref, w, h)) ++failures;
   }
   return failures;
+}
+
+// CrumBLE 4.3: stub for the per-section glyph subset emit. Full
+// implementation is multi-step (codepoint collection from page DOMs,
+// prewarm SdCardFont with the union, serialise the prewarmed mini-data
+// into an EmbeddedGlyphSubset block, append to the section file, patch
+// the v39 trailer fields). This stub only logs the call shape so the
+// dispatch + CLI flag plumbing can land independently and be tested in
+// isolation. Returns true so the prebake pipeline continues unchanged.
+bool emitEmbeddedGlyphSubsetForSection(const std::string& sectionFilePath, SdCardFont& font, int spineIdx,
+                                       uint16_t pageCount) {
+  LOG_INF("PRE",
+          "  section %d (%u pages): would emit embedded glyph subset (cpfontHash=0x%08x, styles=%u) -- emit stub, no-op",
+          spineIdx, static_cast<unsigned>(pageCount), font.contentHash(),
+          static_cast<unsigned>(font.styleCount()));
+  (void)sectionFilePath;
+  return true;
 }
 
 }  // namespace
@@ -1216,7 +1301,8 @@ int main(int argc, char** argv) {
       LOG_INF("CLI", "  sections SKIPPED (--skip-sections)");
     } else {
       const uint32_t t2 = millis();
-      const int sectionFails = prebakeSections(epubPath, cacheDir, cacheDirParent, renderer, sectionSettings);
+      const int sectionFails = prebakeSections(epubPath, cacheDir, cacheDirParent, renderer, sectionSettings,
+                                                sdFontKeepalive.get(), opts.emitSectionGlyphSubsets);
       const uint32_t dtSections = millis() - t2;
       if (sectionFails == 0) {
         LOG_INF("CLI", "  sections OK (%u ms)", dtSections);

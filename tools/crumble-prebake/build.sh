@@ -57,6 +57,16 @@ SOURCES=(
   "$REPO_ROOT/lib/EpdFont/EpdFont.cpp"
   "$REPO_ROOT/lib/EpdFont/EpdFontFamily.cpp"
   "$REPO_ROOT/lib/EpdFont/FontDecompressor.cpp"
+  # CrumBLE 4.2/4.3: SD-card font + manager + registry. Required for the
+  # host build because host_shim/GfxRenderer.cpp references
+  # SdCardFont::resolveStyle() / hasAdvanceTable() through the advance-table
+  # fast path. build-wasm.sh has had these since 4.2; the native build.sh
+  # was missing them (only ever broken when a user happened to call into
+  # the SD-font path), surfaced by the 4.3 prebake-CLI work that exercises
+  # SdCardFont directly from main.cpp.
+  "$REPO_ROOT/lib/EpdFont/SdCardFont.cpp"
+  "$REPO_ROOT/lib/EpdFont/SdCardFontManager.cpp"
+  "$REPO_ROOT/lib/EpdFont/SdCardFontRegistry.cpp"
   "$REPO_ROOT/lib/Utf8/Utf8.cpp"
   "$SCRIPT_DIR/host_shim/GfxRenderer.cpp"
   # PNGdec bundles a copy of zlib in its src/ dir for the inflate path used
