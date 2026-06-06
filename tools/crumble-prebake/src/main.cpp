@@ -16,6 +16,7 @@
 #include <ZipFile.h>
 
 #include <Epub/BookMetadataCache.h>
+#include <Epub/EmbeddedGlyphSubset.h>
 #include <Epub/Page.h>
 #include <Epub/Section.h>
 #include <Epub/blocks/TextBlock.h>
@@ -25,6 +26,7 @@
 #include <Epub/parsers/TocNcxParser.h>
 #include <Utf8.h>
 
+#include <fstream>
 #include <unordered_set>
 
 // Phase 2C font tables. Pure-data PROGMEM headers; including them on host
@@ -758,7 +760,8 @@ bool prebakeCoverThumb(const std::string& epubPath, const std::string& cacheDir,
 //    of the prebake pipeline continues unchanged.
 //  - next commit(s): codepoint collection + prewarm + block serialisation
 //    + trailer patching.
-bool emitEmbeddedGlyphSubsetForSection(Section& section, SdCardFont& font, int spineIdx);
+bool emitEmbeddedGlyphSubsetForSection(const std::string& sectionPath, Section& section, SdCardFont& font,
+                                       int spineIdx);
 
 // EPUB, byte-targeting the device's section file format. Loads an Epub
 // instance from the same on-disk cache Phase 1 just wrote, then loops
@@ -892,7 +895,8 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
       // bakes -- they don't benefit from embedding; the .rodata on-device
       // already holds the full glyph set).
       if (emitGlyphSubsets && sdFontForSubset != nullptr) {
-        const bool subsetOk = emitEmbeddedGlyphSubsetForSection(section, *sdFontForSubset, spineIdx);
+        const std::string sectionPath = shadowCacheDir + "/sections/" + std::to_string(spineIdx) + ".bin";
+        const bool subsetOk = emitEmbeddedGlyphSubsetForSection(sectionPath, section, *sdFontForSubset, spineIdx);
         if (!subsetOk) {
           // Don't fail the whole prebake on a subset-emit failure -- the
           // section file itself is valid v39 with the trailer fields at
@@ -1113,7 +1117,8 @@ int prebakeAllThumbs(const std::string& epubPath, const std::string& cacheDir,
 // Each stage is gated on the previous stage's data so a partial commit
 // can't produce a corrupt section file -- the trailer fields only get
 // patched once the block bytes are fully written.
-bool emitEmbeddedGlyphSubsetForSection(Section& section, SdCardFont& font, int spineIdx) {
+bool emitEmbeddedGlyphSubsetForSection(const std::string& sectionPath, Section& section, SdCardFont& font,
+                                       int spineIdx) {
   // Bucket codepoints per resolved style. EpdFontFamily::Style values are
   // 0=REGULAR, 1=BOLD, 2=ITALIC, 3=BOLD_ITALIC; higher bits (UNDERLINE,
   // STRIKETHROUGH) are decoration-only and don't pick a different font,
@@ -1236,10 +1241,115 @@ bool emitEmbeddedGlyphSubsetForSection(Section& section, SdCardFont& font, int s
             font.miniGlyphCount(styleIdx), font.miniBitmapSize(styleIdx));
   }
 
-  // Stage 3 (block serialise + trailer patch) lands in the next commit.
-  // For now the section file stays at v39 with the trailer fields at
-  // 0/0/0, which on-device load treats as "no embedded subset" and
-  // falls back to the existing SdCardFont miss-handler path.
+  // Stage 3: serialise the prewarmed mini-data into an EmbeddedGlyphSubset
+  // block appended to the section file, then patch the v39 trailer fields
+  // (embeddedGlyphSubsetOffset / Size / CpfontHash) so on-device load can
+  // validate + install the block.
+  //
+  // Count non-empty styles -- the block's BlockHeader.styleCount field
+  // describes how many StyleHeader+data records follow, so we skip styles
+  // whose codepoint set was empty AND styles whose prewarm produced zero
+  // glyphs (e.g. the .cpfont didn't carry that style; SdCardFont's style
+  // fallback resolves it elsewhere).
+  uint8_t emitStyleCount = 0;
+  for (uint8_t s = 0; s < 4; ++s) {
+    if (codepointsByStyle[s].empty()) continue;
+    if (font.miniGlyphCount(s) == 0) continue;
+    emitStyleCount++;
+  }
+  if (emitStyleCount == 0) {
+    LOG_INF("PRE", "  section %d: no styles with non-empty prewarmed working set; skipping block emit", spineIdx);
+    return true;  // not an error, just nothing to embed
+  }
+
+  // Open the just-finalised section file for read+write WITHOUT truncating.
+  // The host_shim's openFileForWrite() truncates (it mirrors SdFat's wb+
+  // semantics), so we go around it with raw std::fstream -- the prebake
+  // CLI is host-only code; portability across the device's FsFile isn't
+  // required for this writer.
+  std::fstream f(sectionPath, std::ios::in | std::ios::out | std::ios::binary);
+  if (!f.is_open()) {
+    LOG_ERR("PRE", "  section %d: cannot open %s for r+w during subset emit", spineIdx, sectionPath.c_str());
+    return false;
+  }
+  // Block start offset = current EOF. Block is appended verbatim; the
+  // section's existing page LUT + anchor / paragraph / li-LUT trailers
+  // are untouched (the v39 trailer fields the section header points at
+  // are AFTER the LUTs, so this doesn't reshuffle anything).
+  f.seekp(0, std::ios::end);
+  const uint32_t blockStartOffset = static_cast<uint32_t>(f.tellp());
+
+  // BlockHeader (16 bytes, packed).
+  embeddedGlyphSubset::BlockHeader hdr{};
+  hdr.magic = embeddedGlyphSubset::BLOCK_MAGIC;
+  hdr.version = embeddedGlyphSubset::BLOCK_VERSION;
+  hdr.styleCount = emitStyleCount;
+  hdr.reserved = 0;
+  hdr.cpfontContentHash = font.contentHash();
+  hdr.reserved2 = 0;
+  static_assert(sizeof(hdr) == 16, "BlockHeader size drift");
+  f.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+
+  // Per non-empty style: StyleHeader (24 bytes) + intervals + glyphs + bitmap.
+  // EpdGlyph::dataOffset values inside the block are ALREADY relative to
+  // the start of this style's miniBitmap (see SdCardFont::prewarm which
+  // assigns dataOffset = miniBitmapOffset, a cumulative byte counter
+  // within miniBitmap). No rebasing required.
+  for (uint8_t s = 0; s < 4; ++s) {
+    if (codepointsByStyle[s].empty()) continue;
+    if (font.miniGlyphCount(s) == 0) continue;
+    embeddedGlyphSubset::StyleHeader sh{};
+    sh.styleId = s;
+    sh.flags = font.miniIs2Bit(s) ? embeddedGlyphSubset::STYLE_FLAG_IS_2BIT : static_cast<uint8_t>(0);
+    sh.reserved = 0;
+    sh.intervalCount = font.miniIntervalCount(s);
+    sh.glyphCount = font.miniGlyphCount(s);
+    sh.bitmapDataSize = font.miniBitmapSize(s);
+    sh.advanceY = font.miniAdvanceY(s);
+    sh.ascender = font.miniAscender(s);
+    sh.descender = font.miniDescender(s);
+    sh.reserved2 = 0;
+    static_assert(sizeof(sh) == 24, "StyleHeader size drift");
+    f.write(reinterpret_cast<const char*>(&sh), sizeof(sh));
+    if (sh.intervalCount > 0) {
+      f.write(reinterpret_cast<const char*>(font.miniIntervalsPtr(s)),
+              static_cast<std::streamsize>(sh.intervalCount) * sizeof(EpdUnicodeInterval));
+    }
+    if (sh.glyphCount > 0) {
+      f.write(reinterpret_cast<const char*>(font.miniGlyphsPtr(s)),
+              static_cast<std::streamsize>(sh.glyphCount) * sizeof(EpdGlyph));
+    }
+    if (sh.bitmapDataSize > 0) {
+      f.write(reinterpret_cast<const char*>(font.miniBitmapPtr(s)), sh.bitmapDataSize);
+    }
+  }
+
+  // Block end offset -> compute size for the trailer field.
+  f.seekp(0, std::ios::end);
+  const uint32_t blockEndOffset = static_cast<uint32_t>(f.tellp());
+  const uint32_t blockSize = blockEndOffset - blockStartOffset;
+
+  // Patch v39 trailer fields. They sit at HEADER_SIZE_V38 (48) in the
+  // file, immediately after the v38 LUT offsets that the existing
+  // page-load path consumes. Layout (matches Section.cpp's writer):
+  //   [0..47]   v38 fields + LUT offsets
+  //   [48..51]  embeddedGlyphSubsetOffset   (uint32_t)
+  //   [52..55]  embeddedGlyphSubsetSize     (uint32_t)
+  //   [56..59]  embeddedGlyphSubsetCpfontHash (uint32_t)
+  constexpr uint32_t kV39TrailerOffset = 48u;
+  f.seekp(kV39TrailerOffset, std::ios::beg);
+  const uint32_t embedOffset = blockStartOffset;
+  const uint32_t embedSize = blockSize;
+  const uint32_t embedHash = font.contentHash();
+  f.write(reinterpret_cast<const char*>(&embedOffset), sizeof(uint32_t));
+  f.write(reinterpret_cast<const char*>(&embedSize), sizeof(uint32_t));
+  f.write(reinterpret_cast<const char*>(&embedHash), sizeof(uint32_t));
+  f.close();
+
+  LOG_INF("PRE",
+          "  section %d: embedded glyph subset block written: offset=%u size=%u bytes "
+          "(styleCount=%u, cpfontHash=0x%08x)",
+          spineIdx, embedOffset, embedSize, static_cast<unsigned>(emitStyleCount), embedHash);
   return true;
 }
 
