@@ -150,10 +150,41 @@ void CrossPointWebServerActivity::onEnter() {
   //            catch the failure mode the higher threshold was guarding
   //            against, so the lower X3 gate trades a small mid-session
   //            recovery risk for the ability to actually use FT at all.
+  // CrumBLE 4.2: consume the silent-reboot mode hint up front so the
+  // low-heap recovery path below can also use it as a loop guard.
+  //   1 = previous boot was in JOIN_NETWORK, restore that mode.
+  //   2 = previous boot was in CREATE_HOTSPOT, restore that mode.
+  //  99 = previous boot silent-restarted FOR low-heap recovery; if the
+  //       pre-flight is still failing after a clean reboot we don't
+  //       loop, we fall through to the alert + exitToOrigin so the user
+  //       sees a real error instead of an infinite restart.
+  constexpr uint32_t SILENT_REBOOT_LOWHEAP_RECOVERY_HINT = 99;
+  const uint32_t modeHint = consumeSilentRebootFtModeHint();
+  const bool justLowHeapRestarted = (modeHint == SILENT_REBOOT_LOWHEAP_RECOVERY_HINT);
+
   const uint32_t FT_MIN_MAX_ALLOC = gpio.deviceIsX3() ? 32000U : 45000U;
   if (ESP.getMaxAllocHeap() < FT_MIN_MAX_ALLOC) {
-    LOG_ERR("WEBACT", "FT pre-flight: maxAlloc=%u below %u, refusing to start", ESP.getMaxAllocHeap(),
-            FT_MIN_MAX_ALLOC);
+    if (!justLowHeapRestarted) {
+      // CrumBLE 4.2: convert the "Reboot the device" alert into an
+      // automatic silent-restart to FT. Symptom we're fixing: user was
+      // in a heap-tight state (e.g. just connected BT on an SD-font
+      // book), exited to FT, the NimBLE/controller/SD-font/index/series
+      // releases above weren't enough to defragment the heap, pre-flight
+      // failed, and the user had to physically reboot. With the silent
+      // restart they instead see a brief loading popup (~3-5 s) and
+      // land in a fresh-boot FT with a clean heap -- same total wait,
+      // zero user action required.
+      LOG_ERR("WEBACT", "FT pre-flight: maxAlloc=%u below %u, silent-restarting to recover",
+              ESP.getMaxAllocHeap(), FT_MIN_MAX_ALLOC);
+      setSilentRebootFtModeHint(SILENT_REBOOT_LOWHEAP_RECOVERY_HINT);
+      silentRestartToFileTransfer();
+      return;  // ESP.restart() in silentRestartToFileTransfer doesn't return
+    }
+    // Already silent-restarted once and still failing -- something is
+    // genuinely wrong (corrupt SD, hardware issue, etc.). Don't loop.
+    // Fall back to the original alert + exit.
+    LOG_ERR("WEBACT", "FT pre-flight: maxAlloc=%u below %u after recovery restart, falling back to alert",
+            ESP.getMaxAllocHeap(), FT_MIN_MAX_ALLOC);
     strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_FT_TITLE), sizeof(APP_STATE.pendingAlertTitle) - 1);
     strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_FT_BODY), sizeof(APP_STATE.pendingAlertBody) - 1);
     APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
@@ -175,8 +206,8 @@ void CrossPointWebServerActivity::onEnter() {
   // mode picker entirely and dive back into the mode the user already
   // chose. Mirrors what would happen if they were to back out + re-
   // enter + re-pick the same mode by hand, except invisibly. Mode
-  // hint values: 1 = JOIN_NETWORK, 2 = CREATE_HOTSPOT.
-  const uint32_t modeHint = consumeSilentRebootFtModeHint();
+  // hint values: 1 = JOIN_NETWORK, 2 = CREATE_HOTSPOT, 99 = low-heap
+  // recovery (no mode auto-restore; mode picker shows normally).
   if (modeHint == 1) {
     LOG_INF("WEBACT", "Auto-restore: JOIN_NETWORK from silent-reboot hint");
     onNetworkModeSelected(NetworkMode::JOIN_NETWORK);
