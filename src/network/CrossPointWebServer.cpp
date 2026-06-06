@@ -478,34 +478,39 @@ static void sendBufferGzip(WebServer* server, const char* mime, const char* data
   const uint32_t preFree = ESP.getFreeHeap();
   const uint32_t preMax = ESP.getMaxAllocHeap();
   LOG_INF("WEB", "serve %s: %u B, pre free=%u maxAlloc=%u", tag, (unsigned)len, preFree, preMax);
-  if (preFree < 22u * 1024u) {
-    // CrumBLE: the only real recovery on this hardware is what the user
-    // already does manually -- exit FT on the device so its onExit
-    // silentRestarts, then re-enter. We automate that here: schedule a
-    // silentRestart with target=FILE_TRANSFER so the device comes back
-    // directly into the FT activity (no Home tour), and meanwhile send
-    // the phone a friendly auto-refreshing "reconnecting" page. By the
-    // time the refresh fires (8 s), the device has rebooted, reconnected
-    // to WiFi, and the FT serve handlers are up again with a fresh heap.
-    //
-    // 8 s is the budget for: silentRestart (~50 ms) + ESP.restart()
-    // (~1 s) + setup() through WiFi connect (~3-5 s) + mDNS rebind. If
-    // the device is slower the browser just refreshes again -- worst
-    // case we loop the friendly page a few times instead of failing.
+  // CrumBLE 4.2: the "schedule a silentRestart, serve an auto-refreshing
+  // empty page" recovery only works for text/html consumers (the FilesPage
+  // / browser UI). For non-HTML resources -- WASM, JS, JSON, font files --
+  // substituting a text/html payload silently breaks the caller: the
+  // optimizer's streaming WebAssembly.compile() rejects on "Incorrect
+  // response MIME type. Expected 'application/wasm'." and the prebake
+  // aborts on every book.
+  //
+  // Two changes:
+  //   1. The HTML-page substitution stays gated on the original 22 KB
+  //      floor -- that path allocates ~5-10 KB for string concatenation
+  //      during page generation, so the floor needs to leave room.
+  //   2. PROGMEM streams (send_P below) go through WiFiClient::write_P
+  //      using a small (~1-2 KB) intermediate buffer rather than buffering
+  //      the whole payload, so they don't need anywhere near 22 KB of
+  //      contiguous heap. Drop the floor to 6 KB for non-HTML serves so
+  //      genuinely tight heap (post-upload, post-optimizer) doesn't block
+  //      the WASM fetch. If we're still below 6 KB the request degrades
+  //      to a real 503 instead of a MIME-mismatched empty HTML body.
+  const bool isHtmlSubstitutionSafe = (mime && strcmp(mime, "text/html") == 0);
+  if (isHtmlSubstitutionSafe && preFree < 22u * 1024u) {
     LOG_ERR("WEB", "serve %s low-heap: scheduling silentRestart to FT", tag);
-    // CrumBLE: feedback minimised. Empty body + a meta-refresh header
-    // -- the browser shows nothing (or whatever was rendered last) and
-    // silently reloads after ~8 s, by which time the device is back
-    // with a fresh heap and serves the real FilesPage. The tab title
-    // stays as the user expects ("File Transfer"). No "Reconnecting..."
-    // banner, no spinner, no instructions to wait -- just a brief
-    // "slow load" moment from the user's perspective.
     server->sendHeader("Refresh", "8");
     server->send(200, "text/html",
                  "<!doctype html><html><head><title>File Transfer</title></head><body></body></html>");
     // Send completes before we set the flag so the response actually
     // reaches the browser before the device reboots.
     g_pendingFtRestart = true;
+    return;
+  }
+  if (!isHtmlSubstitutionSafe && preFree < 6u * 1024u) {
+    LOG_ERR("WEB", "serve %s low-heap (free=%u below 6 KB floor): sending 503", tag, preFree);
+    server->send(503, "text/plain", "Server low memory; retry shortly");
     return;
   }
   server->sendHeader("Content-Encoding", "gzip");
