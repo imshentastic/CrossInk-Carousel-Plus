@@ -199,6 +199,11 @@ class EpubReaderActivity final : public Activity {
   // the user to switch back to the prebake'd layout so the cached sections
   // can actually load instead of being rebuilt from HTML on every chapter.
   std::optional<PrebakeManifest> prebakeManifest_;
+  // CrumBLE 4.2.1: rate-limit the "why didn't the prompt fire?" diagnostic
+  // log to one per book entry so repeated render/loop ticks don't spam.
+  // Reset to false in onEnter; the first reason the check declines to
+  // prompt logs at INF/DBG and flips this true.
+  bool prebakePromptDiagLogged_ = false;
   // Snapshot of the DIRECT SETTINGS values when the user opened this book
   // (or last accepted a settings change that invalidates the prebake cache).
   // We hold the raw SETTINGS values rather than the derived fingerprint
