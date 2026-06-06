@@ -119,10 +119,20 @@ struct HighlightRangeResult {
   std::string previewText;
 };
 
+// CrumBLE 4.2: result from QuoteViewerActivity's Back path. currentIndex is
+// the bookmark the user was looking at when they backed out, so the
+// EpubReaderBookmarkListActivity can restore its cursor to that row instead
+// of resetting to wherever it was before the viewer opened. The Confirm
+// path uses BookmarkResult instead (jump to the bookmark in the book).
+struct QuoteViewerExitResult {
+  int currentIndex = -1;
+};
+
 using ResultVariant = std::variant<std::monostate, WifiResult, KeyboardResult, MenuResult, ChapterResult, PercentResult,
                                    IntervalResult, PageResult, SyncResult, NetworkModeResult, FootnoteResult,
                                    BookmarkResult, FileBrowserActionResult, FilePathResult, SortPickerResult,
-                                   ChoicePromptResult, RearrangeCollectionsResult, HighlightRangeResult>;
+                                   ChoicePromptResult, RearrangeCollectionsResult, HighlightRangeResult,
+                                   QuoteViewerExitResult>;
 
 struct ActivityResult {
   bool isCancelled = false;

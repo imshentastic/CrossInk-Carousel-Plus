@@ -7,7 +7,23 @@
 // These sizes are part of the on-disk format — do not change without
 // incrementing the file version.
 inline constexpr size_t BOOKMARK_CHAPTER_TITLE_MAX = 48;
-inline constexpr size_t BOOKMARK_PREVIEW_MAX = 160;
+// CrumBLE 4.2: bumped from 160 -> 1024. Earlier cap clipped highlights at
+// ~25-30 words which made the new QuoteViewer feel pointless for longer
+// passages (the user explicitly asked for 100+ word quotes). 1024 chars
+// covers ~170 words at typical word length. Existing v4 bookmark files
+// (160-byte preview field) read fine via the version-gated path in
+// BookmarkStore::readFromFile -- they just won't grow until the user
+// re-highlights. In-RAM cost: ~1.1 KB per Bookmark; a typical 50-
+// bookmark book holds ~55 KB in the in-memory vector. Bookmark cap
+// (MAX_BOOKMARKS = 1024 in .cpp) bounds the worst-case at ~1.1 MB on
+// disk but that's only paid by power users; the in-RAM working set
+// for one open book is what matters for heap.
+inline constexpr size_t BOOKMARK_PREVIEW_MAX = 1024;
+// CrumBLE 4.2: legacy size for v4 bookmark files. BookmarkStore reads
+// these via a fixed 160-byte scratch buffer when loading a v4 file, then
+// copies into the now-larger bm.preview field (rest zero-filled). New
+// highlights write at the full BOOKMARK_PREVIEW_MAX size under v5.
+inline constexpr size_t BOOKMARK_PREVIEW_MAX_V4 = 160;
 
 // CrumBLE: bookmarks are now ranges, not points. Phase-1 single-page
 // highlights have startSpine==endSpine and start/end page/word fields

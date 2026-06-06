@@ -6,14 +6,20 @@
 #include <uzlib.h>
 
 #include <algorithm>
+#include <cstring>  // memset / strncpy for v4 -> v5 preview migration
 #include <limits>
 
 namespace {
 constexpr uint8_t LEGACY_VERSION = 2;
-// V3 = point bookmarks (pre-highlight). V4 = ranged highlights w/ preview text.
-// Loading either is supported; writes always emit v4.
+// CrumBLE 4.2: V4 read-compat. v4 files have 160-byte preview fields; we
+// still read them, then upgrade to the v5 layout on the next saveToFile().
+constexpr uint8_t V4_VERSION = 4;
+// V3 = point bookmarks (pre-highlight). V4 = ranged highlights w/ 160-byte
+// preview text. V5 = ranged highlights w/ 1024-byte preview text (CrumBLE
+// 4.2, to surface ~100+ word quotes in QuoteViewerActivity). Loading any
+// of these is supported; writes always emit the current VERSION.
 constexpr uint8_t POINT_VERSION = 3;
-constexpr uint8_t VERSION = 4;
+constexpr uint8_t VERSION = 5;
 // Stored count is uint16_t in v3+, but we keep an in-memory safety cap for ESP32-C3 RAM.
 constexpr uint16_t MAX_BOOKMARKS = 1024;
 constexpr size_t INITIAL_BOOKMARK_RESERVE = 8;
@@ -27,7 +33,7 @@ bool readBookmarkCount(FsFile& file, const uint8_t version, uint16_t& count) {
     return true;
   }
 
-  if (version == POINT_VERSION || version == VERSION) {
+  if (version == POINT_VERSION || version == V4_VERSION || version == VERSION) {
     serialization::readPod(file, count);
     return true;
   }
@@ -218,7 +224,7 @@ bool BookmarkStore::readFromFile() {
 
   uint8_t version;
   serialization::readPod(f, version);
-  if (version != LEGACY_VERSION && version != POINT_VERSION && version != VERSION) {
+  if (version != LEGACY_VERSION && version != POINT_VERSION && version != V4_VERSION && version != VERSION) {
     LOG_ERR("BKS", "Unknown bookmark file version: %u", version);
     f.close();
     return false;
@@ -277,13 +283,16 @@ bool BookmarkStore::readFromFile() {
       return false;
     }
 
-    // V4 additions: end anchor + word indices + preview. Older formats
+    // V4/V5 additions: end anchor + word indices + preview. Older formats
     // (v2 legacy / v3 point) mirror start->end and leave preview empty;
-    // the next saveToFile() will rewrite as v4.
-    if (version == VERSION) {
+    // the next saveToFile() will rewrite as v5.
+    // V4 vs V5 differ only in the preview field's on-disk size
+    // (V4=160 bytes vs V5=1024 bytes); both carry the same v4-shaped
+    // end anchor + word indices block first.
+    if (version == V4_VERSION || version == VERSION) {
       if (f.available() < static_cast<int>(sizeof(bm.endSpineIndex) + sizeof(bm.endProgress) +
                                             sizeof(bm.startWord) + sizeof(bm.endWord))) {
-        LOG_ERR("BKS", "Bookmark file truncated at v4 range fields, record %u", i);
+        LOG_ERR("BKS", "Bookmark file truncated at v4/v5 range fields, record %u", i);
         f.close();
         return false;
       }
@@ -291,12 +300,33 @@ bool BookmarkStore::readFromFile() {
       serialization::readPod(f, bm.endProgress);
       serialization::readPod(f, bm.startWord);
       serialization::readPod(f, bm.endWord);
-      const int prevRead = f.read(reinterpret_cast<uint8_t*>(bm.preview), sizeof(bm.preview));
-      bm.preview[sizeof(bm.preview) - 1] = '\0';
-      if (prevRead != static_cast<int>(sizeof(bm.preview))) {
-        LOG_ERR("BKS", "Bookmark file truncated at preview, record %u", i);
-        f.close();
-        return false;
+
+      if (version == V4_VERSION) {
+        // CrumBLE 4.2: v4 file has a 160-byte preview slot. Read it into a
+        // scratch buffer sized for the legacy layout, then copy into the
+        // (larger) bm.preview field. NUL-terminate at the v4 boundary so
+        // any stale bytes beyond it in the larger buffer don't read as
+        // garbage. The next saveToFile() persists this bookmark as v5 with
+        // the full preview slot.
+        char v4Preview[BOOKMARK_PREVIEW_MAX_V4];
+        const int prevRead = f.read(reinterpret_cast<uint8_t*>(v4Preview), sizeof(v4Preview));
+        if (prevRead != static_cast<int>(sizeof(v4Preview))) {
+          LOG_ERR("BKS", "Bookmark file truncated at v4 preview, record %u", i);
+          f.close();
+          return false;
+        }
+        v4Preview[sizeof(v4Preview) - 1] = '\0';
+        std::memset(bm.preview, 0, sizeof(bm.preview));
+        std::strncpy(bm.preview, v4Preview, sizeof(bm.preview) - 1);
+        bm.preview[sizeof(bm.preview) - 1] = '\0';
+      } else {
+        const int prevRead = f.read(reinterpret_cast<uint8_t*>(bm.preview), sizeof(bm.preview));
+        bm.preview[sizeof(bm.preview) - 1] = '\0';
+        if (prevRead != static_cast<int>(sizeof(bm.preview))) {
+          LOG_ERR("BKS", "Bookmark file truncated at v5 preview, record %u", i);
+          f.close();
+          return false;
+        }
       }
     } else {
       // v2/v3 migration: degenerate (zero-length) highlight at the point.
@@ -386,7 +416,7 @@ bool BookmarkStore::getAllBookmarkedBooks(std::vector<BookmarkedBookEntry>& out)
     }
     uint8_t version;
     serialization::readPod(f, version);
-    if (version != LEGACY_VERSION && version != POINT_VERSION && version != VERSION) {
+    if (version != LEGACY_VERSION && version != POINT_VERSION && version != V4_VERSION && version != VERSION) {
       LOG_DBG("BKS", "Skipping bookmark file with unknown version: %s", name.c_str());
       f.close();
       continue;

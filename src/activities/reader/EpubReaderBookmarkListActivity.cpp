@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 #include "MappedInputManager.h"
+#include "QuoteViewerActivity.h"
 #include "activities/home/FileBrowserActionActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -114,12 +116,39 @@ void EpubReaderBookmarkListActivity::loop() {
       return;
     }
     if (!bookmarks.empty() && selectedIndex >= 0 && selectedIndex < static_cast<int>(bookmarks.size())) {
-      // CrumBLE: Confirm jumps directly to the bookmark location. The
-      // first-tap-to-expand UX was reverted -- preview text is capped at
-      // BOOKMARK_PREVIEW_MAX so an expansion was at best one extra line,
-      // and the user preferred the direct jump.
-      setResult(BookmarkResult{bookmarks[selectedIndex].spineIndex, bookmarks[selectedIndex].progress});
-      finish();
+      // CrumBLE 4.2: Confirm opens the QuoteViewer over this bookmark
+      // instead of jumping straight into the book. The viewer's Confirm
+      // path returns a BookmarkResult that we forward up to our own
+      // caller (the reader) -- net effect from the reader's perspective
+      // is identical to the old direct-jump UX, with one extra screen
+      // in between. The viewer's Back path returns a
+      // QuoteViewerExitResult carrying the index the user was last
+      // viewing; we restore selectedIndex to that so the list cursor
+      // tracks what they were reading.
+      startActivityForResult(
+          std::make_unique<QuoteViewerActivity>(renderer, mappedInput, bookmarks, selectedIndex),
+          [this](const ActivityResult& viewerResult) {
+            if (!viewerResult.isCancelled) {
+              // Confirm in viewer = jump to bookmark. Forward verbatim
+              // so EpubReaderActivity's existing bookmark-list callback
+              // sees the same BookmarkResult shape it always did.
+              setResult(ActivityResult{viewerResult.data});
+              finish();
+              return;
+            }
+            // Back from viewer: update cursor to the last-viewed
+            // bookmark and re-render the list. QuoteViewerExitResult is
+            // the expected payload but we defend against missing data
+            // (e.g. viewer aborted on an empty bookmark list, which
+            // shouldn't happen but is defined to send an empty exit
+            // result regardless).
+            if (const auto* exit = std::get_if<QuoteViewerExitResult>(&viewerResult.data)) {
+              if (exit->currentIndex >= 0 && exit->currentIndex < static_cast<int>(bookmarks.size())) {
+                selectedIndex = exit->currentIndex;
+              }
+            }
+            requestUpdate();
+          });
     }
     return;
   }
@@ -219,8 +248,27 @@ void EpubReaderBookmarkListActivity::render(RenderLock&&) {
     const bool expanded = (itemIndex == expandedIndex_);
     std::vector<std::string> previewLines;
     if (bm.preview[0] != '\0') {
-      previewLines = renderer.wrappedText(SMALL_FONT_ID, bm.preview, previewMaxW,
-                                          expanded ? 32 : (PREVIEW_MAX_LINES + 1));
+      // CrumBLE 4.2: with BOOKMARK_PREVIEW_MAX bumped from 160 -> 1024 for
+      // the QuoteViewer, running wrappedText over the full preview string
+      // for every visible row turned list scrolling visibly laggy. The
+      // collapsed row only displays PREVIEW_MAX_LINES (3) regardless of
+      // the wrap result, so for the non-expanded path we feed wrappedText
+      // a trimmed copy of the preview just long enough to fill those
+      // lines plus the overflow probe (PREVIEW_MAX_LINES + 1). ~200 chars
+      // wraps to ~6-8 lines at SMALL_FONT_ID on both panels we ship, so
+      // 4-line overflow probe still works correctly. Expanded rows keep
+      // the full preview because the user explicitly asked to see all of
+      // it.
+      if (expanded) {
+        previewLines = renderer.wrappedText(SMALL_FONT_ID, bm.preview, previewMaxW, 32);
+      } else {
+        constexpr size_t kCollapsedScanCap = 200;
+        char trimmed[kCollapsedScanCap + 1];
+        const size_t copyLen = std::min(kCollapsedScanCap, std::strlen(bm.preview));
+        std::memcpy(trimmed, bm.preview, copyLen);
+        trimmed[copyLen] = '\0';
+        previewLines = renderer.wrappedText(SMALL_FONT_ID, trimmed, previewMaxW, PREVIEW_MAX_LINES + 1);
+      }
     }
     int rowH = ROW_HEIGHT;
     if (expanded) {
