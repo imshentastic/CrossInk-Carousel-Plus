@@ -235,12 +235,37 @@ void applySort(std::vector<std::string>& paths, CollectionSort mode) {
       // the END of the list regardless of asc/desc, so they don't litter
       // the top of an A-Z view. .xtc / .txt currently have no author
       // metadata path here -- they also fall to the end.
+      //
+      // CrumBLE 4.2.1 hotfix: the per-book load is the slow + heap-heavy
+      // step (~10-50 ms each, allocates BookMetadataCache + CssParser +
+      // book.bin contents transiently). On large collections (All Books
+      // with 200+ books) the loop used to either:
+      //   (a) trip the IDLE-task watchdog (5 s default) because no yield
+      //       gives FreeRTOS scheduler a chance to run the IDLE task,
+      //       leading to panic + device reset, OR
+      //   (b) OOM-terminate when a particularly heavy book hit a
+      //       tight-heap state mid-loop (-fno-exceptions makes bad_alloc
+      //       a terminate call).
+      // Two guards address both: a maxAllocHeap pre-flight per book
+      // (skipping the load if heap is below 20 KB — book gets the same
+      // empty-key fallback as no-author books, sorts to the end), and
+      // a vTaskDelay(1) every kYieldEvery books (resets IDLE WDT and
+      // lets BT / WiFi tasks breathe). Worst-case overhead at the
+      // happy path: ~16 * 1 ms = ~16 ms per 256 books, negligible.
+      constexpr size_t kYieldEvery = 16;
+      constexpr uint32_t kAuthorLoadMinMaxAlloc = 20 * 1024;
       std::vector<std::string> keys(paths.size());
       for (size_t i = 0; i < paths.size(); ++i) {
         if (!FsHelpers::hasEpubExtension(paths[i])) continue;
+        if (ESP.getMaxAllocHeap() < kAuthorLoadMinMaxAlloc) {
+          LOG_DBG("CLN", "AuthorAlpha sort: skipping load %zu/%zu (maxAlloc=%u below %u)", i, paths.size(),
+                  ESP.getMaxAllocHeap(), static_cast<unsigned>(kAuthorLoadMinMaxAlloc));
+          continue;  // empty key -> book sorts to end
+        }
         Epub epub(paths[i], "/.crosspoint");
         epub.load(/*buildIfMissing=*/false, /*skipLoadingCss=*/true);
         keys[i] = lastNameLower(epub.getAuthor());
+        if ((i & (kYieldEvery - 1)) == 0) vTaskDelay(1);
       }
       std::vector<size_t> order(paths.size());
       for (size_t i = 0; i < order.size(); ++i) order[i] = i;
