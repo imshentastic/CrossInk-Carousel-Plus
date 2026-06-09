@@ -20,6 +20,15 @@ using String = std::string;
 // Arduino byte type.
 using byte = uint8_t;
 
+// CrumBLE 4.3 host shim: heap_caps_* are device-only -- map to plain
+// malloc/free on the host so Section.cpp's heap reserve path compiles.
+// The host-side prebake CLI doesn't exercise that code path at runtime;
+// it's only compiled because Section.cpp is in the shared source list.
+#define MALLOC_CAP_8BIT 0
+#include <cstdlib>
+inline void* heap_caps_malloc(size_t size, int /*caps*/) { return std::malloc(size); }
+inline void heap_caps_free(void* ptr) { std::free(ptr); }
+
 // Arduino timing helpers. millis() and micros() are monotonic since
 // process start; delay() is a no-op on host (we never need it for prebake).
 inline uint32_t millis() {

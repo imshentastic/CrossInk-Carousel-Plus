@@ -71,6 +71,16 @@ class Section {
     std::vector<EpdUnicodeInterval> intervals;
     std::vector<EpdGlyph> glyphs;
     std::vector<uint8_t> bitmap;
+    // CrumBLE 4.3 v2 embedded subset additions: kerning + ligatures.
+    // patchEmbeddedFontDataPointers re-points the fontData kerning fields
+    // at these vectors after install/move, mirroring the intervals/glyphs/
+    // bitmap pointers.
+    std::vector<EpdKernClassEntry> kernLeftClasses;
+    std::vector<EpdKernClassEntry> kernRightClasses;
+    std::vector<int8_t> kernMatrix;
+    uint8_t kernLeftClassCount = 0;
+    uint8_t kernRightClassCount = 0;
+    std::vector<EpdLigaturePair> ligaturePairs;
     EpdFontData fontData{};      // pointers patched to vectors above + metrics
   };
   // Slots indexed by styleId (REGULAR=0, BOLD=1, ITALIC=2, BOLDITALIC=3).
@@ -157,6 +167,11 @@ class Section {
   uint32_t embeddedGlyphSubsetOffset() const { return embeddedGlyphSubsetOffset_; }
   uint32_t embeddedGlyphSubsetSize() const { return embeddedGlyphSubsetSize_; }
   uint32_t embeddedGlyphSubsetCpfontHash() const { return embeddedGlyphSubsetCpfontHash_; }
+  // CrumBLE 4.3 diagnostic: surface fileVersion_ so callers can distinguish
+  // "section is pre-v39 (no embedded subset trailer possible)" from "section
+  // is v39 but the prebake CLI didn't emit a subset block". 0 if no section
+  // has been loaded yet.
+  uint8_t fileVersion() const { return fileVersion_; }
   // CrumBLE 4.3: read the embedded glyph subset block from the section file
   // and populate embeddedStyles_. Validates against the caller's
   // cpfontContentHash (which they get from SdCardFont::contentHash()) before
@@ -168,6 +183,12 @@ class Section {
   // True after a successful tryInstallEmbeddedGlyphSubset(); false on a
   // section that didn't carry a block or that failed hash validation.
   bool embeddedSubsetInstalled() const { return embeddedSubsetInstalled_; }
+  // CrumBLE 4.3: free the embedded subset's per-style vectors. Caller is
+  // EpubReaderActivity's BT-enable path -- the v2 subset (with kerning) is
+  // ~10 KB and competes with NimBLE for heap on SD-font books. Drop here,
+  // reload after the post-connect render. Idempotent. No-op when nothing
+  // is installed.
+  void dropEmbeddedGlyphSubset();
   // Returns an EpdFontData* for the requested style (REGULAR=0/BOLD=1/
   // ITALIC=2/BOLDITALIC=3) iff that style was in the embedded block,
   // else nullptr. The EpdFontFamily glyph router consults this before
@@ -179,4 +200,29 @@ class Section {
   // it can re-open the file to read the block contents on demand without
   // disturbing the rest of Section's file state.
   const std::string& activeFilePathForGlyphSubset() const { return activeFilePath; }
+
+  // CrumBLE 4.3 option 3: pre-allocate the ~18 KB page-heap reserve at
+  // boot, while heap is least fragmented. Returns true on success. Call
+  // once from setup() AFTER the long-lived global allocations have run
+  // (so the reserve doesn't displace anything more important) but BEFORE
+  // any chapter open. The reserve is held until loadPageFromSectionFile()
+  // detects heap pressure and releases it for the deserialize allocator.
+  static bool ensurePageHeapReserveAtBoot();
+  // Diagnostic: current reserve state. true = held, false = released.
+  static bool pageHeapReserveHeld();
+  // CrumBLE 4.3 option 3: release the reserve unconditionally for callers
+  // outside loadPageFromSectionFile() that need to hand its bytes to
+  // another consumer. Primary user: BluetoothHIDManager::enable() pre-flight
+  // -- the held reserve drops free heap below the 66 KB NimBLE threshold
+  // and prevents BT from enabling. Caller is responsible for the post-BT
+  // re-acquire (currently best-effort via tryReacquirePageHeapReserve).
+  // No-op if the reserve was already released.
+  static void releasePageHeapReserveForBtEnable();
+  // CrumBLE 4.3 option 3: best-effort re-acquire of the reserve after a
+  // BT-enable releaseFlow. Returns true if the reserve is held after the
+  // call (either because it was already held or because the malloc succeeded).
+  // Safe to call from anywhere; if the heap is too tight the reserve stays
+  // released and the next loadPageFromSectionFile() will deserialize against
+  // whatever's available.
+  static bool tryReacquirePageHeapReserve();
 };

@@ -106,7 +106,12 @@ public:
   // Connection
   bool connectToDevice(const std::string& address);
   bool disconnectFromDevice(const std::string& address);
-  bool isConnected(const std::string& address) const;
+  // CrumBLE 4.3: takes const char* (not const std::string&) so calling with
+  // SETTINGS.bleBondedDeviceAddr (a char[]) doesn't construct a temporary
+  // std::string. Under post-NimBLE heap pressure on SD-font + BT, that
+  // string ctor's small-buffer allocation bad_alloc terminated the device
+  // every reader-loop tick. std::string call sites pass .c_str() instead.
+  bool isConnected(const char* address) const;
   std::vector<std::string> getConnectedDevices() const;
 
   // Input handling

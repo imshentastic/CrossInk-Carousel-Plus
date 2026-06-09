@@ -48,6 +48,50 @@ constexpr uint8_t MIN_READABLE_SECTION_FILE_VERSION = 38;
 // How much the largest free block must have grown since a degraded build before
 // we bother rebuilding it for images (avoids rebuild churn on tiny variations).
 constexpr uint32_t SECTION_DEGRADED_REBUILD_MARGIN = 12 * 1024;
+
+// CrumBLE 4.3 option 3: pre-allocated heap reserve for page-DOM deserialize.
+//
+// Holds ~12 KB of contiguous heap from boot. When loadPageFromSectionFile()
+// detects heap pressure (typical: just after BT enable + connect on an
+// SD-font book) it releases the reserve, which goes back to the heap as a
+// fresh large free block. TextBlock::deserialize's vector<string>::resize
+// and friends then find a contiguous slot to land in and don't bad_alloc.
+// After Page::deserialize returns, we try to re-acquire the reserve
+// (best-effort -- if the page DOM ate the freed region, the reserve stays
+// nullptr until heap recovers and the next render's re-acquire succeeds).
+//
+// Why 12 KB: empirical peak vector::resize bytecount across a sweep of
+// chapters in test books. Leave 1 KB margin above observed peak so a
+// freshly-released reserve can absorb a worst-case page's allocations
+// without re-fragmenting.
+//
+// MALLOC_CAP_8BIT puts the reserve in the standard internal SRAM heap so
+// it competes for the same blocks the deserialize allocator pulls from.
+// CrumBLE 4.3 fifth tuning: back to 18 KB but the BT-enable path
+// releases it explicitly. The hold-through-BT approaches (14 KB, 10 KB)
+// either starved NimBLE or left too little post-release for the page
+// DOM deserialize. Releasing for BT gives NimBLE the full 85 KB +
+// reserve, NimBLE allocates ~70 KB, leaving ~15 KB free + a fresh
+// contiguous slot that the released reserve carved out -- which gives
+// post-NimBLE MaxAlloc the ~13 KB that successfully landed the
+// TextBlock deserialize allocations in the user-confirmed "page turns
+// worked" test.
+constexpr size_t PAGE_HEAP_RESERVE_BYTES = 18 * 1024;
+constexpr uint32_t PAGE_HEAP_RESERVE_TRIGGER_MAX_ALLOC = 16 * 1024;
+void* pageHeapReserve_ = nullptr;
+
+void* tryAcquirePageHeapReserve() {
+  if (pageHeapReserve_) return pageHeapReserve_;
+  pageHeapReserve_ = heap_caps_malloc(PAGE_HEAP_RESERVE_BYTES, MALLOC_CAP_8BIT);
+  return pageHeapReserve_;
+}
+
+void releasePageHeapReserve() {
+  if (pageHeapReserve_) {
+    heap_caps_free(pageHeapReserve_);
+    pageHeapReserve_ = nullptr;
+  }
+}
 // v38 header byte count (all fields up to and including the liLut trailer
 // offset). Kept as a named constant because v38 sections are still readable
 // after the v39 bump; the loader uses this to know when to stop reading
@@ -627,6 +671,20 @@ bool Section::createSectionFile(const int fontId, const float lineCompression, c
   return true;
 }
 
+bool Section::ensurePageHeapReserveAtBoot() {
+  return tryAcquirePageHeapReserve() != nullptr;
+}
+
+bool Section::pageHeapReserveHeld() { return pageHeapReserve_ != nullptr; }
+
+void Section::releasePageHeapReserveForBtEnable() {
+  if (pageHeapReserve_) {
+    releasePageHeapReserve();
+  }
+}
+
+bool Section::tryReacquirePageHeapReserve() { return tryAcquirePageHeapReserve() != nullptr; }
+
 std::unique_ptr<Page> Section::loadPageFromSectionFile() {
   // CrumBLE 4.2: heap pre-flight. Page deserialization runs `std::vector
   // <std::string>::resize()` on the per-word arrays inside
@@ -646,7 +704,44 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
   // hard reboot. 25 KB threshold covers a typical 150-300 word page
   // with overhead headroom; the original crash had maxAlloc well below
   // this floor.
-  constexpr uint32_t PAGE_LOAD_MIN_MAX_ALLOC = 25000;
+  // CrumBLE: page-load floor lowered to 8 KB. Empirical measurements show
+  // typical page peak contiguous allocation = 5-8 KB. The previous 25 KB
+  // floor was over-budgeted, refusing loads under BT pressure that would
+  // have succeeded. v3.7.3 (no floor) worked because most pages load
+  // cleanly; we keep a small floor to catch the truly degenerate cases
+  // before they bad_alloc terminate the device. Heavy pages (long words,
+  // many style switches) that peak above 8 KB will refuse rather than
+  // crash -- user sees "Page load error" and can disconnect BT to read.
+  constexpr uint32_t PAGE_LOAD_MIN_MAX_ALLOC = 8000;
+
+  // CrumBLE 4.3 option 3: opportunistic re-acquire of the reserve when it
+  // was released earlier (BT enable path, or a prior page load that didn't
+  // recover) and heap has since recovered enough to absorb the 18 KB
+  // chunk without sliding back below the BT-enable pre-flight floor. Skip
+  // the re-acquire if we're already tight on contiguous heap -- in that
+  // case the deserialize needs the bytes more than the reserve does.
+  if (!pageHeapReserve_ && ESP.getMaxAllocHeap() > 30 * 1024) {
+    tryAcquirePageHeapReserve();
+  }
+
+  // CrumBLE 4.3 option 3: under heap pressure release the pre-allocated
+  // reserve so the deserialize allocator has a contiguous 12 KB block to
+  // pull from. Pressure threshold is set above the bare PAGE_LOAD floor so
+  // the reserve drops EARLY enough to actually help (if we waited until
+  // MaxAlloc < 8 KB the release happens too late -- vector::resize will
+  // have already grabbed and re-fragmented whatever's available). Drop is
+  // a no-op when the reserve was never acquired or was already released
+  // by a prior page load that hasn't been able to re-acquire yet.
+  const uint32_t maxAllocBeforeReserveDrop = ESP.getMaxAllocHeap();
+  const bool releasedReserveForDeserialize =
+      (maxAllocBeforeReserveDrop < PAGE_HEAP_RESERVE_TRIGGER_MAX_ALLOC) && pageHeapReserve_ != nullptr;
+  if (releasedReserveForDeserialize) {
+    releasePageHeapReserve();
+    LOG_INF("SCT",
+            "loadPageFromSectionFile: released page heap reserve under pressure (maxAlloc %u -> %u, free %u)",
+            maxAllocBeforeReserveDrop, ESP.getMaxAllocHeap(), ESP.getFreeHeap());
+  }
+
   if (ESP.getMaxAllocHeap() < PAGE_LOAD_MIN_MAX_ALLOC) {
     LOG_ERR("SCT", "loadPageFromSectionFile: maxAlloc=%u below %u, refusing load to avoid bad_alloc terminate",
             ESP.getMaxAllocHeap(), PAGE_LOAD_MIN_MAX_ALLOC);
@@ -675,6 +770,20 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
   auto page = Page::deserialize(file);
   // Explicit close() required: member variable persists beyond function scope
   file.close();
+
+  // CrumBLE 4.3 option 3: best-effort reserve re-acquire. If the deserialize
+  // consumed the freed reserve region the heap_caps_malloc will return null
+  // and pageHeapReserve_ stays nullptr; the next render's pressure check
+  // will try again once heap has recovered (e.g. after the post-render
+  // cache drop frees the page DOM). Logged at INF so the BT-stability
+  // diagnostic shows whether the reserve cycle is sustaining itself.
+  if (releasedReserveForDeserialize) {
+    const uint32_t maxAllocBeforeReacquire = ESP.getMaxAllocHeap();
+    const void* reacquired = tryAcquirePageHeapReserve();
+    LOG_INF("SCT", "loadPageFromSectionFile: reserve re-acquire %s (maxAlloc %u -> %u, free %u)",
+            reacquired ? "OK" : "failed -- will retry next render", maxAllocBeforeReacquire, ESP.getMaxAllocHeap(),
+            ESP.getFreeHeap());
+  }
   return page;
 }
 
@@ -890,6 +999,12 @@ bool Section::tryInstallEmbeddedGlyphSubset(uint32_t cpfontContentHash) {
     slot.intervals.clear();
     slot.glyphs.clear();
     slot.bitmap.clear();
+    slot.kernLeftClasses.clear();
+    slot.kernRightClasses.clear();
+    slot.kernMatrix.clear();
+    slot.kernLeftClassCount = 0;
+    slot.kernRightClassCount = 0;
+    slot.ligaturePairs.clear();
     slot.fontData = EpdFontData{};
   }
   if (!hasEmbeddedGlyphSubset()) return false;
@@ -937,7 +1052,7 @@ bool Section::tryInstallEmbeddedGlyphSubset(uint32_t cpfontContentHash) {
   uint8_t populated = 0;
   for (uint8_t i = 0; i < hdr.styleCount; ++i) {
     embeddedGlyphSubset::StyleHeader sh{};
-    static_assert(sizeof(sh) == 24, "EmbeddedGlyphSubset StyleHeader size drift");
+    static_assert(sizeof(sh) == 32, "EmbeddedGlyphSubset StyleHeader v2 size drift");
     if (file.read(reinterpret_cast<uint8_t*>(&sh), sizeof(sh)) != static_cast<int>(sizeof(sh))) {
       LOG_ERR("SCT", "Embedded glyph subset install: truncated StyleHeader at style %u", static_cast<unsigned>(i));
       file.close();
@@ -948,12 +1063,32 @@ bool Section::tryInstallEmbeddedGlyphSubset(uint32_t cpfontContentHash) {
       file.close();
       return false;
     }
+    // CrumBLE 4.3: preflight + alloc-order fix. The bitmap is the largest
+    // single contiguous block (~5 KB). Under post-NimBLE fragmentation it
+    // fails first. We allocate the bitmap FIRST so it gets the freshest
+    // MaxAlloc; intervals/glyphs are small enough to fit afterward in the
+    // fragmented remainder. Preflight checks the bitmap size + 512 bytes
+    // margin (allocator overhead) -- earlier 2 KB margin was for the kerning
+    // blobs that v2 baked, but the kerning data is now skipped by the
+    // prebake CLI (search "EXPERIMENTAL: zero these"). Returning false
+    // leaves the slot empty -- caller threads nullptr to the renderer
+    // routing and per-glyph lookups fall through to SdCardFont onGlyphMiss.
+    const uint32_t needed = sh.bitmapDataSize + 512;
+    if (ESP.getMaxAllocHeap() < needed) {
+      LOG_INF("SCT",
+              "Embedded glyph subset install: skipping style %u under heap pressure (need ~%u bytes, maxAlloc=%u)",
+              static_cast<unsigned>(sh.styleId), needed, ESP.getMaxAllocHeap());
+      file.close();
+      return false;
+    }
     EmbeddedStyleSlot& slot = embeddedStyles_[sh.styleId];
     slot.styleId = sh.styleId;
     slot.flags = sh.flags;
+    // Allocate bitmap first (largest). intervals/glyphs are smaller and
+    // can land in whatever fragments remain.
+    slot.bitmap.resize(sh.bitmapDataSize);
     slot.intervals.resize(sh.intervalCount);
     slot.glyphs.resize(sh.glyphCount);
-    slot.bitmap.resize(sh.bitmapDataSize);
     if (sh.intervalCount > 0) {
       const size_t bytes = sh.intervalCount * sizeof(EpdUnicodeInterval);
       if (file.read(reinterpret_cast<uint8_t*>(slot.intervals.data()), bytes) != static_cast<int>(bytes)) {
@@ -980,11 +1115,59 @@ bool Section::tryInstallEmbeddedGlyphSubset(uint32_t cpfontContentHash) {
         return false;
       }
     }
+    // v2 additions: kerning (left entries, right entries, matrix) + ligatures.
+    slot.kernLeftClassCount = sh.kernLeftClassCount;
+    slot.kernRightClassCount = sh.kernRightClassCount;
+    slot.kernLeftClasses.resize(sh.kernLeftEntryCount);
+    slot.kernRightClasses.resize(sh.kernRightEntryCount);
+    slot.kernMatrix.resize(static_cast<size_t>(sh.kernLeftClassCount) * sh.kernRightClassCount);
+    slot.ligaturePairs.resize(sh.ligaturePairCount);
+    if (sh.kernLeftEntryCount > 0) {
+      const size_t bytes = sh.kernLeftEntryCount * sizeof(EpdKernClassEntry);
+      if (file.read(reinterpret_cast<uint8_t*>(slot.kernLeftClasses.data()), bytes) != static_cast<int>(bytes)) {
+        LOG_ERR("SCT", "Embedded glyph subset install: truncated kernLeft at style %u",
+                static_cast<unsigned>(sh.styleId));
+        file.close();
+        return false;
+      }
+    }
+    if (sh.kernRightEntryCount > 0) {
+      const size_t bytes = sh.kernRightEntryCount * sizeof(EpdKernClassEntry);
+      if (file.read(reinterpret_cast<uint8_t*>(slot.kernRightClasses.data()), bytes) != static_cast<int>(bytes)) {
+        LOG_ERR("SCT", "Embedded glyph subset install: truncated kernRight at style %u",
+                static_cast<unsigned>(sh.styleId));
+        file.close();
+        return false;
+      }
+    }
+    if (!slot.kernMatrix.empty()) {
+      const size_t bytes = slot.kernMatrix.size();
+      if (file.read(reinterpret_cast<uint8_t*>(slot.kernMatrix.data()), bytes) != static_cast<int>(bytes)) {
+        LOG_ERR("SCT", "Embedded glyph subset install: truncated kernMatrix at style %u",
+                static_cast<unsigned>(sh.styleId));
+        file.close();
+        return false;
+      }
+    }
+    if (sh.ligaturePairCount > 0) {
+      const size_t bytes = sh.ligaturePairCount * sizeof(EpdLigaturePair);
+      if (file.read(reinterpret_cast<uint8_t*>(slot.ligaturePairs.data()), bytes) != static_cast<int>(bytes)) {
+        LOG_ERR("SCT", "Embedded glyph subset install: truncated ligaturePairs at style %u",
+                static_cast<unsigned>(sh.styleId));
+        file.close();
+        return false;
+      }
+    }
     slot.fontData.advanceY = sh.advanceY;
     slot.fontData.ascender = sh.ascender;
     slot.fontData.descender = sh.descender;
     slot.fontData.is2Bit = (sh.flags & embeddedGlyphSubset::STYLE_FLAG_IS_2BIT) != 0;
     slot.fontData.intervalCount = sh.intervalCount;
+    slot.fontData.kernLeftEntryCount = sh.kernLeftEntryCount;
+    slot.fontData.kernRightEntryCount = sh.kernRightEntryCount;
+    slot.fontData.kernLeftClassCount = sh.kernLeftClassCount;
+    slot.fontData.kernRightClassCount = sh.kernRightClassCount;
+    slot.fontData.ligaturePairCount = sh.ligaturePairCount;
     populated++;
   }
   file.close();
@@ -1008,11 +1191,13 @@ void Section::patchEmbeddedFontDataPointers() {
     slot.fontData.intervals = slot.intervals.empty() ? nullptr : slot.intervals.data();
     slot.fontData.glyph = slot.glyphs.empty() ? nullptr : slot.glyphs.data();
     slot.fontData.bitmap = slot.bitmap.empty() ? nullptr : slot.bitmap.data();
-    // Kerning + ligatures aren't carried by EmbeddedGlyphSubset v1 --
-    // renderer falls back to "no kerning" for embedded-subset draws.
-    slot.fontData.kernLeftClasses = nullptr;
-    slot.fontData.kernRightClasses = nullptr;
-    slot.fontData.kernMatrix = nullptr;
+    // v2: kerning + ligatures embedded. Re-point the fontData kerning fields
+    // at the slot's std::vector storage. Counts on fontData were set at
+    // install time; we just re-point the data pointers here.
+    slot.fontData.kernLeftClasses = slot.kernLeftClasses.empty() ? nullptr : slot.kernLeftClasses.data();
+    slot.fontData.kernRightClasses = slot.kernRightClasses.empty() ? nullptr : slot.kernRightClasses.data();
+    slot.fontData.kernMatrix = slot.kernMatrix.empty() ? nullptr : slot.kernMatrix.data();
+    slot.fontData.ligaturePairs = slot.ligaturePairs.empty() ? nullptr : slot.ligaturePairs.data();
     slot.fontData.ligaturePairs = nullptr;
     slot.fontData.kernLeftEntryCount = 0;
     slot.fontData.kernRightEntryCount = 0;
@@ -1032,6 +1217,26 @@ void Section::patchEmbeddedFontDataPointers() {
   }
 }
 
+void Section::dropEmbeddedGlyphSubset() {
+  if (!embeddedSubsetInstalled_) return;
+  for (auto& slot : embeddedStyles_) {
+    slot.styleId = 0xFF;
+    slot.flags = 0;
+    // swap-with-empty guarantees vector capacity is freed (clear keeps it).
+    std::vector<EpdUnicodeInterval>().swap(slot.intervals);
+    std::vector<EpdGlyph>().swap(slot.glyphs);
+    std::vector<uint8_t>().swap(slot.bitmap);
+    std::vector<EpdKernClassEntry>().swap(slot.kernLeftClasses);
+    std::vector<EpdKernClassEntry>().swap(slot.kernRightClasses);
+    std::vector<int8_t>().swap(slot.kernMatrix);
+    slot.kernLeftClassCount = 0;
+    slot.kernRightClassCount = 0;
+    std::vector<EpdLigaturePair>().swap(slot.ligaturePairs);
+    slot.fontData = EpdFontData{};
+  }
+  embeddedSubsetInstalled_ = false;
+}
+
 const EpdFontData* Section::embeddedFontDataForStyle(uint8_t styleId) const {
   if (!embeddedSubsetInstalled_) return nullptr;
   if (styleId >= embeddedStyles_.size()) return nullptr;
@@ -1039,3 +1244,4 @@ const EpdFontData* Section::embeddedFontDataForStyle(uint8_t styleId) const {
   if (slot.styleId == 0xFF) return nullptr;
   return &slot.fontData;
 }
+

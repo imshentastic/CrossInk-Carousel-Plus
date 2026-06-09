@@ -5,6 +5,7 @@
 
 #include "../boot_sleep/SleepActivity.h"
 #include <Epub/Page.h>
+#include <Epub/Section.h>
 #include <Epub/blocks/TextBlock.h>
 #include <FontCacheManager.h>
 #include <FsHelpers.h>
@@ -613,6 +614,17 @@ void EpubReaderActivity::warmPageCacheForBtTransition() {
   // for the entire 2.7 s connect + ~1.5 s subscribe window; by the time a
   // natural render happens the heap is fragmented to ~6 KB maxAlloc and
   // the load refuses.
+  //
+  // CrumBLE 4.3: free-old-before-build-new. unique_ptr::operator= evaluates
+  // the RHS (which builds a fresh Page DOM via TextBlock::deserialize)
+  // BEFORE deleting the previously held page. So a naive `cachedRenderPage_
+  // = section->loadPageFromSectionFile()` momentarily holds two complete
+  // page DOMs at once -- the old one + the one being built. Under post-BT
+  // heap (~12 KB MaxAlloc, ~15 KB free) the second one's TextBlock alloc
+  // exceeds remaining contiguous and bad_alloc terminates. Explicit
+  // reset() first guarantees only one DOM resident at the deserialize peak,
+  // recovering ~5-15 KB of contiguous heap for the rebuild to land in.
+  cachedRenderPage_.reset();
   cachedRenderPage_ = section->loadPageFromSectionFile();
   if (cachedRenderPage_) {
     cachedRenderSection_ = static_cast<void*>(section.get());
@@ -1393,18 +1405,26 @@ void EpubReaderActivity::loop() {
         LOG_INF("ERA", "BT connect: dropped reader-settings cache (%zu entries) to free heap for NimBLE",
                 prevSettingsCacheCount);
       }
+      // CrumBLE 4.3: release the 18 KB page-DOM heap reserve right
+      // before NimBLE's enable() runs.
+      if (Section::pageHeapReserveHeld()) {
+        const uint32_t freeBefore = ESP.getFreeHeap();
+        Section::releasePageHeapReserveForBtEnable();
+        LOG_INF("ERA", "BT connect: released page heap reserve (free %u->%u)", freeBefore, ESP.getFreeHeap());
+      }
+      // CrumBLE 4.3 Option 1: KEEP the embedded glyph subset resident
+      // through BT enable. The subset is ~5-7 KB; previously we dropped
+      // it to give NimBLE more pre-flight headroom, but the post-BT
+      // lazy reload would then fail under tight MaxAlloc and all glyphs
+      // rendered as '?'. Keeping it resident costs ~5 KB during BT
+      // (NimBLE has ~80 KB instead of ~85 KB) but the subset stays
+      // available for post-BT glyph lookup -- pages render correctly
+      // from the embedded subset's in-RAM glyphs without needing any
+      // SD-font miniData. Trade-off: NimBLE's enable pre-flight has less
+      // margin; chapter transitions still require BT disconnect because
+      // installing the next chapter's subset (another 5 KB) won't fit
+      // under post-NimBLE MaxAlloc.
       if (!btMgr.isEnabled()) btMgr.enable();
-      // CrumBLE 4.2: at this point NimBLE init has consumed ~50 KB (sync,
-      // ~13 ms), but the async connect handshake hasn't started running its
-      // per-connection allocations yet, and the 6 HID-subscription buffers
-      // are still 2-4 s away. Free heap sits at ~30 KB, mostly contiguous.
-      // This is the only window we get to re-allocate the 25 KB Page DOM
-      // we dropped above -- once connectToDevice() kicks the async stack
-      // running, MaxAllocHeap falls to ~6 KB and the deserialize refuses.
-      // The "Connecting" popup will suppress renderContents for the entire
-      // window, so a natural cache refill never fires; we have to do it
-      // explicitly here so the post-connect re-render is a cache hit.
-      if (btMgr.isEnabled()) warmPageCacheForBtTransition();
       btMgr.connectToDevice(SETTINGS.bleBondedDeviceAddr);
     }
     btManifestPromptAnsweredThisSession_ = true;  // we handled the manifest decision
@@ -3505,10 +3525,28 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     // chapter change away from a prebaked section automatically clears
     // the routing; no separate clear-on-exit hook needed.
     const int curFontId = SETTINGS.getReaderFontId();
-    if (section && section->hasEmbeddedGlyphSubset()) {
+    // CrumBLE 4.3 diagnostic: surface the two silent gates so a "no embedded
+    // subset installed" failure is observable in the log instead of inferred
+    // from a missing success line. Both gates are unconditional info logs
+    // because the install path is rare (once per chapter open) and we need
+    // to know which case fires for the SD-font + BT '?'-glyph regression.
+    if (!section) {
+      LOG_INF("SCT", "EGS gate: section null, skipping embedded-subset install");
+    } else if (!section->hasEmbeddedGlyphSubset()) {
+      LOG_INF("SCT",
+              "EGS gate: section has no v39 embedded-subset trailer (fileVersion=%u) -- skipping install (curFontId=%d)",
+              static_cast<unsigned>(section->fileVersion()), curFontId);
+    } else {
       const auto& sdFontMap = renderer.getSdCardFonts();
       auto it = sdFontMap.find(curFontId);
-      if (it != sdFontMap.end() && it->second != nullptr) {
+      if (it == sdFontMap.end() || it->second == nullptr) {
+        LOG_INF("SCT",
+                "EGS gate: sdFontMap missing curFontId=%d (mapSize=%u) -- skipping install",
+                curFontId, static_cast<unsigned>(sdFontMap.size()));
+      } else {
+        LOG_INF("SCT",
+                "EGS gate: attempting install (curFontId=%d sdFontHash=0x%08x)",
+                curFontId, it->second->contentHash());
         section->tryInstallEmbeddedGlyphSubset(it->second->contentHash());
       }
     }
@@ -3609,9 +3647,37 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     // or chapter change still pays the load cost (~50-80 ms); steady-
     // state re-renders (BT enable popup, focus changes, status bar
     // refreshes) reuse the cached page for free.
-    const bool cacheHit = cachedRenderPage_ && cachedRenderSection_ == static_cast<void*>(section.get()) &&
-                          cachedRenderSpine_ == currentSpineIndex && cachedRenderPageIndex_ == section->currentPage;
-    if (!cacheHit) {
+    // CrumBLE 4.3 heap-regression revert: force cache MISS on every render
+    // and drop the page DOM at end of render. The cachedRenderPage_ feature
+    // (introduced in 1ca7dfcc to spare BT-event re-renders the deserialize
+    // cost) held ~25-40 KB of vector<string>-heavy state and added a 7 KB
+    // permanent maxAlloc regression from the build/drop fragmentation
+    // pattern around BT enable. Re-loading per render is the v3.7.3 behavior
+    // and ~50-80 ms per call -- imperceptible compared to e-ink's 400 ms
+    // refresh cycle.
+    const bool cacheHit = false;
+    {
+      // CrumBLE 4.3: free-old-before-build-new. See warmPageCacheForBtTransition's
+      // matching block for the full explanation. Briefly: unique_ptr::operator=
+      // builds the RHS (a complete fresh Page DOM) before deleting the LHS, so
+      // a doubled-DOM peak exists during deserialize. Under post-BT heap that
+      // peak crashes TextBlock::deserialize -> bad_alloc -> terminate. Explicit
+      // reset() ensures only the new DOM is being allocated at the peak --
+      // recovers the previous page's footprint (~5-15 KB) for the deserialize.
+      cachedRenderPage_.reset();
+      cachedRenderSection_ = nullptr;
+      cachedRenderSpine_ = -1;
+      cachedRenderPageIndex_ = -1;
+
+      // CrumBLE 4.3 known limitation: post-BT page-DOM deserialize peak
+      // (~12-13 KB contiguous for 28+ element pages) exceeds the post-
+      // NimBLE budget (~12.7 KB MaxAlloc) by a few hundred bytes for
+      // text-heavy SD-font book chapters. Manifests as bad_alloc inside
+      // Page::deserialize element loop. Tried a subset-drop escape valve
+      // here -- worked mechanically but broke glyph rendering because
+      // neither the lazy subset reinstall nor the SD-font fallback could
+      // re-allocate after the page DOM ate the freed bytes. Permanent
+      // fix is the page-DOM arena (task #24).
       cachedRenderPage_ = section->loadPageFromSectionFile();
       if (cachedRenderPage_) {
         cachedRenderSection_ = static_cast<void*>(section.get());
@@ -3655,10 +3721,38 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 
     pageLoadRetryCount = 0;
 
+    // CrumBLE 4.3: lazy embedded glyph subset reload. After the BT-enable
+    // path dropped the v2 subset to free heap for NimBLE + page deserialize,
+    // try to re-install it once the page DOM is loaded. The install has
+    // its own preflight (skips if MaxAlloc < bitmap size + 1 KB) so it
+    // silently bails on tight heap and the render falls back to SD-font
+    // onGlyphMiss for everything (some Outside range drift, but readable).
+    if (section && section->hasEmbeddedGlyphSubset() && !section->embeddedSubsetInstalled()) {
+      const int curFontId = SETTINGS.getReaderFontId();
+      const auto& sdFontMap = renderer.getSdCardFonts();
+      auto it = sdFontMap.find(curFontId);
+      if (it != sdFontMap.end() && it->second != nullptr) {
+        const uint32_t freeBefore = ESP.getFreeHeap();
+        const uint32_t maxAllocBefore = ESP.getMaxAllocHeap();
+        const bool ok = section->tryInstallEmbeddedGlyphSubset(it->second->contentHash());
+        LOG_INF("ERA", "Lazy EGS reload: ok=%d (free %u->%u, maxAlloc %u->%u)", ok, freeBefore, ESP.getFreeHeap(),
+                maxAllocBefore, ESP.getMaxAllocHeap());
+        renderer.setEmbeddedGlyphData(curFontId, section->embeddedFontDataForStyle(0),
+                                      section->embeddedFontDataForStyle(1), section->embeddedFontDataForStyle(2),
+                                      section->embeddedFontDataForStyle(3));
+      }
+    }
+
     const auto start = millis();
     renderContents(*cachedRenderPage_, orientedMarginTop, orientedMarginRight, orientedMarginBottom,
                    orientedMarginLeft);
     LOG_DBG("ERS", "Rendered page in %dms (cache %s)", millis() - start, cacheHit ? "hit" : "miss");
+    // CrumBLE 4.3 heap-regression revert: release the page DOM immediately
+    // after render so it doesn't fragment the heap around BT events.
+    cachedRenderPage_.reset();
+    cachedRenderSection_ = nullptr;
+    cachedRenderSpine_ = -1;
+    cachedRenderPageIndex_ = -1;
   }
   silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
   if (!saveProgress(currentSpineIndex, section->currentPage, section->pageCount)) {

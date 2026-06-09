@@ -214,6 +214,11 @@ bool BluetoothHIDManager::enable() {
   // a low-memory chapter rebuild re-enabled BLE at ~56 KB free). Callers treat a
   // false return as "stayed off"; the user can retry once heap recovers (e.g. on
   // a lighter page or from the reader's Bluetooth menu).
+  // CrumBLE 4.3 note: tried lowering to 60 KB so a pre-enable warm page
+  // cache could hold the ~18 KB Page DOM through enable. NimBLE actually
+  // needs MORE than 60 KB at the controller-init step (device hangs at
+  // "Enabling Bluetooth..." with no further output), so the floor stays
+  // at 66 KB. The warm-before-enable path is reverted accordingly.
   constexpr uint32_t kMinFreeHeapForEnable = 66 * 1024;
   const uint32_t freeHeap = esp_get_free_heap_size();
   if (freeHeap < kMinFreeHeapForEnable) {
@@ -299,24 +304,42 @@ bool BluetoothHIDManager::disable() {
     LOG_DBG("BT", "Already disabled");
     return true;
   }
-  
+
   LOG_INF("BT", "Disabling Bluetooth...");
-  
+
   if (_scanning) {
     stopScan();
   }
-  
+
   // Disconnect all devices
   while (!_connectedDevices.empty()) {
     disconnectFromDevice(_connectedDevices[0].address);
   }
-  
-  // Deinitialize NimBLE stack
-  NimBLEDevice::deinit(false);
-  
+
+  // CrumBLE 4.3: full deinit (clearAll=true) so NimBLE deletes ALL client
+  // objects, services, and bonded-but-disconnected state along with the
+  // stack itself. Previously we passed false to preserve client objects for
+  // a "fast reconnect" path on the next enable -- but under repeated
+  // book-switch + BT-cycle pressure those retained NimBLEClient instances
+  // accumulated ~2 KB of stale state per session AND the next enable's
+  // reconnect-with-existing-client attempt could fail mid-subscribe with
+  // `E (NNN) BLE_INIT: Malloc failed` (NimBLE running out of mbufs during
+  // characteristic enumeration), then take ~22 seconds to surrender to the
+  // retry-with-fresh-client fallback -- by which point the heap was so
+  // drained that the section deserialize floor refused to load the page
+  // and we showed "Page load error". With deinit(true) every enable now
+  // starts from a clean NimBLE state; the cost is ~50 ms extra on each
+  // connectToDevice() because we always go through createClient() instead
+  // of getClientByPeerAddress(). The reconnect-with-existing-client path
+  // in connectToDevice() still works for the very first connect after a
+  // single enable (e.g. lost-link auto-recovery without a disable in
+  // between), it just never sees a stale client carried across an
+  // explicit disable boundary.
+  NimBLEDevice::deinit(true);
+
   _enabled = false;
   lastError = "";
-  
+
   LOG_INF("BT", "Bluetooth disabled");
   return true;
 }
@@ -420,7 +443,7 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
   }
   
   // Check if already connected
-  if (isConnected(address)) {
+  if (isConnected(address.c_str())) {
     LOG_INF("BT", "Already connected to %s", address.c_str());
     return true;
   }
@@ -759,8 +782,10 @@ bool BluetoothHIDManager::disconnectFromDevice(const std::string& address) {
   return false;
 }
 
-bool BluetoothHIDManager::isConnected(const std::string& address) const {
-  return std::find_if(_connectedDevices.begin(), _connectedDevices.end(), [&address](const ConnectedDevice& dev) {
+bool BluetoothHIDManager::isConnected(const char* address) const {
+  if (!address) return false;
+  return std::find_if(_connectedDevices.begin(), _connectedDevices.end(), [address](const ConnectedDevice& dev) {
+           // dev.address is std::string; operator== with const char* uses strcmp, no allocation.
            return dev.address == address && dev.client && dev.client->isConnected();
          }) != _connectedDevices.end();
 }

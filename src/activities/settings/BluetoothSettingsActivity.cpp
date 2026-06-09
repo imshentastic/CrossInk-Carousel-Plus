@@ -744,7 +744,7 @@ void BluetoothSettingsActivity::renderDeviceList() {
 
   if (!devices.empty()) {
     for (const auto& device : devices) {
-      const bool connected = btMgr->isConnected(device.address);
+      const bool connected = btMgr->isConnected(device.address.c_str());
 
       // Device name with indicators
       const char* connSymbol = connected ? "[*] " : "";

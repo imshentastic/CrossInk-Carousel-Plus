@@ -668,12 +668,18 @@ int SdCardFont::prewarm(const char* utf8Text, uint8_t styleMask, bool metadataOn
   // = ~131K comparisons, but in practice pages contain far fewer unique codepoints so the
   // actual cost is much lower. This is dwarfed by SD I/O that follows. Alternatives (hash
   // set, bitmap) exceed the 256-byte stack limit or add template bloat.
-  // Heap-allocated: MAX_PAGE_GLYPHS * 4 = 2048 bytes, too large for stack (limit < 256 bytes)
-  std::unique_ptr<uint32_t[]> codepoints(new (std::nothrow) uint32_t[MAX_PAGE_GLYPHS]);
-  if (!codepoints) {
-    LOG_ERR("SDCF", "Failed to allocate codepoint buffer (%u bytes)", MAX_PAGE_GLYPHS * 4);
-    return -1;
-  }
+  //
+  // CrumBLE 4.3 task #2 follow-up: this buffer is now STATIC (one-time
+  // 2 KB BSS allocation at program start, reused every render). The
+  // previous per-render heap allocation was the operator new[] that
+  // throws bad_alloc post-NimBLE, which terminates the render task on
+  // SD-font + BT. Moving the buffer to BSS removes the per-render heap
+  // pressure entirely. Safety: prewarm() is only called from the render
+  // task (FontCacheManager::PrewarmScope::endScanAndPrewarm); the task
+  // is single-threaded so there's no reentrancy concern. Two SdCardFont
+  // instances cannot prewarm concurrently because the render task is
+  // the sole caller.
+  static uint32_t codepoints[MAX_PAGE_GLYPHS];
   uint32_t cpCount = 0;
 
   const unsigned char* p = reinterpret_cast<const unsigned char*>(utf8Text);
@@ -747,13 +753,13 @@ int SdCardFont::prewarm(const char* utf8Text, uint8_t styleMask, bool metadataOn
   }
 
   // Sort codepoints for ordered interval building
-  std::sort(codepoints.get(), codepoints.get() + cpCount);
+  std::sort(codepoints, codepoints + cpCount);
 
   // Prewarm each requested style
   int totalMissed = 0;
   for (uint8_t si = 0; si < MAX_STYLES; si++) {
     if (!(styleMask & (1 << si)) || !styles_[si].present) continue;
-    totalMissed += prewarmStyle(si, codepoints.get(), cpCount, metadataOnly);
+    totalMissed += prewarmStyle(si, codepoints, cpCount, metadataOnly);
   }
 
   stats_.prewarmTotalMs = millis() - startMs;
@@ -1466,4 +1472,43 @@ int16_t SdCardFont::miniDescender(uint8_t styleIdx) const {
 bool SdCardFont::miniIs2Bit(uint8_t styleIdx) const {
   if (styleIdx >= kMaxStylesForAccessor) return false;
   return styles_[styleIdx].miniData.is2Bit;
+}
+uint16_t SdCardFont::miniKernLeftEntryCount(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return 0;
+  return styles_[styleIdx].miniKernLeftEntryCount;
+}
+uint16_t SdCardFont::miniKernRightEntryCount(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return 0;
+  return styles_[styleIdx].miniKernRightEntryCount;
+}
+uint8_t SdCardFont::miniKernLeftClassCount(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return 0;
+  return styles_[styleIdx].miniKernLeftClassCount;
+}
+uint8_t SdCardFont::miniKernRightClassCount(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return 0;
+  return styles_[styleIdx].miniKernRightClassCount;
+}
+uint16_t SdCardFont::miniLigaturePairCount(uint8_t styleIdx) const {
+  // CrumBLE 4.3 v2: ligature pairs are FONT-WIDE (header), not per-style.
+  // Returned once for any installed style so the emit code can write the
+  // same ligature table per style slot.
+  if (styleIdx >= kMaxStylesForAccessor) return 0;
+  return styles_[styleIdx].header.ligaturePairCount;
+}
+const EpdKernClassEntry* SdCardFont::miniKernLeftClassesPtr(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return nullptr;
+  return styles_[styleIdx].miniKernLeftClasses;
+}
+const EpdKernClassEntry* SdCardFont::miniKernRightClassesPtr(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return nullptr;
+  return styles_[styleIdx].miniKernRightClasses;
+}
+const int8_t* SdCardFont::miniKernMatrixPtr(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return nullptr;
+  return styles_[styleIdx].miniKernMatrix;
+}
+const EpdLigaturePair* SdCardFont::miniLigaturePairsPtr(uint8_t styleIdx) const {
+  if (styleIdx >= kMaxStylesForAccessor) return nullptr;
+  return styles_[styleIdx].ligaturePairs;
 }

@@ -46,7 +46,7 @@ class BluetoothHIDManager {
   // Connection
   bool connectToDevice(const std::string& /*address*/) { return false; }
   bool disconnectFromDevice(const std::string& /*address*/) { return false; }
-  bool isConnected(const std::string& /*address*/) const { return false; }
+  bool isConnected(const char* /*address*/) const { return false; }
   std::vector<std::string> getConnectedDevices() const { return {}; }
 
   // Input handling

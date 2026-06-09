@@ -136,6 +136,18 @@ class SdCardFont {
   int16_t miniAscender(uint8_t styleIdx) const;
   int16_t miniDescender(uint8_t styleIdx) const;
   bool miniIs2Bit(uint8_t styleIdx) const;
+  // CrumBLE 4.3 v2: kerning + ligature accessors for the embedded subset's
+  // v2 per-style payload (prebake CLI consumes these to write the kern
+  // matrix / class tables / ligature pairs alongside the bitmap blob).
+  uint16_t miniKernLeftEntryCount(uint8_t styleIdx) const;
+  uint16_t miniKernRightEntryCount(uint8_t styleIdx) const;
+  uint8_t miniKernLeftClassCount(uint8_t styleIdx) const;
+  uint8_t miniKernRightClassCount(uint8_t styleIdx) const;
+  uint16_t miniLigaturePairCount(uint8_t styleIdx) const;
+  const EpdKernClassEntry* miniKernLeftClassesPtr(uint8_t styleIdx) const;
+  const EpdKernClassEntry* miniKernRightClassesPtr(uint8_t styleIdx) const;
+  const int8_t* miniKernMatrixPtr(uint8_t styleIdx) const;
+  const EpdLigaturePair* miniLigaturePairsPtr(uint8_t styleIdx) const;
 
  private:
   // Per-style metadata (parsed from file header/TOC)

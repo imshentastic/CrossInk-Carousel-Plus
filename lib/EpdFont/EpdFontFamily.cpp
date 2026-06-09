@@ -262,6 +262,71 @@ EpdFontFamily::GlyphData EpdFontFamily::getGlyphData(const uint32_t cp, const St
     return {font->data, glyph};
   }
 
+  // CrumBLE 4.3: regular-style fallback for SD fonts with missing styles.
+  // When this is a non-regular style and the lookup fully failed (no
+  // embedded subset entry + miss handler returned null -- typically
+  // because the SD font doesn't have this style at all, e.g. Readerly_12
+  // ships only REGULAR), fall back to the regular glyph instead of
+  // REPLACEMENT_GLYPH. The result is italic/bold text rendered in the
+  // regular style -- visually a small downgrade but readable. Previously
+  // these codepoints became '?' which broke ~30% of text in books with
+  // mixed-style italic phrases. We DON'T retry through the regular style's
+  // miss handler -- recurse via getGlyphData(cp, REGULAR) which does the
+  // full embedded + miss-handler lookup on the regular style.
+  if (style != REGULAR) {
+    if (const GlyphData regularData = getGlyphData(cp, REGULAR); regularData.glyph) {
+      return regularData;
+    }
+  }
+
+  // CrumBLE 4.3: typography substitutions. Some SD fonts (Readerly_12,
+  // ChareInk_*) don't ship Unicode punctuation glyphs -- curly quotes,
+  // dashes, ellipsis etc. EPUBs use these heavily (smart-quoted dialogue,
+  // em-dashed asides). Without substitution they render as REPLACEMENT
+  // GLYPH ('?'), which dominates the page on dialogue-heavy chapters.
+  // ASCII equivalents are guaranteed to be in any font (a-z + ASCII
+  // punctuation), so we map the smart character to its straight equivalent
+  // and retry the lookup. Trade-off: typography downgrade (curly quotes
+  // become straight, em dashes become hyphens) but the text is readable.
+  uint32_t substitute = 0;
+  switch (cp) {
+    case 0x2018:  // LEFT SINGLE QUOTATION MARK
+    case 0x2019:  // RIGHT SINGLE QUOTATION MARK
+    case 0x201A:  // SINGLE LOW-9 QUOTATION MARK
+    case 0x201B:  // SINGLE HIGH-REVERSED-9 QUOTATION MARK
+      substitute = 0x0027;  // APOSTROPHE
+      break;
+    case 0x201C:  // LEFT DOUBLE QUOTATION MARK
+    case 0x201D:  // RIGHT DOUBLE QUOTATION MARK
+    case 0x201E:  // DOUBLE LOW-9 QUOTATION MARK
+    case 0x201F:  // DOUBLE HIGH-REVERSED-9 QUOTATION MARK
+      substitute = 0x0022;  // QUOTATION MARK
+      break;
+    case 0x2013:  // EN DASH
+    case 0x2014:  // EM DASH
+    case 0x2015:  // HORIZONTAL BAR
+    case 0x2212:  // MINUS SIGN
+      substitute = 0x002D;  // HYPHEN-MINUS
+      break;
+    case 0x2026:  // HORIZONTAL ELLIPSIS
+      substitute = 0x002E;  // FULL STOP (one dot -- not "..." since the
+                            // page-DOM wordXpos accounts for a single glyph)
+      break;
+    case 0x00A0:  // NO-BREAK SPACE
+    case 0x2009:  // THIN SPACE
+    case 0x200A:  // HAIR SPACE
+    case 0x202F:  // NARROW NO-BREAK SPACE
+      substitute = 0x0020;  // SPACE
+      break;
+    default:
+      break;
+  }
+  if (substitute != 0 && substitute != cp) {
+    if (const GlyphData subData = getGlyphData(substitute, style); subData.glyph) {
+      return subData;
+    }
+  }
+
   if (cp != REPLACEMENT_GLYPH) {
     return getGlyphData(REPLACEMENT_GLYPH, style);
   }

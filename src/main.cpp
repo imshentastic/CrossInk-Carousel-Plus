@@ -73,6 +73,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
 #include "CollectionsStore.h"
 #include "LibraryIndex.h"
 #include "RecentBooksStore.h"
+#include "Epub/Section.h"
 #include "SeriesIndex.h"
 #include "SdCardFontSystem.h"
 #include "activities/Activity.h"
@@ -1168,6 +1169,14 @@ void setup() {
                                                         : BootResume::Splash;
 
   setupDisplayAndFonts(resume != BootResume::Splash);
+
+  // CrumBLE 4.3 option 3: page-heap reserve was acquired at boot here, but
+  // that starves the File Transfer web server (HTML serve needs ~20 KB
+  // contiguous; held 18 KB reserve drops MaxAlloc below 5 KB → serve fails
+  // → silent-restart loop into FT). The reserve is now acquired lazily by
+  // loadPageFromSectionFile()'s opportunistic-reacquire path on first
+  // chapter open, so FT, Home, and other non-reader activities run with
+  // the full heap.
 
   // LibraryIndex loads its cached JSON now (cheap); the heavy SD walk is
   // deferred until the user first accesses Recently Added / All Books on

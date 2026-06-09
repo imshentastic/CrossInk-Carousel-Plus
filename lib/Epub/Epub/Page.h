@@ -120,8 +120,13 @@ class PageTableFragment final : public PageElement {
 
 class Page {
  public:
-  // the list of block index and line numbers on this page
-  std::vector<std::shared_ptr<PageElement>> elements;
+  // the list of block index and line numbers on this page.
+  // CrumBLE 4.3: unique_ptr (was shared_ptr) to skip the per-element
+  // control-block heap allocation that bad_alloc terminates the device
+  // on SD-font + BT (each PageLine push_back used to allocate ~24 bytes
+  // for the shared_ptr control block; under post-NimBLE heap fragmentation
+  // that allocation can't find a contiguous slot).
+  std::vector<std::unique_ptr<PageElement>> elements;
   std::vector<FootnoteEntry> footnotes;
   static constexpr uint16_t MAX_FOOTNOTES_PER_PAGE = 16;
 
@@ -144,7 +149,7 @@ class Page {
   // Check if page contains any images (used to force full refresh)
   bool hasImages() const {
     return std::any_of(elements.begin(), elements.end(),
-                       [](const std::shared_ptr<PageElement>& el) { return el->getTag() == TAG_PageImage; });
+                       [](const std::unique_ptr<PageElement>& el) { return el->getTag() == TAG_PageImage; });
   }
 
   // Get bounding box of all images on the page (union of image rects)

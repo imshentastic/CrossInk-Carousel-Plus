@@ -1,5 +1,6 @@
 #include "FontCacheManager.h"
 
+#include <Arduino.h>
 #include <FontDecompressor.h>
 #include <Logging.h>
 #include <SdCardFont.h>
@@ -43,6 +44,21 @@ void FontCacheManager::prewarmCache(int fontId, const char* utf8Text, uint8_t st
   // repeated re-renders of the same page reuse them at no SD cost.
   auto it = sdCardFonts_.find(fontId);
   if (it != sdCardFonts_.end()) {
+    // CrumBLE 4.3: skip the SD prewarm unconditionally when this section
+    // has the embedded glyph subset installed. The subset provides the
+    // glyphs the renderer's findGlyphData consults first; miniData is no
+    // longer the primary lookup. Saves ~5-8 KB heap per render that
+    // prewarmStyle would have allocated for miniBitmap. Pre-launchpad
+    // for chapter-prewarm: this is where we'd later expand to run prewarm
+    // ONCE at chapter open with the union of all chapter codepoints,
+    // populating miniData for every page in the section so the per-render
+    // skip is safe under any heap state.
+    auto famIt = fontMap_.find(fontId);
+    if (famIt != fontMap_.end() && famIt->second.hasEmbeddedGlyphData()) {
+      LOG_DBG("FCM", "prewarmCache(SD): skipped -- embedded glyph subset covers fontId=%d", fontId);
+      return;
+    }
+
     // CrumBLE 4.2 Option 2 gate. The lazy-non-REGULAR path is only on when
     // the user has a Bluetooth controller bonded (see
     // EpubReaderActivity::onEnter): they're willing to pay the per-glyph SD

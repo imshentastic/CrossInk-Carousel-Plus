@@ -1181,6 +1181,26 @@ bool emitEmbeddedGlyphSubsetForSection(const std::string& sectionPath, Section& 
   }
   section.currentPage = savedCurrentPage;
 
+  // CrumBLE 4.3: roll up codepoints from styles the SD font doesn't
+  // actually have (typical: Readerly-family SD fonts ship REGULAR only)
+  // into the REGULAR set. This makes the embedded subset cover EVERY
+  // codepoint the section text uses, regardless of original styling.
+  // Combined with EpdFontFamily::getGlyphData's REGULAR-style fallback,
+  // italic/bold codepoints render as regular glyphs instead of '?'
+  // (the alternative was the renderer rejecting them with REPLACEMENT_GLYPH
+  // because the embedded subset had only regular-styled cp and the SD
+  // font had no italic/bold style to fall through to). Trade-off: regular
+  // subset grows by italic/bold cp count (~10-30% on text-heavy chapters)
+  // = 0.5-2 KB extra per section.
+  for (int s = 1; s < 4; ++s) {
+    if (codepointsByStyle[s].empty()) continue;
+    if (font.miniGlyphCount(s) > 0) continue;  // Style exists in font — keep separate
+    for (uint32_t cp : codepointsByStyle[s]) {
+      codepointsByStyle[0].insert(cp);
+    }
+    codepointsByStyle[s].clear();
+  }
+
   // Sanity check: log per-style unique-codepoint counts so we can eyeball
   // whether a section actually used the BOLD/ITALIC styles before we go
   // through the trouble of serialising empty style buckets.
@@ -1309,7 +1329,19 @@ bool emitEmbeddedGlyphSubsetForSection(const std::string& sectionPath, Section& 
     sh.ascender = font.miniAscender(s);
     sh.descender = font.miniDescender(s);
     sh.reserved2 = 0;
-    static_assert(sizeof(sh) == 24, "StyleHeader size drift");
+    // CrumBLE 4.3 v2: kerning + ligature counts.
+    // EXPERIMENTAL: zero these so the subset stays small enough for the
+    // post-NimBLE lazy reload on SD-font + BT (the kerning matrix + class
+    // tables add ~6 KB per style and push the lazy reload over the
+    // post-BT MaxAlloc budget). Layout pre-BT uses prewarm's kerning;
+    // post-BT we accept some Outside range drift in exchange for glyphs
+    // rendering at all.
+    sh.kernLeftEntryCount = 0;
+    sh.kernRightEntryCount = 0;
+    sh.kernLeftClassCount = 0;
+    sh.kernRightClassCount = 0;
+    sh.ligaturePairCount = 0;
+    static_assert(sizeof(sh) == 32, "StyleHeader v2 size drift");
     f.write(reinterpret_cast<const char*>(&sh), sizeof(sh));
     if (sh.intervalCount > 0) {
       f.write(reinterpret_cast<const char*>(font.miniIntervalsPtr(s)),
@@ -1321,6 +1353,24 @@ bool emitEmbeddedGlyphSubsetForSection(const std::string& sectionPath, Section& 
     }
     if (sh.bitmapDataSize > 0) {
       f.write(reinterpret_cast<const char*>(font.miniBitmapPtr(s)), sh.bitmapDataSize);
+    }
+    // v2 kerning + ligature blobs (in install order: kernLeft, kernRight,
+    // kernMatrix, ligaturePairs).
+    if (sh.kernLeftEntryCount > 0) {
+      f.write(reinterpret_cast<const char*>(font.miniKernLeftClassesPtr(s)),
+              static_cast<std::streamsize>(sh.kernLeftEntryCount) * sizeof(EpdKernClassEntry));
+    }
+    if (sh.kernRightEntryCount > 0) {
+      f.write(reinterpret_cast<const char*>(font.miniKernRightClassesPtr(s)),
+              static_cast<std::streamsize>(sh.kernRightEntryCount) * sizeof(EpdKernClassEntry));
+    }
+    const size_t matrixBytes = static_cast<size_t>(sh.kernLeftClassCount) * sh.kernRightClassCount;
+    if (matrixBytes > 0) {
+      f.write(reinterpret_cast<const char*>(font.miniKernMatrixPtr(s)), static_cast<std::streamsize>(matrixBytes));
+    }
+    if (sh.ligaturePairCount > 0) {
+      f.write(reinterpret_cast<const char*>(font.miniLigaturePairsPtr(s)),
+              static_cast<std::streamsize>(sh.ligaturePairCount) * sizeof(EpdLigaturePair));
     }
   }
 

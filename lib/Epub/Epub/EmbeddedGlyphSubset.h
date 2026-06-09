@@ -44,13 +44,16 @@
 // .cpfont's bitmap blob). The prebake CLI rebases them when emitting; the
 // loader doesn't need to translate further.
 //
-// Kerning + ligatures are NOT yet embedded in v1 of this block; they would
-// add ~kernLeftEntries*3 + kernRightEntries*3 + leftClasses*rightClasses +
-// ligaturePairs*8 bytes per style (~5-15 KB on typical fonts). For the
-// vertical-slice scope, kerning falls back to "no kerning applied" when an
-// embedded subset is active. A future v2 of this block can add them
-// without disturbing v1 readers (extend Style header with optional offsets
-// to kern + ligature blobs).
+// v2 (CrumBLE 4.3 second pass): kerning + ligatures are now embedded.
+// Per-style header gained 8 bytes of count fields and the per-style data
+// blob is followed by kernLeftEntries, kernRightEntries, kernMatrix, and
+// ligaturePairs in that order. Adds ~700 bytes-2 KB per style depending
+// on font density. Fixes the "text overshoots viewport / Outside range
+// (480, *)" floods that happened on SD-font + BT books because the
+// runtime was using glyph-only advance widths without the pair-kerning
+// offsets the prebake CLI baked into wordXpos. v1 (kerning-less) sections
+// are rejected by the v2 loader -- bump triggered a full re-bake of all
+// section caches anyway, so callers must regenerate prebake artifacts.
 
 #include <cstdint>
 
@@ -59,7 +62,7 @@
 namespace embeddedGlyphSubset {
 
 constexpr uint32_t BLOCK_MAGIC = 0x4253474C;  // "LGSB" little-endian
-constexpr uint16_t BLOCK_VERSION = 1;
+constexpr uint16_t BLOCK_VERSION = 2;
 constexpr uint8_t MAX_STYLES = 4;
 
 // Per-style flag bits.
@@ -76,8 +79,10 @@ struct BlockHeader {
 } __attribute__((packed));
 static_assert(sizeof(BlockHeader) == 16, "EmbeddedGlyphSubset::BlockHeader must be 16 bytes");
 
-// On-disk per-style entry header (24 bytes). Followed by intervals, glyphs,
-// and bitmaps in that order.
+// On-disk per-style entry header (32 bytes). Followed by intervals, glyphs,
+// bitmaps, kernLeftEntries, kernRightEntries, kernMatrix, ligaturePairs in
+// that order. The four kern* and ligature* count fields drive the size of
+// each blob; install code reads them and resizes the matching slot vectors.
 struct StyleHeader {
   uint8_t styleId;
   uint8_t flags;
@@ -89,7 +94,14 @@ struct StyleHeader {
   int16_t ascender;
   int16_t descender;
   uint16_t reserved2;
+  // v2 additions: kerning + ligature counts. Blobs of corresponding sizes
+  // come after the bitmap, in the listed order.
+  uint16_t kernLeftEntryCount;
+  uint16_t kernRightEntryCount;
+  uint8_t kernLeftClassCount;
+  uint8_t kernRightClassCount;
+  uint16_t ligaturePairCount;
 } __attribute__((packed));
-static_assert(sizeof(StyleHeader) == 24, "EmbeddedGlyphSubset::StyleHeader must be 24 bytes");
+static_assert(sizeof(StyleHeader) == 32, "EmbeddedGlyphSubset::StyleHeader v2 must be 32 bytes");
 
 }  // namespace embeddedGlyphSubset
