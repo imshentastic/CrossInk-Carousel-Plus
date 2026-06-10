@@ -17,6 +17,7 @@
 
 #include <Epub/BookMetadataCache.h>
 #include <Epub/EmbeddedGlyphSubset.h>
+#include <Epub/GlyphAtlas.h>
 #include <Epub/Page.h>
 #include <Epub/Section.h>
 #include <Epub/blocks/TextBlock.h>
@@ -1095,6 +1096,160 @@ int prebakeAllThumbs(const std::string& epubPath, const std::string& cacheDir,
     if (!prebakeCoverThumb(epubPath, cacheDir, coverItemHref, w, h)) ++failures;
   }
   return failures;
+}
+
+// CrumBLE 4.4: per-section glyph atlas builder. Given a SdCardFont whose
+// mini-data has already been prewarmed (by the v39 embedded-subset emit
+// path right below), iterate the prewarmed per-style intervals + glyphs
+// and pack each glyph's bitmap into a 1-bit packed output buffer. The
+// returned byte array is a complete AtlasBlock as defined in
+// lib/Epub/Epub/GlyphAtlas.h: BlockHeader + per-style StyleHeader +
+// GlyphEntry[] + bitmap payload.
+//
+// Source bitmap format is per-style:
+//   - 1-bit packed (8 px/byte, big-endian within byte): copy directly,
+//     possibly with row-stride realignment if widths differ
+//   - 2-bit packed (4 px/byte, 2 MSB = first pixel): threshold each pixel
+//     -- any non-zero source value becomes a 1 in the output
+//
+// Output is always 1-bit packed, row-major, ceil(width/8) bytes per row.
+// This matches the on-disk format the device-side renderer already uses
+// for 1-bit glyph blits (no new decode path needed).
+//
+// Returns an empty vector iff the font has no prewarmed styles (caller
+// treats that as "nothing to emit, not an error").
+std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font) {
+  // Pre-scan: which styles have data, total glyph count.
+  uint8_t styleMask = 0;
+  uint16_t totalGlyphs = 0;
+  for (uint8_t s = 0; s < 4; ++s) {
+    if (font.miniGlyphCount(s) > 0) {
+      styleMask |= static_cast<uint8_t>(1u << s);
+      totalGlyphs = static_cast<uint16_t>(totalGlyphs + font.miniGlyphCount(s));
+    }
+  }
+  if (styleMask == 0) return {};
+
+  // Pack each glyph to 1-bit. Build per-style GlyphEntry vectors and a
+  // single shared output bitmap buffer; each entry's bitmapOffset points
+  // into that buffer.
+  std::vector<uint8_t> bitmapData;
+  bitmapData.reserve(8 * 1024);
+  std::vector<std::vector<glyphatlas::GlyphEntry>> entriesByStyle(4);
+
+  for (uint8_t s = 0; s < 4; ++s) {
+    if ((styleMask & (1u << s)) == 0) continue;
+    const uint32_t glyphCount = font.miniGlyphCount(s);
+    const EpdGlyph* glyphs = font.miniGlyphsPtr(s);
+    const EpdUnicodeInterval* intervals = font.miniIntervalsPtr(s);
+    const uint32_t intervalCount = font.miniIntervalCount(s);
+    const uint8_t* srcBitmap = font.miniBitmapPtr(s);
+    const bool is2Bit = font.miniIs2Bit(s);
+    auto& entries = entriesByStyle[s];
+    entries.reserve(glyphCount);
+
+    // Enumerate codepoints via interval table. Each interval [first..last]
+    // maps to contiguous glyph indices starting at interval.offset.
+    for (uint32_t i = 0; i < intervalCount; ++i) {
+      const EpdUnicodeInterval iv = intervals[i];
+      for (uint32_t cp = iv.first; cp <= iv.last; ++cp) {
+        const uint32_t glyphIdx = iv.offset + (cp - iv.first);
+        if (glyphIdx >= glyphCount) continue;
+        const EpdGlyph g = glyphs[glyphIdx];
+        const uint16_t outRowBytes = glyphatlas::rowBytes(g.width, glyphatlas::BIT_DEPTH_1);
+        const uint32_t outGlyphBytes = static_cast<uint32_t>(outRowBytes) * g.height;
+        if (bitmapData.size() + outGlyphBytes > 0xFFFFu) {
+          LOG_ERR("PRE", "atlas: bitmap payload would exceed 64 KB at cp U+%04X style %u; truncating", cp, s);
+          break;  // bitmapBytes field is uint16_t
+        }
+        const uint16_t bitmapOffset = static_cast<uint16_t>(bitmapData.size());
+        bitmapData.resize(bitmapData.size() + outGlyphBytes, 0);
+        const uint8_t* srcGlyph = srcBitmap + g.dataOffset;
+
+        // Per-pixel copy + threshold. Source format is per-glyph row-major
+        // packed at the font's bit depth; output is row-major 1-bit big
+        // endian within byte (matches the EpdFont blit path).
+        for (uint32_t y = 0; y < g.height; ++y) {
+          for (uint32_t x = 0; x < g.width; ++x) {
+            uint8_t srcPixel;
+            if (is2Bit) {
+              const uint32_t srcBitOffset = (y * g.width + x) * 2u;
+              const uint32_t srcByteIdx = srcBitOffset / 8u;
+              const uint32_t srcBitInByte = srcBitOffset % 8u;
+              srcPixel = (srcGlyph[srcByteIdx] >> (6u - srcBitInByte)) & 0x03u;
+            } else {
+              const uint32_t srcBitOffset = y * g.width + x;
+              const uint32_t srcByteIdx = srcBitOffset / 8u;
+              const uint32_t srcBitInByte = srcBitOffset % 8u;
+              srcPixel = (srcGlyph[srcByteIdx] >> (7u - srcBitInByte)) & 0x01u;
+            }
+            // Threshold: any nonzero source pixel becomes lit in the
+            // 1-bit output. For 2-bit fonts this loses anti-aliasing
+            // (intentional trade for half the storage); for already-1-bit
+            // sources it's identity.
+            if (srcPixel != 0) {
+              const uint32_t outByteIdx = y * outRowBytes + (x / 8u);
+              const uint32_t outBitInByte = x % 8u;
+              bitmapData[bitmapOffset + outByteIdx] |= static_cast<uint8_t>(1u << (7u - outBitInByte));
+            }
+          }
+        }
+
+        glyphatlas::GlyphEntry entry{};
+        entry.codepoint = cp;
+        entry.bitmapOffset = bitmapOffset;
+        entry.width = g.width;
+        entry.height = g.height;
+        const int leftClamped = std::max(-128, std::min(127, static_cast<int>(g.left)));
+        const int topClamped = std::max(-128, std::min(127, static_cast<int>(g.top)));
+        entry.left = static_cast<int8_t>(leftClamped);
+        entry.top = static_cast<int8_t>(topClamped);
+        entry.advanceX = g.advanceX;
+        entries.push_back(entry);
+      }
+    }
+  }
+
+  // Assemble the on-disk block: BlockHeader, then per-style StyleHeader
+  // followed by that style's GlyphEntry[], then the shared bitmap payload.
+  std::vector<uint8_t> output;
+  const size_t headerBytes = sizeof(glyphatlas::BlockHeader);
+  size_t styleSectionBytes = 0;
+  for (uint8_t s = 0; s < 4; ++s) {
+    if ((styleMask & (1u << s)) == 0) continue;
+    styleSectionBytes += sizeof(glyphatlas::StyleHeader) + entriesByStyle[s].size() * sizeof(glyphatlas::GlyphEntry);
+  }
+  output.reserve(headerBytes + styleSectionBytes + bitmapData.size());
+
+  glyphatlas::BlockHeader bh{};
+  bh.magic = glyphatlas::MAGIC;
+  bh.version = glyphatlas::FORMAT_VERSION;
+  bh.bitDepth = glyphatlas::BIT_DEPTH_1;
+  bh.styleMask = styleMask;
+  bh.reserved = 0;
+  bh.totalGlyphs = totalGlyphs;
+  bh.bitmapBytes = static_cast<uint16_t>(bitmapData.size());
+  output.insert(output.end(), reinterpret_cast<const uint8_t*>(&bh),
+                reinterpret_cast<const uint8_t*>(&bh) + sizeof(bh));
+
+  for (uint8_t s = 0; s < 4; ++s) {
+    if ((styleMask & (1u << s)) == 0) continue;
+    glyphatlas::StyleHeader sh{};
+    sh.styleId = s;
+    sh.reserved = 0;
+    sh.glyphCount = static_cast<uint16_t>(entriesByStyle[s].size());
+    sh.ascender = static_cast<uint16_t>(font.miniAscender(s));
+    sh.descender = static_cast<uint16_t>(font.miniDescender(s));
+    sh.lineHeight = static_cast<uint16_t>(font.miniAdvanceY(s));
+    sh.spaceWidth = 0;  // Not currently emitted; renderer can derive from
+                        // the space glyph's advanceX entry as needed.
+    output.insert(output.end(), reinterpret_cast<const uint8_t*>(&sh),
+                  reinterpret_cast<const uint8_t*>(&sh) + sizeof(sh));
+    output.insert(output.end(), reinterpret_cast<const uint8_t*>(entriesByStyle[s].data()),
+                  reinterpret_cast<const uint8_t*>(entriesByStyle[s].data() + entriesByStyle[s].size()));
+  }
+  output.insert(output.end(), bitmapData.begin(), bitmapData.end());
+  return output;
 }
 
 // CrumBLE 4.3: per-section glyph subset emit. Implementation in stages:
