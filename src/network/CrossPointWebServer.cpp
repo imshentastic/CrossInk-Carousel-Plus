@@ -728,9 +728,55 @@ void CrossPointWebServer::handleFileListData() const {
   LOG_INF("WEB", "api-files: sending %u B rows=%u (free=%u maxAlloc=%u) path=%s",
           (unsigned)body.size(), (unsigned)emittedRows, ESP.getFreeHeap(),
           ESP.getMaxAllocHeap(), currentPath.c_str());
+
+  // CrumBLE 4.3-rc2: chunked-write FT listing fix.
+  //
+  // The previous pattern was:
+  //   setContentLength(body.size());
+  //   send(200, "application/json", "");   // headers, empty body
+  //   sendContent(body.c_str());            // single bulk write
+  //
+  // Under tight heap (post-NimBLE, post-page-DOM-build), WiFiClient::write
+  // does partial writes or returns 0 without surfacing the failure to
+  // sendContent. The header promised body.size() bytes; the wire saw
+  // fewer; browsers errored with ERR_CONTENT_LENGTH_MISMATCH and the FT
+  // web UI displayed "An error occurred while loading the files". The
+  // /.crosspoint listing was the canonical reproducer (75+ entries, ~7 KB
+  // response) but the same failure mode left the underlying connection
+  // wedged enough to look like the FT-keeps-disconnecting reports.
+  //
+  // The fix here writes in 512-byte chunks with retry on partial-write,
+  // and gracefully breaks if the client disconnected mid-stream. We still
+  // set Content-Length up front (the alternative -- chunked transfer
+  // encoding -- previously hung on this device per the earlier comment
+  // block).
   server->setContentLength(body.size());
   server->send(200, "application/json", "");
-  server->sendContent(body.c_str());
+  {
+    WiFiClient client = server->client();
+    const uint8_t* src = reinterpret_cast<const uint8_t*>(body.data());
+    size_t remaining = body.size();
+    uint8_t backoffMs = 1;
+    while (remaining > 0) {
+      if (!client.connected()) {
+        LOG_ERR("WEB", "api-files: client disconnected with %u B unsent", (unsigned)remaining);
+        break;
+      }
+      const size_t chunk = remaining < 512 ? remaining : 512;
+      const size_t n = client.write(src, chunk);
+      if (n == 0) {
+        // WiFi tx queue full or temporary failure; back off briefly so the
+        // stack can drain pending segments, then retry. Cap backoff to
+        // bound worst-case latency on a stuck connection.
+        delay(backoffMs);
+        if (backoffMs < 32) backoffMs *= 2;
+        continue;
+      }
+      src += n;
+      remaining -= n;
+      backoffMs = 1;  // reset backoff after any successful write
+    }
+  }
   LOG_INF("WEB", "api-files: done (post free=%u maxAlloc=%u)",
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 }
