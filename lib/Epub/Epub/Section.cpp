@@ -39,11 +39,17 @@ constexpr uint32_t SECTION_CACHE_MAGIC = 0x535843FF;  // bytes: 0xFF, "CXS"
 // heap to ~13 KB after BT enable, below the ~14 KB miniData footprint of an
 // SD font; embedding the section's working glyph set into the section file
 // lets the runtime skip the miniData allocation entirely for that section.
-constexpr uint8_t SECTION_FILE_VERSION = 39;
+// CrumBLE 4.4: v40 adds a 3-uint32 glyph atlas trailer (offset/size/hash)
+// right after the v39 embedded-glyph-subset trailer. Sections with no atlas
+// emit zeros for all three fields; the loader treats that as "no atlas
+// available, fall back to the v39 subset / SD-font miss handler path".
+// See lib/Epub/Epub/GlyphAtlas.h for the on-disk block format.
+constexpr uint8_t SECTION_FILE_VERSION = 40;
 // Oldest section file version this firmware can still read (forward-compat
 // window). v38 sections produced by v4.2.x prebakes / live caches still load
 // cleanly; their embedded glyph subset offsets default to 0 (no subset).
-// Older versions trigger a rebuild as before.
+// v39 sections similarly default the v40 atlas trailer to 0/0/0. Older
+// versions trigger a rebuild as before.
 constexpr uint8_t MIN_READABLE_SECTION_FILE_VERSION = 38;
 // How much the largest free block must have grown since a degraded build before
 // we bother rebuilding it for images (avoids rebuild churn on tiny variations).
@@ -102,8 +108,10 @@ constexpr uint32_t HEADER_SIZE_V38 = sizeof(SECTION_CACHE_MAGIC) + sizeof(uint8_
                                      sizeof(uint8_t) + sizeof(bool) + sizeof(bool) +
                                      sizeof(bool) /*imagesSuppressed*/ + sizeof(uint32_t) /*buildMaxAlloc*/ +
                                      sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t);
-// v39 adds 3 uint32_t trailer fields after the liLutOffset.
-constexpr uint32_t HEADER_SIZE = HEADER_SIZE_V38 + 3 * sizeof(uint32_t);
+// v39 adds 3 uint32_t trailer fields after the liLutOffset (embedded glyph
+// subset offset/size/hash). v40 adds 3 more (glyph atlas offset/size/hash).
+constexpr uint32_t HEADER_SIZE_V39 = HEADER_SIZE_V38 + 3 * sizeof(uint32_t);
+constexpr uint32_t HEADER_SIZE = HEADER_SIZE_V39 + 3 * sizeof(uint32_t);
 
 // The embedded glyph subset block format constants live in
 // EmbeddedGlyphSubset.h (namespace embeddedGlyphSubset) so the on-device
@@ -158,7 +166,10 @@ bool Section::writeSectionFileHeader(const int fontId, const float lineCompressi
                                    sizeof(uint32_t) /*liLutOffset*/ +
                                    sizeof(uint32_t) /*embeddedGlyphSubsetOffset (v39)*/ +
                                    sizeof(uint32_t) /*embeddedGlyphSubsetSize (v39)*/ +
-                                   sizeof(uint32_t) /*embeddedGlyphSubsetCpfontHash (v39)*/,
+                                   sizeof(uint32_t) /*embeddedGlyphSubsetCpfontHash (v39)*/ +
+                                   sizeof(uint32_t) /*glyphAtlasOffset (v40)*/ +
+                                   sizeof(uint32_t) /*glyphAtlasSize (v40)*/ +
+                                   sizeof(uint32_t) /*glyphAtlasCpfontHash (v40)*/,
                 "Header size mismatch");
   return serialization::tryWritePod(file, SECTION_CACHE_MAGIC) &&
          serialization::tryWritePod(file, SECTION_FILE_VERSION) && serialization::tryWritePod(file, fontId) &&
@@ -185,7 +196,15 @@ bool Section::writeSectionFileHeader(const int fontId, const float lineCompressi
          // patched by the prebake CLI when it emits a subset block at finalize.
          serialization::tryWritePod(file, static_cast<uint32_t>(0)) &&  // embeddedGlyphSubsetOffset
          serialization::tryWritePod(file, static_cast<uint32_t>(0)) &&  // embeddedGlyphSubsetSize
-         serialization::tryWritePod(file, static_cast<uint32_t>(0));    // embeddedGlyphSubsetCpfontHash
+         serialization::tryWritePod(file, static_cast<uint32_t>(0)) &&  // embeddedGlyphSubsetCpfontHash
+         // v40 trailer: three uint32_t fields for the optional pre-rendered
+         // glyph atlas block. All zero on device-built sections and on prebake
+         // CLI runs that didn't emit an atlas (e.g. --emit-section-glyph-atlas
+         // not passed). Patched by the prebake CLI when it emits an atlas
+         // block in the buildGlyphAtlasBlock path.
+         serialization::tryWritePod(file, static_cast<uint32_t>(0)) &&  // glyphAtlasOffset
+         serialization::tryWritePod(file, static_cast<uint32_t>(0)) &&  // glyphAtlasSize
+         serialization::tryWritePod(file, static_cast<uint32_t>(0));    // glyphAtlasCpfontHash
 }
 
 bool Section::loadSectionFile(const int fontId, const float lineCompression, const bool extraParagraphSpacing,
@@ -386,6 +405,9 @@ bool Section::tryLoadFromPath(const std::string& path, const int fontId, const f
   embeddedGlyphSubsetOffset_ = 0;
   embeddedGlyphSubsetSize_ = 0;
   embeddedGlyphSubsetCpfontHash_ = 0;
+  glyphAtlasOffset_ = 0;
+  glyphAtlasSize_ = 0;
+  glyphAtlasCpfontHash_ = 0;
   if (fileVersion_ >= 39) {
     if (!file.seek(HEADER_SIZE_V38)) {
       file.close();
@@ -397,6 +419,19 @@ bool Section::tryLoadFromPath(const std::string& path, const int fontId, const f
         !serialization::tryReadPod(file, embeddedGlyphSubsetCpfontHash_)) {
       file.close();
       LOG_ERR("SCT", "Deserialization failed: truncated v39 embedded-glyph-subset trailer (%s)", path.c_str());
+      return false;
+    }
+  }
+  if (fileVersion_ >= 40) {
+    // v40 atlas trailer sits immediately after the v39 subset trailer.
+    // File position is already there because the v39 reads above moved
+    // it forward by exactly 3 * sizeof(uint32_t); we read the next three
+    // uint32_t fields with no seek needed.
+    if (!serialization::tryReadPod(file, glyphAtlasOffset_) ||
+        !serialization::tryReadPod(file, glyphAtlasSize_) ||
+        !serialization::tryReadPod(file, glyphAtlasCpfontHash_)) {
+      file.close();
+      LOG_ERR("SCT", "Deserialization failed: truncated v40 glyph-atlas trailer (%s)", path.c_str());
       return false;
     }
   }

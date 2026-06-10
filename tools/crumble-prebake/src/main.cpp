@@ -763,6 +763,10 @@ bool prebakeCoverThumb(const std::string& epubPath, const std::string& cacheDir,
 //    + trailer patching.
 bool emitEmbeddedGlyphSubsetForSection(const std::string& sectionPath, Section& section, SdCardFont& font,
                                        int spineIdx);
+// CrumBLE 4.4 task #35 step 2a forward decl: buildGlyphAtlasBlock is
+// defined later in this file (near the embedded subset emitter) so the
+// section-loop call site can reach it without re-ordering the file.
+std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font);
 
 // EPUB, byte-targeting the device's section file format. Loads an Epub
 // instance from the same on-disk cache Phase 1 just wrote, then loops
@@ -904,6 +908,44 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
           // 0/0/0, which the on-device load path falls back to (existing
           // SdCardFont miss-handler path). Log + continue.
           LOG_ERR("PRE", "section %d: glyph subset emit FAILED (section file stays v39 with no subset)", spineIdx);
+        }
+        // CrumBLE 4.4 (v4.4 task #35 step 2b): emit the v40 glyph atlas
+        // block too. The subset emit above leaves SdCardFont's mini-data
+        // populated with exactly this section's working glyph set, which
+        // buildGlyphAtlasBlock then iterates to produce a 1-bit packed
+        // atlas. Best-effort like the subset emit; failures leave the v40
+        // atlas trailer at 0/0/0 and the device falls back to the v39
+        // subset path. Subset emit is the precondition (it primes the
+        // mini-data); skipping that case keeps the atlas dimensions
+        // matched against what the on-device renderer will actually look
+        // up at draw time.
+        if (subsetOk) {
+          const std::vector<uint8_t> atlasBlock = buildGlyphAtlasBlock(*sdFontForSubset);
+          if (!atlasBlock.empty()) {
+            std::fstream af(sectionPath, std::ios::in | std::ios::out | std::ios::binary);
+            if (!af.is_open()) {
+              LOG_ERR("PRE", "section %d: cannot open %s for r+w during atlas emit", spineIdx, sectionPath.c_str());
+            } else {
+              af.seekp(0, std::ios::end);
+              const uint32_t atlasStartOffset = static_cast<uint32_t>(af.tellp());
+              af.write(reinterpret_cast<const char*>(atlasBlock.data()), static_cast<std::streamsize>(atlasBlock.size()));
+              const uint32_t atlasSize = static_cast<uint32_t>(atlasBlock.size());
+              // v40 trailer sits at HEADER_SIZE_V38 + 12 (after the v39
+              // embedded-subset triple). Mirrors the seek arithmetic the
+              // v39 emit path uses to patch its own trailer.
+              constexpr uint32_t kV40TrailerOffset = 48u + 3u * sizeof(uint32_t);  // 60
+              af.seekp(kV40TrailerOffset, std::ios::beg);
+              const uint32_t atlasHash = sdFontForSubset->contentHash();
+              af.write(reinterpret_cast<const char*>(&atlasStartOffset), sizeof(uint32_t));
+              af.write(reinterpret_cast<const char*>(&atlasSize), sizeof(uint32_t));
+              af.write(reinterpret_cast<const char*>(&atlasHash), sizeof(uint32_t));
+              af.close();
+              LOG_INF("PRE",
+                      "  section %d: glyph atlas block written: offset=%u size=%u bytes "
+                      "(cpfontHash=0x%08x)",
+                      spineIdx, atlasStartOffset, atlasSize, atlasHash);
+            }
+          }
         }
       }
     }

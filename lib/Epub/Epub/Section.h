@@ -58,6 +58,19 @@ class Section {
   uint32_t embeddedGlyphSubsetSize_ = 0;
   uint32_t embeddedGlyphSubsetCpfontHash_ = 0;
 
+  // CrumBLE 4.4: v40 glyph atlas trailer fields. All zero on sections
+  // that don't carry a pre-rendered atlas (legacy <v40 prebakes, device-
+  // built sections, prebake CLI runs without --emit-section-glyph-atlas).
+  // When non-zero, the atlas block lives at glyphAtlasOffset_ with byte
+  // size glyphAtlasSize_, and glyphAtlasCpfontHash_ identifies the .cpfont
+  // it was baked against -- runtime validates against SdCardFont's
+  // contentHash() before installing, so a font swap since bake falls back
+  // to the v39 embedded subset path or the SD-font miss handler.
+  // See lib/Epub/Epub/GlyphAtlas.h for the block format.
+  uint32_t glyphAtlasOffset_ = 0;
+  uint32_t glyphAtlasSize_ = 0;
+  uint32_t glyphAtlasCpfontHash_ = 0;
+
   // CrumBLE 4.3: parsed in-memory representation of one style's slice of the
   // embedded glyph subset block. Populated by tryInstallEmbeddedGlyphSubset()
   // when the block is present AND its cpfontHash matches the active
@@ -167,6 +180,14 @@ class Section {
   uint32_t embeddedGlyphSubsetOffset() const { return embeddedGlyphSubsetOffset_; }
   uint32_t embeddedGlyphSubsetSize() const { return embeddedGlyphSubsetSize_; }
   uint32_t embeddedGlyphSubsetCpfontHash() const { return embeddedGlyphSubsetCpfontHash_; }
+  // CrumBLE 4.4: v40 glyph atlas accessors. Same shape as the v39 subset
+  // accessors above; hasGlyphAtlas() short-circuits the install path
+  // when no atlas was baked (legacy sections, device-built sections,
+  // built-in font books for the moment until phase 2 of atlas work).
+  bool hasGlyphAtlas() const { return glyphAtlasOffset_ != 0 && glyphAtlasSize_ != 0; }
+  uint32_t glyphAtlasOffset() const { return glyphAtlasOffset_; }
+  uint32_t glyphAtlasSize() const { return glyphAtlasSize_; }
+  uint32_t glyphAtlasCpfontHash() const { return glyphAtlasCpfontHash_; }
   // CrumBLE 4.3 diagnostic: surface fileVersion_ so callers can distinguish
   // "section is pre-v39 (no embedded subset trailer possible)" from "section
   // is v39 but the prebake CLI didn't emit a subset block". 0 if no section
