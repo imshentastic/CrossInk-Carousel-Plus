@@ -1425,12 +1425,92 @@ bool Section::tryInstallGlyphAtlas(uint32_t cpfontContentHash) {
   file.close();
 
   glyphAtlasBitDepth_ = hdr.bitDepth;
+
+  // Step 5: synthesize EpdFontData per populated style so the existing
+  // renderer (which speaks EpdFontData/EpdGlyph/EpdUnicodeInterval) can
+  // consume atlas glyphs through the same setEmbeddedGlyphData slot the
+  // v39 subset uses. Without this step the atlas would sit in RAM
+  // unread by the draw path.
+  for (auto& slot : glyphAtlasSlots_) {
+    if (slot.styleId == 0xFF) continue;
+    synthesizeAtlasFontData(slot);
+  }
+
   glyphAtlasInstalled_ = (populated > 0);
   LOG_INF("SCT",
           "Glyph atlas installed: %u style(s), %u glyphs, %u-bit bitmap (%u bytes)",
           static_cast<unsigned>(populated), static_cast<unsigned>(hdr.totalGlyphs),
           static_cast<unsigned>(glyphAtlasBitDepth_), static_cast<unsigned>(hdr.bitmapBytes));
   return glyphAtlasInstalled_;
+}
+
+void Section::synthesizeAtlasFontData(GlyphAtlasSlot& slot) {
+  // Build the EpdGlyph[] in the same order as the GlyphEntry[]. For each
+  // glyph, dataOffset is the atlas bitmap offset; dataLength is the
+  // packed glyph byte count (rowBytes * height).
+  slot.synthesizedGlyphs.clear();
+  slot.synthesizedGlyphs.reserve(slot.entries.size());
+  for (const auto& e : slot.entries) {
+    EpdGlyph g{};
+    g.width = e.width;
+    g.height = e.height;
+    g.advanceX = e.advanceX;
+    g.left = static_cast<int16_t>(e.left);
+    g.top = static_cast<int16_t>(e.top);
+    g.dataOffset = e.bitmapOffset;
+    g.dataLength = glyphatlas::glyphBytes(e.width, e.height, glyphAtlasBitDepth_);
+    slot.synthesizedGlyphs.push_back(g);
+  }
+
+  // Build EpdUnicodeInterval[] by collapsing runs of consecutive
+  // codepoints. The renderer uses intervals to map codepoint -> glyph
+  // index via binary search; one interval per gap in the codepoint
+  // sequence is optimal.
+  slot.synthesizedIntervals.clear();
+  if (!slot.entries.empty()) {
+    EpdUnicodeInterval current{};
+    current.first = slot.entries.front().codepoint;
+    current.last = slot.entries.front().codepoint;
+    current.offset = 0;
+    for (size_t i = 1; i < slot.entries.size(); ++i) {
+      const uint32_t cp = slot.entries[i].codepoint;
+      if (cp == current.last + 1) {
+        current.last = cp;
+      } else {
+        slot.synthesizedIntervals.push_back(current);
+        current.first = cp;
+        current.last = cp;
+        current.offset = static_cast<uint32_t>(i);
+      }
+    }
+    slot.synthesizedIntervals.push_back(current);
+  }
+
+  // Assemble the EpdFontData with pointers into the just-built vectors
+  // and the section's shared bitmap buffer. is2Bit = (bitDepth == 2);
+  // glyphMissHandler is null because atlas misses fall through to the
+  // EpdFontFamily-level chain (v39 subset, then SD-font miss handler).
+  slot.fontData = EpdFontData{};
+  slot.fontData.bitmap = glyphAtlasBitmap_.data();
+  slot.fontData.glyph = slot.synthesizedGlyphs.data();
+  slot.fontData.intervals = slot.synthesizedIntervals.data();
+  slot.fontData.intervalCount = static_cast<uint32_t>(slot.synthesizedIntervals.size());
+  slot.fontData.advanceY = static_cast<uint8_t>(slot.lineHeight);
+  slot.fontData.ascender = slot.ascender;
+  slot.fontData.descender = slot.descender;
+  slot.fontData.is2Bit = (glyphAtlasBitDepth_ == glyphatlas::BIT_DEPTH_2);
+  // groups / glyphToGroup / glyphMissHandler / kerning / ligatures all
+  // stay null: atlas is a flat lookup table, no compression groups,
+  // no kerning baked in (CrumBLE 4.3 dropped kerning from the embedded
+  // subset to save bytes -- atlas follows the same policy).
+}
+
+const EpdFontData* Section::glyphAtlasFontDataForStyle(uint8_t styleId) const {
+  if (!glyphAtlasInstalled_) return nullptr;
+  if (styleId >= glyphAtlasSlots_.size()) return nullptr;
+  const auto& slot = glyphAtlasSlots_[styleId];
+  if (slot.styleId == 0xFF || slot.synthesizedGlyphs.empty()) return nullptr;
+  return &slot.fontData;
 }
 
 void Section::dropGlyphAtlas() {
@@ -1443,6 +1523,9 @@ void Section::dropGlyphAtlas() {
     slot.spaceWidth = 0;
     // swap-with-empty guarantees vector capacity is freed (clear keeps it).
     std::vector<glyphatlas::GlyphEntry>().swap(slot.entries);
+    std::vector<EpdGlyph>().swap(slot.synthesizedGlyphs);
+    std::vector<EpdUnicodeInterval>().swap(slot.synthesizedIntervals);
+    slot.fontData = EpdFontData{};
   }
   std::vector<uint8_t>().swap(glyphAtlasBitmap_);
   glyphAtlasBitDepth_ = 0;

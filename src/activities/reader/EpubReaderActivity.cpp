@@ -3547,14 +3547,31 @@ void EpubReaderActivity::render(RenderLock&& lock) {
         LOG_INF("SCT",
                 "EGS gate: attempting install (curFontId=%d sdFontHash=0x%08x)",
                 curFontId, it->second->contentHash());
-        section->tryInstallEmbeddedGlyphSubset(it->second->contentHash());
+        // CrumBLE 4.4 step 5: prefer the v40 glyph atlas when present.
+        // If the section has both a v40 atlas and a v39 subset (which
+        // is what the current prebake CLI emits when --emit-section-
+        // glyph-subsets is set), the atlas wins -- it's smaller in
+        // resident memory, has no eviction failure mode, and matches
+        // the renderer's 1-bit blit path directly. The v39 subset stays
+        // available as a fallback if the atlas install fails (e.g.
+        // post-NimBLE heap too tight for the bitmap allocation).
+        const bool atlasOk = section->hasGlyphAtlas() && section->tryInstallGlyphAtlas(it->second->contentHash());
+        if (!atlasOk) {
+          section->tryInstallEmbeddedGlyphSubset(it->second->contentHash());
+        }
       }
     }
-    renderer.setEmbeddedGlyphData(curFontId,
-                                  section ? section->embeddedFontDataForStyle(0) : nullptr,
-                                  section ? section->embeddedFontDataForStyle(1) : nullptr,
-                                  section ? section->embeddedFontDataForStyle(2) : nullptr,
-                                  section ? section->embeddedFontDataForStyle(3) : nullptr);
+    // Atlas takes precedence when installed; the renderer slot is the
+    // same for both paths (setEmbeddedGlyphData), so the existing draw
+    // code doesn't need to know which source produced the data.
+    auto glyphFontData = [&](uint8_t style) -> const EpdFontData* {
+      if (!section) return nullptr;
+      if (section->glyphAtlasInstalled()) {
+        if (const EpdFontData* atlas = section->glyphAtlasFontDataForStyle(style)) return atlas;
+      }
+      return section->embeddedFontDataForStyle(style);
+    };
+    renderer.setEmbeddedGlyphData(curFontId, glyphFontData(0), glyphFontData(1), glyphFontData(2), glyphFontData(3));
 
     if (pendingPageJump.has_value()) {
       if (*pendingPageJump >= section->pageCount && section->pageCount > 0) {
@@ -3727,19 +3744,37 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     // its own preflight (skips if MaxAlloc < bitmap size + 1 KB) so it
     // silently bails on tight heap and the render falls back to SD-font
     // onGlyphMiss for everything (some Outside range drift, but readable).
-    if (section && section->hasEmbeddedGlyphSubset() && !section->embeddedSubsetInstalled()) {
+    // CrumBLE 4.4 step 5: lazy reload prefers the v40 atlas over the v39
+    // subset when both are present, mirroring the section-open path.
+    const bool atlasNeedsReload = section && section->hasGlyphAtlas() && !section->glyphAtlasInstalled();
+    const bool subsetNeedsReload =
+        section && section->hasEmbeddedGlyphSubset() && !section->embeddedSubsetInstalled();
+    if (atlasNeedsReload || subsetNeedsReload) {
       const int curFontId = SETTINGS.getReaderFontId();
       const auto& sdFontMap = renderer.getSdCardFonts();
       auto it = sdFontMap.find(curFontId);
       if (it != sdFontMap.end() && it->second != nullptr) {
         const uint32_t freeBefore = ESP.getFreeHeap();
         const uint32_t maxAllocBefore = ESP.getMaxAllocHeap();
-        const bool ok = section->tryInstallEmbeddedGlyphSubset(it->second->contentHash());
-        LOG_INF("ERA", "Lazy EGS reload: ok=%d (free %u->%u, maxAlloc %u->%u)", ok, freeBefore, ESP.getFreeHeap(),
-                maxAllocBefore, ESP.getMaxAllocHeap());
-        renderer.setEmbeddedGlyphData(curFontId, section->embeddedFontDataForStyle(0),
-                                      section->embeddedFontDataForStyle(1), section->embeddedFontDataForStyle(2),
-                                      section->embeddedFontDataForStyle(3));
+        bool atlasOk = false;
+        if (atlasNeedsReload) {
+          atlasOk = section->tryInstallGlyphAtlas(it->second->contentHash());
+        }
+        bool subsetOk = section->embeddedSubsetInstalled();
+        if (!atlasOk && subsetNeedsReload) {
+          // Atlas unavailable or install failed; fall back to v39 subset.
+          subsetOk = section->tryInstallEmbeddedGlyphSubset(it->second->contentHash());
+        }
+        LOG_INF("ERA", "Lazy glyph data reload: atlas=%d subset=%d (free %u->%u, maxAlloc %u->%u)",
+                atlasOk, subsetOk, freeBefore, ESP.getFreeHeap(), maxAllocBefore, ESP.getMaxAllocHeap());
+        auto glyphFontData = [&](uint8_t style) -> const EpdFontData* {
+          if (section->glyphAtlasInstalled()) {
+            if (const EpdFontData* atlas = section->glyphAtlasFontDataForStyle(style)) return atlas;
+          }
+          return section->embeddedFontDataForStyle(style);
+        };
+        renderer.setEmbeddedGlyphData(curFontId, glyphFontData(0), glyphFontData(1), glyphFontData(2),
+                                      glyphFontData(3));
       }
     }
 

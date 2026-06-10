@@ -86,6 +86,19 @@ class Section {
     uint16_t lineHeight = 0;
     uint16_t spaceWidth = 0;
     std::vector<glyphatlas::GlyphEntry> entries;
+
+    // CrumBLE 4.4 step 5 renderer interop: synthesized representation
+    // of the same atlas data in the EpdFontData/EpdGlyph/EpdUnicodeInterval
+    // shape the existing renderer expects. Populated once at install
+    // time so EpdFontFamily::setEmbeddedGlyphData can be reused unchanged
+    // -- the renderer treats an atlas-backed style the same way it
+    // treats a v39 embedded subset style, with the same 1-bit blit path
+    // and the same per-glyph metadata lookups. Pointers inside fontData
+    // point at the vectors here + the section's shared glyphAtlasBitmap_;
+    // the entire structure is invalidated when dropGlyphAtlas() runs.
+    std::vector<EpdGlyph> synthesizedGlyphs;
+    std::vector<EpdUnicodeInterval> synthesizedIntervals;
+    EpdFontData fontData{};
   };
   // Per-style slots indexed by styleId (REGULAR=0, BOLD=1, ITALIC=2,
   // BOLDITALIC=3). The bitmap payload is SHARED across all styles --
@@ -140,6 +153,16 @@ class Section {
   // slot vectors might move (in practice, only at install time -- the
   // vectors are stable after install).
   void patchEmbeddedFontDataPointers();
+
+  // CrumBLE 4.4 step 5: convert one style's GlyphEntry table into the
+  // EpdFontData + EpdGlyph[] + EpdUnicodeInterval[] shape the renderer
+  // already knows how to consume. Populates the synthesizedGlyphs /
+  // synthesizedIntervals / fontData fields of slot. Called once per
+  // style at tryInstallGlyphAtlas time after entries[] is populated and
+  // glyphAtlasBitmap_ is loaded -- bitmap base pointer in fontData is
+  // taken from glyphAtlasBitmap_.data() so the pointer is stable for
+  // the lifetime of the install.
+  void synthesizeAtlasFontData(GlyphAtlasSlot& slot);
 
   bool writeSectionFileHeader(int fontId, float lineCompression, bool extraParagraphSpacing, bool forceParagraphIndents,
                               uint8_t paragraphAlignment, uint16_t viewportWidth, uint16_t viewportHeight,
@@ -252,6 +275,16 @@ class Section {
     return glyphAtlasBitmap_.empty() ? nullptr : glyphAtlasBitmap_.data();
   }
   uint8_t glyphAtlasBitDepth() const { return glyphAtlasBitDepth_; }
+
+  // CrumBLE 4.4 step 5: per-style EpdFontData synthesized from the
+  // atlas data at install time. Returns nullptr when no atlas is
+  // installed for this style. Pointer lifetime: valid until the next
+  // tryInstallGlyphAtlas / dropGlyphAtlas / Section destruction. The
+  // reader passes these into GfxRenderer::setEmbeddedGlyphData (same
+  // entry point the v39 embedded subset uses) so the existing render
+  // path consumes atlas glyphs through the embedded-data slot without
+  // any blit-path changes.
+  const EpdFontData* glyphAtlasFontDataForStyle(uint8_t styleId) const;
 
   // Per-style metric accessors for the renderer.
   uint16_t glyphAtlasAscender(uint8_t styleId) const {
