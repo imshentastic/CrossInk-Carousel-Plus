@@ -615,8 +615,29 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
     // been cleared at the time of failure (recent.json persisted "")
     // but, defense in depth: also short-circuit here so a re-derivation
     // anywhere upstream can't reanimate the retry loop.
-    if (CoverThumbStatus::isMarkedFailed(book.path, LyraCarouselTheme::kCenterThumbW,
-                                         LyraCarouselTheme::kCenterThumbH)) {
+    //
+    // CrumBLE 4.3-rc2 fix: previously this only checked the carousel
+    // center-thumb dimensions (296x468). For non-carousel themes (flow,
+    // minimal) the failed-gen marker is written at completely different
+    // dimensions (e.g. 192x320 for the standard flow theme), so the
+    // marker existed but the early-bail never matched -- every Home
+    // render re-attempted the failing gen, dropping the fast-path cache
+    // and re-indexing on every navigation. Check whichever dimension
+    // the active theme would actually try to generate this pass.
+    int markerCheckW = LyraCarouselTheme::kCenterThumbW;
+    int markerCheckH = LyraCarouselTheme::kCenterThumbH;
+    if (!isCarouselTheme) {
+      if (isMinimal) {
+        markerCheckW = minimalHomeCoverWidth(coverHeight);
+        markerCheckH = minimalHomeCoverHeight(coverHeight);
+      } else {
+        // Standard flow: 3/5 aspect (matches the thumbW formula used in
+        // the non-carousel gen path on line ~739).
+        markerCheckW = static_cast<int>((static_cast<int64_t>(coverHeight) * 3 + 2) / 5);
+        markerCheckH = coverHeight;
+      }
+    }
+    if (CoverThumbStatus::isMarkedFailed(book.path, markerCheckW, markerCheckH)) {
       progress++;
       continue;
     }
