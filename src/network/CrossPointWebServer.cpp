@@ -728,16 +728,33 @@ void CrossPointWebServer::handleFileListData() const {
   LOG_INF("WEB", "api-files: sending %u B rows=%u (free=%u maxAlloc=%u) path=%s",
           (unsigned)body.size(), (unsigned)emittedRows, ESP.getFreeHeap(),
           ESP.getMaxAllocHeap(), currentPath.c_str());
-  // CrumBLE 4.3-rc2 attempted a chunked-write fix here. It hung the device
-  // on /.crosspoint -- WiFiClient::write returns 0 indefinitely under some
-  // conditions and the retry loop spun without yielding cleanly. Reverted
-  // to the original pattern; the underlying ERR_CONTENT_LENGTH_MISMATCH
-  // for large listings (~7 KB+) is tracked in task #37 and needs a deeper
-  // fix at the transport layer (chunked transfer encoding or response
-  // pagination), not a one-line write loop.
+  // CrumBLE 4.4 task #37 fix: the ERR_CONTENT_LENGTH_MISMATCH for ~7 KB+
+  // listings was NOT a transport-layer problem -- it was a temp-String
+  // allocation failure inside the original `sendContent(body.c_str())` call.
+  //
+  // The Arduino WebServer has no `sendContent(const char*)` single-arg
+  // overload (see WebServer.h: only `(const String&)` and `(const char*,
+  // size_t)` exist). Passing `body.c_str()` selected the `String` overload
+  // via implicit `String(const char*)` construction, which heap-allocates a
+  // second ~7 KB copy of the body. On a device that's already passed the
+  // 22 KB FT guard but is fragmented (post page-serve dip, maxAlloc often
+  // 8-14 KB), that contiguous allocation fails. Arduino String quietly
+  // becomes empty on alloc failure, so `sendContent` then writes zero
+  // body bytes after the headers already promised `Content-Length: N`.
+  // Browsers see "transfer closed with N bytes remaining" /
+  // ERR_CONTENT_LENGTH_MISMATCH. /.crosspoint hit this first because its
+  // ~75 cache entries are the only directory routinely exceeding 7 KB.
+  //
+  // The fix is to call the explicit `(const char*, size_t)` overload so
+  // the body's existing std::string buffer is written directly through
+  // NetworkClient::write. That writer already does select()-gated partial-
+  // write handling internally (NetworkClient.cpp) and honours the 5 s
+  // SO_SNDTIMEO from applyClientSendTimeout, so we get bounded blocking
+  // without the 4.3-rc2 retry-on-zero-write spin that wedged the WiFi task.
+  // No chunked encoding, no second large allocation.
   server->setContentLength(body.size());
   server->send(200, "application/json", "");
-  server->sendContent(body.c_str());
+  server->sendContent(body.data(), body.size());
   LOG_INF("WEB", "api-files: done (post free=%u maxAlloc=%u)",
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 }
