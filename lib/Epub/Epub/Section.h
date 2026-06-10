@@ -8,6 +8,7 @@
 
 #include "../../EpdFont/EpdFontData.h"  // EpdFontData / EpdUnicodeInterval / EpdGlyph
 #include "Epub.h"
+#include "GlyphAtlas.h"  // CrumBLE 4.4: per-section glyph atlas types
 
 class Page;
 class GfxRenderer;
@@ -70,6 +71,36 @@ class Section {
   uint32_t glyphAtlasOffset_ = 0;
   uint32_t glyphAtlasSize_ = 0;
   uint32_t glyphAtlasCpfontHash_ = 0;
+
+  // CrumBLE 4.4: parsed in-RAM glyph atlas for one style. Populated by
+  // tryInstallGlyphAtlas() when the section carries an atlas block and
+  // its cpfontContentHash matches the active SdCardFont. The `entries`
+  // vector is sorted by codepoint (the prebake CLI emits in interval
+  // order which is codepoint-ascending), so the renderer can binary-
+  // search by codepoint. styleId == 0xFF marks the slot as unused
+  // (this style wasn't in the block's styleMask).
+  struct GlyphAtlasSlot {
+    uint8_t styleId = 0xFF;
+    uint16_t ascender = 0;
+    uint16_t descender = 0;
+    uint16_t lineHeight = 0;
+    uint16_t spaceWidth = 0;
+    std::vector<glyphatlas::GlyphEntry> entries;
+  };
+  // Per-style slots indexed by styleId (REGULAR=0, BOLD=1, ITALIC=2,
+  // BOLDITALIC=3). The bitmap payload is SHARED across all styles --
+  // each GlyphEntry::bitmapOffset is a byte offset into the same
+  // glyphAtlasBitmap_ buffer. This matches the prebake CLI's output
+  // (single bitmap blob after all per-style headers) and saves on
+  // per-style allocation overhead during install.
+  std::array<GlyphAtlasSlot, 4> glyphAtlasSlots_;
+  std::vector<uint8_t> glyphAtlasBitmap_;
+  // Bit-depth of glyphAtlasBitmap_ payload. 1 today (atlas emits 1-bit
+  // packed glyphs); 2 if a future builder produces 2-bit anti-aliased
+  // glyphs. The renderer routes the bitmap through different blit paths
+  // depending on this value.
+  uint8_t glyphAtlasBitDepth_ = 0;
+  bool glyphAtlasInstalled_ = false;
 
   // CrumBLE 4.3: parsed in-memory representation of one style's slice of the
   // embedded glyph subset block. Populated by tryInstallEmbeddedGlyphSubset()
@@ -188,6 +219,50 @@ class Section {
   uint32_t glyphAtlasOffset() const { return glyphAtlasOffset_; }
   uint32_t glyphAtlasSize() const { return glyphAtlasSize_; }
   uint32_t glyphAtlasCpfontHash() const { return glyphAtlasCpfontHash_; }
+
+  // CrumBLE 4.4: read the glyph atlas block from the section file and
+  // populate glyphAtlasSlots_ + glyphAtlasBitmap_. Validates against
+  // the caller's cpfontContentHash (from SdCardFont::contentHash())
+  // before consuming the block; mismatch leaves the slots untouched and
+  // returns false so the renderer falls back to the v39 embedded subset
+  // or SD-font miss handler path. Returns true iff at least one style
+  // slot was populated. Idempotent: a second call with the same hash
+  // re-installs cleanly.
+  bool tryInstallGlyphAtlas(uint32_t cpfontContentHash);
+
+  // True after a successful tryInstallGlyphAtlas(); false otherwise.
+  bool glyphAtlasInstalled() const { return glyphAtlasInstalled_; }
+
+  // Free the in-RAM atlas (clears glyphAtlasSlots_ entries and
+  // glyphAtlasBitmap_). Mirror of dropEmbeddedGlyphSubset() for the
+  // BT-enable path -- callers can free atlas memory under pressure and
+  // re-install it later via tryInstallGlyphAtlas(). Idempotent. No-op
+  // when nothing is installed.
+  void dropGlyphAtlas();
+
+  // Look up a glyph by codepoint in the installed atlas for the given
+  // style. Returns nullptr if no atlas is installed for this style or
+  // the codepoint isn't covered. Caller renders via the entry's bitmap
+  // offset (into glyphAtlasBitmapPtr()) and the entry's per-glyph
+  // dimensions / advance / left / top metadata.
+  const glyphatlas::GlyphEntry* lookupGlyphAtlasEntry(uint8_t styleId, uint32_t codepoint) const;
+
+  // Pointer to the shared bitmap payload. nullptr if no atlas installed.
+  const uint8_t* glyphAtlasBitmapPtr() const {
+    return glyphAtlasBitmap_.empty() ? nullptr : glyphAtlasBitmap_.data();
+  }
+  uint8_t glyphAtlasBitDepth() const { return glyphAtlasBitDepth_; }
+
+  // Per-style metric accessors for the renderer.
+  uint16_t glyphAtlasAscender(uint8_t styleId) const {
+    return styleId < glyphAtlasSlots_.size() ? glyphAtlasSlots_[styleId].ascender : 0;
+  }
+  uint16_t glyphAtlasDescender(uint8_t styleId) const {
+    return styleId < glyphAtlasSlots_.size() ? glyphAtlasSlots_[styleId].descender : 0;
+  }
+  uint16_t glyphAtlasLineHeight(uint8_t styleId) const {
+    return styleId < glyphAtlasSlots_.size() ? glyphAtlasSlots_[styleId].lineHeight : 0;
+  }
   // CrumBLE 4.3 diagnostic: surface fileVersion_ so callers can distinguish
   // "section is pre-v39 (no embedded subset trailer possible)" from "section
   // is v39 but the prebake CLI didn't emit a subset block". 0 if no section

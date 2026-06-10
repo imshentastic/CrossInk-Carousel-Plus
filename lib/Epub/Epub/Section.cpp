@@ -6,6 +6,7 @@
 #include <MemoryBudget.h>
 #include <Serialization.h>
 
+#include <algorithm>  // std::lower_bound for atlas lookup
 #include <cstring>
 
 #include "EmbeddedGlyphSubset.h"
@@ -1278,5 +1279,188 @@ const EpdFontData* Section::embeddedFontDataForStyle(uint8_t styleId) const {
   const auto& slot = embeddedStyles_[styleId];
   if (slot.styleId == 0xFF) return nullptr;
   return &slot.fontData;
+}
+
+// CrumBLE 4.4 task #35 step 4: read the v40 glyph atlas block from the
+// section file into per-style slots + a shared bitmap buffer. The block
+// format (see lib/Epub/Epub/GlyphAtlas.h) is:
+//
+//   BlockHeader { magic, version, bitDepth, styleMask, reserved,
+//                 totalGlyphs, bitmapBytes }
+//   For each style bit set in styleMask (low-to-high):
+//     StyleHeader { styleId, reserved, glyphCount,
+//                   ascender, descender, lineHeight, spaceWidth }
+//     GlyphEntry[glyphCount]
+//   uint8_t bitmapPayload[bitmapBytes]
+//
+// The GlyphEntry::bitmapOffset values are byte offsets into the shared
+// payload that comes last; this loader reads them in order and resolves
+// pointers when callers ask for them via glyphAtlasBitmapPtr().
+bool Section::tryInstallGlyphAtlas(uint32_t cpfontContentHash) {
+  // Clear any prior install state -- both successful (re-install) and
+  // failed (partial) paths.
+  glyphAtlasInstalled_ = false;
+  for (auto& slot : glyphAtlasSlots_) {
+    slot.styleId = 0xFF;
+    slot.ascender = 0;
+    slot.descender = 0;
+    slot.lineHeight = 0;
+    slot.spaceWidth = 0;
+    std::vector<glyphatlas::GlyphEntry>().swap(slot.entries);
+  }
+  std::vector<uint8_t>().swap(glyphAtlasBitmap_);
+  glyphAtlasBitDepth_ = 0;
+
+  if (!hasGlyphAtlas()) return false;
+  if (glyphAtlasCpfontHash_ != cpfontContentHash) {
+    LOG_INF("SCT",
+            "Glyph atlas hash mismatch: section baked against 0x%08x, loaded SD font is 0x%08x -- "
+            "falling back to v39 subset / miss-handler",
+            glyphAtlasCpfontHash_, cpfontContentHash);
+    return false;
+  }
+  if (!Storage.openFileForRead("SCT", activeFilePath, file)) {
+    LOG_ERR("SCT", "Glyph atlas install: cannot open %s for read", activeFilePath.c_str());
+    return false;
+  }
+  if (!file.seek(glyphAtlasOffset_)) {
+    LOG_ERR("SCT", "Glyph atlas install: seek to offset %u failed", glyphAtlasOffset_);
+    file.close();
+    return false;
+  }
+
+  glyphatlas::BlockHeader hdr{};
+  static_assert(sizeof(hdr) == 12, "GlyphAtlas BlockHeader size drift");
+  if (file.read(reinterpret_cast<uint8_t*>(&hdr), sizeof(hdr)) != static_cast<int>(sizeof(hdr))) {
+    LOG_ERR("SCT", "Glyph atlas install: truncated BlockHeader read");
+    file.close();
+    return false;
+  }
+  if (hdr.magic != glyphatlas::MAGIC) {
+    LOG_ERR("SCT", "Glyph atlas install: bad block magic 0x%08x (expected 0x%08x)", hdr.magic, glyphatlas::MAGIC);
+    file.close();
+    return false;
+  }
+  if (hdr.version != glyphatlas::FORMAT_VERSION) {
+    LOG_INF("SCT", "Glyph atlas install: block version %u, runtime supports %u -- skipping",
+            static_cast<unsigned>(hdr.version), static_cast<unsigned>(glyphatlas::FORMAT_VERSION));
+    file.close();
+    return false;
+  }
+  if (hdr.bitDepth != glyphatlas::BIT_DEPTH_1 && hdr.bitDepth != glyphatlas::BIT_DEPTH_2) {
+    LOG_ERR("SCT", "Glyph atlas install: unsupported bit depth %u", static_cast<unsigned>(hdr.bitDepth));
+    file.close();
+    return false;
+  }
+
+  // Pre-flight the bitmap allocation -- it's the single biggest chunk in
+  // the atlas (per-style headers + GlyphEntry arrays are small in
+  // comparison). Same allocator-overhead margin used by the v39 subset
+  // install path so the two have consistent heap behaviour under BT.
+  const uint32_t bitmapNeed = static_cast<uint32_t>(hdr.bitmapBytes) + 512u;
+  if (ESP.getMaxAllocHeap() < bitmapNeed) {
+    LOG_INF("SCT",
+            "Glyph atlas install: skipping under heap pressure (bitmap needs ~%u bytes, maxAlloc=%u)",
+            bitmapNeed, ESP.getMaxAllocHeap());
+    file.close();
+    return false;
+  }
+
+  // Per-style header + entry tables come BEFORE the bitmap. We have to
+  // read the styles first (the file position is right after the
+  // BlockHeader), capture all entry data, then read the bitmap payload
+  // at the end.
+  uint8_t populated = 0;
+  for (uint8_t s = 0; s < 4; ++s) {
+    if ((hdr.styleMask & (1u << s)) == 0) continue;
+
+    glyphatlas::StyleHeader sh{};
+    static_assert(sizeof(sh) == 12, "GlyphAtlas StyleHeader size drift");
+    if (file.read(reinterpret_cast<uint8_t*>(&sh), sizeof(sh)) != static_cast<int>(sizeof(sh))) {
+      LOG_ERR("SCT", "Glyph atlas install: truncated StyleHeader at bit %u", static_cast<unsigned>(s));
+      file.close();
+      glyphAtlasInstalled_ = false;
+      return false;
+    }
+    if (sh.styleId >= glyphAtlasSlots_.size()) {
+      LOG_ERR("SCT", "Glyph atlas install: invalid styleId %u in style at bit %u",
+              static_cast<unsigned>(sh.styleId), static_cast<unsigned>(s));
+      file.close();
+      return false;
+    }
+    GlyphAtlasSlot& slot = glyphAtlasSlots_[sh.styleId];
+    slot.styleId = sh.styleId;
+    slot.ascender = sh.ascender;
+    slot.descender = sh.descender;
+    slot.lineHeight = sh.lineHeight;
+    slot.spaceWidth = sh.spaceWidth;
+    slot.entries.resize(sh.glyphCount);
+    if (sh.glyphCount > 0) {
+      const size_t entriesBytes = static_cast<size_t>(sh.glyphCount) * sizeof(glyphatlas::GlyphEntry);
+      if (file.read(reinterpret_cast<uint8_t*>(slot.entries.data()), entriesBytes) !=
+          static_cast<int>(entriesBytes)) {
+        LOG_ERR("SCT", "Glyph atlas install: truncated GlyphEntry table at style %u",
+                static_cast<unsigned>(sh.styleId));
+        file.close();
+        glyphAtlasInstalled_ = false;
+        return false;
+      }
+    }
+    ++populated;
+  }
+
+  // Now read the shared bitmap payload, which sits right after the last
+  // style's entry table.
+  glyphAtlasBitmap_.resize(hdr.bitmapBytes);
+  if (hdr.bitmapBytes > 0) {
+    if (file.read(glyphAtlasBitmap_.data(), hdr.bitmapBytes) != static_cast<int>(hdr.bitmapBytes)) {
+      LOG_ERR("SCT", "Glyph atlas install: truncated bitmap payload (expected %u bytes)",
+              static_cast<unsigned>(hdr.bitmapBytes));
+      file.close();
+      glyphAtlasInstalled_ = false;
+      std::vector<uint8_t>().swap(glyphAtlasBitmap_);
+      return false;
+    }
+  }
+  file.close();
+
+  glyphAtlasBitDepth_ = hdr.bitDepth;
+  glyphAtlasInstalled_ = (populated > 0);
+  LOG_INF("SCT",
+          "Glyph atlas installed: %u style(s), %u glyphs, %u-bit bitmap (%u bytes)",
+          static_cast<unsigned>(populated), static_cast<unsigned>(hdr.totalGlyphs),
+          static_cast<unsigned>(glyphAtlasBitDepth_), static_cast<unsigned>(hdr.bitmapBytes));
+  return glyphAtlasInstalled_;
+}
+
+void Section::dropGlyphAtlas() {
+  if (!glyphAtlasInstalled_) return;
+  for (auto& slot : glyphAtlasSlots_) {
+    slot.styleId = 0xFF;
+    slot.ascender = 0;
+    slot.descender = 0;
+    slot.lineHeight = 0;
+    slot.spaceWidth = 0;
+    // swap-with-empty guarantees vector capacity is freed (clear keeps it).
+    std::vector<glyphatlas::GlyphEntry>().swap(slot.entries);
+  }
+  std::vector<uint8_t>().swap(glyphAtlasBitmap_);
+  glyphAtlasBitDepth_ = 0;
+  glyphAtlasInstalled_ = false;
+}
+
+const glyphatlas::GlyphEntry* Section::lookupGlyphAtlasEntry(uint8_t styleId, uint32_t codepoint) const {
+  if (!glyphAtlasInstalled_) return nullptr;
+  if (styleId >= glyphAtlasSlots_.size()) return nullptr;
+  const GlyphAtlasSlot& slot = glyphAtlasSlots_[styleId];
+  if (slot.styleId == 0xFF || slot.entries.empty()) return nullptr;
+  // Entries are sorted by codepoint ascending (prebake CLI emits in
+  // interval order which is itself codepoint-ascending). Binary search.
+  const auto* first = slot.entries.data();
+  const auto* last = first + slot.entries.size();
+  const auto it = std::lower_bound(first, last, codepoint,
+                                   [](const glyphatlas::GlyphEntry& e, uint32_t cp) { return e.codepoint < cp; });
+  if (it == last || it->codepoint != codepoint) return nullptr;
+  return it;
 }
 
