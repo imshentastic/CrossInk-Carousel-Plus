@@ -891,14 +891,28 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
       [this](const ActivityResult& result) {
         prebakePromptShowing_ = false;
         // ChoicePromptResult lives inside result.data. choice: 0 = "Keep
-        // my current settings", 1 = "Restore prepared layout", -1 =
-        // user backed out. Treat back-out as "Keep" -- the less
-        // destructive default.
+        // my current settings", 1 = "Restore prepared layout", -1 = user
+        // hit the prompt's Cancel/back button.
+        //
+        // CrumBLE 4.4 follow-up: treat Cancel as "back to where I was
+        // before the prompt fired". The prompt fires immediately on book
+        // open when prebake settings drift from the current SETTINGS, so
+        // "before the prompt" = the library carousel. Previously back-out
+        // silently fell through to the "Keep current settings" path,
+        // which then indexed + entered the book with mismatched settings
+        // -- the opposite of what a Cancel button should do. finish()
+        // pops the reader activity off the stack so the library renders
+        // again immediately.
         int chosen = -1;
         if (const auto* cp = std::get_if<ChoicePromptResult>(&result.data)) {
           chosen = cp->choice;
         }
-        const bool keepCurrent = result.isCancelled || chosen != 1;
+        if (result.isCancelled) {
+          LOG_INF("ERA", "Prebake prompt: cancelled, returning to library");
+          finish();
+          return;
+        }
+        const bool keepCurrent = chosen != 1;
         if (keepCurrent) {
           // User declined -- keep their current settings. Don't delete the
           // prebake (Section.cpp's clearCache only ever touches sections/,
@@ -3761,12 +3775,32 @@ void EpubReaderActivity::render(RenderLock&& lock) {
           atlasOk = section->tryInstallGlyphAtlas(it->second->contentHash());
         }
         bool subsetOk = section->embeddedSubsetInstalled();
-        if (!atlasOk && subsetNeedsReload) {
+        // CrumBLE 4.4 v4.4.1: when the atlas is already providing data
+        // (either freshly installed above OR installed at section-open and
+        // still resident), the v39 subset is redundant -- both blocks are
+        // emitted from the same prewarmed glyph working set, so they cover
+        // identical codepoints with identical metrics. Installing the
+        // subset alongside the atlas burns ~6 KB of MaxAlloc and ~5 KB of
+        // free heap (see lazy-reload log line that motivated this change:
+        // `atlas=0 subset=1 (free 56592->49364, maxAlloc 49140->42996)` --
+        // the atlas was already installed at section-open, so the lazy
+        // reload's subset install was pure overhead going into the BT
+        // enable window). Only fall through to the subset when there's no
+        // atlas data at all -- either because the section was baked
+        // pre-v40 (no atlas block) OR the atlas install above failed under
+        // tight heap.
+        const bool atlasUsable = atlasOk || section->glyphAtlasInstalled();
+        if (!atlasUsable && subsetNeedsReload) {
           // Atlas unavailable or install failed; fall back to v39 subset.
           subsetOk = section->tryInstallEmbeddedGlyphSubset(it->second->contentHash());
         }
-        LOG_INF("ERA", "Lazy glyph data reload: atlas=%d subset=%d (free %u->%u, maxAlloc %u->%u)",
-                atlasOk, subsetOk, freeBefore, ESP.getFreeHeap(), maxAllocBefore, ESP.getMaxAllocHeap());
+        // Log skipped subset reloads distinctly so the trace shows
+        // "atlas already covering" vs "both install failed" -- previously
+        // both produced atlas=0 subset=0 with no heap delta.
+        const bool subsetSkippedForAtlas = atlasUsable && subsetNeedsReload && !subsetOk;
+        LOG_INF("ERA", "Lazy glyph data reload: atlas=%d subset=%d%s (free %u->%u, maxAlloc %u->%u)",
+                atlasOk, subsetOk, subsetSkippedForAtlas ? " (subset skipped: atlas covering)" : "",
+                freeBefore, ESP.getFreeHeap(), maxAllocBefore, ESP.getMaxAllocHeap());
         auto glyphFontData = [&](uint8_t style) -> const EpdFontData* {
           if (section->glyphAtlasInstalled()) {
             if (const EpdFontData* atlas = section->glyphAtlasFontDataForStyle(style)) return atlas;
