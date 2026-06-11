@@ -872,6 +872,28 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
   }
   LOG_INF("PRE", "section gen: %d spine entries to build", spineCount);
 
+  // Pre-flight: the section settings declare a fontId (a hash of family + size).
+  // The renderer needs that fontId in its fontMap so layout calls --
+  // getLineHeight, getFontAscenderSize, getTextAdvanceX -- return real metrics.
+  // If the fontId is missing, every metric returns 0, addLineToPage's
+  // "currentPageNextY + lineHeight > viewportHeight" page-break check never
+  // fires, all chapter content lands on page 1, and the user sees "section N
+  // wrote 1 pages" for every section, then jumbled rendering on device. The
+  // common cause is forgetting --sd-font-path / --sd-font-family / --sd-font-size
+  // for an SD-card font book -- without those flags the SD font isn't registered
+  // in the renderer and its hashed fontId stays unknown. Fail loud rather than
+  // silently producing broken section caches.
+  if (renderer.getFontMap().find(s.fontId) == renderer.getFontMap().end()) {
+    LOG_ERR("PRE",
+            "fontId=%d declared in section settings is NOT registered in the renderer. "
+            "Layout metrics will all be 0 and every section would silently bake to 1 page. "
+            "If this book uses an SD-card .cpfont, pass --sd-font-path / --sd-font-family / "
+            "--sd-font-size so the host renderer can register the matching font. "
+            "Aborting section prebake for this book.",
+            s.fontId);
+    return -1;
+  }
+
   int failures = 0;
   for (int spineIdx = 0; spineIdx < spineCount; ++spineIdx) {
     Section section(epub, spineIdx, renderer);
@@ -1198,8 +1220,14 @@ std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font) {
         const uint32_t glyphIdx = iv.offset + (cp - iv.first);
         if (glyphIdx >= glyphCount) continue;
         const EpdGlyph g = glyphs[glyphIdx];
-        const uint16_t outRowBytes = glyphatlas::rowBytes(g.width, glyphatlas::BIT_DEPTH_1);
-        const uint32_t outGlyphBytes = static_cast<uint32_t>(outRowBytes) * g.height;
+        // Output is a CONTINUOUS 1-bit bitstream (no per-row byte alignment),
+        // matching GfxRenderer::renderCharImpl's blit loop which reads
+        // bitmap[pixelPosition >> 3] with pixelPosition running 0..(w*h-1)
+        // across rows. Byte-aligning each row would misalign every row past
+        // the first for any width not a multiple of 8 -- exactly the
+        // "ghost stroke per character" rendering artifact we hit on first
+        // device test of the atlas.
+        const uint32_t outGlyphBytes = glyphatlas::glyphBytes(g.width, g.height, glyphatlas::BIT_DEPTH_1);
         if (bitmapData.size() + outGlyphBytes > 0xFFFFu) {
           LOG_ERR("PRE", "atlas: bitmap payload would exceed 64 KB at cp U+%04X style %u; truncating", cp, s);
           break;  // bitmapBytes field is uint16_t
@@ -1208,9 +1236,12 @@ std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font) {
         bitmapData.resize(bitmapData.size() + outGlyphBytes, 0);
         const uint8_t* srcGlyph = srcBitmap + g.dataOffset;
 
-        // Per-pixel copy + threshold. Source format is per-glyph row-major
-        // packed at the font's bit depth; output is row-major 1-bit big
-        // endian within byte (matches the EpdFont blit path).
+        // Per-pixel copy + threshold. Source format is continuous bitstream
+        // at the font's bit depth (FontDecompressor::compactSingleGlyph
+        // already repacks byte-aligned hot-group data into continuous output,
+        // and SD-card mini bitmaps inherit that packing). Output is a
+        // continuous 1-bit bitstream, big-endian within byte (bit 7 = first
+        // pixel) -- same convention the renderer's else-branch uses.
         for (uint32_t y = 0; y < g.height; ++y) {
           for (uint32_t x = 0; x < g.width; ++x) {
             uint8_t srcPixel;
@@ -1230,8 +1261,9 @@ std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font) {
             // (intentional trade for half the storage); for already-1-bit
             // sources it's identity.
             if (srcPixel != 0) {
-              const uint32_t outByteIdx = y * outRowBytes + (x / 8u);
-              const uint32_t outBitInByte = x % 8u;
+              const uint32_t outBit = y * g.width + x;
+              const uint32_t outByteIdx = outBit / 8u;
+              const uint32_t outBitInByte = outBit % 8u;
               bitmapData[bitmapOffset + outByteIdx] |= static_cast<uint8_t>(1u << (7u - outBitInByte));
             }
           }
@@ -1801,7 +1833,12 @@ int main(int argc, char** argv) {
       } else if (sectionFails > 0) {
         LOG_INF("CLI", "  sections PARTIAL: %d failed (%u ms)", sectionFails, dtSections);
       } else {
-        LOG_INF("CLI", "  sections SKIPPED (Epub::load failed, %u ms)", dtSections);
+        // -1 from prebakeSections is the hard-failure code: Epub::load failed,
+        // shadow-copy failed, or the fontId pre-flight rejected the build (see
+        // the matching LOG_ERR upstream for the specific cause). Either way the
+        // book has no section cache.
+        LOG_ERR("CLI", "  sections HARD FAIL (%u ms) -- see prior PRE log for cause", dtSections);
+        ++failures;
       }
     }
   }
