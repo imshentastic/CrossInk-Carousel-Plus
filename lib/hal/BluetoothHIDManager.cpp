@@ -485,26 +485,42 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
     static ClientCallbacks clientCallbacks;
     pClient->setClientCallbacks(&clientCallbacks);
     
-    // Connect to device
+    // Connect to device. First attempt frequently times out for game-pad
+    // peripherals that haven't been awake for a while: the controller is
+    // still discovering / advertising and our scan-window misses it. User
+    // pattern is reliably "first quick-connect fails, second one works".
+    //
+    // CrumBLE 4.4 task #28-follow: always retry at least once with a fresh
+    // client + a small cool-down between attempts. The fresh-client path
+    // also covers the existing-client-from-previous-session case (where
+    // stale state in NimBLE's host stack rejects the reconnect).
     if (!pClient->connect(bleAddress)) {
-      if (hadExistingClient) {
-        LOG_INF("BT", "Reconnect with existing client failed for %s, retrying with fresh client", address.c_str());
-        NimBLEClient* freshClient = NimBLEDevice::createClient(bleAddress);
-        if (freshClient) {
-          pClient = freshClient;
-          pClient->setSelfDelete(false, false);
-          pClient->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
-          pClient->setConnectionParams(BLE_CONN_MIN_INTERVAL, BLE_CONN_MAX_INTERVAL, BLE_CONN_LATENCY,
-                                       BLE_CONN_TIMEOUT, BLE_CONN_SCAN_INTERVAL, BLE_CONN_SCAN_WINDOW);
-          pClient->setClientCallbacks(&clientCallbacks);
+      LOG_INF("BT", "Initial connect attempt failed for %s; retrying after cool-down", address.c_str());
+      // ~300 ms cool-down: long enough for the controller to settle a
+      // pending advertising window, short enough that the user doesn't
+      // perceive a stall on the rare-but-real case where the first attempt
+      // actually races RF noise rather than peripheral state. NimBLE
+      // controller event loop keeps ticking through delay().
+      delay(300);
+      NimBLEClient* freshClient = NimBLEDevice::createClient(bleAddress);
+      if (freshClient) {
+        if (hadExistingClient) {
+          LOG_INF("BT", "Reconnect with existing client failed; using fresh client");
         }
+        pClient = freshClient;
+        pClient->setSelfDelete(false, false);
+        pClient->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
+        pClient->setConnectionParams(BLE_CONN_MIN_INTERVAL, BLE_CONN_MAX_INTERVAL, BLE_CONN_LATENCY,
+                                     BLE_CONN_TIMEOUT, BLE_CONN_SCAN_INTERVAL, BLE_CONN_SCAN_WINDOW);
+        pClient->setClientCallbacks(&clientCallbacks);
       }
 
       if (!pClient->connect(bleAddress)) {
         lastError = "Connection failed";
-        LOG_ERR("BT", "Failed to connect to %s", address.c_str());
+        LOG_ERR("BT", "Failed to connect to %s (after retry)", address.c_str());
         return false;
       }
+      LOG_INF("BT", "Connect succeeded on retry for %s", address.c_str());
     }
 
     const bool connParamsUpdated =
