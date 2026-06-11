@@ -341,10 +341,43 @@ uint32_t EpdFontFamily::getFallbackCodepoint(const uint32_t cp, const Style styl
   if (findGlyphData(cp, style).glyph) return cp;
   const uint32_t aliasCp = syntheticGlyph::aliasCodepoint(cp);
   if (aliasCp != cp) {
-    return findGlyphData(aliasCp, style).glyph ? aliasCp : REPLACEMENT_GLYPH;
+    if (findGlyphData(aliasCp, style).glyph) return aliasCp;
+    // CrumBLE 4.4 task #28 follow-up: when findGlyphData misses on both
+    // cp and aliasCp, give the font's own miss handler a chance to load
+    // the alias target. The atlas / SD-font miniData only contain
+    // codepoints the chapter actually uses, so a chapter that has '◆'
+    // but no '*' anywhere will see findGlyphData('*') miss even though
+    // the underlying .cpfont ships an asterisk glyph. font->getGlyph
+    // walks the font's intervals AND (for SD-card fonts) calls the
+    // onGlyphMiss handler which lazy-loads from the .cpfont's full
+    // glyph table into the overflow ring buffer -- so a successful
+    // load here means the renderer will draw a real glyph instead of
+    // the synthetic replacement box. Zero cost when the font's intervals
+    // already excluded the alias target (binary-search miss = ~150ns).
+    const EpdFont* f = getFont(style);
+    if (f && f->getGlyph(aliasCp)) return aliasCp;
+    // CrumBLE 4.4 task #26: when bold/italic miss-handler also fails
+    // (font lacks that style entirely), check the regular-style chain.
+    // Mirrors getGlyphData's regular-fallback so drawText's pre-flight
+    // decision matches the actual draw-time outcome.
+    if (style != REGULAR && getGlyphData(aliasCp, REGULAR).glyph) return aliasCp;
+    return REPLACEMENT_GLYPH;
   }
   if (syntheticGlyph::isSpaceFallback(cp)) return cp;
   if (syntheticGlyph::isSolid(cp) || syntheticGlyph::isGreekFallback(cp)) return cp;
+  // CrumBLE 4.4 task #26: chapter titles + emphasis use BOLD / ITALIC.
+  // When the atlas only carries the REGULAR style (the prebake's prewarm
+  // only loads REGULAR by default) AND the SD font lacks the requested
+  // style's glyph (miss handler returns null because the .cpfont ships
+  // regular-only), getGlyphData's existing regular fallback (line ~276)
+  // would salvage the draw -- but only IF the renderer reaches the
+  // renderCharImpl path. Returning REPLACEMENT_GLYPH here short-circuits
+  // that path and forces the synthetic '?' box instead. Probe regular's
+  // chain for `cp`; if it has the glyph, return cp so drawText proceeds
+  // to renderCharImpl which calls getGlyphData and lets the regular
+  // fallback cascade run. The bold/italic visual style is lost but text
+  // stays readable -- preferable to "??? Two" for chapter headers.
+  if (style != REGULAR && getGlyphData(cp, REGULAR).glyph) return cp;
   return REPLACEMENT_GLYPH;
 }
 
