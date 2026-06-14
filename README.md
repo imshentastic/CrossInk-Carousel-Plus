@@ -2,6 +2,10 @@
 
 # CrumBLE
 
+<p align="center">
+  <img width="440" height="591" alt="Screenshot 2026-05-31 at 11 45 56 PM" src="https://github.com/user-attachments/assets/855dbae2-8ce5-4d63-a6a9-15081ffbbb94" />
+</p>
+
 **A personal fork of [CrossInk](https://github.com/uxjulia/CrossInk) for the Xteink X4 — adds full BLE support, dictionary lookup, quote highlighting, an EPUB optimizer with instant-chapter-turn pre-cache, on-demand sleep-screen cycling, customized Collections, Bookshelf display, and a quick-settings overlay drawer! Supports 23 languages and custom fonts.**
 
 </div>
@@ -16,11 +20,6 @@ CrumBLE sits on top of CrossInk and CrossInk Carousel's feature set — see the 
 
 As of v3.0.0, CrumBLE is rebased onto **CrossInk 1.3** (a fresh upstream base rather than back-porting), so it also inherits 1.3's additions — SD-card font sizes, Quick Resume, the Minimal sleep screen, low-memory OPDS handling, and more.
 
-
-
-<p align="center">
-  <img width="440" height="591" alt="Screenshot 2026-05-31 at 11 45 56 PM" src="https://github.com/user-attachments/assets/855dbae2-8ce5-4d63-a6a9-15081ffbbb94" />
-</p>
 
 ### Collections
 
