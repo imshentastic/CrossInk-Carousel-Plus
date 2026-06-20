@@ -9,6 +9,18 @@
 #include <ZipFile.h>
 #include <expat.h>
 
+#include <atomic>
+
+namespace {
+// CrumBLE 4.6: process-wide cover-tone curve, set from main.cpp after
+// SETTINGS loads (and on Settings change). Atomic so the cover-render task
+// can read it without holding a lock.
+std::atomic<uint8_t> g_coverToneCurve{0};
+}  // namespace
+
+void Epub::setCoverToneCurve(uint8_t v) { g_coverToneCurve.store(v, std::memory_order_relaxed); }
+uint8_t Epub::getCoverToneCurve() { return g_coverToneCurve.load(std::memory_order_relaxed); }
+
 #include <cstring>
 
 #include <cstdint>
@@ -1079,8 +1091,8 @@ bool Epub::convertCoverToThumbBmp(const std::string& coverImageHref, const std::
     }
     int THUMB_TARGET_WIDTH = width;
     int THUMB_TARGET_HEIGHT = height;
-    const bool success = JpegToBmpConverter::jpegFileTo1BitBmpStreamWithSize(coverJpg, thumbBmp, THUMB_TARGET_WIDTH,
-                                                                             THUMB_TARGET_HEIGHT, adaptiveContain);
+    const bool success = JpegToBmpConverter::jpegFileTo1BitBmpStreamWithSize(
+        coverJpg, thumbBmp, THUMB_TARGET_WIDTH, THUMB_TARGET_HEIGHT, adaptiveContain, getCoverToneCurve());
     // Explicitly close() files before calling Storage.remove()
     coverJpg.close();
     thumbBmp.close();
@@ -1122,8 +1134,8 @@ bool Epub::convertCoverToThumbBmp(const std::string& coverImageHref, const std::
     }
     int THUMB_TARGET_WIDTH = width;
     int THUMB_TARGET_HEIGHT = height;
-    const bool success = PngToBmpConverter::pngFileTo1BitBmpStreamWithSize(coverPng, thumbBmp, THUMB_TARGET_WIDTH,
-                                                                           THUMB_TARGET_HEIGHT, adaptiveContain);
+    const bool success = PngToBmpConverter::pngFileTo1BitBmpStreamWithSize(
+        coverPng, thumbBmp, THUMB_TARGET_WIDTH, THUMB_TARGET_HEIGHT, adaptiveContain, getCoverToneCurve());
     // Explicitly close() files before calling Storage.remove()
     coverPng.close();
     thumbBmp.close();

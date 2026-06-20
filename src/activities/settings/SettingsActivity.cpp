@@ -277,6 +277,11 @@ void SettingsActivity::rebuildSettingsLists() {
   // thumb_failed_v3_*.marker files so the bookshelf re-attempts on next
   // visit.
   systemChildren.push_back(SettingInfo::Action(StrId::STR_RETRY_FAILED_COVERS, SettingAction::RetryFailedCovers));
+  // CrumBLE 4.6: applies the current Cover Tone curve to existing books by
+  // deleting every cached thumb_<W>x<H>.bmp; the bookshelf regenerates them
+  // on next render using the device-side converter (which now honours
+  // SETTINGS.coverToneCurve via Epub::setCoverToneCurve).
+  systemChildren.push_back(SettingInfo::Action(StrId::STR_REGENERATE_COVERS, SettingAction::RegenerateAllCovers));
 
   rootSettings_.push_back(SettingInfo::Submenu(StrId::STR_CAT_SYSTEM, std::move(systemChildren)));
 }
@@ -478,6 +483,19 @@ void SettingsActivity::toggleCurrentSetting() {
         }
         GUI.drawPopup(renderer, msg);
         // Brief dwell so the message is readable, then return to the menu.
+        delay(1500);
+        requestUpdate();
+        break;
+      }
+      case SettingAction::RegenerateAllCovers: {
+        // CrumBLE 4.6: destructive sibling of RetryFailedCovers -- deletes every
+        // thumb_<W>x<H>.bmp so the firmware regenerates covers using the
+        // current Cover Tone setting. Walk + delete is sub-second; the actual
+        // regen happens lazily on the next bookshelf paint.
+        const int removed = CoverThumbStatus::regenerateAllCovers();
+        char msg[96];
+        std::snprintf(msg, sizeof(msg), tr(STR_COVERS_RETRY_DONE), removed);
+        GUI.drawPopup(renderer, msg);
         delay(1500);
         requestUpdate();
         break;

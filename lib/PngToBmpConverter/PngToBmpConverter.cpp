@@ -4,6 +4,7 @@
 #include <HalStorage.h>
 #include <InflateReader.h>
 #include <Logging.h>
+#include <ToneCurve.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -484,8 +485,9 @@ static void convertScanlineToGray(const PngDecodeContext& ctx, uint8_t* grayRow)
 }
 
 bool PngToBmpConverter::pngFileToBmpStreamInternal(FsFile& pngFile, Print& bmpOut, int targetWidth, int targetHeight,
-                                                   bool oneBit, bool crop, bool adaptiveContain) {
-  LOG_DBG("PNG", "Converting PNG to %s BMP (target: %dx%d)", oneBit ? "1-bit" : "2-bit", targetWidth, targetHeight);
+                                                   bool oneBit, bool crop, bool adaptiveContain, uint8_t coverTone) {
+  LOG_DBG("PNG", "Converting PNG to %s BMP (target: %dx%d, tone=%u)", oneBit ? "1-bit" : "2-bit", targetWidth,
+          targetHeight, static_cast<unsigned>(coverTone));
 
   // Verify PNG signature
   uint8_t sig[8];
@@ -734,6 +736,15 @@ bool PngToBmpConverter::pngFileToBmpStreamInternal(FsFile& pngFile, Print& bmpOu
     return false;
   }
 
+  // CrumBLE 4.6: cover-tone LUT built once. Identity when coverTone==OFF;
+  // null pointer disables the LUT pass (zero-cost when feature is off).
+  uint8_t toneLut[256];
+  const uint8_t* toneLutPtr = nullptr;
+  if (!ToneCurve::isNoop(coverTone)) {
+    ToneCurve::buildLut(coverTone, toneLut);
+    toneLutPtr = toneLut;
+  }
+
   bool success = true;
 
   // Process each scanline
@@ -747,6 +758,9 @@ bool PngToBmpConverter::pngFileToBmpStreamInternal(FsFile& pngFile, Print& bmpOu
 
     // Batch-convert entire scanline to grayscale (one branch, tight loop)
     convertScanlineToGray(ctx, grayRow);
+
+    // Apply cover-tone LUT before dither (no-op when toneLutPtr is null).
+    ToneCurve::applyRow(grayRow, width, toneLutPtr);
 
     if (!needsScaling) {
       // Direct output (no scaling)
@@ -908,11 +922,13 @@ bool PngToBmpConverter::pngFileToBmpStream(FsFile& pngFile, Print& bmpOut, bool 
 }
 
 bool PngToBmpConverter::pngFileToBmpStreamWithSize(FsFile& pngFile, Print& bmpOut, int targetMaxWidth,
-                                                   int targetMaxHeight, bool adaptiveContain) {
-  return pngFileToBmpStreamInternal(pngFile, bmpOut, targetMaxWidth, targetMaxHeight, false, true, adaptiveContain);
+                                                   int targetMaxHeight, bool adaptiveContain, uint8_t coverTone) {
+  return pngFileToBmpStreamInternal(pngFile, bmpOut, targetMaxWidth, targetMaxHeight, false, true, adaptiveContain,
+                                    coverTone);
 }
 
 bool PngToBmpConverter::pngFileTo1BitBmpStreamWithSize(FsFile& pngFile, Print& bmpOut, int targetMaxWidth,
-                                                       int targetMaxHeight, bool adaptiveContain) {
-  return pngFileToBmpStreamInternal(pngFile, bmpOut, targetMaxWidth, targetMaxHeight, true, true, adaptiveContain);
+                                                       int targetMaxHeight, bool adaptiveContain, uint8_t coverTone) {
+  return pngFileToBmpStreamInternal(pngFile, bmpOut, targetMaxWidth, targetMaxHeight, true, true, adaptiveContain,
+                                    coverTone);
 }

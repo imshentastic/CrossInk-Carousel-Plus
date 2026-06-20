@@ -5,6 +5,7 @@
 #include <JPEGDEC.h>
 #include <Logging.h>
 #include <Memory.h>
+#include <ToneCurve.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -237,6 +238,11 @@ struct BmpConvertCtx {
   std::unique_ptr<FloydSteinbergDitherer> fsDitherer;
   std::unique_ptr<Atkinson1BitDitherer> atkinson1BitDitherer;
 
+  // CrumBLE 4.6: cover-tone LUT. nullptr means identity (OFF) and the
+  // dither loops fall through to raw srcRow[] reads; non-null replaces every
+  // pixel with toneLut[pixel] before quantization.
+  const uint8_t* toneLut;
+
   bool error;
 };
 
@@ -330,20 +336,27 @@ static bool shouldContainAdaptive(const int srcWidth, const int srcHeight, const
 static void writeOutputRow(BmpConvertCtx* ctx, const uint8_t* srcRow, int outY) {
   memset(ctx->bmpRow.get(), 0, ctx->bytesPerRow);
 
+  // CrumBLE 4.6: apply cover-tone LUT once per pixel before dither. Branch is
+  // predictable per row (one compare) so the cost is a single uint8_t lookup
+  // when enabled, zero when toneLut is null.
+  const uint8_t* const tone = ctx->toneLut;
+  auto pickGray = [tone](const uint8_t v) -> uint8_t { return tone ? tone[v] : v; };
+
   if (USE_8BIT_OUTPUT && !ctx->oneBit) {
     for (int x = 0; x < ctx->outWidth; x++) {
-      ctx->bmpRow[x] = adjustPixel(srcRow[x]);
+      ctx->bmpRow[x] = adjustPixel(pickGray(srcRow[x]));
     }
   } else if (ctx->oneBit) {
     for (int x = 0; x < ctx->outWidth; x++) {
-      const uint8_t bit = ctx->atkinson1BitDitherer ? ctx->atkinson1BitDitherer->processPixel(srcRow[x], x)
-                                                    : quantize1bit(srcRow[x], x, outY);
+      const uint8_t g = pickGray(srcRow[x]);
+      const uint8_t bit = ctx->atkinson1BitDitherer ? ctx->atkinson1BitDitherer->processPixel(g, x)
+                                                    : quantize1bit(g, x, outY);
       ctx->bmpRow[x / 8] |= (bit << (7 - (x % 8)));
     }
     if (ctx->atkinson1BitDitherer) ctx->atkinson1BitDitherer->nextRow();
   } else {
     for (int x = 0; x < ctx->outWidth; x++) {
-      const uint8_t gray = adjustPixel(srcRow[x]);
+      const uint8_t gray = adjustPixel(pickGray(srcRow[x]));
       uint8_t twoBit;
       if (ctx->atkinsonDitherer) {
         twoBit = ctx->atkinsonDitherer->processPixel(gray, x);
@@ -593,8 +606,9 @@ static bool isProgressiveJpeg(FsFile& file) {
 
 // Internal implementation with configurable target size and bit depth
 bool JpegToBmpConverter::jpegFileToBmpStreamInternal(FsFile& jpegFile, Print& bmpOut, int targetWidth, int targetHeight,
-                                                     bool oneBit, bool crop, bool adaptiveContain) {
-  LOG_DBG("JPG", "Converting JPEG to %s BMP (target: %dx%d)", oneBit ? "1-bit" : "2-bit", targetWidth, targetHeight);
+                                                     bool oneBit, bool crop, bool adaptiveContain, uint8_t coverTone) {
+  LOG_DBG("JPG", "Converting JPEG to %s BMP (target: %dx%d, tone=%u)", oneBit ? "1-bit" : "2-bit", targetWidth,
+          targetHeight, static_cast<unsigned>(coverTone));
 
   if (ESP.getFreeHeap() < MIN_FREE_HEAP) {
     LOG_ERR("JPG", "Not enough heap for JPEG decoder (%u free, need %u)", ESP.getFreeHeap(), MIN_FREE_HEAP);
@@ -744,6 +758,16 @@ bool JpegToBmpConverter::jpegFileToBmpStreamInternal(FsFile& jpegFile, Print& bm
     }
   }
 
+  // CrumBLE 4.6: build per-decode tone LUT if requested. Stored on the stack
+  // here; lifetime extends to end of this function, which encloses the entire
+  // jpeg->decode call below (the draw callback reads via ctx->toneLut).
+  uint8_t toneLutBuf[256];
+  ctx.toneLut = nullptr;
+  if (!ToneCurve::isNoop(coverTone)) {
+    ToneCurve::buildLut(coverTone, toneLutBuf);
+    ctx.toneLut = toneLutBuf;
+  }
+
   jpeg->setPixelType(EIGHT_BIT_GRAYSCALE);
   jpeg->setUserPointer(&ctx);
 
@@ -782,12 +806,14 @@ bool JpegToBmpConverter::jpegFileToBmpStream(FsFile& jpegFile, Print& bmpOut, bo
 
 // Convert with custom target size (for thumbnails, 2-bit)
 bool JpegToBmpConverter::jpegFileToBmpStreamWithSize(FsFile& jpegFile, Print& bmpOut, int targetMaxWidth,
-                                                     int targetMaxHeight, bool adaptiveContain) {
-  return jpegFileToBmpStreamInternal(jpegFile, bmpOut, targetMaxWidth, targetMaxHeight, false, true, adaptiveContain);
+                                                     int targetMaxHeight, bool adaptiveContain, uint8_t coverTone) {
+  return jpegFileToBmpStreamInternal(jpegFile, bmpOut, targetMaxWidth, targetMaxHeight, false, true, adaptiveContain,
+                                     coverTone);
 }
 
 // Convert to 1-bit BMP (black and white only, no grays) for fast home screen rendering
 bool JpegToBmpConverter::jpegFileTo1BitBmpStreamWithSize(FsFile& jpegFile, Print& bmpOut, int targetMaxWidth,
-                                                         int targetMaxHeight, bool adaptiveContain) {
-  return jpegFileToBmpStreamInternal(jpegFile, bmpOut, targetMaxWidth, targetMaxHeight, true, true, adaptiveContain);
+                                                         int targetMaxHeight, bool adaptiveContain, uint8_t coverTone) {
+  return jpegFileToBmpStreamInternal(jpegFile, bmpOut, targetMaxWidth, targetMaxHeight, true, true, adaptiveContain,
+                                     coverTone);
 }

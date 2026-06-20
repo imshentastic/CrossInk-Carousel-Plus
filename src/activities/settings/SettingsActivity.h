@@ -33,6 +33,10 @@ enum class SettingAction {
   // too small) get re-attempted. Also fires automatically on first boot
   // after a firmware-version change.
   RetryFailedCovers,
+  // CrumBLE 4.6: nuke ALL cached thumb_<W>x<H>.bmp files across every book
+  // cache dir so the new Cover Tone setting applies to existing covers.
+  // Distinct from RetryFailedCovers (markers only); this one is destructive.
+  RegenerateAllCovers,
 };
 
 struct SettingInfo {

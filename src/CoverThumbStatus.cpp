@@ -139,4 +139,65 @@ int sweepAllMarkers() {
   return removed;
 }
 
+int regenerateAllCovers() {
+  auto root = Storage.open(kCacheDir);
+  if (!root || !root.isDirectory()) {
+    if (root) root.close();
+    LOG_INF("CTS", "Regenerate: no /.crosspoint dir; nothing to do");
+    return 0;
+  }
+
+  int removedThumbs = 0;
+  char nameBuf[128];
+  for (auto sub = root.openNextFile(); sub; sub = root.openNextFile()) {
+    sub.getName(nameBuf, sizeof(nameBuf));
+    if (!sub.isDirectory()) {
+      sub.close();
+      continue;
+    }
+    const std::string subPath = std::string(kCacheDir) + "/" + nameBuf;
+    sub.close();
+
+    auto bookDir = Storage.open(subPath.c_str());
+    if (!bookDir || !bookDir.isDirectory()) {
+      if (bookDir) bookDir.close();
+      continue;
+    }
+    char fileNameBuf[128];
+    std::vector<std::string> toRemove;
+    for (auto f = bookDir.openNextFile(); f; f = bookDir.openNextFile()) {
+      f.getName(fileNameBuf, sizeof(fileNameBuf));
+      const std::string filename = fileNameBuf;
+      // Match thumb_<W>x<H>.bmp -- all cached thumbnail sizes for this book.
+      // Conservative: require prefix "thumb_" and suffix ".bmp" and NOT match
+      // the "thumb_failed_*" prefix (those are markers, handled below).
+      const std::string thumbPrefix = "thumb_";
+      const std::string failedPrefix = "thumb_failed_";
+      const std::string bmpSuffix = ".bmp";
+      const bool isThumb = filename.size() > thumbPrefix.size() + bmpSuffix.size() &&
+                           filename.compare(0, thumbPrefix.size(), thumbPrefix) == 0 &&
+                           filename.compare(0, failedPrefix.size(), failedPrefix) != 0 &&
+                           filename.compare(filename.size() - bmpSuffix.size(), bmpSuffix.size(), bmpSuffix) == 0;
+      f.close();
+      if (isThumb) toRemove.push_back(subPath + "/" + filename);
+    }
+    bookDir.close();
+
+    for (const auto& path : toRemove) {
+      if (Storage.remove(path.c_str())) {
+        ++removedThumbs;
+      } else {
+        LOG_ERR("CTS", "Regenerate: failed to remove %s", path.c_str());
+      }
+    }
+  }
+  root.close();
+
+  // Also clear failure markers so books with markers re-attempt with the new
+  // settings instead of being skipped.
+  const int markers = sweepAllMarkers();
+  LOG_INF("CTS", "Regenerate: removed %d thumb(s) + %d marker(s)", removedThumbs, markers);
+  return removedThumbs;
+}
+
 }  // namespace CoverThumbStatus

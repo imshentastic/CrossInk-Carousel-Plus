@@ -54,4 +54,11 @@ void clearFailed(const std::string& bookPath, int width, int height);
 // once; cost scales with number of cache subdirs (~10-200 typical).
 int sweepAllMarkers();
 
+// CrumBLE 4.6: nuke EVERY cached thumb across all per-book cache dirs (the
+// thumb_<W>x<H>.bmp files). Forces full cover regeneration on next render,
+// which is the only way to apply a changed Cover Tone setting to books the
+// device has already cached. Also sweeps failure markers as a side effect
+// since they'd otherwise block regen. Returns count of thumbs removed.
+int regenerateAllCovers();
+
 }  // namespace CoverThumbStatus

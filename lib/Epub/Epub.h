@@ -129,6 +129,13 @@ class Epub {
   CssParser* getCssParser() const { return cssParser.get(); }
   int resolveHrefToSpineIndex(const std::string& href) const;
 
+  // CrumBLE 4.6: cover tone curve, applied to grayscale cover scanlines
+  // before dither. Settable from setup() once SETTINGS is loaded, and again
+  // whenever the user changes the setting. Static -- no per-Epub overhead.
+  // 0=Off, 1=Mild, 2=Strong (see lib/ToneCurve).
+  static void setCoverToneCurve(uint8_t v);
+  static uint8_t getCoverToneCurve();
+
  private:
   bool generateThumbBmpInternal(int width, int height, bool adaptiveContain) const;
   // Shared cover-image -> 1-bit BMP conversion used by both the cached

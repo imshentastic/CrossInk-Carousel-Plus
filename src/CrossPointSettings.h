@@ -480,6 +480,16 @@ class CrossPointSettings {
   bool virtualCollectionsDefaultPending = true;
   // Sunlight fading compensation
   uint8_t fadingFix = 0;
+  // CrumBLE 4.6: cover thumbnail tone curve. Applied between the grayscale
+  // conversion and dither when the device regenerates a cover thumb (i.e.,
+  // any cover not pre-baked off-device). E-ink panels render source
+  // midtones much darker than LCD/OLED gamma assumes; lifting them via a
+  // curve makes the cover noticeably brighter without losing detail.
+  //   0 = Off (identity; back-compat default)
+  //   1 = Mild (gamma 1.5 -- gentle midtone lift)
+  //   2 = Strong (85..200 stretch + sigmoid contrast -- aggressive)
+  // See lib/ToneCurve for the exact curves.
+  uint8_t coverToneCurve = 0;
   // Use book's embedded CSS styles for EPUB rendering (1 = enabled, 0 = disabled)
   uint8_t embeddedStyle = 1;
   // Focus Reading - emphasizes the first part of words with bold
