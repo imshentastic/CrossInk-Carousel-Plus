@@ -32,6 +32,54 @@ def patch_websockets(env):
         )
         if os.path.isfile(client_cpp):
             _apply_flush_guard_fix(client_cpp)
+        ws_header = os.path.join(
+            libdeps_dir, env_dir, "WebSockets", "src", "WebSockets.h"
+        )
+        if os.path.isfile(ws_header):
+            _apply_max_data_size_guard(ws_header)
+
+
+def _apply_max_data_size_guard(filepath):
+    """
+    Add an #ifndef guard around the WebSockets.h WEBSOCKETS_MAX_DATA_SIZE
+    #define so a build flag (-DWEBSOCKETS_MAX_DATA_SIZE=N) can override
+    the library's hard-coded 15 KB default.
+
+    Lowering this matters on tight-heap targets (ESP32-C3 ~190 KB total)
+    where the library's per-frame allocation is what crashes MinFree
+    during large WS file uploads -- the original 15 KB peak left only
+    ~1.5 KB free at the worst point, which then loses races with
+    SD-write/WiFi internal allocations.
+
+    Idempotent.
+    """
+    marker = "// CrossPoint patch: allow build-flag override of WEBSOCKETS_MAX_DATA_SIZE"
+    with open(filepath, "r") as f:
+        content = f.read()
+
+    if marker in content:
+        return
+
+    old = "#define WEBSOCKETS_MAX_DATA_SIZE (15 * 1024)"
+    new = (
+        marker + "\n"
+        "#ifndef WEBSOCKETS_MAX_DATA_SIZE\n"
+        + old + "\n"
+        "#endif"
+    )
+
+    count = content.count(old)
+    if count == 0:
+        print(
+            "WARNING: WEBSOCKETS_MAX_DATA_SIZE patch target not found in %s "
+            "- library may have been updated" % filepath
+        )
+        return
+
+    content = content.replace(old, new)
+    with open(filepath, "w") as f:
+        f.write(content)
+    print("Patched WebSockets: WEBSOCKETS_MAX_DATA_SIZE now overridable (%d sites): %s" % (count, filepath))
 
 
 def _apply_flush_guard_fix(filepath):
