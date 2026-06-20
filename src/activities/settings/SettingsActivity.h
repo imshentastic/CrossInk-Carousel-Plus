@@ -28,6 +28,11 @@ enum class SettingAction {
   SdFirmwareUpdate,
   Language,
   DownloadFonts,
+  // CrumBLE 4.4: sweep all thumb_failed_v3_*.marker files so books whose
+  // cover gen failed under an earlier firmware bug (e.g. EOCD scan window
+  // too small) get re-attempted. Also fires automatically on first boot
+  // after a firmware-version change.
+  RetryFailedCovers,
 };
 
 struct SettingInfo {

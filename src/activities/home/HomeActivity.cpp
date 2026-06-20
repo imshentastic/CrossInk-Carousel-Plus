@@ -3349,31 +3349,18 @@ void HomeActivity::updateFocusedBookMeta(const std::string& path) {
   const std::string fname = (slash != std::string::npos) ? path.substr(slash + 1) : path;
   // Read the cached metadata only (buildIfMissing=false): cheap, and leaves the
   // title blank for un-indexed books so the caller falls back to the filename.
-  // Strip trailing ";"/whitespace from author -- some EPUBs leave a
-  // separator without a value, which without this trim renders as a
-  // dangling ";" on the carousel/shelf. Local helper inline to avoid
-  // pulling RecentBooksGridActivity's namespace.
-  const auto trimAuthor = [](std::string s) -> std::string {
-    while (!s.empty()) {
-      const char c = s.back();
-      if (c == ' ' || c == '\t' || c == ';' || c == ',' || c == '\r' || c == '\n') s.pop_back();
-      else break;
-    }
-    size_t i = 0;
-    while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == ';' || s[i] == '\r' || s[i] == '\n')) ++i;
-    if (i > 0) s.erase(0, i);
-    return s;
-  };
+  // CrumBLE 4.4: use the shared normalizeAuthorMeta (RecentBooksStore.h) so
+  // every author-display path goes through the same trim rules.
   if (FsHelpers::hasEpubExtension(fname)) {
     Epub epub(path, "/.crosspoint");
     epub.load(/*buildIfMissing=*/false, /*skipLoadingCss=*/true);
     focusedMetaTitle = epub.getTitle();
-    focusedMetaAuthor = trimAuthor(epub.getAuthor());
+    focusedMetaAuthor = normalizeAuthorMeta(epub.getAuthor());
   } else if (FsHelpers::hasXtcExtension(fname)) {
     Xtc xtc(path, "/.crosspoint");
     if (xtc.load()) {
       focusedMetaTitle = xtc.getTitle();
-      focusedMetaAuthor = trimAuthor(xtc.getAuthor());
+      focusedMetaAuthor = normalizeAuthorMeta(xtc.getAuthor());
     }
   }
   // .txt / .md have no embedded metadata — leave title empty (filename fallback).
@@ -3384,7 +3371,13 @@ void HomeActivity::presentHomeBuffer() {
     pendingFullRefresh = false;
     // One full clear on entry wipes ghosting bled through from the previous
     // screen (the reader page, a low-memory alert, etc.).
-    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+    // CrumBLE 4.4: use HALF_REFRESH_DEEP on this transition specifically.
+    // On X3 it adds an extra resync cycle (~770ms) to scrub polarity drift
+    // accumulated during long dark-mode reader sessions; without it the
+    // book->home transition occasionally flashes inverted. Other HALF
+    // callers (sleep cycle, sleep entry/exit) stay on the cheaper single
+    // resync. No-op vs HALF on X4.
+    renderer.displayBuffer(HalDisplay::HALF_REFRESH_DEEP);
   } else {
     renderer.displayBuffer();
   }

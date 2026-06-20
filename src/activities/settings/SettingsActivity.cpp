@@ -12,7 +12,9 @@
 #include "AppVersion.h"
 #include "ButtonRemapActivity.h"
 #include "ClearCacheActivity.h"
+#include "CoverThumbStatus.h"
 #include "CrossPointSettings.h"
+#include "I18n.h"
 #include "FontDownloadActivity.h"
 #include "FontSelectionActivity.h"
 #include "KOReaderSettingsActivity.h"
@@ -186,6 +188,7 @@ void SettingsActivity::rebuildSettingsLists() {
 
   std::vector<SettingInfo> readerLayout;
   pushByName(readerLayout, allSettings, StrId::STR_LINE_SPACING);
+  pushByName(readerLayout, allSettings, StrId::STR_READER_DARK_MODE);
   pushByName(readerLayout, allSettings, StrId::STR_ORIENTATION);
   pushByName(readerLayout, allSettings, StrId::STR_SCREEN_MARGIN);
   pushByName(readerLayout, allSettings, StrId::STR_PARA_ALIGNMENT);
@@ -269,6 +272,11 @@ void SettingsActivity::rebuildSettingsLists() {
   systemChildren.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
   systemChildren.push_back(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate));
   systemChildren.push_back(SettingInfo::Action(StrId::STR_CLEAR_READING_CACHE, SettingAction::ClearCache));
+  // CrumBLE 4.4: manual retry for books whose cover gen previously failed
+  // (most commonly the EOCD-scan-too-small bug fixed in 4.4). Sweeps
+  // thumb_failed_v3_*.marker files so the bookshelf re-attempts on next
+  // visit.
+  systemChildren.push_back(SettingInfo::Action(StrId::STR_RETRY_FAILED_COVERS, SettingAction::RetryFailedCovers));
 
   rootSettings_.push_back(SettingInfo::Submenu(StrId::STR_CAT_SYSTEM, std::move(systemChildren)));
 }
@@ -457,6 +465,23 @@ void SettingsActivity::toggleCurrentSetting() {
       case SettingAction::Language:
         startActivityForResult(std::make_unique<LanguageSelectActivity>(renderer, mappedInput), resultHandler);
         break;
+      case SettingAction::RetryFailedCovers: {
+        // CrumBLE 4.4: brief popup so the user gets feedback that something
+        // happened (the sweep is a sub-second SD walk; without a popup the
+        // selection just "clicks" with no visible result).
+        const int removed = CoverThumbStatus::sweepAllMarkers();
+        char msg[96];
+        if (removed > 0) {
+          std::snprintf(msg, sizeof(msg), tr(STR_COVERS_RETRY_DONE), removed);
+        } else {
+          std::snprintf(msg, sizeof(msg), "%s", tr(STR_COVERS_RETRY_NONE));
+        }
+        GUI.drawPopup(renderer, msg);
+        // Brief dwell so the message is readable, then return to the menu.
+        delay(1500);
+        requestUpdate();
+        break;
+      }
       case SettingAction::None:
         // Do nothing
         break;

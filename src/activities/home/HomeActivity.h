@@ -18,9 +18,14 @@ struct Rect;
 
 class HomeActivity final : public Activity {
  public:
-  // Keep one rendered carousel frame in RAM. Additional frames remain available
-  // through the SD snapshot cache and are paged in on demand.
-  static constexpr int kCarouselFrameCount = 1;
+  // CrumBLE 4.4: bumped 1->2. With 1 frame, every Left/Right press was a
+  // guaranteed RAM miss → SD seek + ~48 KB read per move. 2 frames give
+  // back-and-forth a hit (LRU evicts the older direction) while still
+  // costing only one extra framebuffer (~48 KB heap) vs the original 3.
+  // Continuous L/L/L travel still pays SD on every move, but the user-
+  // perceived "feels slow" was mostly the back-and-forth case. Additional
+  // frames remain available through the SD snapshot cache.
+  static constexpr int kCarouselFrameCount = 2;
   // Must be >= max(homeRecentBooksCount) across themes — asserted in .cpp.
   // Bumped from 3 to 5 (CrumBLE #124) so Flow's 5-slot carousel can also hit
   // the BookReadingStats / progress cache. Cost is ~32 extra bytes total

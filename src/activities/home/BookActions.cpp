@@ -14,7 +14,9 @@
 #include "CollectionsStore.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
+#include "LibraryIndex.h"
 #include "RecentBooksStore.h"
+#include "SeriesIndex.h"
 #include "activities/reader/BookReadingStats.h"
 #include "activities/reader/GlobalReadingStats.h"
 #include "components/UITheme.h"
@@ -87,6 +89,13 @@ std::vector<FileBrowserActionActivity::MenuItem> buildBookActionItems(const std:
   if (hasClearableBookCache(fullPath)) {
     items.push_back({FileBrowserAction::DeleteCache, StrId::STR_DELETE_CACHE});
   }
+  // 5b. CrumBLE 4.4 (ported from CrossInk v1.3.3): delete just this book's
+  // reading stats (stats.bin). Shown only for EPUBs since CrumBLE's stats
+  // pipeline records per-EPUB. Placed adjacent to Delete Cache so the two
+  // destructive-but-bounded actions cluster together above plain Delete.
+  if (FsHelpers::hasEpubExtension(fullPath)) {
+    items.push_back({FileBrowserAction::DeleteStats, StrId::STR_DELETE_BOOK_STATS});
+  }
   // 6. Delete file -- always last as the most destructive.
   items.push_back({FileBrowserAction::Delete, StrId::STR_DELETE});
 
@@ -100,12 +109,24 @@ bool hasClearableBookCache(const std::string& path) {
 std::string optimizedHeaderLabel(const std::string& fullPath) {
   // Only EPUB carries a prebake. Skip the SD lookup for non-EPUB paths.
   if (!FsHelpers::hasEpubExtension(fullPath)) return "";
-  // Marker file -- written by the 4.2+ WASM optimizer alongside
-  // prebake-manifest.json. Storage.exists is a fast inode lookup
-  // (no read), cheap enough to call from a long-press path that runs
-  // once per book open.
-  const std::string markerPath = Epub::cachePathForFilePath(fullPath, "/.crosspoint") + "/prebake-v2.marker";
-  return Storage.exists(markerPath.c_str()) ? "Optimized" : "";
+  // CrumBLE 4.4: three-tier badge (matches the FT page wording exactly).
+  //   prebake-v2.marker only                  -> "✓IMG"
+  //   + prebake-chap.marker (or sections-prebake/) -> "✓IMG+CHAP"
+  //   + prebake-cpfont.marker                 -> "✓IMG+CHAP+CP.FONT"
+  // Each Storage.exists is a fast inode lookup; the four lookups still
+  // fit comfortably within the long-press path's budget.
+  const std::string cacheDir = Epub::cachePathForFilePath(fullPath, "/.crosspoint");
+  if (!Storage.exists((cacheDir + "/prebake-v2.marker").c_str())) return "";
+  const bool hasChap = Storage.exists((cacheDir + "/prebake-chap.marker").c_str()) ||
+                       Storage.exists((cacheDir + "/sections-prebake").c_str());
+  const bool hasCpFont = Storage.exists((cacheDir + "/prebake-cpfont.marker").c_str());
+  // No leading checkmark on device-side labels -- the long-press header
+  // renders a lightning glyph (drawBolt) next to the label, which carries
+  // the "this is the optimization indicator" signal. The FT page uses
+  // an emoji ⚡ in the text instead since it renders cleanly in browsers.
+  if (hasChap && hasCpFont) return "IMG+CHAP+CP.FONT";
+  if (hasChap) return "IMG+CHAP";
+  return "IMG";
 }
 
 BookHeaderText resolveBookHeaderText(const std::string& fullPath) {
@@ -162,14 +183,26 @@ BookHeaderText resolveBookHeaderText(const std::string& fullPath) {
 }
 
 void clearFileMetadata(const std::string& fullPath) {
+  // CrumBLE 4.4: clear EVERY index/store that holds a reference to this book
+  // path, not just bookmarks + cache. Previously only HomeActivity's delete
+  // path did the full sweep inline -- the bookshelf / file browser deletes
+  // called this helper which left stale entries in Collections, LibraryIndex,
+  // and SeriesIndex. Symptom: deleting a book from inside the bookshelf left
+  // a coverless placeholder that re-appeared in Collections and couldn't be
+  // opened (file gone but RECENT_BOOKS/index entries lingered). Doing the
+  // full cleanup in one place means all four delete sites stay in sync.
   if (FsHelpers::hasEpubExtension(fullPath)) {
     Epub(fullPath, "/.crosspoint").clearCache();
     BookmarkStore::deleteForFilePath(fullPath, "epub");
   } else if (FsHelpers::hasXtcExtension(fullPath)) {
+    Xtc(fullPath, "/.crosspoint").clearCache();
     BookmarkStore::deleteForFilePath(fullPath, "xtc");
   } else if (FsHelpers::hasTxtExtension(fullPath) || FsHelpers::hasMarkdownExtension(fullPath)) {
     BookmarkStore::deleteForFilePath(fullPath, "txt");
   }
+  CollectionsStore::getInstance().removeBookFromAllCollections(fullPath);
+  LibraryIndex::getInstance().forgetPath(fullPath);
+  SeriesIndex::getInstance().forgetPath(fullPath);
   LOG_DBG("BookActions", "Cleared metadata for: %s", fullPath.c_str());
 }
 

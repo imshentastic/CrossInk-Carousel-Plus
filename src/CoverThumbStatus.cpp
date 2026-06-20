@@ -6,6 +6,8 @@
 #include <Logging.h>
 #include <Xtc.h>
 
+#include <vector>
+
 namespace {
 
 // Mirrors the Epub/Xtc on-disk layout. The cache dir for any book the
@@ -75,6 +77,66 @@ void clearFailed(const std::string& bookPath, int width, int height) {
   if (marker.empty()) return;
   if (!Storage.exists(marker.c_str())) return;
   Storage.remove(marker.c_str());
+}
+
+int sweepAllMarkers() {
+  auto root = Storage.open(kCacheDir);
+  if (!root || !root.isDirectory()) {
+    if (root) root.close();
+    LOG_INF("CTS", "Sweep: no /.crosspoint dir (yet); skipping");
+    return 0;
+  }
+
+  int removed = 0;
+  char nameBuf[128];
+  // Iterate per-book cache subdirs (epub_* / xtc_*). Each subdir may contain
+  // one or more thumb_failed_v3_<W>x<H>.marker files -- one per size that
+  // failed (Carousel @ 296x468, Collections @ 130x190, etc.).
+  for (auto sub = root.openNextFile(); sub; sub = root.openNextFile()) {
+    sub.getName(nameBuf, sizeof(nameBuf));
+    if (!sub.isDirectory()) {
+      sub.close();
+      continue;
+    }
+    const std::string subPath = std::string(kCacheDir) + "/" + nameBuf;
+    sub.close();
+
+    auto bookDir = Storage.open(subPath.c_str());
+    if (!bookDir || !bookDir.isDirectory()) {
+      if (bookDir) bookDir.close();
+      continue;
+    }
+    char fileNameBuf[128];
+    std::vector<std::string> toRemove;
+    for (auto f = bookDir.openNextFile(); f; f = bookDir.openNextFile()) {
+      f.getName(fileNameBuf, sizeof(fileNameBuf));
+      // Match thumb_failed_v3_*.marker. String::starts_with isn't available;
+      // do a manual prefix + suffix check. The full prefix is "thumb_failed_v3_"
+      // (16 chars including underscore) and suffix is ".marker" (7 chars).
+      const std::string filename = fileNameBuf;
+      const std::string prefix = "thumb_failed_v3_";
+      const std::string suffix = ".marker";
+      const bool matches = filename.size() > prefix.size() + suffix.size() &&
+                           filename.compare(0, prefix.size(), prefix) == 0 &&
+                           filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) == 0;
+      f.close();
+      if (matches) {
+        toRemove.push_back(subPath + "/" + filename);
+      }
+    }
+    bookDir.close();
+
+    for (const auto& path : toRemove) {
+      if (Storage.remove(path.c_str())) {
+        ++removed;
+      } else {
+        LOG_ERR("CTS", "Sweep: failed to remove %s", path.c_str());
+      }
+    }
+  }
+  root.close();
+  LOG_INF("CTS", "Sweep: removed %d thumb-failed marker(s)", removed);
+  return removed;
 }
 
 }  // namespace CoverThumbStatus

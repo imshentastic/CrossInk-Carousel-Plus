@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 #include <Epub.h>
+
+#include "activities/reader/BookReadingStats.h"  // CrumBLE 4.4: DeleteStats action
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -326,6 +328,16 @@ void FileBrowserActivity::showFileActionMenu(const std::string& entry, bool igno
             }
             requestUpdate();
             return;
+          case FileBrowserAction::DeleteStats: {
+            // CrumBLE 4.4 (ported from CrossInk v1.3.3): delete just this
+            // book's stats.bin, leaving its cache + reading position intact.
+            const std::string cachePath = Epub(fullPath, "/.crosspoint").getCachePath();
+            const bool ok = BookReadingStats::remove(cachePath);
+            BookActions::drawToast(renderer, ok ? tr(STR_BOOK_STATS_DELETED) : tr(STR_CACHE_DELETE_FAILED));
+            delay(ok ? 1000 : 1500);
+            requestUpdate();
+            return;
+          }
           case FileBrowserAction::ToggleCompleted:
             if (BookActions::toggleEpubCompleted(fullPath, getFileName(entry), completedFeedbackIsFinished)) {
               pendingCompletedFeedback = true;

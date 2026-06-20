@@ -12,6 +12,14 @@ struct RecentBook {
   bool operator==(const RecentBook& other) const { return path == other.path; }
 };
 
+// CrumBLE 4.4: shared author-metadata normalizer. Strips leading/trailing
+// whitespace + separator characters (";", ",") that EPUB OPF often leaves
+// behind when an author field has no value or extra delimiters between
+// multiple authors. Idempotent on clean input. Applied at the storage
+// layer (RecentBooksStore + JSON load) so every display site reads clean
+// data without needing to know about EPUB metadata quirks.
+std::string normalizeAuthorMeta(std::string s);
+
 class RecentBooksStore;
 namespace JsonSettingsIO {
 bool loadRecentBooks(RecentBooksStore& store, const char* json);

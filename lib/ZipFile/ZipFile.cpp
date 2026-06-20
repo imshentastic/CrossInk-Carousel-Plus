@@ -291,10 +291,26 @@ bool ZipFile::loadZipDetails() {
     return false;  // Minimum EOCD size is 22 bytes
   }
 
-  // We scan the last 1KB (or the whole file if smaller) for the EOCD signature
-  // 0x06054b50 is stored as 0x50, 0x4b, 0x05, 0x06 in little-endian
-  const int scanRange = fileSize > 1024 ? 1024 : fileSize;
-  const auto buffer = static_cast<uint8_t*>(malloc(scanRange));
+  // We scan the tail of the file for the EOCD signature 0x06054b50 (stored
+  // as 0x50, 0x4b, 0x05, 0x06 in little-endian).
+  //
+  // CrumBLE 4.4: scan window is progressive. The ZIP spec allows the EOCD
+  // comment field to be up to 65535 bytes; re-packaged EPUBs (Anna's
+  // Archive, calibre-modified, signed bundles) sometimes push the EOCD
+  // signature tens of KB back from EOF. Iron Gold from Anna's Archive
+  // wasn't found with a 4 KB scan; needs much more. Try 64 KB (covers
+  // the full ZIP spec) first; if alloc fails under heap pressure, step
+  // down through 16 KB / 4 KB / 1 KB so every heap state still gets the
+  // best window we can afford. Last fallback (1 KB) matches the
+  // pre-CrumBLE-4.4 behaviour -- books that worked then still work now.
+  static constexpr int kScanRangeTiers[] = {65536, 16384, 4096, 1024};
+  uint8_t* buffer = nullptr;
+  int scanRange = 0;
+  for (int tier : kScanRangeTiers) {
+    scanRange = fileSize > tier ? tier : static_cast<int>(fileSize);
+    buffer = static_cast<uint8_t*>(malloc(scanRange));
+    if (buffer) break;
+  }
   if (!buffer) {
     LOG_ERR("ZIP", "Failed to allocate memory for EOCD scan buffer");
     return false;

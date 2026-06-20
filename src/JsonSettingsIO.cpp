@@ -102,6 +102,7 @@ bool JsonSettingsIO::saveState(const CrossPointState& s, const char* path) {
   doc["pendingBookmarkSpine"] = s.pendingBookmarkSpine;
   doc["pendingBookmarkProgress"] = s.pendingBookmarkProgress;
   doc["showBootScreen"] = s.showBootScreen;
+  doc["lastCrumbleVersion"] = s.lastCrumbleVersion;
 
   String json;
   serializeJson(doc, json);
@@ -140,6 +141,7 @@ bool JsonSettingsIO::loadState(CrossPointState& s, const char* json) {
   s.pendingBookmarkSpine = doc["pendingBookmarkSpine"] | static_cast<uint16_t>(UINT16_MAX);
   s.pendingBookmarkProgress = doc["pendingBookmarkProgress"] | static_cast<float>(-1.0f);
   s.showBootScreen = doc["showBootScreen"] | true;
+  s.lastCrumbleVersion = doc["lastCrumbleVersion"] | std::string("");
   return true;
 }
 
@@ -466,7 +468,12 @@ bool JsonSettingsIO::loadRecentBooks(RecentBooksStore& store, const char* json) 
     RecentBook book;
     book.path = obj["path"] | std::string("");
     book.title = obj["title"] | std::string("");
-    book.author = obj["author"] | std::string("");
+    // CrumBLE 4.4: clean previously-stored authors at load time too.
+    // Pre-4.4 saves wrote whatever Epub::getAuthor returned, often with a
+    // trailing ";" from OPF separator artifacts. Normalizing on load
+    // means existing recent.json content displays cleanly without
+    // needing a forced rewrite.
+    book.author = normalizeAuthorMeta(obj["author"] | std::string(""));
     book.coverBmpPath = obj["coverBmpPath"] | std::string("");
     store.recentBooks.push_back(book);
   }
