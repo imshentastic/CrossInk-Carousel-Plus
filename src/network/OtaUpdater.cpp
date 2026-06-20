@@ -6,11 +6,14 @@ const std::string& OtaUpdater::getLatestVersion() const { return latestVersion; 
 OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() { return NO_UPDATE; }
 OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback, void*, std::atomic<bool>*) { return NO_UPDATE; }
 #else
+#include <Arduino.h>
 #include <Logging.h>
 #include <ReleaseJsonParser.h>
 #include <esp_err.h>
+#include <esp_heap_caps.h>
 #include <mbedtls/ssl.h>
 
+#include <algorithm>
 #include <cstring>
 
 #include "AppVersion.h"
@@ -373,7 +376,33 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
 
   WifiPowerSaveGuard wifiPowerSaveGuard;
 
+  // CrumBLE 4.6: hold a defrag reserve through esp_https_ota_begin. begin
+  // does URL parse + http_client_init + TLS handshake to the CDN, allocating
+  // ~5-15 KB of contiguous scratch. On a fragmented heap the realloc inside
+  // http_utils_append_string returns NULL and IDF asserts instead of
+  // returning gracefully (panic at http_utils.c:72). Holding then releasing
+  // the reserve right around begin guarantees that scratch finds a clean
+  // contiguous chunk; perform()'s TLS work then runs against the just-freed
+  // block. Best-effort: if alloc fails we proceed anyway.
+  constexpr size_t kBeginReserveTarget = 24u * 1024u;
+  const size_t beginReserveSize =
+      std::min(kBeginReserveTarget,
+               static_cast<size_t>(ESP.getMaxAllocHeap() > 8u * 1024u ? ESP.getMaxAllocHeap() - 8u * 1024u : 0));
+  void* beginReserve = nullptr;
+  if (beginReserveSize >= 8u * 1024u) {
+    beginReserve = heap_caps_malloc(beginReserveSize, MALLOC_CAP_8BIT);
+    if (beginReserve) {
+      LOG_INF("OTA", "Install begin reserve: held %u bytes (maxAlloc now=%u)", beginReserveSize, ESP.getMaxAllocHeap());
+    }
+  }
+
   esp_err = esp_https_ota_begin(&ota_config, &ota_handle);
+
+  if (beginReserve) {
+    heap_caps_free(beginReserve);
+    LOG_INF("OTA", "Install begin reserve: released (maxAlloc now=%u)", ESP.getMaxAllocHeap());
+  }
+
   if (esp_err != ESP_OK) {
     LOG_DBG("OTA", "HTTP OTA Begin Failed: %s", esp_err_to_name(esp_err));
     return INTERNAL_UPDATE_ERROR;

@@ -261,13 +261,10 @@ void OtaUpdateActivity::loop() {
         requestUpdate(true);
         return;
       }
-      // Re-acquire the defrag reserve for the install download's own HTTPS
-      // handshake (the firmware blob is on objects.githubusercontent.com via
-      // redirect, separate connection). Released right before the actual
-      // install call below. Best-effort: if heap has settled enough that we
-      // can't reserve, the install handshake will try anyway.
-      acquireHeapReserve();
-      releaseHeapReserve();
+      // Heap reserve around install is handled inside OtaUpdater::installUpdate
+      // (acquired before esp_https_ota_begin to defrag URL/HTTP client init,
+      // released right after begin so perform has the freed block for TLS).
+      LOG_INF("OTA", "Pre-install heap: free=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
       const auto res = updater.installUpdate(
           [](void* ctx) {
             // immediate=true notifies the render task directly. The default deferred path only
