@@ -54,6 +54,9 @@ EInkDisplay::RefreshMode convertRefreshMode(HalDisplay::RefreshMode mode) {
     case HalDisplay::FULL_REFRESH:
       return EInkDisplay::FULL_REFRESH;
     case HalDisplay::HALF_REFRESH:
+    case HalDisplay::HALF_REFRESH_DEEP:
+      // Both half modes share the same underlying waveform; DEEP is just a
+      // hint to the X3 resync logic above, transparent to the SDK driver.
       return EInkDisplay::HALF_REFRESH;
     case HalDisplay::FAST_REFRESH:
     default:
@@ -64,8 +67,19 @@ EInkDisplay::RefreshMode convertRefreshMode(HalDisplay::RefreshMode mode) {
 void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen) {
   HalSpiBus::Lock spiLock;
 
-  if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
-    einkDisplay.requestResync(1);
+  if (gpio.deviceIsX3()) {
+    // CrumBLE 4.4: scope the deep (2-cycle) resync to HALF_REFRESH_DEEP only.
+    // Original behaviour was a single resync on every HALF_REFRESH; we
+    // briefly bumped it to 2 to fix the reader->home polarity drift, but
+    // that penalised every sleep refresh on X3 too (~770ms each). Now
+    // sleep + most callers pay the original 1 resync; HomeActivity opts
+    // into the deeper scrub via HALF_REFRESH_DEEP. X4 is unaffected
+    // either way (the resync is X3-only).
+    if (mode == RefreshMode::HALF_REFRESH_DEEP) {
+      einkDisplay.requestResync(2);
+    } else if (mode == RefreshMode::HALF_REFRESH) {
+      einkDisplay.requestResync(1);
+    }
   }
 
   einkDisplay.displayBuffer(convertRefreshMode(mode), turnOffScreen);
@@ -74,8 +88,19 @@ void HalDisplay::displayBuffer(HalDisplay::RefreshMode mode, bool turnOffScreen)
 void HalDisplay::refreshDisplay(HalDisplay::RefreshMode mode, bool turnOffScreen) {
   HalSpiBus::Lock spiLock;
 
-  if (gpio.deviceIsX3() && mode == RefreshMode::HALF_REFRESH) {
-    einkDisplay.requestResync(1);
+  if (gpio.deviceIsX3()) {
+    // CrumBLE 4.4: scope the deep (2-cycle) resync to HALF_REFRESH_DEEP only.
+    // Original behaviour was a single resync on every HALF_REFRESH; we
+    // briefly bumped it to 2 to fix the reader->home polarity drift, but
+    // that penalised every sleep refresh on X3 too (~770ms each). Now
+    // sleep + most callers pay the original 1 resync; HomeActivity opts
+    // into the deeper scrub via HALF_REFRESH_DEEP. X4 is unaffected
+    // either way (the resync is X3-only).
+    if (mode == RefreshMode::HALF_REFRESH_DEEP) {
+      einkDisplay.requestResync(2);
+    } else if (mode == RefreshMode::HALF_REFRESH) {
+      einkDisplay.requestResync(1);
+    }
   }
 
   einkDisplay.refreshDisplay(convertRefreshMode(mode), turnOffScreen);

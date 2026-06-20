@@ -33,6 +33,14 @@ namespace {
 constexpr bool TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH = true;
 constexpr int sleepBuildInfoSideMargin = 20;
 
+// CrumBLE 4.4: cycle counter survives deep-sleep wakes (resets on power loss,
+// like the other silentReboot* RTC_NOINIT_ATTR slots in main.cpp). Used to
+// pick HALF every Nth cycle to scrub ghost buildup, FAST the rest of the time.
+// Conservative N=3 keeps ghost clears frequent while still ~halving the
+// average wall-clock cost of a sleep cycle on both X3 and X4.
+RTC_NOINIT_ATTR uint32_t sleepCycleCounter;
+constexpr uint32_t kSleepCycleHalfEveryN = 3;
+
 // Snapshot of the last reader-rendered framebuffer, written on EpubReaderActivity::onExit
 // and read by cycleScreensaverFromDeepSleep so the cold-boot cycle path can show the last
 // book page behind a transparent PNG without needing fonts or the EPUB parser.
@@ -345,7 +353,8 @@ bool renderPngToSleepScreen(GfxRenderer& renderer, const std::string& filename) 
   return true;
 }
 
-void renderBitmapToSleepScreen(GfxRenderer& renderer, const Bitmap& bitmap, bool skipGreyscalePass = false) {
+void renderBitmapToSleepScreen(GfxRenderer& renderer, const Bitmap& bitmap, bool skipGreyscalePass = false,
+                               HalDisplay::RefreshMode bwRefresh = HalDisplay::HALF_REFRESH) {
   int x, y;
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
@@ -393,7 +402,7 @@ void renderBitmapToSleepScreen(GfxRenderer& renderer, const Bitmap& bitmap, bool
     renderer.invertScreen();
   }
 
-  renderer.displayBuffer(HalDisplay::HALF_REFRESH, TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
+  renderer.displayBuffer(bwRefresh, TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
 
   // Cache the composed B/W full-screen sleep image so a later heap-starved sleep
   // can restore it without a decode (see SLEEP_FB_CACHE_PATH). Snapshot the B/W
@@ -819,6 +828,17 @@ void SleepActivity::cycleScreensaverFromDeepSleep(GfxRenderer& renderer) {
 
   LOG_INF("SLP", "Cycling sleep image to: %s", selection.path.c_str());
 
+  // CrumBLE 4.4: pick FAST_REFRESH for most cycles; HALF every Nth.
+  // FAST is ~470 ms vs HALF's ~770 ms (plus the X3 resync) -- ~half the
+  // wall-clock cost on every cycle that hits this branch. Periodic HALF
+  // sweeps panel ghost buildup that FAST diffs leave behind.
+  ++sleepCycleCounter;
+  const bool useHalf = (sleepCycleCounter % kSleepCycleHalfEveryN) == 0;
+  const HalDisplay::RefreshMode cycleRefresh =
+      useHalf ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
+  LOG_DBG("SLP", "Cycle refresh: %s (count=%u)", useHalf ? "HALF" : "FAST",
+          static_cast<unsigned>(sleepCycleCounter));
+
   if (selection.isPng) {
     // Try to use the cached last reader page as the background so transparent
     // regions of the PNG show book text underneath. Falls back to a clean
@@ -835,7 +855,7 @@ void SleepActivity::cycleScreensaverFromDeepSleep(GfxRenderer& renderer) {
     if (SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::INVERTED_BLACK_AND_WHITE) {
       renderer.invertScreen();
     }
-    renderer.displayBuffer(HalDisplay::HALF_REFRESH, TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
+    renderer.displayBuffer(cycleRefresh, TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
     return;
   }
 
@@ -856,7 +876,7 @@ void SleepActivity::cycleScreensaverFromDeepSleep(GfxRenderer& renderer) {
   // LSB/MSB double-pass. Default off so behaviour matches v3.7.3 unless
   // the user explicitly turns it on in Display settings.
   const bool skipGrayscale = SETTINGS.sleepCycleSkipGrayscale != 0;
-  renderBitmapToSleepScreen(renderer, bitmap, skipGrayscale);
+  renderBitmapToSleepScreen(renderer, bitmap, skipGrayscale, cycleRefresh);
 }
 
 void SleepActivity::renderCoverSleepScreen() const {

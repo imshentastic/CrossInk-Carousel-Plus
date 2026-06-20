@@ -1,5 +1,6 @@
 #include "ClockSyncActivity.h"
 
+#include <Arduino.h>  // millis(), delay()
 #include <GfxRenderer.h>
 #include <HalClock.h>
 #include <I18n.h>
@@ -7,9 +8,11 @@
 #include <WiFi.h>
 
 #include <cstdio>
+#include <vector>
 
 #include "CrossPointSettings.h"
 #include "MappedInputManager.h"
+#include "WifiCredentialStore.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -20,14 +23,87 @@ void ClockSyncActivity::onEnter() {
   requestUpdate();
 }
 
-void ClockSyncActivity::onExit() { Activity::onExit(); }
+void ClockSyncActivity::onExit() {
+  Activity::onExit();
+  // CrumBLE 4.4: if we brought up WiFi just for this sync, drop it on the
+  // way out so the activity doesn't leak a session. Skipped when WiFi was
+  // already up at entry (some other flow owns it).
+  if (wifiActivatedByUs) {
+    WiFi.disconnect(false);
+  }
+}
 
 void ClockSyncActivity::runSync() {
   if (WiFi.status() != WL_CONNECTED) {
-    LOG_INF("CLK", "Manual sync requested but WiFi is not connected");
-    state = NO_WIFI;
-    requestUpdate();
-    return;
+    // CrumBLE 4.4: previously this bailed immediately with NO_WIFI even
+    // when the user had saved networks. The settings entry implies "do
+    // the sync for me" -- requiring them to first navigate to WiFi
+    // settings, pick a network, wait for it to connect, then come back
+    // here is poor UX. Try auto-connecting to saved networks. Initial
+    // version only tried lastConnectedSsid + the first credential, but
+    // pre-mechanism saved networks don't have a lastConnectedSsid value
+    // and the first credential may not be in range. Now iterate through
+    // ALL saved credentials in priority order, short timeout per attempt
+    // so the worst-case wait stays bounded.
+    const auto& creds = WIFI_STORE.getCredentials();
+    if (creds.empty()) {
+      LOG_INF("CLK", "Manual sync requested but no saved WiFi networks");
+      state = NO_WIFI;
+      requestUpdate();
+      return;
+    }
+    // Build an attempt order: lastConnectedSsid first (most likely still
+    // in range), then the rest in storage order. Avoids retrying the same
+    // SSID twice when lastConnectedSsid is present.
+    const auto& lastSsid = WIFI_STORE.getLastConnectedSsid();
+    std::vector<const WifiCredential*> attemptOrder;
+    attemptOrder.reserve(creds.size());
+    if (!lastSsid.empty()) {
+      if (const WifiCredential* lastCred = WIFI_STORE.findCredential(lastSsid)) {
+        attemptOrder.push_back(lastCred);
+      }
+    }
+    for (const auto& c : creds) {
+      if (attemptOrder.empty() || c.ssid != attemptOrder.front()->ssid) {
+        attemptOrder.push_back(&c);
+      }
+    }
+
+    WiFi.mode(WIFI_STA);
+    wifiActivatedByUs = true;
+    // 6s per network. Most home networks connect in 2-4s. Worst case
+    // with 8 saved networks: ~48s, but in practice the first or second
+    // attempt succeeds because at most one network is usually in range.
+    constexpr uint32_t kPerAttemptMs = 6000;
+    bool connected = false;
+    for (const WifiCredential* cred : attemptOrder) {
+      LOG_INF("CLK", "Auto-connecting to '%s' for clock sync", cred->ssid.c_str());
+      if (cred->password.empty()) {
+        WiFi.begin(cred->ssid.c_str());
+      } else {
+        WiFi.begin(cred->ssid.c_str(), cred->password.c_str());
+      }
+      const uint32_t startMs = millis();
+      while (WiFi.status() != WL_CONNECTED && millis() - startMs < kPerAttemptMs) {
+        delay(200);
+      }
+      if (WiFi.status() == WL_CONNECTED) {
+        LOG_INF("CLK", "Auto-connected to '%s' in %lu ms", cred->ssid.c_str(),
+                static_cast<unsigned long>(millis() - startMs));
+        connected = true;
+        break;
+      }
+      LOG_INF("CLK", "  failed (status=%d), trying next", static_cast<int>(WiFi.status()));
+      WiFi.disconnect(false);
+      delay(100);
+    }
+    if (!connected) {
+      LOG_INF("CLK", "All %u saved networks failed -- bailing",
+              static_cast<unsigned>(attemptOrder.size()));
+      state = NO_WIFI;
+      requestUpdate();
+      return;
+    }
   }
 
   const bool ok = halClock.syncFromNTP();

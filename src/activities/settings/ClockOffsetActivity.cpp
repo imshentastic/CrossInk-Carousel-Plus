@@ -4,6 +4,7 @@
 #include <HalClock.h>
 #include <I18n.h>
 
+#include <algorithm>
 #include <cstdio>
 
 #include "CrossPointSettings.h"
@@ -47,7 +48,12 @@ void decodeOffset(uint8_t biased, uint8_t& sign, uint8_t& hours, uint8_t& quarte
 void ClockOffsetActivity::onEnter() {
   Activity::onEnter();
   loadFromSettings();
-  activeField = FIELD_HOURS;
+  // CrumBLE 4.4: start at the sign field so western-hemisphere users see
+  // the +/- caret immediately and can flip to negative without first
+  // discovering that "Next Field" cycles all three positions. Previously
+  // started at FIELD_HOURS, which made it look like only positive
+  // offsets (0..+14) were available unless you pressed Next Field twice.
+  activeField = FIELD_SIGN;
   requestUpdate();
 }
 
@@ -146,48 +152,49 @@ void ClockOffsetActivity::render(RenderLock&&) {
 
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_CLOCK_UTC_OFFSET));
 
-  // Build the offset string. Use a generous font and centre it.
-  char offsetBuf[16];
-  snprintf(offsetBuf, sizeof(offsetBuf), "UTC %c %d:%02d", sign == 1 ? '-' : '+', hours,
-           minutesQuarter * MINUTES_PER_QUARTER);
+  // CrumBLE 4.5: render each segment with its own drawText call, tracking
+  // the running X. The focus-box X for any field MUST equal the X where
+  // that segment was drawn -- measuring prefix substrings of a single
+  // composite string can drift by a pixel or two due to kerning with the
+  // following character, which shifted the sign/hours frames so the
+  // character appeared right-justified inside them. With per-segment
+  // drawText + per-segment X tracking, the frame and the glyph use the
+  // identical coordinate so the character always sits centred.
+  auto widthOf = [&](const char* s) {
+    return renderer.getTextWidth(UI_12_FONT_ID, s, EpdFontFamily::BOLD);
+  };
 
-  const int centreY = pageHeight / 2 - 40;
-  renderer.drawCenteredText(UI_12_FONT_ID, centreY, offsetBuf, true, EpdFontFamily::BOLD);
-
-  // Underline / caret under the active field. Compute positions by measuring substrings of the
-  // formatted string so the caret follows the font glyph widths exactly.
-  // Field substrings:
-  //   "UTC "        -> prefix
-  //   "{+/-}"       -> sign
-  //   " "
-  //   "{hours}"     -> hours
-  //   ":"
-  //   "{mm}"        -> minutes
-  auto widthOf = [&](const char* s) { return renderer.getTextWidth(UI_12_FONT_ID, s); };
-  const int totalWidth = widthOf(offsetBuf);
-  const int leftEdge = (pageWidth - totalWidth) / 2;
-
-  // Locate each field by reformatting prefixes.
-  char prefixSign[16];
-  snprintf(prefixSign, sizeof(prefixSign), "UTC ");
-  const int signX = leftEdge + widthOf(prefixSign);
-
-  char prefixHours[16];
-  snprintf(prefixHours, sizeof(prefixHours), "UTC %c ", sign == 1 ? '-' : '+');
-  const int hoursX = leftEdge + widthOf(prefixHours);
-
-  char prefixMinutes[16];
-  snprintf(prefixMinutes, sizeof(prefixMinutes), "UTC %c %d:", sign == 1 ? '-' : '+', hours);
-  const int minutesX = leftEdge + widthOf(prefixMinutes);
-
-  // Width of each field substring for the caret span.
-  const int signW = widthOf(sign == 1 ? "-" : "+");
+  const char* signStr = sign == 1 ? "-" : "+";
   char hoursStr[8];
   snprintf(hoursStr, sizeof(hoursStr), "%d", hours);
-  const int hoursW = widthOf(hoursStr);
   char minutesStr[8];
   snprintf(minutesStr, sizeof(minutesStr), "%02d", minutesQuarter * MINUTES_PER_QUARTER);
+
+  const int utcW = widthOf("UTC ");
+  const int signW = widthOf(signStr);
+  const int gapW = widthOf(" ");
+  const int hoursW = widthOf(hoursStr);
+  const int colonW = widthOf(":");
   const int minutesW = widthOf(minutesStr);
+  const int totalWidth = utcW + signW + gapW + hoursW + colonW + minutesW;
+
+  const int centreY = pageHeight / 2 - 40;
+  int x = (pageWidth - totalWidth) / 2;
+
+  renderer.drawText(UI_12_FONT_ID, x, centreY, "UTC ", true, EpdFontFamily::BOLD);
+  x += utcW;
+  const int signX = x;
+  renderer.drawText(UI_12_FONT_ID, x, centreY, signStr, true, EpdFontFamily::BOLD);
+  x += signW;
+  renderer.drawText(UI_12_FONT_ID, x, centreY, " ", true, EpdFontFamily::BOLD);
+  x += gapW;
+  const int hoursX = x;
+  renderer.drawText(UI_12_FONT_ID, x, centreY, hoursStr, true, EpdFontFamily::BOLD);
+  x += hoursW;
+  renderer.drawText(UI_12_FONT_ID, x, centreY, ":", true, EpdFontFamily::BOLD);
+  x += colonW;
+  const int minutesX = x;
+  renderer.drawText(UI_12_FONT_ID, x, centreY, minutesStr, true, EpdFontFamily::BOLD);
 
   int caretX = 0;
   int caretW = 0;
@@ -207,10 +214,32 @@ void ClockOffsetActivity::render(RenderLock&&) {
     default:
       break;
   }
-  // Caret drawn as a short bar below the active field.
-  const int caretY = centreY + 10;
-  for (int dy = 0; dy < 2; dy++) {
-    renderer.drawLine(caretX, caretY + dy, caretX + caretW, caretY + dy);
+  // CrumBLE 4.4: dotted box around the active field. The previous design
+  // was a short underline at centreY+10 which (with this font) landed
+  // partway up the glyph rather than below it, making it look like a
+  // mid-character strikethrough. A dotted rectangle wraps the whole
+  // character unambiguously regardless of glyph metrics.
+  const int boxLineH = renderer.getLineHeight(UI_12_FONT_ID);
+  constexpr int kBoxPadX = 4;
+  constexpr int kBoxPadY = 3;
+  constexpr int kDashThickness = 2;  // 2px-thick edges so the box reads from arm's length
+  const int boxLeft = caretX - kBoxPadX;
+  const int boxRight = caretX + caretW + kBoxPadX;
+  const int boxTop = centreY - kBoxPadY;
+  const int boxBottom = centreY + boxLineH + kBoxPadY;
+  // 3-on / 2-off dashed pattern, 2px thick. Slightly longer dashes than
+  // before so the box reads as a frame from arm's length on e-ink.
+  constexpr int kDashOn = 3;
+  constexpr int kDashStep = 5;  // 3 on + 2 off
+  for (int x = boxLeft; x <= boxRight; x += kDashStep) {
+    const int x2 = std::min(x + kDashOn - 1, boxRight);
+    renderer.fillRect(x, boxTop, x2 - x + 1, kDashThickness, true);
+    renderer.fillRect(x, boxBottom - (kDashThickness - 1), x2 - x + 1, kDashThickness, true);
+  }
+  for (int y = boxTop; y <= boxBottom; y += kDashStep) {
+    const int y2 = std::min(y + kDashOn - 1, boxBottom);
+    renderer.fillRect(boxLeft, y, kDashThickness, y2 - y + 1, true);
+    renderer.fillRect(boxRight - (kDashThickness - 1), y, kDashThickness, y2 - y + 1, true);
   }
 
   // Live preview of the resulting wall-clock time, so users can verify against a watch.
