@@ -1,5 +1,6 @@
 #include "Activity.h"
 
+#include <Arduino.h>  // ESP.getMaxAllocHeap()
 #include <BluetoothHIDManager.h>
 #include <I18n.h>
 
@@ -30,7 +31,19 @@ void Activity::exitToHomeWithPopup() {
   // this, the reader's long-tail exit (BLE shutdown, session save,
   // activity replace, carousel render) leaves the panel frozen on
   // the last reader page for ~700 ms.
-  GUI.drawPopup(renderer, tr(STR_GOING_HOME));
+  //
+  // CrumBLE 4.4: on a tight heap, FAST_REFRESH's custom LUT can produce
+  // a dim / partially-inverted popup -- the controller's view of the
+  // panel state diverges from the framebuffer when BW backup
+  // compression or display-buffer allocations fail. Fall back to
+  // HALF_REFRESH in that case: ~770 ms instead of instant, but the
+  // popup actually renders correctly. Threshold mirrors other
+  // heap-pre-flight checks in the reader (~32 KB MaxAlloc floor).
+  constexpr uint32_t kGoingHomePopupHealthyMaxAlloc = 32u * 1024u;
+  const auto popupRefresh = ESP.getMaxAllocHeap() >= kGoingHomePopupHealthyMaxAlloc
+                                ? HalDisplay::FAST_REFRESH
+                                : HalDisplay::HALF_REFRESH;
+  GUI.drawPopup(renderer, tr(STR_GOING_HOME), /*minTextWidth=*/0, /*leftAlignText=*/false, popupRefresh);
   // CrumBLE: tear NimBLE down synchronously BEFORE the Home transition. Home's
   // Flow shelf renders on a separate task and would otherwise race the reader's
   // deferred BLE disable -- rendering while NimBLE still holds ~58 KB, which

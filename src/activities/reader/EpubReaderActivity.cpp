@@ -22,12 +22,15 @@
 #include <limits>
 #include <memory>
 
+#include "../../SilentRestart.h"  // CrumBLE 4.4: silent-restart-before-BT pre-flight
 #include "../settings/BluetoothSettingsActivity.h"
 #include "../settings/KOReaderSettingsActivity.h"
 #include "BookSettingsDrawerActivity.h"
 // CrumBLE: dictionary feature (ported from SEEK reader sumegig/seek-reader).
+#include "DictionaryDefinitionActivity.h"
 #include "DictionaryIndexBuildActivity.h"
 #include "DictionaryWordSelectActivity.h"
+#include "fontIds.h"  // BITTER_12_FONT_ID for direct-launched definitions
 #include "LookedUpWordsActivity.h"
 #include "util/Dictionary.h"
 #include "util/LookupHistory.h"
@@ -460,7 +463,11 @@ void EpubReaderActivity::onEnter() {
     APP_STATE.saveToFile();
   } else {
     FsFile f;
-    if (Storage.openFileForRead("ERS", epub->getCachePath() + "/progress.bin", f)) {
+    // CrumBLE 4.4: quiet existence check first to silence the noisy
+    // "[ERS] File does not exist" line when opening a never-read book.
+    // Missing progress.bin is the normal "fresh book" state, not an error.
+    const std::string progressPath = epub->getCachePath() + "/progress.bin";
+    if (Storage.exists(progressPath.c_str()) && Storage.openFileForRead("ERS", progressPath, f)) {
       uint8_t data[6];
       int dataSize = f.read(data, 6);
       if (dataSize == 4 || dataSize == 6) {
@@ -1032,6 +1039,31 @@ void EpubReaderActivity::onExit() {
   // guards `if (!epub) return;`, subsuming 1.3's null-check on save.)
   commitReadingSession();
 
+  // CrumBLE 4.4: defensive save-on-exit. Progress is already saved on
+  // every page render (line ~4131), so the typical exit has nothing new
+  // to write. But if the render-time save FAILED under heap fragmentation
+  // (e.g. mid-page interaction left MaxAlloc too low for the FsFile
+  // alloc), the book gets stuck on its last successfully-saved page --
+  // user-fatal because only deleting/re-uploading the book clears it.
+  // Here at onExit the heap is usually cleaner (page DOM released,
+  // BT teardown queued), so one more attempt with a heap pre-flight
+  // catches the common case at near-zero cost.
+  if (epub && section && pendingSyncSaveError) {
+    constexpr uint32_t kExitSaveMinMaxAlloc = 4 * 1024;
+    const uint32_t exitMaxAlloc = ESP.getMaxAllocHeap();
+    if (exitMaxAlloc >= kExitSaveMinMaxAlloc) {
+      if (saveProgress(currentSpineIndex, section->currentPage, section->pageCount)) {
+        LOG_INF("ERS", "Defensive save-on-exit recovered progress (maxAlloc=%u)", exitMaxAlloc);
+        pendingSyncSaveError = false;
+      } else {
+        LOG_INF("ERS", "Defensive save-on-exit still failed (maxAlloc=%u)", exitMaxAlloc);
+      }
+    } else {
+      LOG_INF("ERS", "Defensive save-on-exit skipped: heap too low (maxAlloc=%u < %u)",
+              exitMaxAlloc, kExitSaveMinMaxAlloc);
+    }
+  }
+
   BOOKMARKS.unload();
   section.reset();
 
@@ -1105,6 +1137,76 @@ void EpubReaderActivity::loop() {
   if (deferredOnEnterPending_ && firstRenderCompleted_) {
     deferredOnEnterPending_ = false;
     runDeferredOnEnter();
+  }
+
+  // CrumBLE 4.4 post-bisect: dispatch the post-boot action queued by the
+  // previous boot's silentRestartToReaderWithAction(). Runs once after the
+  // first render has landed AND deferred init has finished -- so the heap
+  // is in its stable post-boot shape, not mid-fast-open.
+  //   EnableBt   -> set pendingBleQuickConnect_ (existing BT-connect SM)
+  //   OpenLookup -> re-fire the LOOKUP menu action on a fresh heap
+  //   OpenHighlight -> re-fire ADD_HIGHLIGHT
+  {
+    static bool postBootActionDispatched = false;
+    if (!postBootActionDispatched && firstRenderCompleted_ && !deferredOnEnterPending_) {
+      postBootActionDispatched = true;
+      const ReaderPostBootAction action = consumeReaderPostBootAction();
+      if (action == ReaderPostBootAction::EnableBt) {
+        LOG_INF("ERA", "post-boot dispatch: EnableBt -> pendingBleQuickConnect_ (free=%u maxAlloc=%u)",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        pendingBleQuickConnect_ = true;
+        pendingBleQuickConnectNoImages_ = false;
+        pendingBleQuickConnectSettingsChanged_ = false;
+        pendingBleQuickConnectPromptStage_ = -1;
+        requestUpdate();
+      } else if (action == ReaderPostBootAction::OpenLookup) {
+        LOG_INF("ERA", "post-boot dispatch: OpenLookup (free=%u maxAlloc=%u)",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::LOOKUP);
+      } else if (action == ReaderPostBootAction::OpenHighlight) {
+        LOG_INF("ERA", "post-boot dispatch: OpenHighlight (free=%u maxAlloc=%u)",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::ADD_HIGHLIGHT);
+      } else if (action == ReaderPostBootAction::OpenDefinition) {
+        const char* word = consumePendingDefinitionWord();
+        if (word && word[0] != '\0' && epub) {
+          LOG_INF("ERA", "post-boot dispatch: OpenDefinition('%s') (free=%u maxAlloc=%u)",
+                  word, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+          // CrumBLE 4.4 post-bisect: thread the word into the LOOKUP flow
+          // so the word-select activity opens with cursor on the word AND
+          // auto-opens the definition overlay. Replaces the prior
+          // DictionaryDefinitionActivity push path -- now the overlay is
+          // the SINGLE rendering path for definitions, so post-boot dispatch
+          // routes through LOOKUP regardless of where the user was when
+          // the silent-restart fired.
+          pendingLookupDefinitionWord_ = word;
+          onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::LOOKUP);
+        } else {
+          LOG_INF("ERA", "post-boot dispatch: OpenDefinition but no word queued; falling back to OpenLookup");
+          onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::LOOKUP);
+        }
+      } else if (action == ReaderPostBootAction::OpenReadingStats) {
+        LOG_INF("ERA", "post-boot dispatch: OpenReadingStats (free=%u maxAlloc=%u)",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::READING_STATS);
+      } else if (action == ReaderPostBootAction::OpenKoSync) {
+        LOG_INF("ERA", "post-boot dispatch: OpenKoSync (free=%u maxAlloc=%u)",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::SYNC);
+      } else if (action == ReaderPostBootAction::OpenLookupAtWord) {
+        const char* word = consumePendingDefinitionWord();
+        if (word && word[0] != '\0' && epub) {
+          LOG_INF("ERA", "post-boot dispatch: OpenLookupAtWord('%s') (free=%u maxAlloc=%u)",
+                  word, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+          pendingLookupDefinitionWord_ = word;
+          pendingLookupCursorOnly_ = true;
+          onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::LOOKUP);
+        } else {
+          LOG_INF("ERA", "post-boot dispatch: OpenLookupAtWord but no word queued; falling back to OpenLookup");
+          onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::LOOKUP);
+        }
+      }
+    }
   }
 
   // A chapter layout aborted under BLE pressure and we requested a BLE disable.
@@ -1369,6 +1471,52 @@ void EpubReaderActivity::loop() {
     pendingBleQuickConnectNoImages_ = false;
     pendingBleQuickConnectPromptStage_ = -1;
     if (noImages) renderer.setSuppressImages(true);
+
+    // CrumBLE 4.4 post-bisect: BT enable pre-flight. If the heap is degraded
+    // (typical: user opened the book, browsed a bit, did lookup/highlight,
+    // accumulated fragmentation), silent-restart first so NimBLE inits into
+    // a clean ~115 KB heap and post-BT MaxAlloc lands ~12-15 KB instead of
+    // ~6 KB. Skips if this enable is already the result of a prior silent
+    // restart (avoid restart loop on the same boot's recovery dispatch).
+    //
+    // The continuation flag is CLEARED after this check runs, so a LATER
+    // BT enable in the same session (e.g. after lookup/highlight dragged
+    // heap down) can still trigger another silent restart.
+    //
+    // Threshold history: raised from 40 KB -> 55 KB after a field crash
+    // where SD-card-font mode (plus dark mode, both holding extra resident
+    // state) left the pre-BT MaxAlloc at ~43 KB. The pre-flight passed,
+    // but NimBLE init + connect + 6 HID report-char subscriptions then
+    // consumed ~66 KB of free heap, leaving MaxAlloc at 92 bytes and
+    // killing the next page deserialize. SD-card-font path has a higher
+    // resident baseline than built-in fonts (font registry buffers, atlas,
+    // per-section subset), so the safe floor for the post-NimBLE residual
+    // has to be correspondingly higher. 55 KB leaves ~10-15 KB MaxAlloc
+    // post-connect even in the SD-font case; degraded sessions below that
+    // just take the silent-restart path and reconnect from a fresh heap.
+    {
+      const uint32_t preBtFree = ESP.getFreeHeap();
+      const uint32_t preBtMaxAlloc = ESP.getMaxAllocHeap();
+      constexpr uint32_t kPreBtFreshMaxAllocThreshold = 55 * 1024;
+      if (isContinuingFromSilentReboot()) {
+        LOG_INF("ERA",
+                "BT enable pre-flight: skipped (post-recovery dispatch; this enable is the result of "
+                "a prior silent restart, free=%u maxAlloc=%u)",
+                preBtFree, preBtMaxAlloc);
+        clearSilentRebootContinuationFlag();
+      } else if (preBtMaxAlloc < kPreBtFreshMaxAllocThreshold) {
+        LOG_INF("ERA",
+                "BT enable pre-flight: pre-BT heap is degraded "
+                "(free=%u maxAlloc=%u < %u); triggering silent restart with EnableBt to defrag heap",
+                preBtFree, preBtMaxAlloc, kPreBtFreshMaxAllocThreshold);
+        silentRestartToReaderWithAction(ReaderPostBootAction::EnableBt);
+        return;
+      } else {
+        LOG_INF("ERA",
+                "BT enable pre-flight: heap acceptable (free=%u maxAlloc=%u); proceeding",
+                preBtFree, preBtMaxAlloc);
+      }
+    }
     // Persistent "Connecting Bluetooth..." popup spanning the blocking
     // NimBLE init + GATT handshake (~2-3 s total -- enable() initializes
     // the controller and host, connectToDevice() establishes the link and
@@ -1647,6 +1795,23 @@ void EpubReaderActivity::loop() {
                              }
                              if (!result.isCancelled) {
                                onReaderMenuConfirm(static_cast<EpubReaderMenuActivity::MenuAction>(menu.action));
+                             }
+                             // CrumBLE 4.4: post-menu heap pre-flight. If the menu allocations + a
+                             // BT auto-reconnect that fires while the menu was up squeezed MaxAlloc
+                             // below the page-deserialize floor (~8 KB), the very next render's
+                             // TextBlock alloc fails with "maxAlloc=116 < needed=231" and the
+                             // section-cache-clear retry path reinstalls the atlas, pushing the
+                             // heap below 1 KB and triggering an abort(). Silent-restart preserves
+                             // the open book + page progress via progress.bin and resumes on a
+                             // fresh ~115 KB heap. Threshold mirrors the chapter-transition
+                             // pre-flight that already exists for the same class of failure.
+                             constexpr uint32_t POST_MENU_MIN_MAX_ALLOC = 8u * 1024u;
+                             const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+                             if (maxAlloc < POST_MENU_MIN_MAX_ALLOC) {
+                               LOG_INF("ERA",
+                                       "Post-menu heap pre-flight: maxAlloc=%u below %u; silent-restart to reader",
+                                       maxAlloc, POST_MENU_MIN_MAX_ALLOC);
+                               silentRestartToReader();
                              }
                            });
   }
@@ -1983,6 +2148,27 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       // bonded remote back on their next button press post-Lookup.
       auto& btMgr = BluetoothHIDManager::getInstance();
       const bool bleWasOnForLookup = btMgr.isEnabled();
+      // CrumBLE 4.4 post-bisect: pre-BT-disable heap gate. NimBLE's host-stop
+      // sequence (ble_hs_stop -> terminate connection -> free internal pools)
+      // transiently allocates ~5-10 KB during teardown. Under a fragmented
+      // heap where MaxAlloc is below that, the allocation lands in corrupted
+      // memory and heap_caps_free aborts with "free() target outside heap
+      // areas". Observed in the field: Lookup triggered with MaxAlloc=5364
+      // -> btMgr.disable() -> ble_hs_stop_terminate_timeout -> heap canary
+      // burnt -> panic. Catch the case here BEFORE entering NimBLE teardown:
+      // silent-restart with OpenLookup so the post-boot flow runs with a
+      // cold ~115 KB heap and BT already off (so the disable inside the
+      // restarted LOOKUP path is a safe no-op).
+      constexpr uint32_t LOOKUP_PRE_DISABLE_MIN_MAX_ALLOC = 12000;
+      if (bleWasOnForLookup && ESP.getMaxAllocHeap() < LOOKUP_PRE_DISABLE_MIN_MAX_ALLOC &&
+          !isContinuingFromSilentReboot()) {
+        LOG_INF("ERS",
+                "Lookup: pre-BT-disable maxAlloc=%u below %u; silent-restart with OpenLookup "
+                "to avoid NimBLE-teardown heap corruption",
+                ESP.getMaxAllocHeap(), LOOKUP_PRE_DISABLE_MIN_MAX_ALLOC);
+        silentRestartToReaderWithAction(ReaderPostBootAction::OpenLookup);
+        break;
+      }
       if (bleWasOnForLookup) {
         LOG_INF("ERS", "Lookup: disabling BT to free heap for word build (re-enabling on exit)");
         btMgr.disable();
@@ -2000,12 +2186,20 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       // each of which is correct (better than a reboot).
       constexpr uint32_t LOOKUP_MIN_MAX_ALLOC = 32000;
       if (ESP.getMaxAllocHeap() < LOOKUP_MIN_MAX_ALLOC) {
-        LOG_INF("ERS", "Lookup pre-flight: maxAlloc=%u below %u even after BT off, attempting recovery",
+        // CrumBLE 4.4 post-bisect: silent-restart with OpenLookup queued
+        // instead of the "low memory" dead-end. Post-boot dispatch
+        // re-launches the activity. Skip if already post-recovery.
+        if (!isContinuingFromSilentReboot()) {
+          LOG_INF("ERS",
+                  "Lookup pre-flight: maxAlloc=%u below %u; triggering silent restart with OpenLookup to defrag heap",
+                  ESP.getMaxAllocHeap(), LOOKUP_MIN_MAX_ALLOC);
+          silentRestartToReaderWithAction(ReaderPostBootAction::OpenLookup);
+          break;
+        }
+        LOG_INF("ERS", "Lookup pre-flight: maxAlloc=%u below %u even after silent restart, showing alert",
                 ESP.getMaxAllocHeap(), LOOKUP_MIN_MAX_ALLOC);
+        clearSilentRebootContinuationFlag();  // future ops can restart again if needed
         if (bleWasOnForLookup) btMgr.requestEnableLater();
-        // CrumBLE 4.2: passive heap recovery. Drop reusable allocations
-        // and yield -- the next user tap on Lookup runs against the
-        // recovered heap. Alert text guides them through that retry.
         tryRecoverLowHeapForLookup();
         strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_LOOKUP_TITLE),
                 sizeof(APP_STATE.pendingAlertTitle) - 1);
@@ -2014,6 +2208,10 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
         APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
         break;
       }
+      // Heap is acceptable. Clear continuation flag so future ops
+      // (highlight, BT-reconnect) can silent-restart if their heap is
+      // degraded after this lookup runs.
+      clearSilentRebootContinuationFlag();
       // Port of SEEK reader's dictionary lookup. Compute the orientation-
       // adjusted margins from the current page so the word-select overlay
       // can hit-test taps against the rendered glyphs; also peek the FIRST
@@ -2096,10 +2294,22 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       };
       auto launchWordSelect = [this, pageShared, readerFontId, orientedMarginLeft, orientedMarginTop, cachePath,
                                orientation, nextPageFirstWord, reEnableBleIfNeeded]() {
+        auto activity = std::make_unique<DictionaryWordSelectActivity>(
+            renderer, mappedInput, std::move(*pageShared), readerFontId,
+            orientedMarginLeft, orientedMarginTop, cachePath, orientation,
+            nextPageFirstWord);
+        // CrumBLE 4.4 post-bisect: thread the word + cursor-only flag from
+        // the post-boot dispatch into the activity.
+        //   OpenDefinition  -> cursorOnly = false: navigate cursor + auto-open popup
+        //   OpenLookupAtWord-> cursorOnly = true:  navigate cursor only (dismiss path)
+        if (!pendingLookupDefinitionWord_.empty()) {
+          activity->setPendingDefinitionWord(std::move(pendingLookupDefinitionWord_),
+                                              /*openOverlay=*/!pendingLookupCursorOnly_);
+          pendingLookupDefinitionWord_.clear();
+          pendingLookupCursorOnly_ = false;
+        }
         startActivityForResult(
-            std::make_unique<DictionaryWordSelectActivity>(renderer, mappedInput, std::move(*pageShared), readerFontId,
-                                                          orientedMarginLeft, orientedMarginTop, cachePath, orientation,
-                                                          nextPageFirstWord),
+            std::move(activity),
             [this, reEnableBleIfNeeded](const ActivityResult& result) {
               reEnableBleIfNeeded();
               requestUpdate();
@@ -2201,11 +2411,17 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       }
       constexpr uint32_t HIGHLIGHT_MIN_MAX_ALLOC = 32000;
       if (ESP.getMaxAllocHeap() < HIGHLIGHT_MIN_MAX_ALLOC) {
-        LOG_INF("ERS", "AddHighlight pre-flight: maxAlloc=%u below %u, attempting recovery",
+        if (!isContinuingFromSilentReboot()) {
+          LOG_INF("ERS",
+                  "AddHighlight pre-flight: maxAlloc=%u below %u; triggering silent restart with OpenHighlight",
+                  ESP.getMaxAllocHeap(), HIGHLIGHT_MIN_MAX_ALLOC);
+          silentRestartToReaderWithAction(ReaderPostBootAction::OpenHighlight);
+          break;
+        }
+        LOG_INF("ERS", "AddHighlight pre-flight: maxAlloc=%u below %u even after silent restart, showing alert",
                 ESP.getMaxAllocHeap(), HIGHLIGHT_MIN_MAX_ALLOC);
+        clearSilentRebootContinuationFlag();
         if (bleWasOnForHighlight) btMgrH.requestEnableLater();
-        // CrumBLE 4.2: passive heap recovery before the alert -- see
-        // tryRecoverLowHeapForLookup for the rationale.
         tryRecoverLowHeapForLookup();
         strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_LOOKUP_TITLE),
                 sizeof(APP_STATE.pendingAlertTitle) - 1);
@@ -2214,6 +2430,8 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
         APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
         break;
       }
+      // Heap acceptable; clear continuation so future ops can restart.
+      clearSilentRebootContinuationFlag();
 
       // Same page/margin extraction as LOOKUP -- the activity needs the
       // current Page to render and hit-test taps. Behind RenderLock so
@@ -2646,6 +2864,18 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       exitToHomeWithPopup();
       return;
     }
+    case EpubReaderMenuActivity::MenuAction::DELETE_STATS: {
+      // CrumBLE 4.4 (ported from CrossInk v1.3.3): delete just this book's
+      // stats.bin. No cache clear, no exit -- the book stays open and
+      // reading position is preserved.
+      bool ok = false;
+      if (epub) {
+        ok = BookReadingStats::remove(epub->getCachePath());
+      }
+      drawToast(renderer, ok ? tr(STR_BOOK_STATS_DELETED) : tr(STR_CACHE_DELETE_FAILED));
+      delay(ok ? 1000 : 1500);
+      return;
+    }
     case EpubReaderMenuActivity::MenuAction::DELETE_CACHE: {
       bool cacheDeleted = false;
       {
@@ -2680,6 +2910,37 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       break;
     }
     case EpubReaderMenuActivity::MenuAction::READING_STATS: {
+      // CrumBLE 4.4 post-bisect: pre-flight under BT. Reading Stats pushes
+      // a new activity (BookStatsActivity) that allocates for chart/text
+      // rendering; under BT (~58 KB held by NimBLE) the available MaxAlloc
+      // can be too low to safely both teardown NimBLE *and* construct the
+      // new activity. Mirror the LOOKUP pattern: if BT is up and MaxAlloc
+      // is below the pre-disable safe threshold, silent-restart with
+      // OpenReadingStats so the post-boot path runs on a fresh heap with
+      // BT already off. Field-observed crash: heap_caps_free assert
+      // ("free() target outside heap areas") during NimBLE teardown when
+      // Stats was opened with MaxAlloc ~5 KB.
+      auto& btMgr = BluetoothHIDManager::getInstance();
+      constexpr uint32_t STATS_PRE_DISABLE_MIN_MAX_ALLOC = 12000;
+      if (btMgr.isEnabled() && ESP.getMaxAllocHeap() < STATS_PRE_DISABLE_MIN_MAX_ALLOC &&
+          !isContinuingFromSilentReboot()) {
+        LOG_INF("ERS",
+                "Reading Stats: pre-BT-disable maxAlloc=%u below %u; silent-restart with OpenReadingStats",
+                ESP.getMaxAllocHeap(), STATS_PRE_DISABLE_MIN_MAX_ALLOC);
+        silentRestartToReaderWithAction(ReaderPostBootAction::OpenReadingStats);
+        break;
+      }
+      // Auto-disable BT for the duration of Reading Stats, mirroring the
+      // Lookup convention. The Stats screen is buttons-only (BT remote
+      // would just compete for input), and freeing ~58 KB of NimBLE state
+      // keeps the activity push within heap budget. requestEnableLater()
+      // brings BT back on the user's next button press post-Stats.
+      const bool bleWasOnForStats = btMgr.isEnabled();
+      if (bleWasOnForStats) {
+        LOG_INF("ERS", "Reading Stats: disabling BT to free heap (re-enabling on exit)");
+        btMgr.disable();
+      }
+      clearSilentRebootContinuationFlag();
       // Include elapsed time from the CURRENT (uncommitted) session
       // segment on top of what's been banked into stats. Previously
       // banked segments are already in `stats.totalReadingSeconds`
@@ -2690,7 +2951,12 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       startActivityForResult(
           std::make_unique<BookStatsActivity>(renderer, mappedInput, epub->getPath(), epub->getTitle(),
                                               epub->getThumbBmpPath(), displayStats, globalStats),
-          [this](const ActivityResult&) { requestUpdate(); });
+          [this, bleWasOnForStats](const ActivityResult&) {
+            if (bleWasOnForStats) {
+              BluetoothHIDManager::getInstance().requestEnableLater();
+            }
+            requestUpdate();
+          });
       break;
     }
     case EpubReaderMenuActivity::MenuAction::TOGGLE_COMPLETED: {
@@ -2702,6 +2968,22 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
     }
     case EpubReaderMenuActivity::MenuAction::SYNC: {
       if (KOREADER_STORE.hasCredentials()) {
+        // CrumBLE 4.4: KOReader Sync's TLS handshake needs ~55 KB of free
+        // heap (cert chain + mbedTLS scratch). Mid-reading the heap is
+        // typically 16-19 KB free / 13-19 KB maxAlloc -- nowhere near
+        // enough, and the user just gets "Not enough memory for sync --
+        // please retry" with no path to actually recover. Pre-flight:
+        // if free heap is below the TLS floor AND we're not already in
+        // a post-restart attempt, silent-restart with OpenKoSync so the
+        // sync runs against the fresh ~115 KB post-boot heap (BT cold).
+        constexpr uint32_t KOSYNC_TLS_HEAP_FLOOR = 60u * 1024u;
+        if (ESP.getFreeHeap() < KOSYNC_TLS_HEAP_FLOOR && !isContinuingFromSilentReboot()) {
+          LOG_INF("KOSync",
+                  "SYNC pre-flight: free=%u below %u; silent-restart with OpenKoSync",
+                  ESP.getFreeHeap(), KOSYNC_TLS_HEAP_FLOOR);
+          silentRestartToReaderWithAction(ReaderPostBootAction::OpenKoSync);
+          break;
+        }
         const int currentPage = section ? section->currentPage : nextPageNumber;
         const int totalPages = section ? section->pageCount : cachedChapterTotalPageCount;
         std::optional<uint16_t> paragraphIndex;
@@ -2983,6 +3265,11 @@ void EpubReaderActivity::executeReaderQuickAction(CrossPointSettings::LONG_PRESS
         showTiltPageTurnFeedback(SETTINGS.tiltPageTurn != CrossPointSettings::TILT_OFF);
         requestUpdate();
       }
+      break;
+    case CrossPointSettings::LONG_MENU_TOGGLE_DARK_MODE:
+      SETTINGS.readerDarkMode = SETTINGS.readerDarkMode ? 0 : 1;
+      SETTINGS.saveToFile();
+      requestUpdate();
       break;
     case CrossPointSettings::LONG_MENU_OFF:
     default:
@@ -3292,8 +3579,9 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 
   // Show end of book screen
   if (currentSpineIndex == epub->getSpineItemsCount()) {
-    renderer.clearScreen();
-    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_END_OF_BOOK), true, EpdFontFamily::BOLD);
+    renderer.clearScreen(ReaderUtils::readerBackgroundColor());
+    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_END_OF_BOOK), ReaderUtils::readerForegroundBlack(),
+                              EpdFontFamily::BOLD);
     renderer.displayBuffer();
     automaticPageTurnActive = false;
     showPendingSyncSaveError();
@@ -3569,9 +3857,38 @@ void EpubReaderActivity::render(RenderLock&& lock) {
         // the renderer's 1-bit blit path directly. The v39 subset stays
         // available as a fallback if the atlas install fails (e.g.
         // post-NimBLE heap too tight for the bitmap allocation).
-        const bool atlasOk = section->hasGlyphAtlas() && section->tryInstallGlyphAtlas(it->second->contentHash());
+        //
+        // glyphAtlasEnabled toggle: when 0, atlas install is skipped
+        // entirely and we go straight to the v39 subset path -- used to
+        // A/B test whether the atlas integration is the source of the
+        // FT upload heap regression.
+        if (!SETTINGS.glyphAtlasEnabled && section->hasGlyphAtlas()) {
+          LOG_INF("SCT", "EGS gate: atlas available but glyphAtlasEnabled=0, falling back to v39 subset");
+        }
+        const bool atlasOk = SETTINGS.glyphAtlasEnabled && section->hasGlyphAtlas() &&
+                              section->tryInstallGlyphAtlas(it->second->contentHash(),
+                                                       /*preferLowBitDepth=*/BluetoothHIDManager::getInstance().isEnabled());
         if (!atlasOk) {
           section->tryInstallEmbeddedGlyphSubset(it->second->contentHash());
+        }
+        // CrumBLE 4.4: one-time backward-compat write of prebake-cpfont.marker
+        // for books that were re-uploaded with the optimizer.js atlas-emit
+        // fix but missed the WASM CLI marker write (those came before the
+        // CLI rebuild that emits this marker). Once the marker exists, the
+        // badge tier upgrades to ✓IMG+CHAP+CP.FONT on the next FT listing
+        // and on the next device long-press. Storage.exists is cheap;
+        // gated on first-install success so we don't write for v40
+        // sections that don't carry atlas.
+        if (atlasOk && epub) {
+          const std::string markerPath =
+              Epub::cachePathForFilePath(epub->getPath(), "/.crosspoint") + "/prebake-cpfont.marker";
+          if (!Storage.exists(markerPath.c_str())) {
+            HalFile m;
+            if (Storage.openFileForWrite("ERA", markerPath, m)) {
+              m.close();
+              LOG_INF("ERA", "Wrote backward-compat prebake-cpfont.marker for %s", epub->getPath().c_str());
+            }
+          }
         }
       }
     }
@@ -3580,7 +3897,12 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     // code doesn't need to know which source produced the data.
     auto glyphFontData = [&](uint8_t style) -> const EpdFontData* {
       if (!section) return nullptr;
-      if (section->glyphAtlasInstalled()) {
+      // glyphAtlasEnabled toggle gates the atlas read path too -- with
+      // toggle OFF, the install above was skipped so glyphAtlasInstalled()
+      // is false anyway, but checking the flag here makes it explicit and
+      // catches the edge case where the atlas was already installed before
+      // the user flipped the toggle.
+      if (SETTINGS.glyphAtlasEnabled && section->glyphAtlasInstalled()) {
         if (const EpdFontData* atlas = section->glyphAtlasFontDataForStyle(style)) return atlas;
       }
       return section->embeddedFontDataForStyle(style);
@@ -3646,11 +3968,12 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     }
   }
 
-  renderer.clearScreen();
+  renderer.clearScreen(ReaderUtils::readerBackgroundColor());
 
   if (section->pageCount == 0) {
     LOG_DBG("ERS", "No pages to render");
-    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_EMPTY_CHAPTER), true, EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_EMPTY_CHAPTER), ReaderUtils::readerForegroundBlack(),
+                              EpdFontFamily::BOLD);
     renderStatusBar();
     renderer.displayBuffer();
     automaticPageTurnActive = false;
@@ -3660,7 +3983,8 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 
   if (section->currentPage < 0 || section->currentPage >= section->pageCount) {
     LOG_DBG("ERS", "Page out of bounds: %d (max %d)", section->currentPage, section->pageCount);
-    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_OUT_OF_BOUNDS), true, EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_OUT_OF_BOUNDS), ReaderUtils::readerForegroundBlack(),
+                              EpdFontFamily::BOLD);
     renderStatusBar();
     renderer.displayBuffer();
     automaticPageTurnActive = false;
@@ -3737,12 +4061,13 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       }
 
       LOG_ERR("ERS", "Failed to load page from SD after %d retries", pageLoadRetryCount);
-      renderer.clearScreen();
-      renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), true, EpdFontFamily::BOLD);
+      renderer.clearScreen(ReaderUtils::readerBackgroundColor());
+      renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_PAGE_LOAD_ERROR), ReaderUtils::readerForegroundBlack(),
+                                EpdFontFamily::BOLD);
       // The auto-retry already tried clearing+rebuilding this chapter's cache. If
       // it still won't load, the SD filesystem is likely the problem (it can't be
       // self-healed on-device) -- point the user at the recovery options.
-      renderer.drawCenteredText(UI_10_FONT_ID, 332, tr(STR_PAGE_LOAD_ERROR_HINT), true);
+      renderer.drawCenteredText(UI_10_FONT_ID, 332, tr(STR_PAGE_LOAD_ERROR_HINT), ReaderUtils::readerForegroundBlack());
       renderStatusBar();
       renderer.displayBuffer();
       automaticPageTurnActive = false;
@@ -3760,7 +4085,10 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     // onGlyphMiss for everything (some Outside range drift, but readable).
     // CrumBLE 4.4 step 5: lazy reload prefers the v40 atlas over the v39
     // subset when both are present, mirroring the section-open path.
-    const bool atlasNeedsReload = section && section->hasGlyphAtlas() && !section->glyphAtlasInstalled();
+    // glyphAtlasEnabled toggle: when off, atlasNeedsReload stays false and
+    // the lazy reload reaches only the v39 subset path.
+    const bool atlasNeedsReload = SETTINGS.glyphAtlasEnabled && section &&
+                                  section->hasGlyphAtlas() && !section->glyphAtlasInstalled();
     const bool subsetNeedsReload =
         section && section->hasEmbeddedGlyphSubset() && !section->embeddedSubsetInstalled();
     if (atlasNeedsReload || subsetNeedsReload) {
@@ -3772,7 +4100,8 @@ void EpubReaderActivity::render(RenderLock&& lock) {
         const uint32_t maxAllocBefore = ESP.getMaxAllocHeap();
         bool atlasOk = false;
         if (atlasNeedsReload) {
-          atlasOk = section->tryInstallGlyphAtlas(it->second->contentHash());
+          atlasOk = section->tryInstallGlyphAtlas(it->second->contentHash(),
+                                                       /*preferLowBitDepth=*/BluetoothHIDManager::getInstance().isEnabled());
         }
         bool subsetOk = section->embeddedSubsetInstalled();
         // CrumBLE 4.4 v4.4.1: when the atlas is already providing data
@@ -3930,7 +4259,8 @@ void EpubReaderActivity::renderContents(const Page& page, const int orientedMarg
 
   renderer.takeRenderStarved();        // clear stale; capture only this render's failures
   renderer.takeImageRepaintUnsafe();   // clear stale; capture only this render's uncached images
-  page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+  page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop,
+              ReaderUtils::readerForegroundBlack());
 
   // Note when the BLE remote came up. The connect handshake makes NimBLE grab
   // its ~58 KB and churn temporary buffers, which briefly spikes heap pressure
@@ -4065,7 +4395,8 @@ void EpubReaderActivity::renderContents(const Page& page, const int orientedMarg
       // Re-render page content to restore images into the blanked area
       // Status bar is not re-rendered here to avoid reading stale dynamic values (e.g. battery %)
       const auto tImageRestoreRender = millis();
-      page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+      page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop,
+                  ReaderUtils::readerForegroundBlack());
       const uint32_t imageRestoreRenderMs = millis() - tImageRestoreRender;
       const auto tImageFinalDisplay = millis();
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
@@ -4118,10 +4449,15 @@ void EpubReaderActivity::renderContents(const Page& page, const int orientedMarg
 
   // grayscale rendering
   if (canApplyGrayscale) {
+    // CrumBLE 4.4: the LSB/MSB grayscale buffers are intentionally cleared to
+    // 0x00 (their "no glyph here" state), separate from dark mode. The actual
+    // foreground/background colour comes from the text draw paths below, so
+    // pass readerForegroundBlack into page.render the same as the BW path.
+    const bool fg = ReaderUtils::readerForegroundBlack();
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
     if (needsTextGrayscale) {
-      page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+      page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop, fg);
     } else {
       page.renderImages(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
     }
@@ -4132,7 +4468,7 @@ void EpubReaderActivity::renderContents(const Page& page, const int orientedMarg
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
     if (needsTextGrayscale) {
-      page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+      page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop, fg);
     } else {
       page.renderImages(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
     }
@@ -4157,8 +4493,9 @@ void EpubReaderActivity::renderContents(const Page& page, const int orientedMarg
       // writing that BW framebuffer back to it. Skipping (2) was the cause
       // of the heavy ghosting — the panel kept the 4-level grayscale RAM
       // and the next refresh smeared against it.
-      renderer.clearScreen();
-      page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
+      renderer.clearScreen(ReaderUtils::readerBackgroundColor());
+      page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop,
+                  ReaderUtils::readerForegroundBlack());
       renderStatusBar();
       renderer.cleanupGrayscaleWithFrameBuffer();
     }
@@ -4225,7 +4562,8 @@ void EpubReaderActivity::renderStatusBar() const {
   const float rawProgress = (pageCount > 0) ? (static_cast<float>(section->currentPage) / pageCount) : 0.0f;
   const bool bookmarked = BOOKMARKS.hasBookmarkForPage(static_cast<uint16_t>(currentSpineIndex), rawProgress,
                                                        section->pageCount > 0 ? section->pageCount : 1);
-  GUI.drawStatusBar(renderer, bookProgress, currentPage, pageCount, title, 0, textYOffset, bookmarked);
+  GUI.drawStatusBar(renderer, bookProgress, currentPage, pageCount, title, 0, textYOffset, bookmarked,
+                    ReaderUtils::readerDarkModeEnabled());
 }
 
 void EpubReaderActivity::navigateToHref(const std::string& hrefStr, const bool savePosition) {
@@ -4362,8 +4700,8 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
     return false;
   }
 
-  renderer.clearScreen();
-  page->render(renderer, SETTINGS.getReaderFontId(), marginLeft, marginTop);
+  renderer.clearScreen(ReaderUtils::readerBackgroundColor());
+  page->render(renderer, SETTINGS.getReaderFontId(), marginLeft, marginTop, ReaderUtils::readerForegroundBlack());
   // No displayBuffer call; caller (SleepActivity) handles that after compositing the overlay.
   return true;
 }

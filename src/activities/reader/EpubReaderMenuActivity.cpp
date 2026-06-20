@@ -164,24 +164,24 @@ std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMainM
   // from BT-on through BT-off, covering both connected and "scanning to
   // reconnect" states which are equally heap-pressured.
   const bool bleActive = BluetoothHIDManager::getInstance().isEnabled();
-  if (!bleActive) {
-    items.push_back({MenuAction::LOOKUP, StrId::STR_LOOKUP});
-    if (hasDictionary && hasLookupHistory) {
-      items.push_back({MenuAction::LOOKED_UP_WORDS, StrId::STR_LOOKED_UP_WORDS});
-    }
+  // CrumBLE 4.4 post-bisect: lookup + highlight are always visible. If
+  // BT is active when the user taps them, the lookup/highlight handler
+  // disables BT, then heap pre-flight triggers a silent restart with
+  // OpenLookup/OpenHighlight queued -- post-boot dispatch re-launches
+  // the activity on a fresh heap. User no longer has to manually
+  // disconnect BT first.
+  items.push_back({MenuAction::LOOKUP, StrId::STR_LOOKUP});
+  if (hasDictionary && hasLookupHistory) {
+    items.push_back({MenuAction::LOOKED_UP_WORDS, StrId::STR_LOOKED_UP_WORDS});
   }
   (void)hasDictionary;
-  // Highlight quick action. Pending-hold state replaces Add with the
-  // Finish/Cancel pair so the menu doesn't dangle two ways to start.
-  // Hidden when BLE is active (same heap-pressure rationale as Lookup).
-  if (!bleActive) {
-    if (hasPendingHighlight) {
-      items.push_back({MenuAction::FINISH_HIGHLIGHT, StrId::STR_FINISH_HIGHLIGHT});
-      items.push_back({MenuAction::CANCEL_HIGHLIGHT, StrId::STR_CANCEL_HIGHLIGHT});
-    } else {
-      items.push_back({MenuAction::ADD_HIGHLIGHT, StrId::STR_ADD_HIGHLIGHT});
-    }
+  if (hasPendingHighlight) {
+    items.push_back({MenuAction::FINISH_HIGHLIGHT, StrId::STR_FINISH_HIGHLIGHT});
+    items.push_back({MenuAction::CANCEL_HIGHLIGHT, StrId::STR_CANCEL_HIGHLIGHT});
   } else {
+    items.push_back({MenuAction::ADD_HIGHLIGHT, StrId::STR_ADD_HIGHLIGHT});
+  }
+  if (bleActive) {
     // BLE active: drop the pending highlight if any was in flight so the
     // user doesn't return from a BT session with a half-started highlight
     // hanging around. The pendingHighlight state is fed in from the
@@ -212,6 +212,7 @@ std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMainM
   items.push_back({MenuAction::SCREENSHOT, StrId::STR_SCREENSHOT_BUTTON});
   items.push_back(
       {MenuAction::TOGGLE_COMPLETED, isBookCompleted ? StrId::STR_MARK_UNFINISHED : StrId::STR_MARK_FINISHED});
+  items.push_back({MenuAction::DELETE_STATS, StrId::STR_DELETE_BOOK_STATS});
   items.push_back({MenuAction::DELETE_CACHE, StrId::STR_DELETE_CACHE});
 
   // isCurrentPageBookmarked / hasBookmarks are not used here directly --

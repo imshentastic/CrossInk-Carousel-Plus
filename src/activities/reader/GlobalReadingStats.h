@@ -15,4 +15,9 @@ struct GlobalReadingStats {
 
   // Saves stats to /.crosspoint/global_stats.bin.
   void save() const;
+
+  // Wipes the persisted all-time stats by removing the primary + backup
+  // files. Returns true if both removals (or the absences) succeeded.
+  // CrumBLE 4.4: ported from CrossInk v1.3.2 "Reset All-time Stats".
+  static bool reset();
 };

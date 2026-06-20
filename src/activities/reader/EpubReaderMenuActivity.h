@@ -24,6 +24,7 @@ class EpubReaderMenuActivity final : public Activity {
     GO_HOME,
     SYNC,
     DELETE_CACHE,
+    DELETE_STATS,  // CrumBLE 4.4: ported from CrossInk v1.3.3 reading-stats split
     READING_STATS,
     TOGGLE_COMPLETED,
     READER_OPTIONS,

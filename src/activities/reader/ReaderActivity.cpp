@@ -4,6 +4,7 @@
 #include <HalStorage.h>
 #include <I18n.h>
 
+#include "../../SilentRestart.h"
 #include "CrossPointSettings.h"
 #include "Epub.h"
 #include "EpubReaderActivity.h"
@@ -127,8 +128,16 @@ void ReaderActivity::onEnter() {
   // keep showing the previous page and the tap feels dropped. Draw the loading
   // popup right away so the user sees their open registered. The reader's first
   // render replaces it (with the animated "Indexing..." popup on a cache miss).
-  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
-  renderer.displayBuffer();
+  //
+  // CrumBLE 4.4 post-bisect: skip the popup when continuing from silent reboot.
+  // The BootResume::Silent path already restored the user's pre-restart frame
+  // via loadSleepFrameBuffer + displayBuffer(HALF), so the panel is showing
+  // their book page -- a better "I'm working" indicator than overlaying a
+  // "Loading" popup that defaces the restored content.
+  if (!isContinuingFromSilentReboot()) {
+    GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+    renderer.displayBuffer();
+  }
 
   sdFontSystem.ensureLoaded(renderer);
 

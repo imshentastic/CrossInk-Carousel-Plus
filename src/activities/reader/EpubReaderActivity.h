@@ -325,6 +325,21 @@ class EpubReaderActivity final : public Activity {
   // bt.enable() + connectToDevice(). Doing the connect inline from the
   // drawer's lambda used to race the NimBLE handshake against a
   // heap-heavy section rebuild and brick the link.
+  // CrumBLE 4.4 post-bisect: post-silent-restart restore for the inline
+  // definition overlay. Set by the OpenDefinition post-boot dispatch from
+  // the word carried in silentRebootDefinitionWord; consumed by the LOOKUP
+  // case to thread the word into the freshly-built DictionaryWordSelectActivity
+  // via setPendingDefinitionWord. The activity then snaps the cursor to
+  // that word and auto-opens the popup, putting the user back exactly
+  // where they were before the heap-defrag restart.
+  std::string pendingLookupDefinitionWord_;
+  // CrumBLE 4.4 post-bisect: parallel to pendingLookupDefinitionWord_ but
+  // signals the post-boot dispatch came from the dismiss-time silent-restart
+  // path (OpenLookupAtWord). The launchWordSelect lambda threads this flag
+  // into the activity so it navigates the cursor to the word WITHOUT
+  // auto-opening the definition popup -- user resumes on the same word
+  // they were just reading, free to dismiss or pick a different word.
+  bool pendingLookupCursorOnly_ = false;
   bool pendingBleQuickConnect_ = false;
   bool pendingBleQuickConnectNoImages_ = false;
   // True when the drawer reported settingsChanged alongside the QC request.

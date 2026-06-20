@@ -119,3 +119,19 @@ void GlobalReadingStats::save() const {
     Storage.remove(GLOBAL_STATS_PATH);
   }
 }
+
+bool GlobalReadingStats::reset() {
+  // Remove primary + backup. Storage.remove returns false when the file
+  // doesn't exist, which is fine here -- "already gone" is the desired
+  // state. Treat both as success.
+  bool ok = true;
+  if (Storage.exists(GLOBAL_STATS_PATH) && !Storage.remove(GLOBAL_STATS_PATH)) {
+    LOG_ERR("GSTATS", "Could not remove global_stats.bin");
+    ok = false;
+  }
+  if (Storage.exists(GLOBAL_STATS_BAK_PATH) && !Storage.remove(GLOBAL_STATS_BAK_PATH)) {
+    LOG_ERR("GSTATS", "Could not remove global_stats.bin.bak");
+    ok = false;
+  }
+  return ok;
+}

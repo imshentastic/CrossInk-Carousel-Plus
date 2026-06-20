@@ -23,6 +23,11 @@ struct BookReadingStats {
   // Saves stats to cachePath/stats.bin.
   void save(const std::string& cachePath) const;
 
+  // CrumBLE 4.4 (ported from CrossInk v1.3.3): deletes cachePath/stats.bin.
+  // Missing files are treated as success. Used by the new "Delete Book's
+  // Reading Stats" action in the reader menu + file-browser context menu.
+  static bool remove(const std::string& cachePath);
+
   // Formats a duration in seconds into a human-readable string.
   // Output examples: "< 1 min", "45 min", "2h 30 min"
   static void formatDuration(uint32_t seconds, char* buf, size_t len);

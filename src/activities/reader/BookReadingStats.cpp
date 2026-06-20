@@ -26,20 +26,27 @@ static constexpr int STATS_FILE_SIZE = 12;
 }  // namespace
 
 bool BookReadingStats::exists(const std::string& cachePath) {
-  // Use the existing "open for read; close if successful" idiom -- there's no
-  // dedicated existence API on HalStorage, but a failed open is a fast no-op.
-  FsFile f;
-  if (!Storage.openFileForRead("STATS", cachePath + "/stats.bin", f)) {
-    return false;
-  }
-  f.close();
-  return true;
+  // CrumBLE 4.4: use HalStorage::exists directly. The previous open-then-close
+  // idiom routed through SDCardManager::openFileForRead, which emits
+  // "[STATS] File does not exist: ..." to Serial for every miss -- and a
+  // "miss" is the normal case for any book the user hasn't opened yet.
+  // Across home navigation + carousel pre-render that's dozens of noisy
+  // lines per session. Storage.exists is a quiet sd.exists() check.
+  return Storage.exists((cachePath + "/stats.bin").c_str());
 }
 
 BookReadingStats BookReadingStats::load(const std::string& cachePath) {
   BookReadingStats stats;
+  // CrumBLE 4.4: quiet existence check first -- avoids the
+  // "[STATS] File does not exist" Serial spam for new/unread books. We still
+  // call openFileForRead afterwards so a true I/O failure (file present but
+  // unreadable) is logged as the genuine error it is.
+  const std::string statsPath = cachePath + "/stats.bin";
+  if (!Storage.exists(statsPath.c_str())) {
+    return stats;
+  }
   FsFile f;
-  if (!Storage.openFileForRead("STATS", cachePath + "/stats.bin", f)) {
+  if (!Storage.openFileForRead("STATS", statsPath, f)) {
     return stats;
   }
   uint8_t data[STATS_FILE_SIZE] = {};
@@ -103,4 +110,16 @@ void BookReadingStats::save(const std::string& cachePath) const {
   data[11] = isCompleted ? 1 : 0;
   f.write(data, STATS_FILE_SIZE);
   f.close();
+}
+
+bool BookReadingStats::remove(const std::string& cachePath) {
+  const std::string statsPath = cachePath + "/stats.bin";
+  if (!Storage.exists(statsPath.c_str())) {
+    return true;
+  }
+  if (!Storage.remove(statsPath.c_str())) {
+    LOG_ERR("STATS", "Could not delete stats.bin");
+    return false;
+  }
+  return true;
 }

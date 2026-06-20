@@ -2,6 +2,7 @@
 
 #include <DNSServer.h>
 #include <ESPmDNS.h>
+#include <Epub/Section.h>
 #include <GfxRenderer.h>
 #include <I18n.h>
 #include <WiFi.h>
@@ -102,6 +103,26 @@ void CrossPointWebServerActivity::onEnter() {
   // the SD font (if one is loaded) reclaims that headroom; it's reloaded
   // automatically when the reader resumes. No-op for built-in fonts.
   sdFontSystem.releaseLoadedFont(renderer);
+
+  // CrumBLE 4.4: release the page-DOM heap reserve (commit 403de139, 18 KB
+  // chunk lazily acquired on first chapter open to guarantee the
+  // deserialize allocator a contiguous slot under BT-induced fragmentation).
+  // It was previously only released for BT-enable, so a reader -> home -> FT
+  // session arrived here with 18 KB of contiguous heap permanently locked
+  // away -- which exactly matched the WS upload heap-pressure regression
+  // (MinFree bottoming at ~1-4 KB mid-upload instead of the pre-v4.3
+  // ~12-15 KB it ran at). FT doesn't read pages; releasing here reclaims
+  // the headroom for WS/SD/lwIP. The reserve will be lazily re-acquired by
+  // Section::loadPageFromSectionFile the next time the user opens a book,
+  // gated on MaxAlloc > 30 KB so it never wedges a tight-heap restart.
+  // releasePageHeapReserveForBtEnable() is just the misleadingly-named
+  // unconditional release primitive -- nothing BT-specific about it.
+  if (Section::pageHeapReserveHeld()) {
+    LOG_INF("WEBACT", "Releasing page-DOM heap reserve (18 KB) for FT activity");
+    Section::releasePageHeapReserveForBtEnable();
+    LOG_INF("WEBACT", "Free heap after page-reserve release: %d bytes (maxAlloc %d)",
+            ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  }
 
   // CrumBLE: the in-RAM LibraryIndex (up to tens of KB for a big library) is
   // dead weight while the web server runs and is a major reason free heap sits
