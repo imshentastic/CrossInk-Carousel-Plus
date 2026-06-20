@@ -874,7 +874,11 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                   heapBeforeImage.maxAllocHeap, src.c_str());
 
           // Resolve the image path relative to the HTML file.
-          std::string resolvedPath = FsHelpers::normalisePath(self->contentBase + src);
+          // CrumBLE 4.4: percent-decode the src -- chapter HTML can reference
+          // an image whose ZIP entry has literal spaces (e.g. "Images/cover
+          // photo.jpg") via src="../Images/cover%20photo.jpg". Without this,
+          // the ZIP lookup misses and the image silently doesn't render.
+          std::string resolvedPath = FsHelpers::normalisePath(self->contentBase + FsHelpers::urlDecode(src));
 
           // CrumBLE: does the optimizer bundle a pre-rendered .pxc next to this
           // image? If so the image renders from that pixel cache and is NEVER
@@ -2163,8 +2167,10 @@ void ChapterHtmlSlimParser::makePages() {
     currentPageNextY += blockStyle.paddingBottom;
   }
 
-  // Extra paragraph spacing if enabled (default behavior)
+  // CrumBLE 4.4: paragraph spacing is now three-way (0/1/2). The half-
+  // lineHeight unit matches the legacy "Extra Spacing = ON" behavior, so
+  // value 1 reproduces the prior default exactly and value 2 doubles it.
   if (extraParagraphSpacing) {
-    currentPageNextY += lineHeight / 2;
+    currentPageNextY += static_cast<int>(extraParagraphSpacing) * lineHeight / 2;
   }
 }

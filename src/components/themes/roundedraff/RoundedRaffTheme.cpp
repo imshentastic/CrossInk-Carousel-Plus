@@ -442,7 +442,7 @@ void RoundedRaffTheme::drawList(const GfxRenderer& renderer, Rect rect, int item
 }
 
 void RoundedRaffTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
-                                       const char* btn4, const bool allowInvertedText) const {
+                                       const char* btn4, const bool allowInvertedText, const bool darkMode) const {
   const GfxRenderer::Orientation origOrientation = renderer.getOrientation();
   const bool invertText = allowInvertedText && origOrientation == GfxRenderer::Orientation::PortraitInverted;
   renderer.setOrientation(invertText ? GfxRenderer::Orientation::PortraitInverted : GfxRenderer::Orientation::Portrait);
@@ -471,11 +471,18 @@ void RoundedRaffTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, 
   const std::string upText = (rightInnerLabel && rightInnerLabel[0] != '\0') ? std::string(rightInnerLabel) : "";
   const std::string downText = (rightOuterLabel && rightOuterLabel[0] != '\0') ? std::string(rightOuterLabel) : "";
 
-  // Ensure button hints always "win" visually even if other elements accidentally render into this area.
-  renderer.fillRect(leftGroupX, hintY, groupWidth, hintHeight, false);
-  renderer.fillRect(rightGroupX, hintY, groupWidth, hintHeight, false);
+  // CrumBLE 4.4: dark-mode hint groups. Default keeps the white wipe + black
+  // outline + black text. In dark mode the wipe flips to black, outline +
+  // text to white so the strip matches a dark-mode page underneath.
+  const bool fillInk = darkMode;
+  const bool strokeInk = !darkMode;
+  const bool textBlack = !darkMode;
 
-  renderer.drawRoundedRect(leftGroupX, hintY, groupWidth, hintHeight, 2, kBottomRadius, true);
+  // Ensure button hints always "win" visually even if other elements accidentally render into this area.
+  renderer.fillRect(leftGroupX, hintY, groupWidth, hintHeight, fillInk);
+  renderer.fillRect(rightGroupX, hintY, groupWidth, hintHeight, fillInk);
+
+  renderer.drawRoundedRect(leftGroupX, hintY, groupWidth, hintHeight, 2, kBottomRadius, strokeInk);
   const int selectWidth = renderer.getTextWidth(kGuideFontId, selectText.c_str(), EpdFontFamily::REGULAR);
   const int downWidth = renderer.getTextWidth(kGuideFontId, downText.c_str(), EpdFontFamily::REGULAR);
   constexpr int innerEdgePadding = 16;
@@ -486,14 +493,14 @@ void RoundedRaffTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, 
   const int downX = rightGroupX + groupWidth - innerEdgePadding - downWidth;
 
   if (!backDisabled) {
-    renderer.drawText(kGuideFontId, backX, textY, backLabel.c_str(), true, EpdFontFamily::REGULAR);
+    renderer.drawText(kGuideFontId, backX, textY, backLabel.c_str(), textBlack, EpdFontFamily::REGULAR);
   }
-  renderer.drawText(kGuideFontId, selectX, textY, selectText.c_str(), true, EpdFontFamily::REGULAR);
+  renderer.drawText(kGuideFontId, selectX, textY, selectText.c_str(), textBlack, EpdFontFamily::REGULAR);
 
-  renderer.drawRoundedRect(rightGroupX, hintY, groupWidth, hintHeight, 2, kBottomRadius, true);
+  renderer.drawRoundedRect(rightGroupX, hintY, groupWidth, hintHeight, 2, kBottomRadius, strokeInk);
 
-  renderer.drawText(kGuideFontId, upX, textY, upText.c_str(), true, EpdFontFamily::REGULAR);
-  renderer.drawText(kGuideFontId, downX, textY, downText.c_str(), true, EpdFontFamily::REGULAR);
+  renderer.drawText(kGuideFontId, upX, textY, upText.c_str(), textBlack, EpdFontFamily::REGULAR);
+  renderer.drawText(kGuideFontId, downX, textY, downText.c_str(), textBlack, EpdFontFamily::REGULAR);
 
   renderer.setOrientation(origOrientation);
 }

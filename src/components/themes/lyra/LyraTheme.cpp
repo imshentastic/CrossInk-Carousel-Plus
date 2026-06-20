@@ -93,22 +93,23 @@ const uint8_t* LyraTheme::iconForName(UIIcon icon, uint32_t size) {
   return nullptr;
 }
 
-void LyraTheme::fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage) const {
+void LyraTheme::fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage,
+                                const bool foregroundBlack) const {
   const bool charging = gpio.isUsbConnected();
 
   if (charging) {
     // Solid fill when charging so lightning bolt is visible
-    renderer.fillRect(rect.x + 2, rect.y + 2, rect.width - 5, rect.height - 4);
-    drawBatteryLightningBolt(renderer, rect.x + 4, rect.y + 2);
+    renderer.fillRect(rect.x + 2, rect.y + 2, rect.width - 5, rect.height - 4, foregroundBlack);
+    drawBatteryLightningBolt(renderer, rect.x + 4, rect.y + 2, !foregroundBlack);
   } else {
     if (percentage > 10) {
-      renderer.fillRect(rect.x + 2, rect.y + 2, 3, rect.height - 4);
+      renderer.fillRect(rect.x + 2, rect.y + 2, 3, rect.height - 4, foregroundBlack);
     }
     if (percentage > 40) {
-      renderer.fillRect(rect.x + 6, rect.y + 2, 3, rect.height - 4);
+      renderer.fillRect(rect.x + 6, rect.y + 2, 3, rect.height - 4, foregroundBlack);
     }
     if (percentage > 70) {
-      renderer.fillRect(rect.x + 10, rect.y + 2, 3, rect.height - 4);
+      renderer.fillRect(rect.x + 10, rect.y + 2, 3, rect.height - 4, foregroundBlack);
     }
   }
 }
@@ -393,7 +394,7 @@ void LyraTheme::drawListWithMetrics(const GfxRenderer& renderer, Rect rect, int 
 }
 
 void LyraTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
-                                const char* btn4, const bool allowInvertedText) const {
+                                const char* btn4, const bool allowInvertedText, const bool darkMode) const {
   const GfxRenderer::Orientation orig_orientation = renderer.getOrientation();
   const bool invertText = allowInvertedText && orig_orientation == GfxRenderer::Orientation::PortraitInverted;
   renderer.setOrientation(invertText ? GfxRenderer::Orientation::PortraitInverted : GfxRenderer::Orientation::Portrait);
@@ -410,22 +411,30 @@ void LyraTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const c
   const int* buttonPositions = gpio.deviceIsX3() ? x3ButtonPositions : x4ButtonPositions;
   const char* labels[] = {btn1, btn2, btn3, btn4};
 
+  // CrumBLE 4.4: dark-mode hint buttons. Default keeps the existing
+  // white-fill / black-outline / black-text palette. In dark mode the
+  // fill flips to black, outline + text to white -- visually consistent
+  // with the dark-mode page underneath.
+  const Color buttonFill = darkMode ? Color::Black : Color::White;
+  const bool strokeInk = !darkMode;
+  const bool textBlack = !darkMode;
+
   for (int i = 0; i < 4; i++) {
     const int x = buttonPositions[invertText ? 3 - i : i];
     if (labels[i] != nullptr && labels[i][0] != '\0') {
       // Draw the filled background and border for a FULL-sized button
-      renderer.fillRoundedRect(x, pageHeight - buttonY, buttonWidth, buttonHeight, cornerRadius, Color::White);
+      renderer.fillRoundedRect(x, pageHeight - buttonY, buttonWidth, buttonHeight, cornerRadius, buttonFill);
       renderer.drawRoundedRect(x, pageHeight - buttonY, buttonWidth, buttonHeight, 1, cornerRadius, true, true, false,
-                               false, true);
+                               false, strokeInk);
       const int textWidth = renderer.getTextWidth(SMALL_FONT_ID, labels[i]);
       const int textX = x + (buttonWidth - 1 - textWidth) / 2;
-      renderer.drawText(SMALL_FONT_ID, textX, pageHeight - buttonY + textYOffset, labels[i]);
+      renderer.drawText(SMALL_FONT_ID, textX, pageHeight - buttonY + textYOffset, labels[i], textBlack);
     } else {
       // Draw the filled background and border for a SMALL-sized button
       const int smallButtonY = invertText ? 0 : pageHeight - smallButtonHeight;
-      renderer.fillRoundedRect(x, smallButtonY, buttonWidth, smallButtonHeight, cornerRadius, Color::White);
+      renderer.fillRoundedRect(x, smallButtonY, buttonWidth, smallButtonHeight, cornerRadius, buttonFill);
       renderer.drawRoundedRect(x, smallButtonY, buttonWidth, smallButtonHeight, 1, cornerRadius, true, true, false,
-                               false, true);
+                               false, strokeInk);
     }
   }
 

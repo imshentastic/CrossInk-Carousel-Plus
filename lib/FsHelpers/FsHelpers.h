@@ -9,6 +9,15 @@ namespace FsHelpers {
 
 std::string normalisePath(const std::string& path);
 
+// Percent-decode an EPUB href / OPF URI. EPUB hrefs are IRIs per spec, so the
+// reading system must decode %XX sequences before treating them as ZIP entry
+// names. CrumBLE 4.4: added after a book with literal spaces and ampersands in
+// chapter filenames (encoded as %20 and %26 in OPF) hung at chapter entry --
+// the encoded names never matched the ZIP central directory's literal entries.
+// Leaves non-percent characters untouched and is tolerant of malformed
+// sequences (passes them through verbatim).
+std::string urlDecode(const std::string& s);
+
 void sortFileList(std::vector<std::string>& strs);
 
 /**

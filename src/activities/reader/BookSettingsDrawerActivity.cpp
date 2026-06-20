@@ -13,6 +13,7 @@
 #include "CrossPointSettings.h"
 #include "EpubReaderActivity.h"  // prewarmReaderTextBuffer
 #include "MappedInputManager.h"
+#include "ReaderUtils.h"
 #include "SdCardFontSystem.h"  // sdFontSystem for SD-aware FONT_FAMILY / FONT_SIZE rows
 #include "SettingsList.h"
 #include "components/UITheme.h"
@@ -679,23 +680,34 @@ void BookSettingsDrawerActivity::renderDrawer() {
   }
   // else: intentionally no clearScreen() — see comment above.
 
-  // Panel body — filled white, with the top two corners rounded so the panel
+  // CrumBLE 4.4: dark-mode-aware drawer. When the reader is in dark mode,
+  // the drawer panel inverts (black fill, white borders, white text) so it
+  // visually matches the dark page underneath instead of flashing as a
+  // bright white panel. Selected-row highlight also flips: white fill +
+  // black text in dark mode, mirroring the page-level reverse-video pattern
+  // used for selection highlights and the lookup popup hints.
+  const bool darkMode = ReaderUtils::readerDarkModeEnabled();
+  const Color panelFill = darkMode ? Color::Black : Color::White;
+  const bool panelStrokeInk = !darkMode;  // true=black stroke in light; false=white stroke in dark
+  const bool panelTextBlack = !darkMode;
+
+  // Panel body — filled, with the top two corners rounded so the panel
   // looks like it has rounded shoulders.
   const int panelTopY = drawerY + kTabOverlap;
   const int panelBodyH = drawerH - kTabOverlap;
   renderer.fillRoundedRect(drawerX, panelTopY, drawerW, panelBodyH, kPanelCornerRadius,
-                           /*topL=*/true, /*topR=*/true, /*botL=*/false, /*botR=*/false, Color::White);
+                           /*topL=*/true, /*topR=*/true, /*botL=*/false, /*botR=*/false, panelFill);
 
   // Panel top edge — a horizontal line between the rounded corners. The middle
   // section will be overpainted by the tab below so it appears to pass "behind"
   // the tab outline.
   renderer.drawLine(drawerX + kPanelCornerRadius, panelTopY,
-                    drawerX + drawerW - kPanelCornerRadius - 1, panelTopY, 2, true);
+                    drawerX + drawerW - kPanelCornerRadius - 1, panelTopY, 2, panelStrokeInk);
   // Quarter-circle outlines for the panel's top corners (matches the fill).
   renderer.drawArc(kPanelCornerRadius, drawerX + kPanelCornerRadius, panelTopY + kPanelCornerRadius,
-                   -1, -1, 2, true);
+                   -1, -1, 2, panelStrokeInk);
   renderer.drawArc(kPanelCornerRadius, drawerX + drawerW - kPanelCornerRadius - 1,
-                   panelTopY + kPanelCornerRadius, 1, -1, 2, true);
+                   panelTopY + kPanelCornerRadius, 1, -1, 2, panelStrokeInk);
 
   // Tab — centred above the panel's top edge. Width auto-fits the header text
   // with horizontal padding; bottom of the tab extends kTabOverlap into the
@@ -710,21 +722,21 @@ void BookSettingsDrawerActivity::renderDrawer() {
 
   // 1) Erase the panel's top line where it would pass through the tab.
   renderer.fillRoundedRect(tabX, tabY, tabW, kTabHeight, kTabCornerRadius,
-                           /*topL=*/true, /*topR=*/true, /*botL=*/false, /*botR=*/false, Color::White);
+                           /*topL=*/true, /*topR=*/true, /*botL=*/false, /*botR=*/false, panelFill);
 
   // 2) Tab outline — top + rounded top corners + left and right sides only.
   // Bottom side intentionally omitted so the tab visually merges with the panel.
-  renderer.drawLine(tabX + kTabCornerRadius, tabY, tabX + tabW - kTabCornerRadius - 1, tabY, 2, true);
-  renderer.drawArc(kTabCornerRadius, tabX + kTabCornerRadius, tabY + kTabCornerRadius, -1, -1, 2, true);
-  renderer.drawArc(kTabCornerRadius, tabX + tabW - kTabCornerRadius - 1, tabY + kTabCornerRadius, 1, -1, 2, true);
-  renderer.drawLine(tabX, tabY + kTabCornerRadius, tabX, tabBottomY - 1, 2, true);
-  renderer.drawLine(tabX + tabW - 1, tabY + kTabCornerRadius, tabX + tabW - 1, tabBottomY - 1, 2, true);
+  renderer.drawLine(tabX + kTabCornerRadius, tabY, tabX + tabW - kTabCornerRadius - 1, tabY, 2, panelStrokeInk);
+  renderer.drawArc(kTabCornerRadius, tabX + kTabCornerRadius, tabY + kTabCornerRadius, -1, -1, 2, panelStrokeInk);
+  renderer.drawArc(kTabCornerRadius, tabX + tabW - kTabCornerRadius - 1, tabY + kTabCornerRadius, 1, -1, 2, panelStrokeInk);
+  renderer.drawLine(tabX, tabY + kTabCornerRadius, tabX, tabBottomY - 1, 2, panelStrokeInk);
+  renderer.drawLine(tabX + tabW - 1, tabY + kTabCornerRadius, tabX + tabW - 1, tabBottomY - 1, 2, panelStrokeInk);
 
   // Tab text — vertically centred in the upper portion of the tab so it sits
   // above the panel's top line.
   const int tabTextX = tabX + (tabW - headerTextW) / 2;
   const int tabTextY = tabY + 6;
-  renderer.drawText(UI_12_FONT_ID, tabTextX, tabTextY, headerText, true, EpdFontFamily::BOLD);
+  renderer.drawText(UI_12_FONT_ID, tabTextX, tabTextY, headerText, panelTextBlack, EpdFontFamily::BOLD);
 
   // Item list — starts a small pad below the panel's top line.
   const int listStartY = panelTopY + kListTopPad;
@@ -742,7 +754,11 @@ void BookSettingsDrawerActivity::renderDrawer() {
     const int rowY = listStartY + i * itemHeight;
     const bool selected = (idx == selectedIndex);
     if (selected) {
-      renderer.fillRect(drawerX + 1, rowY, drawerW - 2, itemHeight, true);
+      // Selection highlight uses inverse video relative to the panel: in
+      // light mode the panel is white so highlight is black; in dark mode
+      // the panel is black so highlight is white. panelStrokeInk doubles
+      // as "draw with ink" which matches the panel's contrast direction.
+      renderer.fillRect(drawerX + 1, rowY, drawerW - 2, itemHeight, panelStrokeInk);
     }
     const char* name = !item.customName.empty() ? item.customName.c_str() : I18N.get(item.nameId);
     const auto& src = currentSettings();
@@ -750,7 +766,10 @@ void BookSettingsDrawerActivity::renderDrawer() {
         (item.settingIndex >= 0 && item.settingIndex < static_cast<int>(src.size()))
             ? valueTextForSetting(src[item.settingIndex])
             : std::string{};
-    const bool textBlack = !selected;
+    // Row text color: when NOT selected, draw with the panel's primary text
+    // color (black in light, white in dark). When selected, the highlight rect
+    // has inverted; draw text in the opposite color so it stays legible.
+    const bool textBlack = selected ? darkMode : panelTextBlack;
     renderer.drawText(UI_12_FONT_ID, drawerX + leftPad, rowY + rowTextY, name, textBlack);
     if (!value.empty()) {
       const int valueWidth = renderer.getTextWidth(UI_12_FONT_ID, value.c_str());
@@ -769,7 +788,7 @@ void BookSettingsDrawerActivity::renderDrawer() {
     const int barH = std::max(8, (trackH * itemsVisible) / static_cast<int>(items.size()));
     const int barY = listStartY + (trackH - barH) * scrollOffset /
                                        std::max(1, static_cast<int>(items.size()) - itemsVisible);
-    renderer.fillRect(drawerX + drawerW - 4, barY, 2, barH, true);
+    renderer.fillRect(drawerX + drawerW - 4, barY, 2, barH, panelStrokeInk);
   }
 
   // Button hints.
@@ -782,7 +801,7 @@ void BookSettingsDrawerActivity::renderDrawer() {
   // the middle, dpad Up/Down on the RIGHT. Reading the hint left-to-right
   // now mirrors the user's eye as it scans across the bottom of the device.
   std::string hintLine = std::string(labels.btn1) + " · " + labels.btn2 + " · " + labels.btn3 + "/" + labels.btn4;
-  renderer.drawCenteredText(SMALL_FONT_ID, hintY, hintLine.c_str(), true);
+  renderer.drawCenteredText(SMALL_FONT_ID, hintY, hintLine.c_str(), panelTextBlack);
 }
 
 void BookSettingsDrawerActivity::presentFastRefresh() {

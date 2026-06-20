@@ -26,33 +26,41 @@ constexpr int subtitleY = 738;
 
 }  // namespace
 
-void BaseTheme::drawBatteryOutline(const GfxRenderer& renderer, int x, int y, int battWidth, int rectHeight) {
+void BaseTheme::drawBatteryOutline(const GfxRenderer& renderer, int x, int y, int battWidth, int rectHeight,
+                                   const bool foregroundBlack) {
+  // CrumBLE 4.4: foregroundBlack flips outline ink colour for the reader's
+  // dark mode. The drawLine overload that takes a width parameter is the one
+  // that accepts a colour bool, so use thickness=1 explicitly.
   // Top line
-  renderer.drawLine(x + 1, y, x + battWidth - 3, y);
+  renderer.drawLine(x + 1, y, x + battWidth - 3, y, 1, foregroundBlack);
   // Bottom line
-  renderer.drawLine(x + 1, y + rectHeight - 1, x + battWidth - 3, y + rectHeight - 1);
+  renderer.drawLine(x + 1, y + rectHeight - 1, x + battWidth - 3, y + rectHeight - 1, 1, foregroundBlack);
   // Left line
-  renderer.drawLine(x, y + 1, x, y + rectHeight - 2);
+  renderer.drawLine(x, y + 1, x, y + rectHeight - 2, 1, foregroundBlack);
   // Battery end
-  renderer.drawLine(x + battWidth - 2, y + 1, x + battWidth - 2, y + rectHeight - 2);
-  renderer.drawPixel(x + battWidth - 1, y + 3);
-  renderer.drawPixel(x + battWidth - 1, y + rectHeight - 4);
-  renderer.drawLine(x + battWidth - 0, y + 4, x + battWidth - 0, y + rectHeight - 5);
+  renderer.drawLine(x + battWidth - 2, y + 1, x + battWidth - 2, y + rectHeight - 2, 1, foregroundBlack);
+  renderer.drawPixel(x + battWidth - 1, y + 3, foregroundBlack);
+  renderer.drawPixel(x + battWidth - 1, y + rectHeight - 4, foregroundBlack);
+  renderer.drawLine(x + battWidth - 0, y + 4, x + battWidth - 0, y + rectHeight - 5, 1, foregroundBlack);
 }
 
-void BaseTheme::drawBatteryLightningBolt(const GfxRenderer& renderer, int boltX, int boltY) {
-  // Draw lightning bolt (white/inverted on black fill for visibility)
-  renderer.drawLine(boltX + 4, boltY + 0, boltX + 5, boltY + 0, false);
-  renderer.drawLine(boltX + 3, boltY + 1, boltX + 4, boltY + 1, false);
-  renderer.drawLine(boltX + 2, boltY + 2, boltX + 5, boltY + 2, false);
-  renderer.drawLine(boltX + 3, boltY + 3, boltX + 4, boltY + 3, false);
-  renderer.drawLine(boltX + 2, boltY + 4, boltX + 3, boltY + 4, false);
-  renderer.drawLine(boltX + 1, boltY + 5, boltX + 4, boltY + 5, false);
-  renderer.drawLine(boltX + 2, boltY + 6, boltX + 3, boltY + 6, false);
-  renderer.drawLine(boltX + 1, boltY + 7, boltX + 2, boltY + 7, false);
+void BaseTheme::drawBatteryLightningBolt(const GfxRenderer& renderer, int boltX, int boltY, const bool boltInk) {
+  // CrumBLE 4.4: boltInk flips the bolt colour. Default false matches the
+  // original "white/inverted on black fill" semantics (charge bolt punched
+  // out of a black-filled battery icon). In dark mode the battery fill is
+  // already white, so the bolt becomes black via boltInk=true.
+  renderer.drawLine(boltX + 4, boltY + 0, boltX + 5, boltY + 0, 1, boltInk);
+  renderer.drawLine(boltX + 3, boltY + 1, boltX + 4, boltY + 1, 1, boltInk);
+  renderer.drawLine(boltX + 2, boltY + 2, boltX + 5, boltY + 2, 1, boltInk);
+  renderer.drawLine(boltX + 3, boltY + 3, boltX + 4, boltY + 3, 1, boltInk);
+  renderer.drawLine(boltX + 2, boltY + 4, boltX + 3, boltY + 4, 1, boltInk);
+  renderer.drawLine(boltX + 1, boltY + 5, boltX + 4, boltY + 5, 1, boltInk);
+  renderer.drawLine(boltX + 2, boltY + 6, boltX + 3, boltY + 6, 1, boltInk);
+  renderer.drawLine(boltX + 1, boltY + 7, boltX + 2, boltY + 7, 1, boltInk);
 }
 
-void BaseTheme::fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage) const {
+void BaseTheme::fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage,
+                                const bool foregroundBlack) const {
   const bool charging = gpio.isUsbConnected();
 
   const int maxFillWidth = rect.width - 5;
@@ -72,14 +80,17 @@ void BaseTheme::fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t
     filledWidth = std::min(minFillForBolt, maxFillWidth);
   }
 
-  renderer.fillRect(rect.x + 2, rect.y + 2, filledWidth, fillHeight);
+  renderer.fillRect(rect.x + 2, rect.y + 2, filledWidth, fillHeight, foregroundBlack);
 
   if (charging) {
-    drawBatteryLightningBolt(renderer, rect.x + 4, rect.y + 2);
+    // CrumBLE 4.4: bolt is the inverse of the fill colour so it stays visible
+    // against the now-foregroundBlack fill in either theme.
+    drawBatteryLightningBolt(renderer, rect.x + 4, rect.y + 2, !foregroundBlack);
   }
 }
 
-void BaseTheme::drawBatteryLeft(const GfxRenderer& renderer, Rect rect, const bool showPercentage) const {
+void BaseTheme::drawBatteryLeft(const GfxRenderer& renderer, Rect rect, const bool showPercentage,
+                                const bool foregroundBlack) const {
   // Left aligned: icon on left, percentage number on right (reader mode).
   // CrumBLE: dropped the "%" suffix per user preference -- number alone
   // reads cleaner in the bottom-left status corner.
@@ -88,12 +99,15 @@ void BaseTheme::drawBatteryLeft(const GfxRenderer& renderer, Rect rect, const bo
 
   if (showPercentage) {
     const auto percentageText = std::to_string(percentage);
-    renderer.drawText(SMALL_FONT_ID, rect.x + batteryPercentSpacing + rect.width, rect.y, percentageText.c_str());
+    renderer.drawText(SMALL_FONT_ID, rect.x + batteryPercentSpacing + rect.width, rect.y, percentageText.c_str(),
+                      foregroundBlack);
   }
 
   const Rect iconRect{rect.x, y, rect.width, rect.height};
-  drawBatteryOutline(renderer, rect.x, y, rect.width, rect.height);
-  fillBatteryIcon(renderer, iconRect, percentage);
+  // CrumBLE 4.4: outline + fill take foregroundBlack so the battery icon
+  // flips white-on-black in the reader's dark mode.
+  drawBatteryOutline(renderer, rect.x, y, rect.width, rect.height, foregroundBlack);
+  fillBatteryIcon(renderer, iconRect, percentage, foregroundBlack);
 }
 
 void BaseTheme::drawBatteryRight(const GfxRenderer& renderer, Rect rect, const bool showPercentage) const {
@@ -138,7 +152,7 @@ void BaseTheme::drawProgressBar(const GfxRenderer& renderer, Rect rect, const si
 }
 
 void BaseTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
-                                const char* btn4, const bool allowInvertedText) const {
+                                const char* btn4, const bool allowInvertedText, const bool darkMode) const {
   const GfxRenderer::Orientation orig_orientation = renderer.getOrientation();
   const bool invertText = allowInvertedText && orig_orientation == GfxRenderer::Orientation::PortraitInverted;
   renderer.setOrientation(invertText ? GfxRenderer::Orientation::PortraitInverted : GfxRenderer::Orientation::Portrait);
@@ -154,15 +168,23 @@ void BaseTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const c
   const int* buttonPositions = gpio.deviceIsX3() ? x3ButtonPositions : x4ButtonPositions;
   const char* labels[] = {btn1, btn2, btn3, btn4};
 
+  // CrumBLE 4.4: dark-mode inverts each hint button -- black fill, white
+  // border, white text -- so the bottom strip blends with a dark-mode page
+  // instead of flashing as four bright white tiles. Only opted into by
+  // callers whose surrounding screen is already dark; default stays light.
+  const bool fillInk = darkMode;           // true=black fill, false=white fill
+  const bool strokeInk = !darkMode;        // true=black border, false=white border
+  const bool textBlack = !darkMode;        // true=black text, false=white text
+
   for (int i = 0; i < 4; i++) {
     // Only draw if the label is non-empty
     if (labels[i] != nullptr && labels[i][0] != '\0') {
       const int x = buttonPositions[invertText ? 3 - i : i];
-      renderer.fillRect(x, pageHeight - buttonY, buttonWidth, buttonHeight, false);
-      renderer.drawRect(x, pageHeight - buttonY, buttonWidth, buttonHeight);
+      renderer.fillRect(x, pageHeight - buttonY, buttonWidth, buttonHeight, fillInk);
+      renderer.drawRect(x, pageHeight - buttonY, buttonWidth, buttonHeight, strokeInk);
       const int textWidth = renderer.getTextWidth(UI_10_FONT_ID, labels[i]);
       const int textX = x + (buttonWidth - 1 - textWidth) / 2;
-      renderer.drawText(UI_10_FONT_ID, textX, pageHeight - buttonY + textYOffset, labels[i]);
+      renderer.drawText(UI_10_FONT_ID, textX, pageHeight - buttonY + textYOffset, labels[i], textBlack);
     }
   }
 
@@ -660,7 +682,7 @@ void BaseTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount
 }
 
 Rect BaseTheme::drawPopup(const GfxRenderer& renderer, const char* message, int minTextWidth,
-                          bool leftAlignText) const {
+                          bool leftAlignText, HalDisplay::RefreshMode refreshMode) const {
   const auto& metrics = UITheme::getInstance().getMetrics();
   const int marginX = metrics.popupMarginX;
   const int marginY = metrics.popupMarginY;
@@ -693,7 +715,7 @@ Rect BaseTheme::drawPopup(const GfxRenderer& renderer, const char* message, int 
   const int textX = leftAlignText ? (x + marginX) : (x + (w - actualTextWidth) / 2);
   const int textY = y + marginY + metrics.popupTextBaselineOffsetY;
   renderer.drawText(UI_12_FONT_ID, textX, textY, message, metrics.popupTextInverted, popupFontFamily);
-  renderer.displayBuffer();
+  renderer.displayBuffer(refreshMode);
   return Rect{x, y, w, h};
 }
 
@@ -724,7 +746,12 @@ void BaseTheme::fillPopupProgress(const GfxRenderer& renderer, const Rect& layou
 
 void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, const int currentPage,
                               const int pageCount, std::string title, const int paddingBottom, const int textYOffset,
-                              const bool isPageBookmarked) const {
+                              const bool isPageBookmarked, const bool darkMode) const {
+  // CrumBLE 4.4: ported per-element flip pattern from upstream CrossInk
+  // v1.3.2. foregroundBlack flips every draw colour; the bookmark notch is
+  // the lone exception -- it's a cutout into the bookmark body and must paint
+  // in the *background* colour, so it passes `darkMode` directly (= !fg).
+  const bool foregroundBlack = !darkMode;
   auto metrics = UITheme::getInstance().getMetrics();
   int orientedMarginTop, orientedMarginRight, orientedMarginBottom, orientedMarginLeft;
   renderer.getOrientedViewableTRBL(&orientedMarginTop, &orientedMarginRight, &orientedMarginBottom,
@@ -764,8 +791,8 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
     const int textHeight = renderer.getTextHeight(SMALL_FONT_ID);
     const int clearX = renderer.getScreenWidth() - metrics.statusBarHorizontalMargin -
                        orientedMarginRight - maxProgressTextWidth;
-    renderer.fillRect(clearX, textY, maxProgressTextWidth, textHeight, false);
-    renderer.drawText(SMALL_FONT_ID, textX, textY, progressStr);
+    renderer.fillRect(clearX, textY, maxProgressTextWidth, textHeight, darkMode);
+    renderer.drawText(SMALL_FONT_ID, textX, textY, progressStr, foregroundBlack);
   }
 
   // Draw Progress Bar
@@ -782,7 +809,7 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
     }
     const int barWidth = progressBarMaxWidth * progress / 100;
     renderer.fillRect(orientedMarginLeft, progressBarY, barWidth, ((SETTINGS.statusBarProgressBarThickness + 1) * 2),
-                      true);
+                      foregroundBlack);
   }
 
   // Bookmark icon: drawn at the far left of the status bar when the current page is bookmarked.
@@ -798,10 +825,10 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
     // +5 compensates for the battery nub drawn above the rect origin by drawBatteryLeft,
     // which shifts the battery body's visual center below the mathematical rect center.
     const int bmY = textY + (metrics.batteryHeight - bmIconH) / 2 + 5;
-    renderer.fillRect(bmX, bmY, bmIconW, bmIconH, true);
+    renderer.fillRect(bmX, bmY, bmIconW, bmIconH, foregroundBlack);
     const int xNotch[3] = {bmX, bmX + bmIconW, bmX + bmIconW / 2};
     const int yNotch[3] = {bmY + bmIconH, bmY + bmIconH, bmY + bmIconH - bmNotchDepth};
-    renderer.fillPolygon(xNotch, yNotch, 3, false);
+    renderer.fillPolygon(xNotch, yNotch, 3, darkMode);
   }
 
   // Draw Battery (in the leftmost slot of the status bar, right after the
@@ -811,7 +838,7 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
   const int batteryX = metrics.statusBarHorizontalMargin + orientedMarginLeft + 1 + bmTotalWidth;
   if (SETTINGS.statusBarBattery) {
     GUI.drawBatteryLeft(renderer, Rect{batteryX, textY, metrics.batteryWidth, metrics.batteryHeight},
-                        showBatteryPercentage);
+                        showBatteryPercentage, foregroundBlack);
   }
 
   // CrumBLE: BT status icon removed -- the connection-state tracking was
@@ -828,7 +855,7 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
       // Position to the left of the progress text (with a small gap)
       const int clockX = renderer.getScreenWidth() - metrics.statusBarHorizontalMargin - orientedMarginRight -
                          progressTextWidth - (progressTextWidth > 0 ? 10 : 0) - clockTextWidth;
-      renderer.drawText(SMALL_FONT_ID, clockX, textY, timeBuf);
+      renderer.drawText(SMALL_FONT_ID, clockX, textY, timeBuf, foregroundBlack);
     }
   }
 
@@ -867,7 +894,7 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
     renderer.drawText(SMALL_FONT_ID,
                       titleMarginLeftAdjusted + metrics.statusBarHorizontalMargin + orientedMarginLeft +
                           (availableTitleSpace - titleWidth) / 2,
-                      textY, title.c_str());
+                      textY, title.c_str(), foregroundBlack);
   }
 }
 

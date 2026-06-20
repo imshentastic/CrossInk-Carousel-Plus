@@ -167,6 +167,28 @@ class CrossPointSettings {
     SD_FONT_SIZE_RANGE_COUNT
   };
   enum LINE_COMPRESSION { TIGHT = 0, NORMAL = 1, WIDE = 2, LINE_COMPRESSION_COUNT };
+  // CrumBLE 4.4 (ported from CPR-vCodex): Text Darkness setting. Affects the
+  // 2-bit grayscale glyph blit -- maps the font's per-pixel AA value (0..3)
+  // to which framebuffer plane (MSB, LSB) gets ink. Doesn't touch the 1-bit
+  // BW path. Stored as uint8_t (textDarkness) so layouts stay compact.
+  //   NORMAL    : CrossInk-style solid text with smooth AA (current behaviour)
+  //   LEGACY_BW : Lighter overlay, the pre-CrumBLE 4.4 look
+  //   DARK      : Both AA buckets get inked, denser glyphs
+  //   EXTRA_DARK: Same as DARK in the current renderer (reserved for future tuning)
+  enum TEXT_DARKNESS {
+    TEXT_DARKNESS_NORMAL = 0,
+    TEXT_DARKNESS_LEGACY_BW = 1,
+    TEXT_DARKNESS_DARK = 2,
+    TEXT_DARKNESS_EXTRA_DARK = 3,
+    TEXT_DARKNESS_COUNT
+  };
+  // Spacing *between* paragraphs. Three-way enum (the byte field
+  // `extraParagraphSpacing` carries 0/1/2). TIGHT keeps the classic-novel
+  // text-indent style with no vertical gap; NORMAL is the default block-style
+  // paragraph with a lineHeight/2 gap; WIDE doubles that to a full lineHeight.
+  // The byte format is unchanged from the legacy bool, so old config files
+  // and old section caches with 0/1 round-trip identically.
+  enum EXTRA_PARAGRAPH_SPACING { EPS_TIGHT = 0, EPS_NORMAL = 1, EPS_WIDE = 2, EXTRA_PARAGRAPH_SPACING_COUNT };
   enum PARAGRAPH_ALIGNMENT {
     JUSTIFIED = 0,
     LEFT_ALIGN = 1,
@@ -282,6 +304,7 @@ class CrossPointSettings {
     LONG_MENU_FILE_TRANSFER = 12,
     LONG_MENU_BOOK_SETTINGS = 13,
     LONG_MENU_TOGGLE_TILT_PAGE_TURN = 14,
+    LONG_MENU_TOGGLE_DARK_MODE = 15,
     LONG_PRESS_MENU_ACTION_COUNT
   };
 
@@ -397,6 +420,15 @@ class CrossPointSettings {
 #endif
   uint8_t lineSpacing = NORMAL;
   uint8_t paragraphAlignment = JUSTIFIED;
+  // CrumBLE 4.4: ported from upstream CrossInk v1.3.2. Selective reader-page
+  // inversion -- black page background with white text/UI, but EPUB content
+  // images render right-side up (no inverted-photo weirdness). Reader-only;
+  // menus, file browser, and the sleep screen remain in light mode.
+  uint8_t readerDarkMode = 0;
+  // CrumBLE 4.4 (ported from CPR-vCodex): Text Darkness, 0=Normal, 1=Legacy
+  // BW, 2=Dark, 3=Extra Dark. Sync to GfxRenderer.setTextDarkness() at boot
+  // and whenever this field is edited so the next glyph blit uses it.
+  uint8_t textDarkness = TEXT_DARKNESS_NORMAL;
   // Auto-sleep timeout setting (default 10 minutes). Legacy sleepTimeout enum values are migration-only.
   uint8_t sleepTimeoutMinutes = 10;
   // E-ink refresh frequency (default 15 pages)
@@ -454,6 +486,12 @@ class CrossPointSettings {
   uint8_t bionicReadingEnabled = 0;
   // Guide Dots - places a middle dot between words to guide the eye
   uint8_t guideReadingEnabled = 0;
+  // Glyph atlas (v40 section format): when enabled, the reader installs and
+  // renders from the prebake'd glyph atlas. Default ON to keep the existing
+  // optimized render path. Turn OFF to A/B test the upload-reliability
+  // regression hypothesis -- when off, the renderer falls back to the v39
+  // embedded glyph subset (or full SD-font glyph fetch if neither exists).
+  uint8_t glyphAtlasEnabled = 1;
   // SD card font family name, including optional range suffix (empty = use built-in fontFamily)
   char sdFontFamilyName[64] = "";
   // Show hidden files/directories (starting with '.') in the file browser (0 = hidden, 1 = show)

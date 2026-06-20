@@ -95,6 +95,6 @@ class RoundedRaffTheme : public BaseTheme {
                 const std::function<bool(int index)>& rowDimmed = nullptr,
                 const std::function<bool(int index)>& isHeader = nullptr) const override;
   void drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3, const char* btn4,
-                       bool allowInvertedText = false) const override;
+                       bool allowInvertedText = false, bool darkMode = false) const override;
   bool homeMenuShowsContinueReading() const { return true; }
 };

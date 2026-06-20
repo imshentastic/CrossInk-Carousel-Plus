@@ -1,5 +1,6 @@
 #include "Page.h"
 
+#include <Arduino.h>  // ESP.getMaxAllocHeap() for footnote.resize() pre-flight
 #include <GfxRenderer.h>
 #include <Logging.h>
 #include <Serialization.h>
@@ -16,18 +17,20 @@ static_assert(PageTableFragment::MAX_SERIALIZED_ROWS == MAX_TABLE_ROWS_PER_FRAGM
 
 template <typename Predicate>
 void renderFilteredPageElements(const std::vector<std::unique_ptr<PageElement>>& elements, GfxRenderer& renderer,
-                                const int fontId, const int xOffset, const int yOffset, Predicate&& predicate) {
+                                const int fontId, const int xOffset, const int yOffset, const bool foregroundBlack,
+                                Predicate&& predicate) {
   for (const auto& element : elements) {
     if (predicate(*element)) {
-      element->render(renderer, fontId, xOffset, yOffset);
+      element->render(renderer, fontId, xOffset, yOffset, foregroundBlack);
     }
   }
 }
 
 }  // namespace
 
-void PageLine::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) {
-  block->render(renderer, fontId, xPos + xOffset, yPos + yOffset);
+void PageLine::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
+                      const bool foregroundBlack) {
+  block->render(renderer, fontId, xPos + xOffset, yPos + yOffset, foregroundBlack);
 }
 
 bool PageLine::serialize(FsFile& file) {
@@ -54,6 +57,25 @@ std::unique_ptr<PageLine> PageLine::deserialize(FsFile& file) {
     return nullptr;
   }
 
+  // CrumBLE 4.4 post-bisect: pre-flight before constructing PageLine.
+  // The constructor converts the unique_ptr<TextBlock> argument into a
+  // shared_ptr<TextBlock> member, which allocates a control block (~24
+  // bytes on this libstdc++) using a regular (throwing) new. With
+  // -fno-exceptions, that allocation either aborts or returns a corrupt
+  // pointer on OOM -- we've observed the latter, where the control
+  // block's mutex pointer ends up at a garbage address (e.g. 0x00530000),
+  // and the eventual cachedRenderPage_.reset() destruction then crashes
+  // in pthread_mutex_destroy. Refuse up-front rather than risk poisoning
+  // the page DOM with a corrupt PageLine that survives heap recovery and
+  // panic-crashes later.
+  //
+  // 96-byte margin = sizeof(PageLine) ~32 + shared_ptr ctrl block ~24
+  // + bookkeeping. Cheap to over-reserve.
+  if (ESP.getMaxAllocHeap() < 96) {
+    LOG_ERR("PGE", "Refusing PageLine alloc: maxAlloc=%u < 96 (risk of corrupt shared_ptr ctrl block)",
+            ESP.getMaxAllocHeap());
+    return nullptr;
+  }
   auto* pageLine = new (std::nothrow) PageLine(std::move(tb), xPos, yPos);
   if (!pageLine) {
     LOG_ERR("PGE", "Deserialization failed: could not allocate PageLine");
@@ -62,8 +84,11 @@ std::unique_ptr<PageLine> PageLine::deserialize(FsFile& file) {
   return std::unique_ptr<PageLine>(pageLine);
 }
 
-void PageImage::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) {
-  // Images don't use fontId or text rendering
+void PageImage::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
+                       const bool foregroundBlack) {
+  // CrumBLE 4.4: foregroundBlack ignored -- EPUB content images render
+  // right-side-up in dark mode (no negative-photo effect).
+  (void)foregroundBlack;
   imageBlock->render(renderer, xPos + xOffset, yPos + yOffset);
 }
 
@@ -99,13 +124,15 @@ std::unique_ptr<PageImage> PageImage::deserialize(FsFile& file) {
   return std::unique_ptr<PageImage>(pageImage);
 }
 
-void PageHorizontalRule::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) {
+void PageHorizontalRule::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
+                                const bool foregroundBlack) {
   (void)fontId;
   if (width == 0 || thickness == 0) {
     return;
   }
 
-  renderer.drawLine(xPos + xOffset, yPos + yOffset, xPos + xOffset + width - 1, yPos + yOffset, thickness, true);
+  renderer.drawLine(xPos + xOffset, yPos + yOffset, xPos + xOffset + width - 1, yPos + yOffset, thickness,
+                    foregroundBlack);
 }
 
 bool PageHorizontalRule::serialize(FsFile& file) {
@@ -233,7 +260,8 @@ uint16_t PageTableFragment::getHeight() const {
   return total;
 }
 
-void PageTableFragment::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) {
+void PageTableFragment::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
+                               const bool foregroundBlack) {
   if (columnCount == 0 || rows.empty() || width < 2) {
     return;
   }
@@ -248,10 +276,10 @@ void PageTableFragment::render(GfxRenderer& renderer, const int fontId, const in
   }
   columnStarts[columnCount] = static_cast<int16_t>(width - 1);
 
-  renderer.drawRect(drawX, drawY, width, totalHeight, true);
+  renderer.drawRect(drawX, drawY, width, totalHeight, foregroundBlack);
   for (uint8_t i = 1; i < columnCount; i++) {
     const int x = drawX + columnStarts[i];
-    renderer.drawLine(x, drawY, x, drawY + totalHeight - 1, true);
+    renderer.drawLine(x, drawY, x, drawY + totalHeight - 1, foregroundBlack);
   }
 
   int currentY = 0;
@@ -265,14 +293,14 @@ void PageTableFragment::render(GfxRenderer& renderer, const int fontId, const in
 
       for (size_t lineIndex = 0; lineIndex < cell.lines.size(); lineIndex++) {
         cell.lines[lineIndex]->render(renderer, fontId, cellTextX,
-                                      cellTextY + static_cast<int>(lineIndex) * lineHeight);
+                                      cellTextY + static_cast<int>(lineIndex) * lineHeight, foregroundBlack);
       }
     }
 
     currentY += row.height;
     if (rowIndex + 1 < rows.size()) {
       const int lineWidth = row.headerSeparator ? 2 : 1;
-      renderer.drawLine(drawX, drawY + currentY, drawX + width - 1, drawY + currentY, lineWidth, true);
+      renderer.drawLine(drawX, drawY + currentY, drawX + width - 1, drawY + currentY, lineWidth, foregroundBlack);
     }
   }
 }
@@ -340,17 +368,21 @@ std::unique_ptr<PageTableFragment> PageTableFragment::deserialize(FsFile& file) 
   return std::unique_ptr<PageTableFragment>(fragment);
 }
 
-void Page::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) const {
-  renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset, [](const PageElement&) { return true; });
+void Page::render(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
+                  const bool foregroundBlack) const {
+  renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset, foregroundBlack,
+                             [](const PageElement&) { return true; });
 }
 
-void Page::renderText(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) const {
-  renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset,
+void Page::renderText(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset,
+                      const bool foregroundBlack) const {
+  renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset, foregroundBlack,
                              [](const PageElement& element) { return element.getTag() != TAG_PageImage; });
 }
 
 void Page::renderImages(GfxRenderer& renderer, const int fontId, const int xOffset, const int yOffset) const {
-  renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset,
+  // Images always paint right-side-up regardless of dark mode.
+  renderFilteredPageElements(elements, renderer, fontId, xOffset, yOffset, /*foregroundBlack=*/true,
                              [](const PageElement& element) { return element.getTag() == TAG_PageImage; });
 }
 
@@ -461,7 +493,21 @@ std::unique_ptr<Page> Page::deserialize(FsFile& file) {
     LOG_ERR("PGE", "Invalid footnote count %u", fnCount);
     return nullptr;
   }
-  page->footnotes.resize(fnCount);
+  // CrumBLE 4.4 post-bisect: pre-flight gate around footnote vector resize.
+  // Build runs with -fno-exceptions, so the only way to avoid bad_alloc ->
+  // __cxa_allocate_exception -> terminate is to never reach the throw.
+  // FootnoteEntry is ~80 bytes; refuse the page if MaxAlloc can't cover it.
+  // Only check when fnCount > 0 -- resize(0) is a no-op that should never
+  // be refused even when heap is critically fragmented.
+  if (fnCount > 0) {
+    const uint32_t needed = static_cast<uint32_t>(fnCount) * sizeof(FootnoteEntry);
+    if (ESP.getMaxAllocHeap() < needed + 256) {
+      LOG_ERR("PGE", "Refusing footnote.resize(%u): maxAlloc=%u < needed=%u",
+              fnCount, ESP.getMaxAllocHeap(), needed + 256);
+      return nullptr;
+    }
+    page->footnotes.resize(fnCount);
+  }
   for (uint16_t i = 0; i < fnCount; i++) {
     auto& entry = page->footnotes[i];
     if (file.read(entry.number, sizeof(entry.number)) != sizeof(entry.number) ||

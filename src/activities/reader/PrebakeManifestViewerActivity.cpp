@@ -160,10 +160,40 @@ void PrebakeManifestViewerActivity::render(RenderLock&&) {
   } else {
     fontLine1 = fontFamilyName(manifest_.fontFamily);
   }
+  // CrumBLE 4.4: human-readable font-size label. The manifest stores a
+  // FONT_SIZE enum index (built-in) or a step-into-range index (SD), neither
+  // of which means anything to the user on its own. Resolve to the actual
+  // point size and render as "N pt". Falls back to the raw step/range pair
+  // when the values are out of bounds for the current settings shape (e.g.
+  // a manifest baked by a future firmware with a wider enum).
   char fontLine2[32];
-  std::snprintf(fontLine2, sizeof(fontLine2), "step %u / range %u", static_cast<unsigned>(manifest_.fontSize),
-                static_cast<unsigned>(manifest_.sdFontSizeRange));
-  rows.push_back({"Font", fontLine1, fontLine2});
+  uint8_t pointSize = 0;
+  bool gotPt = false;
+  if (manifest_.sdFontFamilyName[0] != '\0') {
+    if (manifest_.sdFontSizeRange < CrossPointSettings::SD_FONT_SIZE_RANGE_COUNT) {
+      pointSize = CrossPointSettings::getSdFontRangePointSize(manifest_.sdFontSizeRange, manifest_.fontSize);
+      gotPt = pointSize != 0;
+    }
+  } else {
+    if (manifest_.fontSize < CrossPointSettings::FONT_SIZE_COUNT) {
+      pointSize = CrossPointSettings::getReaderFontPointSize(
+          static_cast<CrossPointSettings::FONT_SIZE>(manifest_.fontSize));
+      gotPt = pointSize != 0;
+    }
+  }
+  if (gotPt) {
+    std::snprintf(fontLine2, sizeof(fontLine2), "%u pt", static_cast<unsigned>(pointSize));
+  } else {
+    std::snprintf(fontLine2, sizeof(fontLine2), "step %u / range %u",
+                  static_cast<unsigned>(manifest_.fontSize),
+                  static_cast<unsigned>(manifest_.sdFontSizeRange));
+  }
+  // CrumBLE 4.4: split into two labeled rows. Earlier layout used the
+  // continuation line for the point-size value, which read as a blank-
+  // label gap next to the family name. "Font" + "Font Size" makes both
+  // values self-explanatory at a glance.
+  rows.push_back({"Font", fontLine1});
+  rows.push_back({"Font Size", fontLine2});
 
   rows.push_back({"Orientation", orientationName(manifest_.orientation)});
   rows.push_back({"Screen margin", std::to_string(manifest_.screenMargin) + " px"});

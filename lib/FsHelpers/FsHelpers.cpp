@@ -43,6 +43,34 @@ std::string normalisePath(const std::string& path) {
   return result;
 }
 
+std::string urlDecode(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  const size_t n = s.size();
+  for (size_t i = 0; i < n; ++i) {
+    const char c = s[i];
+    if (c == '%' && i + 2 < n) {
+      const char h1 = s[i + 1];
+      const char h2 = s[i + 2];
+      const auto fromHex = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
+        if (ch >= 'A' && ch <= 'F') return 10 + (ch - 'A');
+        return -1;
+      };
+      const int v1 = fromHex(h1);
+      const int v2 = fromHex(h2);
+      if (v1 >= 0 && v2 >= 0) {
+        out += static_cast<char>((v1 << 4) | v2);
+        i += 2;
+        continue;
+      }
+    }
+    out += c;
+  }
+  return out;
+}
+
 void sortFileList(std::vector<std::string>& strs) {
   std::sort(begin(strs), end(strs), [](const std::string& str1, const std::string& str2) {
     // Directories first

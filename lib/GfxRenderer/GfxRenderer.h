@@ -100,6 +100,10 @@ class GfxRenderer {
   RenderMode renderMode;
   Orientation orientation;
   bool fadingFix;
+  // CrumBLE 4.4 (ported from CPR-vCodex): Text Darkness. Read by the 2-bit
+  // glyph blit in renderCharImpl to choose which AA buckets get inked.
+  // 0=Normal, 1=Legacy BW, 2=Dark, 3=Extra Dark.
+  uint8_t textDarkness = 0;
   mutable bool renderStarved = false;
   // Set when an image was decoded this render but not cached to .pxc (partial /
   // off-screen). Such a page re-decodes on every repaint, so it is not BLE-safe.
@@ -287,6 +291,8 @@ class GfxRenderer {
 
   // Fading fix control
   void setFadingFix(const bool enabled) { fadingFix = enabled; }
+  void setTextDarkness(const uint8_t darkness) { textDarkness = darkness; }
+  uint8_t getTextDarkness() const { return textDarkness; }
 
   // Render-starvation signal. Set when a glyph couldn't be decompressed for OOM
   // (getGlyphBitmap) or an image failed to decode (ImageBlock::render) — i.e.

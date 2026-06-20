@@ -145,7 +145,8 @@ void XMLCALL TocNcxParser::endElement(void* userData, const XML_Char* name) {
     // This is the safest place to push the data, assuming <navLabel> always comes before <content>.
     // NCX spec says navLabel comes before content.
     if (!self->currentLabel.empty() && !self->currentSrc.empty()) {
-      std::string href = FsHelpers::normalisePath(self->baseContentPath + self->currentSrc);
+      // CrumBLE 4.4: percent-decode -- see ContentOpfParser.cpp note.
+      std::string href = FsHelpers::normalisePath(self->baseContentPath + FsHelpers::urlDecode(self->currentSrc));
       std::string anchor;
 
       const size_t pos = href.find('#');
