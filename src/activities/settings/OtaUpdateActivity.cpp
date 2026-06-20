@@ -1,7 +1,9 @@
 #include "OtaUpdateActivity.h"
 
+#include <Arduino.h>  // ESP.getMaxAllocHeap()
 #include <GfxRenderer.h>
 #include <I18n.h>
+#include <Logging.h>
 #include <WiFi.h>
 
 #include "AppVersion.h"
@@ -65,6 +67,30 @@ void OtaUpdateActivity::onWifiSelectionComplete(const bool success) {
 
 void OtaUpdateActivity::onEnter() {
   Activity::onEnter();
+
+  // CrumBLE 4.5: heap pre-flight. mbedtls SSL setup needs ~40-50KB
+  // contiguous on top of WiFi's ~58KB share for the GitHub API HTTPS
+  // handshake; on a used-for-a-while device the post-WiFi MaxAlloc can
+  // collapse below that and the handshake bails with -0x7F00
+  // (MBEDTLS_ERR_SSL_ALLOC_FAILED), surfaced to the user as the
+  // unhelpful "Update Failed". Threshold ~80KB MaxAlloc before WiFi
+  // leaves headroom for the SSL allocs after WiFi takes its bite.
+  // Silent-restart to OTA so we re-enter with a clean ~115KB heap.
+  // isContinuingFromSilentReboot prevents an infinite restart loop if
+  // the fresh-boot heap still isn't enough (genuinely broken state).
+  constexpr uint32_t kOtaPreflightMaxAlloc = 80u * 1024u;
+  const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+  if (maxAlloc < kOtaPreflightMaxAlloc && !isContinuingFromSilentReboot()) {
+    LOG_INF("OTA",
+            "Heap pre-flight: maxAlloc=%u below %u; silent-restarting to OTA so the SSL handshake fits",
+            maxAlloc, kOtaPreflightMaxAlloc);
+    silentRestartToOtaUpdate();
+    return;
+  }
+  if (isContinuingFromSilentReboot()) {
+    LOG_INF("OTA", "Post-silent-restart entry: maxAlloc=%u (proceeding)", maxAlloc);
+    clearSilentRebootContinuationFlag();
+  }
 
   // Turn on WiFi immediately
   LOG_DBG("OTA", "Turning on WiFi...");

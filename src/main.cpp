@@ -435,6 +435,12 @@ constexpr uint32_t SILENT_REBOOT_TARGET_READER = 1;
 // re-navigate to File Transfer from Home -- mirrors the path they'd
 // take by hitting Back manually but skips the trip through the menu.
 constexpr uint32_t SILENT_REBOOT_TARGET_FILE_TRANSFER = 2;
+// CrumBLE 4.5: heap-defrag reboot from OtaUpdateActivity when the pre-flight
+// finds MaxAlloc below the SSL-handshake floor. After this reboot, setup()
+// routes straight to OtaUpdateActivity so the user doesn't see Home flash
+// through. They re-select WiFi but on a fresh ~115KB heap the mbedtls SSL
+// setup (~40-50KB cert + handshake) fits comfortably.
+constexpr uint32_t SILENT_REBOOT_TARGET_OTA_UPDATE = 3;
 
 // How the device is coming back to life, resolved once at boot. Both resume
 // flows suppress the splash and leave the panel holding its pre-boot frame; a
@@ -473,6 +479,16 @@ void silentRestartToFileTransfer() {
   silentRebootMagic = SILENT_REBOOT_MAGIC;
   LOG_DBG("MAIN", "Silent restart (target=file-transfer, modeHint=%u)",
           static_cast<unsigned>(silentRebootFtModeHint));
+  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+  delay(50);
+  ESP.restart();
+}
+
+void silentRestartToOtaUpdate() {
+  if (deepSleepInProgress) return;
+  silentRebootTarget = SILENT_REBOOT_TARGET_OTA_UPDATE;
+  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  LOG_INF("MAIN", "Silent restart (target=ota-update) — heap pre-flight tripped");
   GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
   delay(50);
   ESP.restart();
@@ -1138,7 +1154,7 @@ void setup() {
   // Bound the target range too — RTC_NOINIT memory is uninitialized on cold boot.
   const bool isSilentReboot = (silentRebootMagic == SILENT_REBOOT_MAGIC);
   const uint32_t snapshotTarget =
-      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_FILE_TRANSFER) ? silentRebootTarget : 0;
+      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_OTA_UPDATE) ? silentRebootTarget : 0;
   // Snapshot the FT mode hint into a normal variable before clearing
   // RTC state, so the FT activity's onEnter can read it via
   // consumeSilentRebootFtModeHint(). Only honour it on a confirmed
@@ -1447,6 +1463,12 @@ void setup() {
     // (Hotspot vs Join) again -- that screen is the FT activity's normal
     // first step on entry.
     activityManager.goToFileTransfer();
+  } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_OTA_UPDATE) {
+    // CrumBLE 4.5: heap-defrag restart from OtaUpdateActivity's pre-flight.
+    // Route straight to OTA Update so the user doesn't see Home flash
+    // through. They re-select WiFi but on the fresh post-boot heap the
+    // mbedtls SSL handshake fits.
+    activityManager.goToOtaUpdate();
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_READER &&
              !APP_STATE.openEpubPath.empty()) {
     activityManager.goToReader(APP_STATE.openEpubPath);

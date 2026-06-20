@@ -90,6 +90,9 @@ class ActivityManager {
 
   // goTo... functions are convenient wrapper for replaceActivity()
   void goToFileTransfer(std::string returnBookPath = {});
+  // CrumBLE 4.5: route straight to OtaUpdateActivity. Used by the post-boot
+  // dispatch after a heap-defrag silent restart from OTA's pre-flight.
+  void goToOtaUpdate();
   void goToSettings();
   void goToFileBrowser(std::string path = {});
   void goToRecentBooks();

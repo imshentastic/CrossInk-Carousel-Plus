@@ -119,3 +119,11 @@ ReaderPostBootAction consumeReaderPostBootAction();
 // query it during the boot sequence.
 bool isContinuingFromSilentReboot();
 void clearSilentRebootContinuationFlag();
+
+// CrumBLE 4.5: silent restart that lands on the OTA Update activity once the
+// boot completes. Used by OtaUpdateActivity's heap pre-flight: a tight-heap
+// device that's been used for a while can fail mbedtls SSL setup with
+// MBEDTLS_ERR_SSL_ALLOC_FAILED during the GitHub API HTTPS handshake (needs
+// ~40-50KB contiguous on top of WiFi's ~58KB share). Silent-restart lands
+// on a clean ~115KB heap so the SSL handshake fits.
+void silentRestartToOtaUpdate();
