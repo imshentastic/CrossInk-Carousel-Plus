@@ -1190,6 +1190,16 @@ void setup() {
   silentRebootReaderPostAction = 0;
   silentRebootTargetSpine = 0;
 
+  // CrumBLE 4.5: lean-boot path for silent-restart-to-OTA. The mbedtls SSL
+  // handshake to api.github.com needs ~40-50 KB contiguous on top of WiFi's
+  // ~58 KB share, and a normal boot's cover/library/recent/koreader/opds
+  // loads + BT setup eat ~50 KB before OTA ever dispatches -- leaving the
+  // post-WiFi MaxAlloc around ~12 KB (SSL setup -> -0x7F00). Skipping those
+  // loads when we know the next activity is OTA hands the handshake the
+  // full ~115 KB clean heap. Anything skipped here is reloaded by the
+  // normal boot that follows OtaUpdateActivity::onExit's silentRestart().
+  const bool isOtaSilentReboot = (isSilentReboot && snapshotTarget == SILENT_REBOOT_TARGET_OTA_UPDATE);
+
   gpio.begin();
   powerManager.begin();
   halTiltSensor.begin();
@@ -1275,7 +1285,9 @@ void setup() {
   // change so the fix actually takes effect without manual intervention.
   // Manual lever lives at Settings > System > Retry Failed Covers for
   // ad-hoc re-attempts (e.g. user freed heap, replaced a book file).
-  if (APP_STATE.lastCrumbleVersion != CRUMBLE_VERSION) {
+  // Lean-boot OTA path skips the sweep -- it'll run on the normal boot
+  // that follows OTA exit.
+  if (!isOtaSilentReboot && APP_STATE.lastCrumbleVersion != CRUMBLE_VERSION) {
     const int swept = CoverThumbStatus::sweepAllMarkers();
     LOG_INF("BOOT", "Firmware version changed (%s -> %s); swept %d cover-failed marker(s)",
             APP_STATE.lastCrumbleVersion.empty() ? "<none>" : APP_STATE.lastCrumbleVersion.c_str(),
@@ -1284,15 +1296,23 @@ void setup() {
     APP_STATE.saveToFile();
   }
 
-  RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
-  KOREADER_STORE.loadFromFile();
-  OPDS_STORE.loadFromFile();
   UITheme::getInstance().reload();
   ButtonNavigator::setMappedInputManager(mappedInputManager);
 
+  if (!isOtaSilentReboot) {
+    // Lean-boot OTA path skips these heap-heavy stores; reloaded on the
+    // normal boot after OTA exit.
+    RECENT_BOOKS.loadFromFile();
+    KOREADER_STORE.loadFromFile();
+    OPDS_STORE.loadFromFile();
+  } else {
+    LOG_INF("BOOT", "Lean-boot for OTA silent-restart: skipping RecentBooks/KOReader/OPDS/BT/Library/Series/Collections");
+  }
+
 #ifndef SIMULATOR
-  {
+  if (!isOtaSilentReboot) {
+    // OTA does not enable BT; the callbacks aren't needed on this boot.
     auto& btMgr = BluetoothHIDManager::getInstance();
     btMgr.setButtonInjector(
         [](uint8_t buttonIndex, bool pressed) { gpio.setVirtualButtonState(buttonIndex, pressed); });
@@ -1378,26 +1398,29 @@ void setup() {
 
   // LibraryIndex loads its cached JSON now (cheap); the heavy SD walk is
   // deferred until the user first accesses Recently Added / All Books on
-  // the shelf so boot stays fast.
-  LibraryIndex::getInstance().begin();
-  SeriesIndex::getInstance().begin();
+  // the shelf so boot stays fast. Lean-boot OTA path skips this too --
+  // OTA doesn't touch the library and the next normal boot will load it.
+  if (!isOtaSilentReboot) {
+    LibraryIndex::getInstance().begin();
+    SeriesIndex::getInstance().begin();
 
-  // CrumBLE: All Books / Recently Added are opt-in -- we no longer run the
-  // whole-SD walk at boot (it was the cause of the long first-boot indexing
-  // people complained about). On the first boot after this update, migrate
-  // existing users (anyone who already has a library index) so those
-  // collections stay visible; fresh installs leave them hidden until the user
-  // opts in from the Home menu (which prompts before scanning). Must run before
-  // CollectionsStore::begin() seeds the virtuals from these settings.
-  if (SETTINGS.virtualCollectionsDefaultPending) {
-    const bool existingUser = !LibraryIndex::getInstance().wasFreshFirstBoot();
-    SETTINGS.showRecentlyAddedCollection = existingUser ? 1 : 0;
-    SETTINGS.showAllBooksCollection = existingUser ? 1 : 0;
-    SETTINGS.virtualCollectionsDefaultPending = false;
-    SETTINGS.saveToFile();
+    // CrumBLE: All Books / Recently Added are opt-in -- we no longer run the
+    // whole-SD walk at boot (it was the cause of the long first-boot indexing
+    // people complained about). On the first boot after this update, migrate
+    // existing users (anyone who already has a library index) so those
+    // collections stay visible; fresh installs leave them hidden until the user
+    // opts in from the Home menu (which prompts before scanning). Must run before
+    // CollectionsStore::begin() seeds the virtuals from these settings.
+    if (SETTINGS.virtualCollectionsDefaultPending) {
+      const bool existingUser = !LibraryIndex::getInstance().wasFreshFirstBoot();
+      SETTINGS.showRecentlyAddedCollection = existingUser ? 1 : 0;
+      SETTINGS.showAllBooksCollection = existingUser ? 1 : 0;
+      SETTINGS.virtualCollectionsDefaultPending = false;
+      SETTINGS.saveToFile();
+    }
+
+    CollectionsStore::getInstance().begin();
   }
-
-  CollectionsStore::getInstance().begin();
 
   switch (resume) {
     case BootResume::Silent:
@@ -1466,8 +1489,11 @@ void setup() {
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_OTA_UPDATE) {
     // CrumBLE 4.5: heap-defrag restart from OtaUpdateActivity's pre-flight.
     // Route straight to OTA Update so the user doesn't see Home flash
-    // through. They re-select WiFi but on the fresh post-boot heap the
-    // mbedtls SSL handshake fits.
+    // through. Lean-boot guards above (isOtaSilentReboot) already skipped
+    // the heap-heavy stores/library so the post-boot heap available to
+    // the mbedtls SSL handshake matches a fresh power-on rather than the
+    // ~65 KB MaxAlloc seen on a full boot.
+    LOG_INF("BOOT", "Lean-boot OTA dispatch: heap=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     activityManager.goToOtaUpdate();
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_READER &&
              !APP_STATE.openEpubPath.empty()) {
