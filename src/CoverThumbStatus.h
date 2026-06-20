@@ -42,4 +42,16 @@ void markFailed(const std::string& bookPath, int width, int height);
 // at; pass the same dimensions that were used in the gen attempt.
 void clearFailed(const std::string& bookPath, int width, int height);
 
+// CrumBLE 4.4: wipe ALL thumb_failed_v3_*.marker files across every
+// per-book cache dir under /.crosspoint/. Used by:
+//   1. Boot-time auto-sweep after a firmware-version change so users
+//      whose covers broke on a fixed bug (e.g. the EOCD scan window
+//      bump) get their covers back without manual intervention.
+//   2. Settings > System > Retry Failed Cover Thumbnails -- manual
+//      lever for users who want to re-attempt without waiting for the
+//      next update (e.g. they freed heap, replaced a book file, etc.).
+// Returns the count of markers removed. Walks the /.crosspoint/ tree
+// once; cost scales with number of cache subdirs (~10-200 typical).
+int sweepAllMarkers();
+
 }  // namespace CoverThumbStatus

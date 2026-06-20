@@ -229,7 +229,10 @@ bool BluetoothHIDManager::enable() {
   }
 
   LOG_INF("BT", "Enabling Bluetooth...");
-  
+  // CrumBLE 4.4 post-bisect: fresh auto-reconnect budget per BT cycle.
+  _autoReconnectConsumedThisCycle = false;
+  _autoReconnectPending = false;
+
   // CRITICAL: Disable WiFi when enabling Bluetooth
   // ESP32-C3 cannot have both WiFi and BLE enabled simultaneously
   if (WiFi.getMode() != WIFI_OFF) {
@@ -421,17 +424,49 @@ void BluetoothHIDManager::onScanResult(NimBLEAdvertisedDevice* advertisedDevice)
       return;
     }
   }
-  
+
+  // CrumBLE 4.4: cap discovered devices. On a busy RF environment we see 20+
+  // results and the post-scan picker activity allocates a std::vector<std::
+  // string> with a "name (addr) RSSI" entry per device -- on the X3's NimBLE-
+  // squeezed heap (NimBLE eats ~58 KB), even 20 entries hit the picker's
+  // grow-on-build with MaxAlloc < entry size and abort(). Cap at 12 so the
+  // picker fits comfortably; weakest-RSSI entry is evicted to keep the most
+  // promising ones. HID devices (remotes) get eviction priority over non-HID.
+  constexpr size_t MAX_SCAN_RESULTS = 12;
+  if (_discoveredDevices.size() >= MAX_SCAN_RESULTS) {
+    // Find weakest entry to evict. Prefer evicting non-HID over HID so a real
+    // remote isn't dropped in favour of nearby phones/headphones.
+    auto pickEvictionTarget = [this](bool requireNonHid) {
+      auto worst = _discoveredDevices.end();
+      int worstRssi = INT32_MAX;
+      for (auto it = _discoveredDevices.begin(); it != _discoveredDevices.end(); ++it) {
+        if (requireNonHid && it->isHID) continue;
+        if (it->rssi < worstRssi) { worstRssi = it->rssi; worst = it; }
+      }
+      return worst;
+    };
+    auto victim = pickEvictionTarget(/*requireNonHid=*/true);
+    if (victim == _discoveredDevices.end()) {
+      victim = pickEvictionTarget(/*requireNonHid=*/false);
+    }
+    // Only evict if the new device beats the weakest -- otherwise just drop.
+    if (victim == _discoveredDevices.end() || rssi <= victim->rssi) {
+      LOG_DBG("BT", "Scan cap reached, dropping weaker new device RSSI=%d", rssi);
+      return;
+    }
+    _discoveredDevices.erase(victim);
+  }
+
   // Add new device
   BluetoothDevice device;
   device.address = address;
   device.name = name.empty() ? "Unknown" : name;
   device.rssi = rssi;
   device.isHID = isHID;
-  
+
   _discoveredDevices.push_back(device);
 
-  LOG_DBG("BT", "Found device: %s (%s) RSSI:%d HID:%d", 
+  LOG_DBG("BT", "Found device: %s (%s) RSSI:%d HID:%d",
           device.name.c_str(), device.address.c_str(), rssi, isHID);
 }
 
@@ -485,26 +520,42 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
     static ClientCallbacks clientCallbacks;
     pClient->setClientCallbacks(&clientCallbacks);
     
-    // Connect to device
+    // Connect to device. First attempt frequently times out for game-pad
+    // peripherals that haven't been awake for a while: the controller is
+    // still discovering / advertising and our scan-window misses it. User
+    // pattern is reliably "first quick-connect fails, second one works".
+    //
+    // CrumBLE 4.4 task #28-follow: always retry at least once with a fresh
+    // client + a small cool-down between attempts. The fresh-client path
+    // also covers the existing-client-from-previous-session case (where
+    // stale state in NimBLE's host stack rejects the reconnect).
     if (!pClient->connect(bleAddress)) {
-      if (hadExistingClient) {
-        LOG_INF("BT", "Reconnect with existing client failed for %s, retrying with fresh client", address.c_str());
-        NimBLEClient* freshClient = NimBLEDevice::createClient(bleAddress);
-        if (freshClient) {
-          pClient = freshClient;
-          pClient->setSelfDelete(false, false);
-          pClient->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
-          pClient->setConnectionParams(BLE_CONN_MIN_INTERVAL, BLE_CONN_MAX_INTERVAL, BLE_CONN_LATENCY,
-                                       BLE_CONN_TIMEOUT, BLE_CONN_SCAN_INTERVAL, BLE_CONN_SCAN_WINDOW);
-          pClient->setClientCallbacks(&clientCallbacks);
+      LOG_INF("BT", "Initial connect attempt failed for %s; retrying after cool-down", address.c_str());
+      // ~300 ms cool-down: long enough for the controller to settle a
+      // pending advertising window, short enough that the user doesn't
+      // perceive a stall on the rare-but-real case where the first attempt
+      // actually races RF noise rather than peripheral state. NimBLE
+      // controller event loop keeps ticking through delay().
+      delay(300);
+      NimBLEClient* freshClient = NimBLEDevice::createClient(bleAddress);
+      if (freshClient) {
+        if (hadExistingClient) {
+          LOG_INF("BT", "Reconnect with existing client failed; using fresh client");
         }
+        pClient = freshClient;
+        pClient->setSelfDelete(false, false);
+        pClient->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
+        pClient->setConnectionParams(BLE_CONN_MIN_INTERVAL, BLE_CONN_MAX_INTERVAL, BLE_CONN_LATENCY,
+                                     BLE_CONN_TIMEOUT, BLE_CONN_SCAN_INTERVAL, BLE_CONN_SCAN_WINDOW);
+        pClient->setClientCallbacks(&clientCallbacks);
       }
 
       if (!pClient->connect(bleAddress)) {
         lastError = "Connection failed";
-        LOG_ERR("BT", "Failed to connect to %s", address.c_str());
+        LOG_ERR("BT", "Failed to connect to %s (after retry)", address.c_str());
         return false;
       }
+      LOG_INF("BT", "Connect succeeded on retry for %s", address.c_str());
     }
 
     const bool connParamsUpdated =
@@ -735,7 +786,13 @@ void BluetoothHIDManager::noteClientDisconnect(int reason) {
   // A drop in the first SETTLE_MS is almost always bonding/encryption renegotiation
   // on the first connect (the link comes back on its own within a second). Earlier
   // this fired a false "BT couldn't stay connected" alert every first connect.
-  if (since < SETTLE_MS) {
+  //
+  // CrumBLE 4.4 post-bisect: HCI reason 520 (0x208 = BLE supervision timeout) is
+  // unambiguous — it's the "controller timed the link out under heap pressure"
+  // case, NOT renegotiation. Fall through to the auto-reconnect branch even
+  // inside the settle window so a drop at ~2s (observed empirically) still
+  // triggers the one-shot retry.
+  if (since < SETTLE_MS && reason != 520) {
     LOG_DBG("BT", "Link dropped %lums after connect (reason %d); within settle window, no alert",
             since, reason);
     return;
@@ -744,9 +801,21 @@ void BluetoothHIDManager::noteClientDisconnect(int reason) {
   // link out under heap pressure" case (HCI 0x08 / reason 520). Surface it so the
   // user isn't left wondering why Bluetooth silently went away.
   if (since < EARLY_DISCONNECT_MS) {
-    LOG_INF("BT", "Link dropped %lums after connect (reason %d); flagging low-memory connect alert",
-            since, reason);
-    _connectionLostAlertPending = true;
+    // CrumBLE 4.4 post-bisect: an early reason-520 drop is the
+    // "supervision timeout during post-connect render" race. Fire a
+    // one-shot auto-reconnect (reader polls takeAutoReconnectRequest()
+    // and calls connectToDevice() again). If the second attempt also
+    // drops, the alert path takes over -- no infinite retry loop.
+    if (!_autoReconnectConsumedThisCycle) {
+      LOG_INF("BT", "Link dropped %lums after connect (reason %d); queueing one-shot auto-reconnect",
+              since, reason);
+      _autoReconnectPending = true;
+      _autoReconnectConsumedThisCycle = true;
+    } else {
+      LOG_INF("BT", "Link dropped %lums after connect (reason %d); auto-reconnect already used, flagging alert",
+              since, reason);
+      _connectionLostAlertPending = true;
+    }
   }
 }
 

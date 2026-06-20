@@ -5,12 +5,22 @@
 #include <HalTiltSensor.h>
 #include <Logging.h>
 
+#include "../../SilentRestart.h"  // CrumBLE 4.4: skip HALF refresh on first paint post-silent-reboot
 #include "MappedInputManager.h"
 
 namespace ReaderUtils {
 
 constexpr unsigned long SKIP_HOLD_MS = 700;
 constexpr unsigned long GO_HOME_MS = 1000;
+
+// CrumBLE 4.4: reader dark mode (selective inversion). When enabled, the
+// reader page is painted on a black background with white text/UI; EPUB
+// content images render right-side up (no negative-photo effect). These
+// helpers centralise the SETTINGS lookup so callers don't sprinkle
+// SETTINGS.readerDarkMode reads through the draw pipeline.
+inline bool readerDarkModeEnabled() { return SETTINGS.readerDarkMode != 0; }
+inline uint8_t readerBackgroundColor() { return readerDarkModeEnabled() ? 0x00 : 0xFF; }
+inline bool readerForegroundBlack() { return !readerDarkModeEnabled(); }
 
 inline GfxRenderer::Orientation toRendererOrientation(const uint8_t orientation) {
   switch (orientation) {
@@ -69,6 +79,17 @@ inline PageTurnResult detectPageTurn(const MappedInputManager& input) {
 }
 
 inline void displayWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntilFullRefresh) {
+  // CrumBLE 4.4 post-bisect: on the first paint after a silent restart,
+  // skip the HALF refresh's panel-cycling flash. The panel is still
+  // holding the user's pre-restart frame (because we didn't paint
+  // anything before ESP.restart), so a FAST update transitions smoothly
+  // without a visible black/white cycle. Don't touch pagesUntilFullRefresh
+  // here so the normal HALF cadence resumes once the activity's
+  // pre-flight has cleared the continuation flag.
+  if (isContinuingFromSilentReboot()) {
+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+    return;
+  }
   if (pagesUntilFullRefresh <= 1) {
     renderer.displayBuffer(HalDisplay::HALF_REFRESH);
     pagesUntilFullRefresh = SETTINGS.getRefreshFrequency();

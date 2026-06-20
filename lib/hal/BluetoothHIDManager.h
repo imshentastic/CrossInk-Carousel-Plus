@@ -155,6 +155,15 @@ public:
     _connectionLostAlertPending = false;
     return v;
   }
+  // CrumBLE 4.4 post-bisect: one-shot auto-reconnect request. Set by
+  // noteClientDisconnect when an early supervision-timeout drop is
+  // observed. The reader's loop polls this and calls connectToDevice()
+  // again to spare the user a manual reconnect. Cleared on consume.
+  bool takeAutoReconnectRequest() {
+    bool v = _autoReconnectPending;
+    _autoReconnectPending = false;
+    return v;
+  }
 
 private:
   BluetoothHIDManager();
@@ -175,6 +184,8 @@ private:
   unsigned long _lastConnectMillis = 0;        // when a link was last established
   bool _intentionalDisconnect = false;         // suppress the alert for disconnects we initiate
   bool _connectionLostAlertPending = false;    // one-shot: a link dropped unexpectedly soon after connecting
+  bool _autoReconnectPending = false;          // one-shot: an early drop has fired; reader should retry connect
+  bool _autoReconnectConsumedThisCycle = false;  // gate so we only auto-retry once per enable() cycle
   // A drop in the first SETTLE_MS after connect is almost always benign bonding/
   // encryption renegotiation -- the link is then re-established cleanly and the
   // user never notices unless we surface a (spurious) alert. Drops in

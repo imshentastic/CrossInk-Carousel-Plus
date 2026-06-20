@@ -55,6 +55,19 @@ class DictionaryWordSelectActivity final : public Activity {
   void onExit() override;
   void render(RenderLock&&) override;
 
+  // CrumBLE 4.4 post-bisect: post-silent-restart restore hook. The reader's
+  // OpenDefinition / OpenLookupAtWord post-boot dispatch sets this to the
+  // word the user was looking up. On the first loop() tick after extractWords,
+  // the activity navigates the cursor to this word (if found on the current
+  // page); if openOverlay is true (OpenDefinition path), it then auto-opens
+  // the definition popup. If false (OpenLookupAtWord -- dismiss-time restart
+  // path), it stops after the cursor navigation so the user resumes on the
+  // word free to dismiss or pick another.
+  void setPendingDefinitionWord(std::string word, bool openOverlay = true) {
+    pendingDefinitionWord_ = std::move(word);
+    pendingOpenOverlay_ = openOverlay;
+  }
+
  private:
   std::unique_ptr<Page> page;
   int fontId;
@@ -76,6 +89,35 @@ class DictionaryWordSelectActivity final : public Activity {
   // and the anchor define an inclusive range that's rendered as a
   // contiguous highlight underline rather than the single-word box.
   int highlightAnchorWordIdx_ = -1;
+
+  // CrumBLE 4.4 post-bisect: inline definition overlay (kindle-style).
+  // When a Confirm in Lookup mode picks a word, we capture the current
+  // selection screen via storeBwBuffer (packbits-compressed 2-5 KB) and
+  // draw a centered definition popup on top. Back closes the popup and
+  // restoreBwBuffer redraws the selection screen underneath -- no full
+  // activity push, no silent restart, the user's selection cursor is
+  // preserved across the lookup. Replaces the prior
+  // DictionaryDefinitionActivity push pattern (which required a
+  // silent-restart for the second-and-later definition on low heap).
+  std::string pendingDefinitionWord_;  // set by setPendingDefinitionWord; consumed on first loop() tick
+  bool pendingDefinitionCursorMoved_ = false;  // phase gate: false=navigate first, true=now open overlay
+  bool pendingOpenOverlay_ = true;  // true: auto-open overlay after cursor move; false: cursor only
+  bool defOverlay_ = false;
+  bool defOverlayLoading_ = false;  // performing lookup; popup drawn empty
+  bool defOverlayNotFound_ = false;
+  bool defOverlayLowMemory_ = false;
+  bool defOverlayCaptureValid_ = false;  // storeBwBuffer succeeded
+  std::string defTargetWord_;
+  std::vector<std::string> defLines_;
+  int defScrollOffset_ = 0;
+  int defLinesPerPage_ = 0;
+  int defMaxScroll_ = 0;
+
+  void openDefinitionOverlay(const std::string& word);
+  void closeDefinitionOverlay();
+  void performDefinitionLookup();
+  void wrapDefinition(const std::string& definition);
+  void renderDefinitionOverlay();
 
   void extractWords();
   void mergeHyphenatedWords();

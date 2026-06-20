@@ -45,7 +45,7 @@ constexpr uint32_t SECTION_CACHE_MAGIC = 0x535843FF;  // bytes: 0xFF, "CXS"
 // emit zeros for all three fields; the loader treats that as "no atlas
 // available, fall back to the v39 subset / SD-font miss handler path".
 // See lib/Epub/Epub/GlyphAtlas.h for the on-disk block format.
-constexpr uint8_t SECTION_FILE_VERSION = 40;
+constexpr uint8_t SECTION_FILE_VERSION = 41;
 // Oldest section file version this firmware can still read (forward-compat
 // window). v38 sections produced by v4.2.x prebakes / live caches still load
 // cleanly; their embedded glyph subset offsets default to 0 (no subset).
@@ -112,7 +112,8 @@ constexpr uint32_t HEADER_SIZE_V38 = sizeof(SECTION_CACHE_MAGIC) + sizeof(uint8_
 // v39 adds 3 uint32_t trailer fields after the liLutOffset (embedded glyph
 // subset offset/size/hash). v40 adds 3 more (glyph atlas offset/size/hash).
 constexpr uint32_t HEADER_SIZE_V39 = HEADER_SIZE_V38 + 3 * sizeof(uint32_t);
-constexpr uint32_t HEADER_SIZE = HEADER_SIZE_V39 + 3 * sizeof(uint32_t);
+constexpr uint32_t HEADER_SIZE_V40 = HEADER_SIZE_V39 + 3 * sizeof(uint32_t);
+constexpr uint32_t HEADER_SIZE = HEADER_SIZE_V40 + 3 * sizeof(uint32_t);  // +3 for v41 alt-atlas trailer
 
 // The embedded glyph subset block format constants live in
 // EmbeddedGlyphSubset.h (namespace embeddedGlyphSubset) so the on-device
@@ -146,7 +147,7 @@ uint32_t Section::onPageComplete(std::unique_ptr<Page> page) {
   return position;
 }
 
-bool Section::writeSectionFileHeader(const int fontId, const float lineCompression, const bool extraParagraphSpacing,
+bool Section::writeSectionFileHeader(const int fontId, const float lineCompression, const uint8_t extraParagraphSpacing,
                                      const bool forceParagraphIndents, const uint8_t paragraphAlignment,
                                      const uint16_t viewportWidth, const uint16_t viewportHeight,
                                      const bool hyphenationEnabled, const bool embeddedStyle,
@@ -170,7 +171,10 @@ bool Section::writeSectionFileHeader(const int fontId, const float lineCompressi
                                    sizeof(uint32_t) /*embeddedGlyphSubsetCpfontHash (v39)*/ +
                                    sizeof(uint32_t) /*glyphAtlasOffset (v40)*/ +
                                    sizeof(uint32_t) /*glyphAtlasSize (v40)*/ +
-                                   sizeof(uint32_t) /*glyphAtlasCpfontHash (v40)*/,
+                                   sizeof(uint32_t) /*glyphAtlasCpfontHash (v40)*/ +
+                                   sizeof(uint32_t) /*glyphAtlasAltOffset (v41)*/ +
+                                   sizeof(uint32_t) /*glyphAtlasAltSize (v41)*/ +
+                                   sizeof(uint32_t) /*glyphAtlasAltCpfontHash (v41)*/,
                 "Header size mismatch");
   return serialization::tryWritePod(file, SECTION_CACHE_MAGIC) &&
          serialization::tryWritePod(file, SECTION_FILE_VERSION) && serialization::tryWritePod(file, fontId) &&
@@ -205,10 +209,17 @@ bool Section::writeSectionFileHeader(const int fontId, const float lineCompressi
          // block in the buildGlyphAtlasBlock path.
          serialization::tryWritePod(file, static_cast<uint32_t>(0)) &&  // glyphAtlasOffset
          serialization::tryWritePod(file, static_cast<uint32_t>(0)) &&  // glyphAtlasSize
-         serialization::tryWritePod(file, static_cast<uint32_t>(0));    // glyphAtlasCpfontHash
+         serialization::tryWritePod(file, static_cast<uint32_t>(0)) &&  // glyphAtlasCpfontHash
+         // v41 trailer: three uint32_t fields for the alternate atlas slot
+         // (the OTHER bit-depth of the same glyph set). All zero on bakes
+         // that only produced one bit-depth. Patched by the prebake CLI's
+         // atlas-emit path when --emit-section-glyph-subsets is set.
+         serialization::tryWritePod(file, static_cast<uint32_t>(0)) &&  // glyphAtlasAltOffset
+         serialization::tryWritePod(file, static_cast<uint32_t>(0)) &&  // glyphAtlasAltSize
+         serialization::tryWritePod(file, static_cast<uint32_t>(0));    // glyphAtlasAltCpfontHash
 }
 
-bool Section::loadSectionFile(const int fontId, const float lineCompression, const bool extraParagraphSpacing,
+bool Section::loadSectionFile(const int fontId, const float lineCompression, const uint8_t extraParagraphSpacing,
                               const bool forceParagraphIndents, const uint8_t paragraphAlignment,
                               const uint16_t viewportWidth, const uint16_t viewportHeight,
                               const bool hyphenationEnabled, const bool embeddedStyle, const uint8_t imageRendering,
@@ -251,7 +262,7 @@ bool Section::loadSectionFile(const int fontId, const float lineCompression, con
 }
 
 bool Section::tryLoadFromPath(const std::string& path, const int fontId, const float lineCompression,
-                              const bool extraParagraphSpacing, const bool forceParagraphIndents,
+                              const uint8_t extraParagraphSpacing, const bool forceParagraphIndents,
                               const uint8_t paragraphAlignment, const uint16_t viewportWidth,
                               const uint16_t viewportHeight, const bool hyphenationEnabled, const bool embeddedStyle,
                               const uint8_t imageRendering, const bool bionicReadingEnabled,
@@ -296,7 +307,7 @@ bool Section::tryLoadFromPath(const std::string& path, const int fontId, const f
     int fileFontId;
     uint16_t fileViewportWidth, fileViewportHeight;
     float fileLineCompression;
-    bool fileExtraParagraphSpacing;
+    uint8_t fileExtraParagraphSpacing;
     bool fileForceParagraphIndents;
     uint8_t fileParagraphAlignment;
     bool fileHyphenationEnabled;
@@ -409,6 +420,9 @@ bool Section::tryLoadFromPath(const std::string& path, const int fontId, const f
   glyphAtlasOffset_ = 0;
   glyphAtlasSize_ = 0;
   glyphAtlasCpfontHash_ = 0;
+  glyphAtlasAltOffset_ = 0;
+  glyphAtlasAltSize_ = 0;
+  glyphAtlasAltCpfontHash_ = 0;
   if (fileVersion_ >= 39) {
     if (!file.seek(HEADER_SIZE_V38)) {
       file.close();
@@ -433,6 +447,20 @@ bool Section::tryLoadFromPath(const std::string& path, const int fontId, const f
         !serialization::tryReadPod(file, glyphAtlasCpfontHash_)) {
       file.close();
       LOG_ERR("SCT", "Deserialization failed: truncated v40 glyph-atlas trailer (%s)", path.c_str());
+      return false;
+    }
+  }
+  if (fileVersion_ >= 41) {
+    // v41 alternate atlas trailer sits immediately after the v40 trailer.
+    // Same offset-progression pattern: file position advanced by the v40
+    // reads, no seek needed. v40 files don't have these bytes, so we
+    // leave the alt fields at 0 and the install path falls through to
+    // the single (v40) atlas slot.
+    if (!serialization::tryReadPod(file, glyphAtlasAltOffset_) ||
+        !serialization::tryReadPod(file, glyphAtlasAltSize_) ||
+        !serialization::tryReadPod(file, glyphAtlasAltCpfontHash_)) {
+      file.close();
+      LOG_ERR("SCT", "Deserialization failed: truncated v41 glyph-atlas-alt trailer (%s)", path.c_str());
       return false;
     }
   }
@@ -464,7 +492,7 @@ bool Section::clearCache() const {
   return true;
 }
 
-bool Section::createSectionFile(const int fontId, const float lineCompression, const bool extraParagraphSpacing,
+bool Section::createSectionFile(const int fontId, const float lineCompression, const uint8_t extraParagraphSpacing,
                                 const bool forceParagraphIndents, const uint8_t paragraphAlignment,
                                 const uint16_t viewportWidth, const uint16_t viewportHeight,
                                 const bool hyphenationEnabled, const bool embeddedStyle, const uint8_t imageRendering,
@@ -740,15 +768,18 @@ std::unique_ptr<Page> Section::loadPageFromSectionFile() {
   // hard reboot. 25 KB threshold covers a typical 150-300 word page
   // with overhead headroom; the original crash had maxAlloc well below
   // this floor.
-  // CrumBLE: page-load floor lowered to 8 KB. Empirical measurements show
-  // typical page peak contiguous allocation = 5-8 KB. The previous 25 KB
-  // floor was over-budgeted, refusing loads under BT pressure that would
-  // have succeeded. v3.7.3 (no floor) worked because most pages load
-  // cleanly; we keep a small floor to catch the truly degenerate cases
-  // before they bad_alloc terminate the device. Heavy pages (long words,
-  // many style switches) that peak above 8 KB will refuse rather than
-  // crash -- user sees "Page load error" and can disconnect BT to read.
-  constexpr uint32_t PAGE_LOAD_MIN_MAX_ALLOC = 8000;
+  // CrumBLE 4.4 post-bisect: page-load floor lowered to 1.5 KB.
+  // TextBlock::deserialize now allocates ONE compact data block per
+  // TextBlock (~100-500 bytes each) instead of the old per-vector
+  // pattern (which peaked at 5-8 KB contiguous). Empirically the new
+  // pattern succeeds even at MaxAlloc=2036 bytes under post-BT pressure
+  // (validated across 5 page-turns in the Option I test). The 8 KB
+  // floor was set for the old peak and now refuses loads that would
+  // actually succeed; with 2-bit atlas + post-BT pressure, MaxAlloc
+  // typically lands at ~5-7 KB which was below the legacy gate. Floor
+  // stays at 1500 to catch truly degenerate cases (largest single
+  // TextBlock compact block) before they bad_alloc.
+  constexpr uint32_t PAGE_LOAD_MIN_MAX_ALLOC = 1500;
 
   // CrumBLE 4.3 option 3: opportunistic re-acquire of the reserve when it
   // was released earlier (BT enable path, or a prior page load that didn't
@@ -1296,7 +1327,7 @@ const EpdFontData* Section::embeddedFontDataForStyle(uint8_t styleId) const {
 // The GlyphEntry::bitmapOffset values are byte offsets into the shared
 // payload that comes last; this loader reads them in order and resolves
 // pointers when callers ask for them via glyphAtlasBitmapPtr().
-bool Section::tryInstallGlyphAtlas(uint32_t cpfontContentHash) {
+bool Section::tryInstallGlyphAtlas(uint32_t cpfontContentHash, bool preferLowBitDepth) {
   // Clear any prior install state -- both successful (re-install) and
   // failed (partial) paths.
   glyphAtlasInstalled_ = false;
@@ -1311,23 +1342,46 @@ bool Section::tryInstallGlyphAtlas(uint32_t cpfontContentHash) {
   std::vector<uint8_t>().swap(glyphAtlasBitmap_);
   glyphAtlasBitDepth_ = 0;
 
-  if (!hasGlyphAtlas()) return false;
-  if (glyphAtlasCpfontHash_ != cpfontContentHash) {
+  // CrumBLE 4.4 v41: dual-slot atlas selection. Primary slot is the
+  // BT-friendly bake (1-bit on v41; can be either depth on legacy v40);
+  // alt slot is the BT-cold upgrade (2-bit on v41 ≥16pt bakes; empty
+  // otherwise). preferLowBitDepth comes from the caller's BT-enabled
+  // check -- when true we install primary; when false (BT cold) we
+  // prefer alt and fall through to primary if alt is empty.
+  uint32_t chosenOffset = 0;
+  uint32_t chosenSize = 0;
+  uint32_t chosenHash = 0;
+  const char* chosenLabel = "(none)";
+  if (!preferLowBitDepth && hasGlyphAtlasAlt()) {
+    chosenOffset = glyphAtlasAltOffset_;
+    chosenSize = glyphAtlasAltSize_;
+    chosenHash = glyphAtlasAltCpfontHash_;
+    chosenLabel = "alt (2-bit, BT-cold)";
+  } else if (hasGlyphAtlas()) {
+    chosenOffset = glyphAtlasOffset_;
+    chosenSize = glyphAtlasSize_;
+    chosenHash = glyphAtlasCpfontHash_;
+    chosenLabel = preferLowBitDepth ? "primary (BT-enabled)" : "primary (no alt available)";
+  } else {
+    return false;
+  }
+  if (chosenHash != cpfontContentHash) {
     LOG_INF("SCT",
-            "Glyph atlas hash mismatch: section baked against 0x%08x, loaded SD font is 0x%08x -- "
+            "Glyph atlas hash mismatch on %s slot: section baked against 0x%08x, loaded SD font is 0x%08x -- "
             "falling back to v39 subset / miss-handler",
-            glyphAtlasCpfontHash_, cpfontContentHash);
+            chosenLabel, chosenHash, cpfontContentHash);
     return false;
   }
   if (!Storage.openFileForRead("SCT", activeFilePath, file)) {
     LOG_ERR("SCT", "Glyph atlas install: cannot open %s for read", activeFilePath.c_str());
     return false;
   }
-  if (!file.seek(glyphAtlasOffset_)) {
-    LOG_ERR("SCT", "Glyph atlas install: seek to offset %u failed", glyphAtlasOffset_);
+  if (!file.seek(chosenOffset)) {
+    LOG_ERR("SCT", "Glyph atlas install: seek to %s offset %u failed", chosenLabel, chosenOffset);
     file.close();
     return false;
   }
+  (void)chosenSize;  // currently unused -- size validation lives inside BlockHeader read
 
   glyphatlas::BlockHeader hdr{};
   static_assert(sizeof(hdr) == 12, "GlyphAtlas BlockHeader size drift");

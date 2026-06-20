@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include <HalStorage.h>  // CrumBLE 4.4 task #51: HalFile persistentGlyphFile_
+
 #include "EpdFont.h"
 #include "EpdFontData.h"
 
@@ -227,6 +229,18 @@ class SdCardFont {
   uint8_t styleCount_ = 0;
 
   char filePath_[128] = {};
+
+  // CrumBLE 4.4 task #51: persistent file handle for SdCardFont::onGlyphMiss.
+  // Without this, every glyph miss opens the .cpfont fresh via
+  // Storage.openFileForRead -> make_unique<HalFile::Impl> which allocates
+  // ~12 bytes + FsFile state. Under post-NimBLE heap pressure (MaxAlloc
+  // 500-2000 bytes after BT connect, lower on memory-tight books) that
+  // allocation fails -> bad_alloc -> __terminate -> panic-reboot. The
+  // handle is opened during load() while the heap is healthy and reused
+  // for every glyph miss; onGlyphMiss does only seek + read on it
+  // (no allocations). If the load-time open fails, onGlyphMiss falls
+  // back to the original per-call open path.
+  HalFile persistentGlyphFile_;
 
   // Overflow context: glyphMissHandler needs to know which style it's serving
   struct OverflowContext {

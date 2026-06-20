@@ -10,6 +10,7 @@
 #include <HalGPIO.h>
 #include <HalPowerManager.h>
 #include <HalStorage.h>
+#include <HalSpiBus.h>
 #include <HalSystem.h>
 #include <HalTiltSensor.h>
 #include <I18n.h>
@@ -64,8 +65,10 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
 #include <cstring>
 
 #include "AppVersion.h"
+#include "CoverThumbStatus.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
+#include "SilentRestart.h"  // CrumBLE 4.4: ReaderPostBootAction enum + decls
 #include "GlobalActions.h"
 #include "KOReaderCredentialStore.h"
 #include "MappedInputManager.h"
@@ -78,6 +81,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
 #include "SdCardFontSystem.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
+#include "activities/RenderLock.h"
 #include "activities/boot_sleep/SleepActivity.h"
 #include "activities/reader/KOReaderSyncActivity.h"
 #include "activities/settings/KOReaderSettingsActivity.h"
@@ -414,6 +418,14 @@ RTC_NOINIT_ATTR uint32_t silentRebootTarget;
 // straight to onNetworkModeSelected(<saved>). 0 = no hint, fall through
 // to the normal mode-picker. 1 = JOIN_NETWORK, 2 = CREATE_HOTSPOT.
 RTC_NOINIT_ATTR uint32_t silentRebootFtModeHint;
+// CrumBLE 4.4 post-bisect: post-boot action queued by silentRestartToReaderWithAction.
+// Holds a ReaderPostBootAction value (cast to uint32_t).
+RTC_NOINIT_ATTR uint32_t silentRebootReaderPostAction;
+// CrumBLE 4.4 post-bisect: target spine for ResumeAtSpine post-boot action.
+RTC_NOINIT_ATTR uint32_t silentRebootTargetSpine;
+// CrumBLE 4.4 post-bisect: word string for OpenDefinition action. 63
+// chars + null is enough for any single dictionary lookup word.
+RTC_NOINIT_ATTR char silentRebootDefinitionWord[64];
 constexpr uint32_t SILENT_REBOOT_MAGIC = 0xC1EAB007;
 constexpr uint32_t SILENT_REBOOT_TARGET_HOME = 0;
 constexpr uint32_t SILENT_REBOOT_TARGET_READER = 1;
@@ -483,15 +495,143 @@ uint32_t consumeSilentRebootFtModeHint() {
   return v;
 }
 
+// Forward declaration: the silent-restart functions below snapshot the
+// framebuffer to SD via this helper (defined later alongside loadSleepFrameBuffer).
+static void saveSleepFrameBuffer();
+
+// Hold RenderLock + the recursive SPI bus mutex across the multi-step SD save.
+// RenderLock ensures the render task isn't mid-render (so the framebuffer is in
+// a consistent post-paint state, not a partially-drawn intermediate); HalSpiBus::Lock
+// ensures the SD bus operations aren't interleaved with any in-flight display SPI
+// activity. saveSleepFrameBuffer internally calls openFileForWrite + write + close,
+// each of which acquires StorageLock (StorageLock takes HalSpiBus::Lock + storageMutex
+// recursively, no deadlock).
+//
+// Lock order: RenderLock first, then HalSpiBus::Lock. The render task's display path
+// already takes RenderLock before HalSpiBus::Lock, so this ordering avoids deadlock.
+//
+// CrumBLE 4.4 post-bisect: without RenderLock, snapshots taken during the render
+// task's render() showed up at boot as half-painted frames, producing a visible
+// "full black/white flash before the small flash" instead of the QuickResume-style
+// smooth restore.
+static void snapshotFrameBufferForSilentRestart() {
+  RenderLock renderLock;
+  HalSpiBus::Lock spiLock;
+  saveSleepFrameBuffer();
+}
+
 void silentRestartToReader() {
   if (deepSleepInProgress) return;  // sleeping supersedes the heap-defrag reboot
   silentRebootTarget = SILENT_REBOOT_TARGET_READER;
+  silentRebootReaderPostAction = static_cast<uint32_t>(ReaderPostBootAction::None);
   silentRebootMagic = SILENT_REBOOT_MAGIC;
   LOG_DBG("MAIN", "Silent restart (target=reader)");
   GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+  snapshotFrameBufferForSilentRestart();
   delay(50);
   ESP.restart();
 }
+
+// CrumBLE 4.4 post-bisect: post-boot action snapshot. setup() pulls this
+// from the RTC slot at boot, then EpubReaderActivity consumes it via
+// consumeReaderPostBootAction() on its first loop tick.
+static ReaderPostBootAction g_pendingReaderPostBootAction = ReaderPostBootAction::None;
+// Resume-at-spine target captured at boot (paired with ReaderPostBootAction::ResumeAtSpine).
+static int g_pendingResumeSpine = -1;
+// Process-lifetime flag indicating the current boot resumed from a silent
+// restart. Lets activities skip cold-boot ceremony (e.g. the e-ink panel
+// is still holding the pre-restart popup; don't repaint over it).
+static bool g_continuingFromSilentReboot = false;
+
+void silentRestartToReaderWithAction(ReaderPostBootAction action) {
+  if (deepSleepInProgress) return;
+  silentRebootTarget = SILENT_REBOOT_TARGET_READER;
+  silentRebootReaderPostAction = static_cast<uint32_t>(action);
+  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  LOG_INF("MAIN", "Silent restart (target=reader, postAction=%u)", static_cast<unsigned>(action));
+  snapshotFrameBufferForSilentRestart();
+  delay(50);
+  ESP.restart();
+}
+
+// CrumBLE 4.4 post-bisect: OpenDefinition variant -- carries the word
+// string across the reboot so the post-boot dispatch can land the user
+// directly on the definition for the word they just tapped, rather than
+// merely re-opening the word-select activity.
+void silentRestartToReaderWithDefinition(const char* word) {
+  if (deepSleepInProgress) return;
+  silentRebootTarget = SILENT_REBOOT_TARGET_READER;
+  silentRebootReaderPostAction = static_cast<uint32_t>(ReaderPostBootAction::OpenDefinition);
+  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  // Copy word into the fixed-size RTC slot, truncating if necessary.
+  if (word) {
+    strncpy(silentRebootDefinitionWord, word, sizeof(silentRebootDefinitionWord) - 1);
+    silentRebootDefinitionWord[sizeof(silentRebootDefinitionWord) - 1] = '\0';
+  } else {
+    silentRebootDefinitionWord[0] = '\0';
+  }
+  LOG_INF("MAIN", "Silent restart (target=reader, OpenDefinition='%s')", silentRebootDefinitionWord);
+  snapshotFrameBufferForSilentRestart();
+  delay(50);
+  ESP.restart();
+}
+
+void silentRestartToReaderWithCursorWord(const char* word) {
+  if (deepSleepInProgress) return;
+  silentRebootTarget = SILENT_REBOOT_TARGET_READER;
+  silentRebootReaderPostAction = static_cast<uint32_t>(ReaderPostBootAction::OpenLookupAtWord);
+  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  if (word) {
+    strncpy(silentRebootDefinitionWord, word, sizeof(silentRebootDefinitionWord) - 1);
+    silentRebootDefinitionWord[sizeof(silentRebootDefinitionWord) - 1] = '\0';
+  } else {
+    silentRebootDefinitionWord[0] = '\0';
+  }
+  LOG_INF("MAIN", "Silent restart (target=reader, OpenLookupAtWord='%s')", silentRebootDefinitionWord);
+  snapshotFrameBufferForSilentRestart();
+  delay(50);
+  ESP.restart();
+}
+
+void silentRestartToReaderResumingAtSpine(int targetSpine) {
+  if (deepSleepInProgress) return;
+  silentRebootTarget = SILENT_REBOOT_TARGET_READER;
+  silentRebootReaderPostAction = static_cast<uint32_t>(ReaderPostBootAction::ResumeAtSpine);
+  silentRebootTargetSpine = static_cast<uint32_t>(targetSpine < 0 ? 0 : targetSpine) & 0xFFFF;
+  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  LOG_INF("MAIN", "Silent restart (target=reader, ResumeAtSpine=%d)", targetSpine);
+  snapshotFrameBufferForSilentRestart();
+  delay(50);
+  ESP.restart();
+}
+
+ReaderPostBootAction consumeReaderPostBootAction() {
+  const ReaderPostBootAction v = g_pendingReaderPostBootAction;
+  g_pendingReaderPostBootAction = ReaderPostBootAction::None;
+  return v;
+}
+
+int consumePendingResumeSpine() {
+  const int v = g_pendingResumeSpine;
+  g_pendingResumeSpine = -1;
+  return v;
+}
+
+// CrumBLE 4.4 post-bisect: read-and-clear the queued definition word.
+// The post-boot dispatcher calls this once and passes the string to the
+// DictionaryDefinitionActivity. Returns a pointer to a static buffer
+// (lives for the life of the process); nullptr if no word was queued.
+static char g_pendingDefinitionWordBuf[64] = {0};
+const char* consumePendingDefinitionWord() {
+  if (silentRebootDefinitionWord[0] == '\0') return nullptr;
+  std::strncpy(g_pendingDefinitionWordBuf, silentRebootDefinitionWord, sizeof(g_pendingDefinitionWordBuf) - 1);
+  g_pendingDefinitionWordBuf[sizeof(g_pendingDefinitionWordBuf) - 1] = '\0';
+  silentRebootDefinitionWord[0] = '\0';
+  return g_pendingDefinitionWordBuf;
+}
+
+bool isContinuingFromSilentReboot() { return g_continuingFromSilentReboot; }
+void clearSilentRebootContinuationFlag() { g_continuingFromSilentReboot = false; }
 
 void waitForPowerRelease() {
   gpio.update();
@@ -1006,9 +1146,33 @@ void setup() {
   // garbage or stale state from a different silent-reboot target).
   g_pendingFtModeHintSnapshot =
       (isSilentReboot && snapshotTarget == SILENT_REBOOT_TARGET_FILE_TRANSFER) ? silentRebootFtModeHint : 0;
+
+  // CrumBLE 4.4 post-bisect: snapshot the reader post-boot action and
+  // resume-spine target before clearing RTC. Both honoured only when this
+  // boot is a confirmed silent reboot whose target is the reader.
+  g_continuingFromSilentReboot = isSilentReboot;
+  if (isSilentReboot && snapshotTarget == SILENT_REBOOT_TARGET_READER) {
+    const uint32_t raw = silentRebootReaderPostAction;
+    if (raw <= static_cast<uint32_t>(ReaderPostBootAction::OpenKoSync)) {
+      g_pendingReaderPostBootAction = static_cast<ReaderPostBootAction>(raw);
+    } else {
+      g_pendingReaderPostBootAction = ReaderPostBootAction::None;
+    }
+    if (g_pendingReaderPostBootAction == ReaderPostBootAction::ResumeAtSpine) {
+      g_pendingResumeSpine = static_cast<int>(silentRebootTargetSpine & 0xFFFF);
+    }
+    if (g_pendingReaderPostBootAction == ReaderPostBootAction::OpenDefinition ||
+        g_pendingReaderPostBootAction == ReaderPostBootAction::OpenLookupAtWord) {
+      // Validate the word slot is null-terminated within bounds.
+      silentRebootDefinitionWord[sizeof(silentRebootDefinitionWord) - 1] = '\0';
+    }
+  }
+
   silentRebootMagic = 0;
   silentRebootTarget = 0;
   silentRebootFtModeHint = 0;
+  silentRebootReaderPostAction = 0;
+  silentRebootTargetSpine = 0;
 
   gpio.begin();
   powerManager.begin();
@@ -1086,6 +1250,24 @@ void setup() {
 #endif
   if (fontFamilyClamped) SETTINGS.saveToFile();
   APP_STATE.loadFromFile();
+
+  // CrumBLE 4.4: post-firmware-update cover-thumb retry. The 4.4 EOCD scan
+  // bump (1KB -> 4KB) lets the bookshelf decode covers from re-packaged
+  // EPUBs (Anna's Archive etc.) that previously failed. Anyone who hit
+  // that bug under earlier firmware now has thumb_failed_v3_*.marker
+  // files poisoning every cover-gen retry; sweep them once per version
+  // change so the fix actually takes effect without manual intervention.
+  // Manual lever lives at Settings > System > Retry Failed Covers for
+  // ad-hoc re-attempts (e.g. user freed heap, replaced a book file).
+  if (APP_STATE.lastCrumbleVersion != CRUMBLE_VERSION) {
+    const int swept = CoverThumbStatus::sweepAllMarkers();
+    LOG_INF("BOOT", "Firmware version changed (%s -> %s); swept %d cover-failed marker(s)",
+            APP_STATE.lastCrumbleVersion.empty() ? "<none>" : APP_STATE.lastCrumbleVersion.c_str(),
+            CRUMBLE_VERSION, swept);
+    APP_STATE.lastCrumbleVersion = CRUMBLE_VERSION;
+    APP_STATE.saveToFile();
+  }
+
   RECENT_BOOKS.loadFromFile();
   I18N.setLanguage(static_cast<Language>(SETTINGS.language));
   KOREADER_STORE.loadFromFile();
@@ -1203,8 +1385,20 @@ void setup() {
 
   switch (resume) {
     case BootResume::Silent:
-      // Splash skipped: the routing block below picks the target activity; the
-      // panel keeps showing the pre-reboot popup until that first paint lands.
+      // CrumBLE 4.4 post-bisect: paint the saved pre-restart framebuffer via
+      // HALF refresh, mirroring the QuickResume sleep/wake pattern. The boot
+      // HALF cycle is physically unavoidable (SDK power-init is bundled with
+      // HALF for the first paint after begin()), so landing on the user's
+      // previous content during that cycle turns a "cold-boot black/white
+      // flash" into a "quick-resume flash" -- same technical refresh, very
+      // different perceived UX. The activity's first render then FAST-refreshes
+      // to the new content via ReaderUtils::displayWithRefreshCycle's
+      // isContinuingFromSilentReboot branch. Falls through gracefully if the
+      // snapshot is missing (first boot after this change, SD error, prior
+      // restart's snapshot path didn't run).
+      if (loadSleepFrameBuffer()) {
+        renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+      }
       break;
     case BootResume::QuickResume:
       // One-shot flag: re-arm the splash for the next non-quick-resume boot. Save
@@ -1364,6 +1558,20 @@ void loop() {
   // frees the heap back up, so a low-heap setting change isn't silently lost.
   SETTINGS.retryDeferredSaveIfNeeded();
 
+  // CrumBLE 4.4 post-bisect: one-shot auto-reconnect on early supervision-
+  // timeout drop (HCI reason 520). The post-connect render's e-ink refresh
+  // races the BLE event handler; if the link drops within ~3-10s of connect
+  // and we haven't auto-retried this cycle, fire one silent re-connect
+  // before going to the alert path. Spares the user a manual reconnect for
+  // the common race-condition case.
+  if (btMgr.takeAutoReconnectRequest() && btMgr.isEnabled()) {
+    if (SETTINGS.bleBondedDeviceAddr[0] != '\0') {
+      LOG_INF("MAIN", "BT auto-reconnect: re-attempting connect to %s after early drop",
+              SETTINGS.bleBondedDeviceAddr);
+      btMgr.connectToDevice(SETTINGS.bleBondedDeviceAddr);
+    }
+  }
+
   // CrumBLE: a Bluetooth link that dropped on its own seconds after connecting
   // is almost always heap starvation -- the connect spike craters free heap and
   // the controller times the link out (HCI 0x08). Surface a clear message
@@ -1378,6 +1586,7 @@ void loop() {
   const bool bleRecentActivity = btMgr.hasRecentActivity();
 
   renderer.setFadingFix(SETTINGS.fadingFix);
+  renderer.setTextDarkness(SETTINGS.textDarkness);
 
   if (Serial && millis() - lastMemPrint >= 10000) {
     LOG_INF("MEM", "Free: %d bytes, Total: %d bytes, Min Free: %d bytes, MaxAlloc: %d bytes", ESP.getFreeHeap(),

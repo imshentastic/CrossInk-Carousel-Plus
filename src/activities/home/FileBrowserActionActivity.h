@@ -110,6 +110,10 @@ enum class FileBrowserAction : int {
   // verify what their saved layout actually looks like without restoring
   // it.
   ViewOptimizedDetails = 25,
+  // CrumBLE 4.4 (ported from CrossInk v1.3.3): deletes just this book's
+  // stats.bin via BookReadingStats::remove(). Surfaced from the file
+  // browser's long-press menu when an EPUB is selected.
+  DeleteStats = 26,
 };
 
 class FileBrowserActionActivity final : public Activity {

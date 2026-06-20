@@ -18,6 +18,12 @@ class CrossPointState {
   uint8_t readerActivityLoadCount = 0;
   bool lastSleepFromReader = false;
   bool showBootScreen = true;
+  // CrumBLE 4.4: last firmware version that ran on this device. Compared
+  // against CRUMBLE_VERSION at boot so we can run one-shot post-update
+  // tasks (currently: sweep thumb_failed_v3_*.marker files so users whose
+  // cover gen failed under an earlier-firmware bug -- e.g. the EOCD scan
+  // window bump -- get their covers back automatically).
+  std::string lastCrumbleVersion;
 
   // Returns true if idx was shown within the last checkCount picks.
   // Walks backwards from the most recently written slot.

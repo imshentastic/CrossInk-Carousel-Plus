@@ -24,13 +24,38 @@ constexpr int MAX_RECENT_BOOKS = 18;
 
 RecentBooksStore RecentBooksStore::instance;
 
+std::string normalizeAuthorMeta(std::string s) {
+  // EPUBs commonly leave dangling ";" or ", ;" in the author field (an
+  // OPF separator with no value after it). Strip both ends of any
+  // whitespace + separator runs so consumers can treat a "Foo Bar;" the
+  // same as "Foo Bar" and an empty-after-strip result the same as a real
+  // empty author.
+  while (!s.empty()) {
+    const char c = s.back();
+    if (c == ' ' || c == '\t' || c == ';' || c == ',' || c == '\r' || c == '\n') {
+      s.pop_back();
+    } else {
+      break;
+    }
+  }
+  size_t i = 0;
+  while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == ';' || s[i] == '\r' || s[i] == '\n')) ++i;
+  if (i > 0) s.erase(0, i);
+  return s;
+}
+
 void RecentBooksStore::addBook(const std::string& path, const std::string& title, const std::string& author,
                                const std::string& coverBmpPath) {
   addOrUpdateBook(path, title, author, coverBmpPath);
 }
 
-void RecentBooksStore::addOrUpdateBook(const std::string& path, const std::string& title, const std::string& author,
+void RecentBooksStore::addOrUpdateBook(const std::string& path, const std::string& title, const std::string& rawAuthor,
                                        const std::string& coverBmpPath) {
+  // CrumBLE 4.4: normalize the author once at the storage boundary so
+  // every downstream display site (Lyra carousel, Minimal theme, file
+  // browser long-press subtitle, etc.) reads a clean string without
+  // each having to re-strip the EPUB-leftover ";".
+  const std::string author = normalizeAuthorMeta(rawAuthor);
   // Drop stale entries first so a new add can't evict a valid book in their stead.
   pruneMissing();
 
@@ -55,7 +80,7 @@ void RecentBooksStore::addOrUpdateBook(const std::string& path, const std::strin
   saveToFile();
 }
 
-bool RecentBooksStore::updateBook(const std::string& path, const std::string& title, const std::string& author,
+bool RecentBooksStore::updateBook(const std::string& path, const std::string& title, const std::string& rawAuthor,
                                   const std::string& coverBmpPath) {
   auto it =
       std::find_if(recentBooks.begin(), recentBooks.end(), [&](const RecentBook& book) { return book.path == path; });
@@ -64,7 +89,7 @@ bool RecentBooksStore::updateBook(const std::string& path, const std::string& ti
   }
   RecentBook& book = *it;
   book.title = title;
-  book.author = author;
+  book.author = normalizeAuthorMeta(rawAuthor);
   book.coverBmpPath = coverBmpPath;
   saveToFile();
   return true;
@@ -136,12 +161,12 @@ RecentBook RecentBooksStore::getDataFromBook(std::string path) const {
   if (FsHelpers::hasEpubExtension(lastBookFileName)) {
     Epub epub(path, "/.crosspoint");
     epub.load(false, true);
-    return RecentBook{path, epub.getTitle(), epub.getAuthor(), epub.getThumbBmpPath()};
+    return RecentBook{path, epub.getTitle(), normalizeAuthorMeta(epub.getAuthor()), epub.getThumbBmpPath()};
   } else if (FsHelpers::hasXtcExtension(lastBookFileName)) {
     // Handle XTC file
     Xtc xtc(path, "/.crosspoint");
     if (xtc.load()) {
-      return RecentBook{path, xtc.getTitle(), xtc.getAuthor(), xtc.getThumbBmpPath()};
+      return RecentBook{path, xtc.getTitle(), normalizeAuthorMeta(xtc.getAuthor()), xtc.getThumbBmpPath()};
     }
   } else if (FsHelpers::hasTxtExtension(lastBookFileName) || FsHelpers::hasMarkdownExtension(lastBookFileName)) {
     return RecentBook{path, lastBookFileName, "", ""};

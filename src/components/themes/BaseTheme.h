@@ -1,5 +1,7 @@
 #pragma once
 
+#include <HalDisplay.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -189,13 +191,14 @@ class BaseTheme {
 
   // Component drawing methods
   void drawProgressBar(const GfxRenderer& renderer, Rect rect, size_t current, size_t total) const;
-  void drawBatteryLeft(const GfxRenderer& renderer, Rect rect,
-                       bool showPercentage = true) const;  // Left aligned (reader mode)
+  void drawBatteryLeft(const GfxRenderer& renderer, Rect rect, bool showPercentage = true,
+                       bool foregroundBlack = true) const;  // Left aligned (reader mode)
   void drawBatteryRight(const GfxRenderer& renderer, Rect rect,
                         bool showPercentage = true) const;  // Right aligned (UI headers)
-  virtual void fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage) const;
+  virtual void fillBatteryIcon(const GfxRenderer& renderer, Rect rect, uint16_t percentage,
+                               bool foregroundBlack = true) const;
   virtual void drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
-                               const char* btn4, bool allowInvertedText = false) const;
+                               const char* btn4, bool allowInvertedText = false, bool darkMode = false) const;
   virtual void drawSideButtonHints(const GfxRenderer& renderer, const char* topBtn, const char* bottomBtn) const;
   virtual void drawList(const GfxRenderer& renderer, Rect rect, int itemCount, int selectedIndex,
                         const std::function<std::string(int index)>& rowTitle,
@@ -232,11 +235,15 @@ class BaseTheme {
   // the trailing dots appear/disappear to its right without shifting
   // the word itself.
   virtual Rect drawPopup(const GfxRenderer& renderer, const char* message, int minTextWidth = 0,
-                         bool leftAlignText = false) const;
+                         bool leftAlignText = false,
+                         HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
   virtual void fillPopupProgress(const GfxRenderer& renderer, const Rect& layout, const int progress) const;
+  // CrumBLE 4.4: darkMode flips foreground to white and background to black
+  // (for the reader's dark mode); default false matches all prior callers.
   virtual void drawStatusBar(GfxRenderer& renderer, const float bookProgress, const int currentPage,
                              const int pageCount, std::string title, const int paddingBottom = 0,
-                             const int textYOffset = 0, const bool isPageBookmarked = false) const;
+                             const int textYOffset = 0, const bool isPageBookmarked = false,
+                             const bool darkMode = false) const;
   virtual void drawHelpText(const GfxRenderer& renderer, Rect rect, const char* label) const;
   virtual void drawTextField(const GfxRenderer& renderer, Rect rect, const int textWidth, bool cursorMode = false,
                              int contentStartX = 0, int contentWidth = 0) const;
@@ -251,8 +258,9 @@ class BaseTheme {
 
   // Shared constants and helpers for battery drawing (used by all themes)
   static constexpr int batteryPercentSpacing = 4;
-  static void drawBatteryOutline(const GfxRenderer& renderer, int x, int y, int battWidth, int rectHeight);
-  static void drawBatteryLightningBolt(const GfxRenderer& renderer, int boltX, int boltY);
+  static void drawBatteryOutline(const GfxRenderer& renderer, int x, int y, int battWidth, int rectHeight,
+                                 bool foregroundBlack = true);
+  static void drawBatteryLightningBolt(const GfxRenderer& renderer, int boltX, int boltY, bool boltInk = false);
 
   // CrumBLE: status-bar BT icon removed -- the always-dotted variant misled
   // users when the remote disconnected, and the state-tracking variant

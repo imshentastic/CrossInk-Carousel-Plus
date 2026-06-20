@@ -146,6 +146,11 @@ void SdCardFont::freeAll() {
   styleCount_ = 0;
   contentHash_ = 0;
   loaded_ = false;
+  // CrumBLE 4.4 task #51: release the persistent glyph file handle on
+  // unload. Re-opened on the next load().
+  if (persistentGlyphFile_.isOpen()) {
+    persistentGlyphFile_.close();
+  }
 }
 
 void SdCardFont::clearOverflow() {
@@ -623,6 +628,36 @@ bool SdCardFont::load(const char* path) {
   }
 
   loaded_ = true;
+
+  // CrumBLE 4.4 task #51: open the persistent glyph-miss file handle
+  // NOW while the heap is still healthy. onGlyphMiss() reuses this
+  // handle (seek + read, no allocation) instead of opening the file
+  // fresh on every miss. Pre-NimBLE heap is comfortable, so the open
+  // will succeed; under post-NimBLE pressure where the per-call open
+  // would fail, this handle is already open and the seek/read
+  // succeeds. If this open fails for some reason, persistentGlyphFile_
+  // stays closed and onGlyphMiss falls back to its original per-call
+  // open path -- graceful degradation, no behavior change vs old.
+  if (!Storage.openFileForRead("SDCF", filePath_, persistentGlyphFile_)) {
+    LOG_ERR("SDCF", "Failed to pre-open persistent glyph file; "
+                    "onGlyphMiss will fall back to per-call open path");
+  }
+
+  // CrumBLE 4.4 task #51: also eagerly load each style's full intervals
+  // table NOW so onGlyphMiss never triggers the lazy
+  // ensureStyleIntervalsLoaded path -- that path opens the file AND
+  // allocates `new EpdUnicodeInterval[intervalCount]`, both of which
+  // fail under post-NimBLE heap pressure. Doing it here costs maybe a
+  // few KB of resident memory per book but happens against a healthy
+  // boot heap. The lazy entry point still exists for other callers
+  // (e.g. prebake tools) and as a fallback if this eager load fails.
+  for (uint8_t i = 0; i < MAX_STYLES; i++) {
+    if (!styles_[i].present) continue;
+    if (!ensureStyleIntervalsLoaded(i)) {
+      LOG_ERR("SDCF", "Failed to pre-load intervals for style %u; "
+                      "onGlyphMiss will retry the lazy load (may fail on tight heap)", i);
+    }
+  }
 
   LOG_DBG("SDCF", "Loaded: %s (v%u, %u styles)", path, CPFONT_VERSION, styleCount_);
   for (uint8_t i = 0; i < MAX_STYLES; i++) {
@@ -1340,18 +1375,34 @@ const EpdGlyph* SdCardFont::onGlyphMiss(void* ctx, uint32_t codepoint) {
   uint32_t slot = self->overflowNext_;
   bool wasAtCapacity = (self->overflowCount_ == OVERFLOW_CAPACITY);
 
-  // Read glyph metadata into temporary
-  FsFile file;
-  if (!Storage.openFileForRead("SDCF", self->filePath_, file)) {
-    LOG_ERR("SDCF", "Overflow: failed to open .cpfont");
-    return nullptr;
+  // CrumBLE 4.4 task #51: use the persistent file handle when
+  // available. The per-call Storage.openFileForRead path allocates
+  // ~12 bytes for HalFile::Impl and crashes under post-NimBLE heap
+  // pressure. The persistent handle was opened during load() while
+  // the heap was healthy; here we just seek and read on it. Fallback
+  // to the per-call open path if the persistent handle isn't open
+  // (load-time pre-open failed -- graceful degradation).
+  FsFile fallbackFile;
+  HalFile* fileRef = nullptr;
+  if (self->persistentGlyphFile_.isOpen()) {
+    fileRef = &self->persistentGlyphFile_;
+  } else {
+    if (!Storage.openFileForRead("SDCF", self->filePath_, fallbackFile)) {
+      LOG_ERR("SDCF", "Overflow: failed to open .cpfont");
+      return nullptr;
+    }
+    fileRef = &fallbackFile;
   }
+  HalFile& file = *fileRef;
 
   EpdGlyph tempGlyph = {};
   uint32_t glyphFileOff = s.glyphsFileOffset + static_cast<uint32_t>(globalIdx) * sizeof(EpdGlyph);
   if (!file.seekSet(glyphFileOff)) {
     LOG_ERR("SDCF", "Overflow: failed to seek to glyph for U+%04X style %u", codepoint, styleIdx);
-    file.close();
+    // Do NOT close on seek failure -- file is still valid, only the
+    // seek failed. Closing would force every future miss back to the
+    // per-call open path, defeating the fix. fallbackFile (if used)
+    // closes itself on scope exit.
     return nullptr;
   }
   if (file.read(reinterpret_cast<uint8_t*>(&tempGlyph), sizeof(EpdGlyph)) != sizeof(EpdGlyph)) {
@@ -1370,7 +1421,9 @@ const EpdGlyph* SdCardFont::onGlyphMiss(void* ctx, uint32_t codepoint) {
     if (!file.seekSet(s.bitmapFileOffset + tempGlyph.dataOffset)) {
       LOG_ERR("SDCF", "Overflow: failed to seek to bitmap for U+%04X", codepoint);
       delete[] tempBitmap;
-      file.close();
+      // CrumBLE 4.4 task #51: do NOT close the persistent handle on a
+      // bad seek -- the file is still valid. Closing would force every
+      // subsequent miss back to the per-call open path.
       return nullptr;
     }
     if (file.read(tempBitmap, tempGlyph.dataLength) != static_cast<int>(tempGlyph.dataLength)) {

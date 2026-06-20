@@ -297,6 +297,36 @@
       margin-left: 6px;
       vertical-align: middle;
       letter-spacing: 0.02em;
+      /* CrumBLE 4.4: pointer cursor signals the badge is interactive (hovered
+         tooltip exposes the prepared-layout summary). */
+      cursor: pointer;
+      position: relative;
+    }
+    /* CrumBLE 4.4: custom hover tooltip with near-zero delay. Native HTML
+       `title` is browser-mandated to wait ~500-700ms before showing. The
+       data-tooltip attribute carries the multi-line summary; CSS reveals
+       a styled bubble on hover. position:relative on the badge anchors
+       the absolutely-positioned ::after bubble. */
+    .prebaked-badge[data-tooltip]:hover::after {
+      content: attr(data-tooltip);
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 50%;
+      transform: translateX(-50%);
+      white-space: pre;
+      background: #1f2a36;
+      color: #ecf0f1;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 0.85em;
+      font-weight: normal;
+      letter-spacing: normal;
+      line-height: 1.45;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+      z-index: 1000;
+      pointer-events: none;
+      /* Snap-visible: no transition delay so it appears the instant the
+         cursor enters the badge. */
     }
     /* "Highly Recommended" pill that sits inline with the toggle title.
        Smaller + colour-emphasised so it telegraphs "you almost certainly
@@ -697,6 +727,16 @@
       color: var(--label-color);
       margin-top: 4px;
       line-height: 1.3;
+    }
+    .setting-desc-list {
+      margin: 0;
+      padding-left: 1.1em;
+    }
+    .setting-desc-list li {
+      margin: 0 0 2px 0;
+    }
+    .setting-desc-list li:last-child {
+      margin-bottom: 0;
     }
     /* Rotation Buttons */
     .rotation-buttons {
@@ -1653,8 +1693,14 @@
           <div class="bt-friendly-option" id="btFriendlyOption">
             <div class="bt-friendly-row">
               <div class="bt-friendly-text">
-                <div class="setting-title">Pre-Cache for fast chapter turns <span class="recommended-pill">Highly Recommended</span></div>
-                <div class="setting-desc">Optimizes for instant chapter turns and accelerated book opening. Adds ~40 s to upload time per book in exchange for zero-delay reading!</div>
+                <div class="setting-title">Pre-Bake (Image, Chapter, Custom Font) <span class="recommended-pill">Highly Recommended</span></div>
+                <div class="setting-desc">
+                  <ul class="setting-desc-list">
+                    <li>Instant chapter turns, fast book opening, and pre-cached covers/images</li>
+                    <li>Embedded font atlas for Custom fonts (.cpfont)</li>
+                    <li>Adds ~40 s to upload time per book in exchange for zero-delay optimized reading!</li>
+                  </ul>
+                </div>
               </div>
               <label class="toggle-switch">
                 <input type="checkbox" id="optimize-for-device-checkbox" checked>
@@ -2024,6 +2070,33 @@
       });
     });
 
+    await loadFiles();
+
+    // CrumBLE 4.4: opportunistic optimizer.js preload. The "Optimize Selected"
+    // and "Optimize & Upload" flows both await ensureOptimizer() BEFORE they
+    // can show their confirmation prompt (showOptimizerPreflightModal lives
+    // inside optimizer.js, so the prompt cannot precede the load). On a cold
+    // page the script fetch takes 5-7 s on a tight-heap device, and the user
+    // experiences that as the Optimize click being unresponsive. Kick the
+    // fetch off here so the cache is warm by the time the user clicks. Fire-
+    // and-forget: failure just means the eventual click pays the same cost
+    // it would have without this optimisation. setTimeout pushes it after
+    // the initial render's painting so the file list shows up first.
+    setTimeout(() => {
+      ensureOptimizer().catch(err => console.warn('Optimizer preload (background) failed:', err));
+    }, 0);
+  }
+
+  // CrumBLE 4.4: file-listing refresh. Pulled out of hydrate() so the
+  // upload modal's Close button can refresh the table without a full
+  // window.location.reload(). The reload was triggering a heavy serve
+  // html (~20 KB) right after an upload's already-tight heap, which
+  // tripped the low-heap guard and silent-restarted to FT, in turn
+  // truncating the api-files response on the next attempt. This in-
+  // place refresh sends only the api-files JSON fetch (light), and the
+  // existing auto-reconnect-on-503 retry loop handles transient device
+  // unavailability.
+  async function loadFiles() {
     const breadcrumbs = document.getElementById('directory-breadcrumbs');
     const fileTable = document.getElementById('file-table');
 
@@ -2041,16 +2114,82 @@
     }
     breadcrumbs.innerHTML = breadcrumbContent;
 
+    // CrumBLE 4.4: auto-reconnect the file listing if the device is mid-
+    // silent-restart (returns 503) or temporarily unreachable (WiFi blip).
+    // Up to 10 attempts at 2s each; UI shows a "Reconnecting..." status
+    // instead of an immediate error that requires the user to manually
+    // refresh. Each retry uses cache-busting via &_=Date.now() so we get
+    // a fresh response from the device once it's back.
     let files = [];
-    try {
-      const response = await fetch('/api/files?path=' + encodeURIComponent(currentPath) + '&_=' + Date.now());
-      if (!response.ok) {
-        throw new Error('Failed to load files: ' + response.status + ' ' + response.statusText);
+    const MAX_RECONNECT_ATTEMPTS = 10;
+    let lastErrMsg = null;
+    for (let attempt = 0; attempt <= MAX_RECONNECT_ATTEMPTS; attempt++) {
+      try {
+        const response = await fetch('/api/files?path=' + encodeURIComponent(currentPath) + '&_=' + Date.now());
+        if (response.status === 503) {
+          // Device is in low-heap recovery; back off and retry.
+          throw new Error('Device busy (503) — likely silent-restarting');
+        }
+        if (!response.ok) {
+          throw new Error('Failed to load files: ' + response.status + ' ' + response.statusText);
+        }
+        files = await response.json();
+        lastErrMsg = null;
+        break;  // success
+      } catch (e) {
+        lastErrMsg = e.message || String(e);
+        console.warn('[FilesPage] load attempt ' + (attempt + 1) + '/' + (MAX_RECONNECT_ATTEMPTS + 1) + ' failed:', lastErrMsg);
+        if (attempt < MAX_RECONNECT_ATTEMPTS) {
+          // First attempt (attempt=0) failing typically means "device is mid-
+          // silent-restart" -- nearly always recovers on retry 1. Showing a
+          // generic loading spinner there reads as "still loading" rather
+          // than "something's wrong, we're retrying". Only switch to the
+          // explicit "Reconnecting N/MAX" labeling once we know the first
+          // retry also didn't land (attempt >= 1).
+          if (attempt === 0) {
+            fileTable.innerHTML =
+              '<div class="no-files" style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:20px;">' +
+              '<div class="reconnect-spinner" aria-hidden="true"></div>' +
+              '<div>Loading files...</div>' +
+              '</div>' +
+              '<style>' +
+              '@keyframes reconnect-spin { 0% { transform: rotate(0deg) } 100% { transform: rotate(360deg) } }' +
+              '.reconnect-spinner { width:32px; height:32px; border:3px solid #e0e0e0; border-top-color:#666; ' +
+              'border-radius:50%; animation: reconnect-spin 1s linear infinite; }' +
+              '</style>';
+          } else {
+            // attempt >= 1 -- show count of failed retries so far. Display
+            // counter is (attempt) which goes 1, 2, 3, ... MAX. Animated
+            // dots so the user sees the retry actively ticking.
+            fileTable.innerHTML =
+              '<div class="no-files" style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:20px;">' +
+              '<div class="reconnect-spinner" aria-hidden="true"></div>' +
+              '<div>Device reconnecting' +
+              '<span class="reconnect-dots" aria-hidden="true">' +
+              '<span class="dot dot-1">.</span><span class="dot dot-2">.</span><span class="dot dot-3">.</span>' +
+              '</span></div>' +
+              '<div style="font-size:0.85em;color:#888;">attempt ' + attempt + '/' + MAX_RECONNECT_ATTEMPTS + '</div>' +
+              '</div>' +
+              '<style>' +
+              '@keyframes reconnect-spin { 0% { transform: rotate(0deg) } 100% { transform: rotate(360deg) } }' +
+              '@keyframes reconnect-blink { 0%,80%,100% { opacity:0.2 } 40% { opacity:1 } }' +
+              '.reconnect-spinner { width:32px; height:32px; border:3px solid #e0e0e0; border-top-color:#666; ' +
+              'border-radius:50%; animation: reconnect-spin 1s linear infinite; }' +
+              '.reconnect-dots { display:inline-block; }' +
+              '.reconnect-dots .dot { animation: reconnect-blink 1.4s infinite both; display:inline-block; }' +
+              '.reconnect-dots .dot-1 { animation-delay: 0s; }' +
+              '.reconnect-dots .dot-2 { animation-delay: 0.2s; }' +
+              '.reconnect-dots .dot-3 { animation-delay: 0.4s; }' +
+              '</style>';
+          }
+          await new Promise(r => setTimeout(r, 2000));
+        }
       }
-      files = await response.json();
-    } catch (e) {
-      console.error(e);
-      fileTable.innerHTML = '<div class="no-files">An error occurred while loading the files</div>';
+    }
+    if (lastErrMsg) {
+      fileTable.innerHTML = '<div class="no-files">Device unreachable after ' +
+                            (MAX_RECONNECT_ATTEMPTS + 1) + ' attempts. Please refresh and try again. ' +
+                            '<br><small>' + lastErrMsg + '</small></div>';
       return;
     }
 
@@ -2108,12 +2247,38 @@
           fileTableContent += `<td><input type="checkbox" class="select-item" data-path="${encodeURIComponent(filePath)}" data-name="${escapeHtml(file.name)}" data-type="file"></td>`;
           fileTableContent += `<td><span class="file-icon">${file.isEpub ? '📗' : '📄'}</span>`;
           fileTableContent += `<a rel="noopener noreferrer" target="_blank" href="/download?path=${encodeURIComponent(filePath)}" class="file-link">${escapeHtml(file.name)}</a>`;
-          // CrumBLE: pre-cached badge -- /api/files returns prebaked=true when
-          // a prebake-manifest.json exists in the per-book cache dir. Surfaces
-          // optimization status in the file manager so the user can spot which
-          // books they've already pre-processed without opening each one.
+          // CrumBLE 4.4: three-tier badge. /api/files returns three booleans;
+          // we render the highest tier the book qualifies for. Same wording
+          // as the device-side long-press badge for consistency.
+          //   prebaked + prebakedChap + prebakedCpFont -> "✓IMG+CHAP+CP.FONT"
+          //   prebaked + prebakedChap                   -> "✓IMG+CHAP"
+          //   prebaked                                   -> "✓IMG"
           if (file.prebaked) {
-            fileTableContent += ` <span class="prebaked-badge" title="Chapter index pre-cached">Pre-cached</span>`;
+            let badgeText = '⚡IMG';
+            let badgeTitle = 'Images pre-converted for faster opening';
+            if (file.prebakedChap) {
+              badgeText += '+CHAP';
+              badgeTitle = 'Images + chapter layout pre-built';
+            }
+            if (file.prebakedCpFont) {
+              badgeText += '+CP.FONT';
+              badgeTitle = 'Images + chapters + custom-font glyph atlas';
+            }
+            // CrumBLE 4.4: append the device-side prepared-layout settings
+            // (font/size/orientation/etc.) so the FT badge tooltip mirrors
+            // the on-device long-press viewer. Server returns the
+            // pre-formatted multi-line string in file.prebakeTooltip;
+            // empty when manifest is missing or heap was too tight to
+            // parse. Two newlines separate the badge meaning from the
+            // layout summary.
+            if (file.prebakeTooltip) {
+              badgeTitle += '\n\n' + file.prebakeTooltip;
+            }
+            // CrumBLE 4.4: render via data-tooltip (CSS hover bubble, near-
+            // instant) instead of native title (~500ms browser delay).
+            // Keep title= as fallback for screen readers / older browsers
+            // that don't render ::after on inline elements.
+            fileTableContent += ` <span class="prebaked-badge" data-tooltip="${escapeHtml(badgeTitle)}" title="${escapeHtml(badgeTitle)}">${escapeHtml(badgeText)}</span>`;
           }
           fileTableContent += '</td>';
           fileTableContent += file.isEpub ? '<td><span class="epub-badge">EPUB</span></td>' : `<td>${escapeHtml(file.name.split('.').pop().toUpperCase())}</td>`;
@@ -2203,7 +2368,16 @@
     }
     if (modalNeedsRefreshOnClose) {
       modalNeedsRefreshOnClose = false;
-      window.location.reload();
+      // CrumBLE 4.4: in-place file-list refresh instead of full page reload.
+      // window.location.reload() served the entire FilesPage HTML (~20 KB)
+      // right after an upload, when device heap was already tight from the
+      // file write -- the low-heap guard then fired, silent-restarted to FT,
+      // and the post-restart api-files truncated. loadFiles() makes a single
+      // light /api/files JSON fetch and re-renders the table, with the
+      // auto-reconnect-on-503 retry already wired in case the device is
+      // briefly unavailable.
+      document.getElementById('uploadModal').classList.remove('open');
+      loadFiles();
       return;
     }
     if (modalNeedsBannerOnClose) {
@@ -2289,7 +2463,25 @@
     const uploadBtn = document.getElementById('uploadBtn');
     // Begin fetching the optimizer module as soon as the user opts in, so it's
     // ready by the time they press Optimize & Upload.
-    if (checked) ensureOptimizer().catch(err => console.error('Optimizer preload failed:', err));
+    // CrumBLE 4.4: chain a WASM chapter-prebake preload after ensureOptimizer.
+    // The ~900 KB combined .js + .wasm fetch is brutal on tight heap; doing
+    // it post-upload (the previous behavior) had MaxAlloc cratering to 2 KB
+    // during the 10+ sec serve_P stream and the streaming WebAssembly
+    // compile aborting with "Response body loading was aborted". Moving the
+    // fetch to opt-in-click time spends it when heap is fresh and the user
+    // hasn't started the upload yet. loadCrumblePrebakeModule is defined
+    // in optimizer.js, so we wait for ensureOptimizer to inject that script
+    // before calling it. Failure is silent -- the prebake step at the end
+    // of the upload flow still tries to load the WASM as a fallback.
+    if (checked) {
+      ensureOptimizer()
+        .then(() => {
+          if (typeof loadCrumblePrebakeModule === 'function') {
+            return loadCrumblePrebakeModule();
+          }
+        })
+        .catch(err => console.warn('Optimizer/prebake preload failed (will retry on use):', err));
+    }
     document.getElementById('convertWarning').style.display = checked ? 'block' : 'none';
     document.getElementById('convertInfo').style.display = checked ? 'block' : 'none';
     // Show the pre-cache toggle alongside Optimize EPUB. Hidden when
@@ -2741,7 +2933,7 @@
     document.getElementById('deleteModal').classList.remove('open');
   }
 
-  function confirmDelete() {
+  async function confirmDelete() {
     if (!deleteItemsGlobal || deleteItemsGlobal.length === 0) {
       closeDeleteModal();
       return;
@@ -2754,23 +2946,41 @@
       return p;
     });
 
-    const body = 'paths=' + encodeURIComponent(JSON.stringify(paths));
-    fetch('/delete', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: body
-    }).then(async res => {
-      if (res.ok) {
-        window.location.reload();
-      } else {
-        const text = await res.text();
-        alert('Failed to delete: ' + text);
-        closeDeleteModal();
+    // CrumBLE 4.4: chunk multi-delete into smaller batches. The ESP32 WebServer's
+    // x-www-form-urlencoded body parser silently drops large payloads -- a
+    // selection of ~100+ cache files in /.crosspoint/epub_*/ produced a ~7KB
+    // body and the server rejected it with "Missing `path` or `paths` argument"
+    // because the `paths` form arg never materialized. 20 paths per request
+    // keeps each body well under any practical limit, and the loop preserves
+    // the all-or-nothing-on-error semantics by stopping at the first failure.
+    const CHUNK_SIZE = 20;
+    const failures = [];
+    for (let i = 0; i < paths.length; i += CHUNK_SIZE) {
+      const chunk = paths.slice(i, i + CHUNK_SIZE);
+      const body = 'paths=' + encodeURIComponent(JSON.stringify(chunk));
+      try {
+        const res = await fetch('/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: body
+        });
+        if (!res.ok) {
+          const text = await res.text();
+          failures.push(`Chunk ${Math.floor(i / CHUNK_SIZE) + 1}: ${text}`);
+          break;  // stop on first failure -- subsequent requests would likely fail the same way
+        }
+      } catch (e) {
+        failures.push(`Chunk ${Math.floor(i / CHUNK_SIZE) + 1}: network error`);
+        break;
       }
-    }).catch(() => {
-      alert('Failed to delete - network error');
+    }
+
+    if (failures.length === 0) {
+      window.location.reload();
+    } else {
+      alert('Failed to delete:\n' + failures.join('\n'));
       closeDeleteModal();
-    });
+    }
   }
 
   // Helper to clear image picker state
@@ -3002,8 +3212,68 @@ function getWsUrl() {
   return `ws://${host}:${WS_PORT}/`;
 }
 
-// Upload file via WebSocket (faster, binary protocol)
-function uploadFileWebSocket(file, onProgress, onComplete, onError) {
+// CrumBLE 4.4: errors that should NOT be retried (the device explicitly
+// rejected the upload for a non-transient reason). Anything else falls
+// through to the auto-resume retry loop in uploadFileWebSocket().
+function isFatalUploadError(errMsg) {
+  if (!errMsg) return false;
+  const lower = String(errMsg).toLowerCase();
+  return lower.includes('access denied') ||
+         lower.includes('disk full') ||
+         lower.includes('invalid start') ||
+         lower.includes('overflow') ||
+         lower.includes('failed to create file');
+}
+
+// Upload file via WebSocket (faster, binary protocol). Auto-resumes via the
+// server-side RESUME:N protocol: on a mid-upload close, waits with backoff
+// and reconnects. The server detects the partial file and tells the browser
+// to resume from byte N. Each retry advances the upload further; eventually
+// it crosses the finish line.
+async function uploadFileWebSocket(file, onProgress, onComplete, onError) {
+  // CrumBLE 4.4: 10 retries (was 5). On weak/contended WiFi, large image-heavy
+  // EPUBs need ~6-8 successful resume cycles to cross the finish line --
+  // ~6 attempts often gets to 98% then falls just short. Backoff caps at
+  // 32 s, so 10 retries = ~2-3 minutes of total wait. The manual "Resume"
+  // button in the failed-uploads banner provides an unlimited override.
+  const MAX_RETRIES = 10;
+  let attempt = 0;
+  let lastError = null;
+
+  while (attempt <= MAX_RETRIES) {
+    try {
+      // CrumBLE 4.4: surface devicePath (returned by DONE:<path> upgrade) so
+      // the caller can skip the post-upload /api/files lookup.
+      const devicePath = await uploadFileWebSocketOnce(file, onProgress, onComplete, onError);
+      return devicePath;
+    } catch (err) {
+      lastError = err;
+      if (isFatalUploadError(err.message)) {
+        throw err;  // not retryable
+      }
+      if (attempt >= MAX_RETRIES) {
+        throw err;  // out of retries
+      }
+      attempt++;
+      const delayMs = Math.min(2000 * Math.pow(2, attempt - 1), 32000);
+      console.warn('[WS] Upload failed (attempt ' + attempt + '/' + MAX_RETRIES +
+                   '), auto-resuming in ' + (delayMs / 1000) + 's:', err.message);
+      // Surface retry status via the onError callback so the UI can show
+      // "Retrying..." instead of "Failed". The actual onError fires only
+      // when retries are exhausted.
+      if (onError) {
+        try { onError('Upload paused (attempt ' + attempt + '/' + MAX_RETRIES +
+                       ') — auto-resuming in ' + (delayMs / 1000) + 's...'); }
+        catch (e) { /* ignore */ }
+      }
+      await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+
+  throw lastError;
+}
+
+function uploadFileWebSocketOnce(file, onProgress, onComplete, onError) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(getWsUrl());
     currentUploadWs = ws;
@@ -3023,7 +3293,18 @@ function uploadFileWebSocket(file, onProgress, onComplete, onError) {
       const msg = event.data;
       console.log('[WS] Message:', msg);
 
-      if (msg === 'READY') {
+      // CrumBLE 4.4: resume support. Server sends "RESUME:<bytes>" when a
+      // partial upload exists at the destination path. We start sending
+      // from that offset instead of 0, and seed local progress so the UI
+      // bar starts where it left off rather than re-counting from 0.
+      let resumeOffset = 0;
+      if (msg.startsWith('RESUME:')) {
+        resumeOffset = parseInt(msg.substring(7), 10) || 0;
+        console.log('[WS] Resuming from byte ' + resumeOffset);
+        if (onProgress) onProgress(resumeOffset, file.size);
+      }
+
+      if (msg === 'READY' || msg.startsWith('RESUME:')) {
         uploadStarted = true;
         sendingChunks = true;
 
@@ -3033,15 +3314,21 @@ function uploadFileWebSocket(file, onProgress, onComplete, onError) {
         try {
           // Send file in chunks
           const totalSize = file.size;
-          let offset = 0;
+          let offset = resumeOffset;
 
           while (offset < totalSize && ws.readyState === WebSocket.OPEN) {
             const chunkSize = Math.min(WS_CHUNK_SIZE, totalSize - offset);
             const chunk = file.slice(offset, offset + chunkSize);
             const buffer = await chunk.arrayBuffer();
 
-            // Wait for buffer to clear - more aggressive backpressure
-            while (ws.bufferedAmount > WS_CHUNK_SIZE * 2 && ws.readyState === WebSocket.OPEN) {
+            // CrumBLE 4.4: single-chunk-in-flight throttle. Browser will only
+            // pipeline ~half a chunk before waiting for the device to drain.
+            // Without this, on ESP32-C3 the lib's per-frame alloc + lwIP
+            // receive buffers + SD writes race for ~13 KB of contiguous heap
+            // and uploads stall instantly (no progress) or crater at MinFree
+            // ~1 KB mid-stream. Cost: ~5-10 seconds added on a typical book,
+            // which is well worth the reliability win.
+            while (ws.bufferedAmount > WS_CHUNK_SIZE / 2 && ws.readyState === WebSocket.OPEN) {
               await new Promise(r => setTimeout(r, 5));
             }
 
@@ -3071,14 +3358,19 @@ function uploadFileWebSocket(file, onProgress, onComplete, onError) {
         // Server confirmed progress - log for debugging but don't update UI
         // (local progress is smoother, server progress causes jumping)
         console.log('[WS] Server progress:', msg);
-      } else if (msg === 'DONE') {
+      } else if (msg === 'DONE' || msg.startsWith('DONE:')) {
+        // CrumBLE 4.4: DONE may carry the sanitized device path as
+        // "DONE:/Books/foo.epub" so the prebake step can skip the
+        // /api/files lookup. Legacy "DONE" (bare) still works -- caller
+        // falls back to listing-search if devicePath is null.
+        const devicePath = msg.startsWith('DONE:') ? msg.substring(5) : null;
         // Show 100% when server confirms completion
         if (onProgress) onProgress(file.size, file.size);
         uploadComplete = true;
         currentUploadWs = null;
         ws.close();
-        if (onComplete) onComplete();
-        resolve();
+        if (onComplete) onComplete(devicePath);
+        resolve(devicePath);
       } else if (msg.startsWith('ERROR:')) {
         const error = msg.substring(6);
         ws.close();
@@ -3328,7 +3620,11 @@ async function uploadFile() {
     // file is an EPUB. The phase-end snaps are tracked below so a phase
     // that bails early hands off to the next one without rewinding.
     const isEpubUpload = file && file.name && /\.epub$/i.test(file.name);
-    const willPrebake = isEpubUpload && !!document.getElementById('optimize-for-device-checkbox')?.checked;
+    // CrumBLE 4.4: gate willPrebake on the outer "Optimize EPUB" toggle too;
+    // the inner pre-cache checkbox stays "checked" when its row is hidden,
+    // and reserving 20% of the bar for a prebake that never runs would make
+    // the bar visibly stall at 80% on every upload after the user opts out.
+    const willPrebake = isEpubUpload && !!document.getElementById('optimize-for-device-checkbox')?.checked && convertEnabled;
     const convertEnd = needsConversion ? (willPrebake ? 25 : 50) : 0;
     const uploadEnd = willPrebake ? 80 : 100;
 
@@ -3403,7 +3699,13 @@ async function uploadFile() {
       // prebake) -- onError handles the bookkeeping.
       const isEpubFile = file && file.name && /\.epub$/i.test(file.name);
       const preOptToggle = document.getElementById('optimize-for-device-checkbox');
-      const preOptOn = !!preOptToggle && preOptToggle.checked;
+      // CrumBLE 4.4: also gate on the outer "Optimize EPUB" toggle. The
+      // inner pre-cache checkbox keeps its persistent checked state when
+      // the outer is unchecked (toggleConvertOptions only hides the row),
+      // so without this guard the layout-settings modal still fires and
+      // the cache files still upload even when the user opted out of all
+      // optimization. Treat pre-cache as logically off when the outer is.
+      const preOptOn = !!preOptToggle && preOptToggle.checked && convertEnabled;
       const willOptimize = isEpubFile && (needsConversion || preOptOn);
       // Show preflight ONCE per batch -- the same SETTINGS lock applies
       // to every book in this upload session, so re-prompting per file
@@ -3489,8 +3791,13 @@ async function uploadFile() {
         }
       }
 
+      // CrumBLE 4.4: capture the sanitized device path returned by the WS
+      // DONE message so the post-upload prebake can skip the heap-fragile
+      // /api/files listing. HTTP fallback doesn't carry the path -- prebake
+      // there still goes through the listing path.
+      let uploadedDevicePath = null;
       if (useWebSocket) {
-        await uploadFileWebSocket(file, onProgress, null, null);
+        uploadedDevicePath = await uploadFileWebSocket(file, onProgress, null, null);
       } else {
         await uploadFileHTTP(file, onProgress, null, null);
       }
@@ -3506,7 +3813,12 @@ async function uploadFile() {
       // .epub uploads. Failure is non-fatal -- we still report the upload
       // as complete; only the chapter speed-up is missed.
       const prebakeCheckbox = document.getElementById('optimize-for-device-checkbox');
-      if (prebakeCheckbox && prebakeCheckbox.checked && isEpubUpload) {
+      // CrumBLE 4.4: also require convertEnabled (the outer "Optimize EPUB"
+      // toggle). Without this, the inner pre-cache checkbox -- which retains
+      // its checked state even when its row is hidden by toggleConvertOptions
+      // -- would still drive the prebake step and stream cache files for a
+      // user who explicitly opted out of all optimization.
+      if (prebakeCheckbox && prebakeCheckbox.checked && isEpubUpload && convertEnabled) {
         try {
           progressText.textContent = `Optimizing chapter indexing for ${file.name}...`;
           // Single-colour bar: don't repaint here, keep green continuous.
@@ -3518,16 +3830,54 @@ async function uploadFile() {
           // Epub::cachePathForFilePath hashes for the cache dir name.
           // Match by size + .epub heuristic; uploads of identical-size
           // EPUBs in the same dir are vanishingly unlikely.
-          let listingPath = currentPath || '/';
-          if (!listingPath.endsWith('/')) listingPath += '/';
-          const listingResp = await fetch('/api/files?path=' + encodeURIComponent(listingPath));
-          const listing = listingResp.ok ? await listingResp.json() : [];
-          const actualEntry = listing.find((e) => e.isEpub && e.size === file.size)
+          //
+          // CrumBLE 4.4: retry the listing query with backoff. Right after a
+          // big upload the device's heap can be tight enough that the
+          // post-upload /api/files request returns a 503 or empty array
+          // (silent-restart-to-FT in progress, file-list rebuilt from scratch
+          // after the silent restart, etc.). Without retry, the prebake step
+          // immediately gave up. 3 attempts at 2s, 4s, 6s gives the device
+          // up to ~12 s to settle.
+          // CrumBLE 4.4 fast path: the WS DONE message now carries the
+          // device-sanitized path so we can skip the heap-fragile /api/files
+          // listing entirely. On a tight post-upload heap, that listing was
+          // bailing after a handful of rows and the prebake step then
+          // reported "could not find uploaded EPUB" -- exactly the Onyx
+          // Storm failure. devicePath null only when the WS path is unused
+          // (HTTP fallback) or talking to a pre-4.4 device.
+          let devicePath;
+          if (uploadedDevicePath) {
+            devicePath = uploadedDevicePath;
+          } else {
+            let listingPath = currentPath || '/';
+            if (!listingPath.endsWith('/')) listingPath += '/';
+            let actualEntry = null;
+            let lastListingErr = null;
+            for (let listAttempt = 0; listAttempt < 3 && !actualEntry; listAttempt++) {
+              if (listAttempt > 0) {
+                const delaySec = 2 * listAttempt; // 2s, 4s
+                progressText.textContent =
+                  `Locating uploaded ${file.name} on device... (retry ${listAttempt + 1}/3 in ${delaySec}s)`;
+                await new Promise(r => setTimeout(r, delaySec * 1000));
+              }
+              try {
+                const listingResp = await fetch('/api/files?path=' + encodeURIComponent(listingPath));
+                const listing = listingResp.ok ? await listingResp.json() : [];
+                actualEntry = listing.find((e) => e.isEpub && e.size === file.size)
                            || listing.find((e) => e.name === file.name);
-          if (!actualEntry) {
-            throw new Error(`could not find uploaded EPUB at ${listingPath} (looked for size=${file.size})`);
+                if (!actualEntry) {
+                  lastListingErr = `not present in listing of ${listing.length} entries`;
+                }
+              } catch (e) {
+                lastListingErr = e.message || String(e);
+                console.warn('[prebake] listing fetch failed (attempt ' + (listAttempt + 1) + '):', lastListingErr);
+              }
+            }
+            if (!actualEntry) {
+              throw new Error(`could not find uploaded EPUB at ${listingPath} (looked for size=${file.size}; ${lastListingErr})`);
+            }
+            devicePath = listingPath + actualEntry.name;
           }
-          const devicePath = listingPath + actualEntry.name;
           await prebakeChapters(file, devicePath, (percent, status) => {
             // Scale prebake into [80, 100].
             const barPct = 80 + Math.round(percent * 0.2);
@@ -3594,7 +3944,8 @@ function showFailedUploadsBanner() {
         <div class="failed-file-name">📄 ${escapeHtml(failedFile.name)}</div>
         <div class="failed-file-error">Error: ${escapeHtml(failedFile.error)}</div>
       </div>
-      <button class="retry-btn" onclick="retrySingleUpload(${index})">Retry</button>
+      <button class="retry-btn" onclick="resumeSingleUpload(${index})">Resume</button>
+      <button class="retry-btn" onclick="retrySingleUpload(${index})" title="Reopen the upload modal to change options">Retry from start</button>
     `;
     filesList.appendChild(item);
   });
@@ -3634,6 +3985,63 @@ function retrySingleUpload(index) {
   // Open modal and trigger upload
   openUploadModal();
   validateFile();
+}
+
+// CrumBLE 4.4: true one-click resume. Calls uploadFileWebSocket() directly
+// with the failed file; the device-side RESUME:N protocol detects the
+// partial bytes on SD and continues from where the previous attempt left
+// off, no modal interaction needed. If this resume run also fails, the
+// file goes back into the failed-uploads banner with the latest error so
+// the user can resume again -- effectively unlimited retries via this
+// button, on top of the 10 auto-resumes that uploadFileWebSocket() does
+// internally per attempt.
+async function resumeSingleUpload(index) {
+  const failedFile = failedUploadsGlobal[index];
+  if (!failedFile || !failedFile.file) return;
+
+  // Remove from list while we attempt. If it fails again it gets re-added.
+  failedUploadsGlobal.splice(index, 1);
+  showFailedUploadsBanner();  // re-render without this entry
+  if (failedUploadsGlobal.length === 0) {
+    dismissFailedUploads();
+  }
+
+  // Simple inline progress so the user has feedback while the upload runs
+  // (the main upload modal is already closed at this point).
+  const banner = document.getElementById('failedUploadsBanner');
+  let statusEl = document.getElementById('resumeStatusInline');
+  if (!statusEl) {
+    statusEl = document.createElement('div');
+    statusEl.id = 'resumeStatusInline';
+    statusEl.style.cssText = 'padding:8px 12px;margin:6px 0;font-size:13px;color:#555;';
+    banner.appendChild(statusEl);
+  }
+  statusEl.textContent = 'Resuming ' + failedFile.name + '...';
+
+  const onProgress = (sent, total) => {
+    const pct = total > 0 ? Math.round((sent * 100) / total) : 0;
+    statusEl.textContent = 'Resuming ' + failedFile.name + ' — ' + pct + '%';
+  };
+  const onErrorStatus = (msg) => {
+    statusEl.textContent = 'Resuming ' + failedFile.name + ' — ' + msg;
+  };
+
+  try {
+    await uploadFileWebSocket(failedFile.file, onProgress, null, onErrorStatus);
+    statusEl.textContent = '✓ ' + failedFile.name + ' uploaded successfully';
+    setTimeout(() => { statusEl.remove(); }, 4000);
+    // Refresh the file list so the user sees the new file.
+    if (typeof loadFiles === 'function') loadFiles();
+  } catch (err) {
+    // Put it back in the failed list with the latest error.
+    failedUploadsGlobal.push({
+      name: failedFile.name,
+      error: err.message || String(err),
+      file: failedFile.file,
+    });
+    statusEl.remove();
+    showFailedUploadsBanner();
+  }
 }
 
 function retryAllFailedUploads() {

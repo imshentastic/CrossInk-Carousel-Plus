@@ -874,7 +874,11 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                   heapBeforeImage.maxAllocHeap, src.c_str());
 
           // Resolve the image path relative to the HTML file.
-          std::string resolvedPath = FsHelpers::normalisePath(self->contentBase + src);
+          // CrumBLE 4.4: percent-decode the src -- chapter HTML can reference
+          // an image whose ZIP entry has literal spaces (e.g. "Images/cover
+          // photo.jpg") via src="../Images/cover%20photo.jpg". Without this,
+          // the ZIP lookup misses and the image silently doesn't render.
+          std::string resolvedPath = FsHelpers::normalisePath(self->contentBase + FsHelpers::urlDecode(src));
 
           // CrumBLE: does the optimizer bundle a pre-rendered .pxc next to this
           // image? If so the image renders from that pixel cache and is NEVER
@@ -1625,6 +1629,87 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
       continue;
     }
 
+    // CrumBLE 4.4 task #28: typographic punctuation -> ASCII substitution.
+    // Applied at parse time so the stored page text and the prewarmed glyph
+    // working set are both ASCII for these codepoints. Without this the
+    // atlas / SD-font mini bitmap only contains whatever the chapter
+    // happened to use (typically only the smart-quote form, never the ASCII
+    // form), so the renderer-level aliasCodepoint() target ('. - " ' *)
+    // had no glyph in the atlas to alias to and we still rendered '?'.
+    //
+    // Same parser runs on host (prebake CLI) and device (live section
+    // rebuild), so the substitution is consistent between baked sections
+    // and any on-device rebuild path. Cost: lose semantic distinction
+    // between em-dash / en-dash / hyphen, ellipsis collapses to a single
+    // period, and smart quotes become straight ASCII. All acceptable
+    // trades vs visible '?' glyphs.
+    //
+    // The targeted three-byte sequences all start with 0xE2 0x80, covering
+    // the General Punctuation block (U+2010..U+2027). The third-byte
+    // switch picks the substitution; non-matching codepoints fall through
+    // unchanged (the FEFF check below + the generic byte-append at the
+    // end of the loop still see the original bytes).
+    if (i + 2 < len && static_cast<uint8_t>(s[i]) == 0xE2 && static_cast<uint8_t>(s[i + 1]) == 0x80) {
+      const uint8_t b3 = static_cast<uint8_t>(s[i + 2]);
+      char ascii = 0;
+      switch (b3) {
+        case 0x98:  // U+2018 LEFT SINGLE QUOTATION MARK
+        case 0x99:  // U+2019 RIGHT SINGLE QUOTATION MARK
+        case 0x9A:  // U+201A SINGLE LOW-9 QUOTATION MARK
+        case 0x9B:  // U+201B SINGLE HIGH-REVERSED-9 QUOTATION MARK
+          ascii = '\'';
+          break;
+        case 0x9C:  // U+201C LEFT DOUBLE QUOTATION MARK
+        case 0x9D:  // U+201D RIGHT DOUBLE QUOTATION MARK
+        case 0x9E:  // U+201E DOUBLE LOW-9 QUOTATION MARK
+        case 0x9F:  // U+201F DOUBLE HIGH-REVERSED-9 QUOTATION MARK
+          ascii = '"';
+          break;
+        case 0x90:  // U+2010 HYPHEN
+        case 0x91:  // U+2011 NON-BREAKING HYPHEN
+        case 0x92:  // U+2012 FIGURE DASH
+        case 0x93:  // U+2013 EN DASH
+        case 0x94:  // U+2014 EM DASH
+        case 0x95:  // U+2015 HORIZONTAL BAR
+          ascii = '-';
+          break;
+        case 0xA2:  // U+2022 BULLET
+        case 0xA3:  // U+2023 TRIANGULAR BULLET
+          ascii = '*';
+          break;
+        case 0xA6:  // U+2026 HORIZONTAL ELLIPSIS
+          ascii = '.';
+          break;
+        default:
+          break;
+      }
+      if (ascii != 0) {
+        // Buffer-overflow safety: mirror the byte-append path below so a
+        // word at MAX_WORD_SIZE flushes before we write the ASCII byte.
+        if (self->partWordBufferIndex >= MAX_WORD_SIZE) {
+          int safeLen = utf8SafeTruncateBuffer(self->partWordBuffer, self->partWordBufferIndex);
+          if (safeLen < self->partWordBufferIndex && safeLen > 0) {
+            int overflow = self->partWordBufferIndex - safeLen;
+            char saved[4];
+            for (int j = 0; j < overflow; j++) {
+              saved[j] = self->partWordBuffer[safeLen + j];
+            }
+            self->partWordBufferIndex = safeLen;
+            self->flushPartWordBuffer();
+            for (int j = 0; j < overflow; j++) {
+              self->partWordBuffer[j] = saved[j];
+            }
+            self->partWordBufferIndex = overflow;
+          } else {
+            self->flushPartWordBuffer();
+          }
+        }
+        self->partWordBuffer[self->partWordBufferIndex++] = ascii;
+        i += 2;  // loop's i++ handles the first byte; skip the other two
+        continue;
+      }
+    }
+
     // Skip Zero Width No-Break Space / BOM (U+FEFF) = 0xEF 0xBB 0xBF
     const XML_Char FEFF_BYTE_1 = static_cast<XML_Char>(0xEF);
     const XML_Char FEFF_BYTE_2 = static_cast<XML_Char>(0xBB);
@@ -2082,8 +2167,10 @@ void ChapterHtmlSlimParser::makePages() {
     currentPageNextY += blockStyle.paddingBottom;
   }
 
-  // Extra paragraph spacing if enabled (default behavior)
+  // CrumBLE 4.4: paragraph spacing is now three-way (0/1/2). The half-
+  // lineHeight unit matches the legacy "Extra Spacing = ON" behavior, so
+  // value 1 reproduces the prior default exactly and value 2 doubles it.
   if (extraParagraphSpacing) {
-    currentPageNextY += lineHeight / 2;
+    currentPageNextY += static_cast<int>(extraParagraphSpacing) * lineHeight / 2;
   }
 }

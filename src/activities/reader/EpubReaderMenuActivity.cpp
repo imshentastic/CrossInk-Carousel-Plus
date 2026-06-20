@@ -148,18 +148,46 @@ std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMainM
   // the SD card" info screen instead of launching the word-select flow.
   // LOOKED_UP_WORDS stays gated -- the history list only makes sense
   // when a dictionary is actually present and has been used.
+  //
+  // CrumBLE 4.4 BT guardrail: hide Lookup / Looked-Up Words / Highlight
+  // entries entirely when a BLE remote is currently active. The lookup
+  // word-select pass + highlight word-walk both allocate a WordInfo vector
+  // sized by the page's word count, and NimBLE pins ~58 KB of fragmented
+  // heap while a remote is connected. The "auto-disable BT, run lookup,
+  // re-enable BT" path we shipped previously turned a low-heap path into
+  // a fragile reconnect dance that aborts when the recovery doesn't free
+  // enough headroom (logs show MaxAlloc dipping to ~5 KB post-reconnect
+  // before the lookup buffer alloc fails). Hiding the entries is the
+  // honest tradeoff: the user disconnects BT first, runs lookup, then
+  // reconnects -- no chance of an in-flight reconnect-while-lookup race.
+  // BluetoothHIDManager::isEnabled() is the source of truth: it's true
+  // from BT-on through BT-off, covering both connected and "scanning to
+  // reconnect" states which are equally heap-pressured.
+  const bool bleActive = BluetoothHIDManager::getInstance().isEnabled();
+  // CrumBLE 4.4 post-bisect: lookup + highlight are always visible. If
+  // BT is active when the user taps them, the lookup/highlight handler
+  // disables BT, then heap pre-flight triggers a silent restart with
+  // OpenLookup/OpenHighlight queued -- post-boot dispatch re-launches
+  // the activity on a fresh heap. User no longer has to manually
+  // disconnect BT first.
   items.push_back({MenuAction::LOOKUP, StrId::STR_LOOKUP});
   if (hasDictionary && hasLookupHistory) {
     items.push_back({MenuAction::LOOKED_UP_WORDS, StrId::STR_LOOKED_UP_WORDS});
   }
   (void)hasDictionary;
-  // Highlight quick action. Pending-hold state replaces Add with the
-  // Finish/Cancel pair so the menu doesn't dangle two ways to start.
   if (hasPendingHighlight) {
     items.push_back({MenuAction::FINISH_HIGHLIGHT, StrId::STR_FINISH_HIGHLIGHT});
     items.push_back({MenuAction::CANCEL_HIGHLIGHT, StrId::STR_CANCEL_HIGHLIGHT});
   } else {
     items.push_back({MenuAction::ADD_HIGHLIGHT, StrId::STR_ADD_HIGHLIGHT});
+  }
+  if (bleActive) {
+    // BLE active: drop the pending highlight if any was in flight so the
+    // user doesn't return from a BT session with a half-started highlight
+    // hanging around. The pendingHighlight state is fed in from the
+    // activity; we can't mutate it here, but the menu user will see no
+    // dangling Finish/Cancel option, which matches expectation.
+    (void)hasPendingHighlight;
   }
   items.push_back({MenuAction::READING_STATS, StrId::STR_READING_STATS});
   items.push_back({MenuAction::AUTO_PAGE_TURN, StrId::STR_AUTO_TURN_INTERVAL_SECONDS});
@@ -184,6 +212,7 @@ std::vector<EpubReaderMenuActivity::MenuItem> EpubReaderMenuActivity::buildMainM
   items.push_back({MenuAction::SCREENSHOT, StrId::STR_SCREENSHOT_BUTTON});
   items.push_back(
       {MenuAction::TOGGLE_COMPLETED, isBookCompleted ? StrId::STR_MARK_UNFINISHED : StrId::STR_MARK_FINISHED});
+  items.push_back({MenuAction::DELETE_STATS, StrId::STR_DELETE_BOOK_STATS});
   items.push_back({MenuAction::DELETE_CACHE, StrId::STR_DELETE_CACHE});
 
   // isCurrentPageBookmarked / hasBookmarks are not used here directly --

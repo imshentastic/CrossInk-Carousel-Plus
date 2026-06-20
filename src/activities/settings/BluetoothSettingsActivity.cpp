@@ -12,6 +12,31 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 
+namespace {
+// CrumBLE 4.4: pre-flight before starting a BT scan. With NimBLE up and a
+// book open in the background, free heap can be < 7 KB / MaxAlloc < 5 KB --
+// not enough for the scan callback to grow its result list + the post-scan
+// picker activity to allocate per-device strings. The result was an abort()
+// after "Scan complete, found N devices". Returns true (ok to scan) when
+// there's enough headroom; otherwise sets `outError` and returns false so
+// the caller can show the user a clear message rather than crashing.
+bool checkScanHeapOrError(std::string& outError) {
+  // Need to cover: scan onResult callbacks (~12 * std::string copies) +
+  // picker activity (vector<MenuItem> with ~80 B per entry) + render path.
+  constexpr uint32_t kScanMinFreeHeap = 14u * 1024u;
+  constexpr uint32_t kScanMinMaxAlloc = 8u * 1024u;
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+  if (freeHeap >= kScanMinFreeHeap && maxAlloc >= kScanMinMaxAlloc) {
+    return true;
+  }
+  LOG_ERR("BT", "BT scan pre-flight refused: free=%u maxAlloc=%u (need %u/%u)",
+          freeHeap, maxAlloc, kScanMinFreeHeap, kScanMinMaxAlloc);
+  outError = "Memory low. Restart device, then scan before opening a book.";
+  return false;
+}
+}  // namespace
+
 void BluetoothSettingsActivity::onEnter() {
   Activity::onEnter();
   
@@ -264,11 +289,13 @@ void BluetoothSettingsActivity::handleMainMenuInput() {
     } else if (selectedIndex == kScanForDevicesIndex) {
       // Start scan and switch to device list
       if (btMgr->isEnabled()) {
-        btMgr->startScan(10000);
-        lastScanTime = millis();
-        viewMode = ViewMode::DEVICE_LIST;
-        selectedIndex = 0;
-        lastError = "";
+        if (checkScanHeapOrError(lastError)) {
+          btMgr->startScan(10000);
+          lastScanTime = millis();
+          viewMode = ViewMode::DEVICE_LIST;
+          selectedIndex = 0;
+          lastError = "";
+        }
       } else {
         lastError = "Enable BT first";
       }
@@ -504,6 +531,10 @@ void BluetoothSettingsActivity::handleDeviceListInput() {
   
   if (mappedInput.wasPressed(MappedInputManager::Button::Right)) {
     // Quick rescan
+    if (!checkScanHeapOrError(lastError)) {
+      requestUpdate();
+      return;
+    }
     LOG_INF("BT", "Quick rescan...");
     lastError = "Scanning...";
     btMgr->startScan(10000);
@@ -516,6 +547,10 @@ void BluetoothSettingsActivity::handleDeviceListInput() {
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
     // Check if "Refresh" is selected
     if (selectedIndex == static_cast<int>(devices.size())) {
+      if (!checkScanHeapOrError(lastError)) {
+        requestUpdate();
+        return;
+      }
       LOG_INF("BT", "Refreshing scan...");
       lastError = "Scanning...";
       btMgr->startScan(10000);

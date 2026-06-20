@@ -79,6 +79,7 @@ size_t wsUploadReceived = 0;
 unsigned long wsUploadStartTime = 0;
 bool wsUploadInProgress = false;
 
+
 // CrumBLE: set by sendBufferGzip when the heap is too low to serve. The
 // FT activity's loop() polls this via consumeFtRestartRequest() and
 // triggers silentRestartToFileTransfer once the request handler has
@@ -154,6 +155,74 @@ bool isProtectedPath(const String& path) {
 
   return false;
 }
+
+// CrumBLE 4.4: read /.crosspoint/<hash>/prebake-manifest.json and format a
+// concise multi-line tooltip with the locked-in layout settings, suitable
+// for stuffing into the HTML `title="..."` attribute on the file-listing
+// badge. Mirrors the on-device PrebakeManifestViewerActivity at a glance --
+// only the five highest-signal fields (font, size, orientation, line
+// spacing, margin) so the tooltip doesn't overflow on hover. Returns ""
+// when the file doesn't exist or heap is too tight to safely parse JSON,
+// which keeps the badge tooltip empty rather than crashing the listing.
+std::string formatPrebakeTooltip(const std::string& cacheDir) {
+  // Heap guard: JsonDocument allocations on a fragmented heap could blow
+  // the per-row budget. Skip parsing entirely below 8 KB MaxAlloc.
+  if (ESP.getMaxAllocHeap() < 8u * 1024u) return "";
+  const std::string path = cacheDir + "/prebake-manifest.json";
+  if (!Storage.exists(path.c_str())) return "";
+  String json = Storage.readFile(path.c_str());
+  if (json.isEmpty()) return "";
+  JsonDocument doc;
+  if (deserializeJson(doc, json) != DeserializationError::Code::Ok) return "";
+
+  auto familyLabel = [&]() -> std::string {
+    const char* sdName = doc["sdFontFamilyName"] | "";
+    if (sdName && sdName[0] != '\0') return std::string("SD: ") + sdName;
+    switch (static_cast<uint8_t>(doc["fontFamily"] | 0)) {
+      case CrossPointSettings::LEXENDDECA: return "Lexend Deca";
+      case CrossPointSettings::BITTER: return "Bitter";
+      case CrossPointSettings::CHAREINK: return "CharEink";
+      default: return "Unknown";
+    }
+  };
+  auto orientationLabel = [](uint8_t o) -> const char* {
+    switch (o) {
+      case CrossPointSettings::PORTRAIT: return "Portrait";
+      case CrossPointSettings::LANDSCAPE_CW: return "Landscape CW";
+      case CrossPointSettings::INVERTED: return "Portrait inverted";
+      case CrossPointSettings::LANDSCAPE_CCW: return "Landscape CCW";
+      default: return "Unknown";
+    }
+  };
+  auto pointSize = [&]() -> uint8_t {
+    const char* sdName = doc["sdFontFamilyName"] | "";
+    const uint8_t fontSize = static_cast<uint8_t>(doc["fontSize"] | 0);
+    const uint8_t range = static_cast<uint8_t>(doc["sdFontSizeRange"] | 0);
+    if (sdName && sdName[0] != '\0') {
+      if (range < CrossPointSettings::SD_FONT_SIZE_RANGE_COUNT) {
+        return CrossPointSettings::getSdFontRangePointSize(range, fontSize);
+      }
+      return 0;
+    }
+    if (fontSize < CrossPointSettings::FONT_SIZE_COUNT) {
+      return CrossPointSettings::getReaderFontPointSize(static_cast<CrossPointSettings::FONT_SIZE>(fontSize));
+    }
+    return 0;
+  };
+
+  const uint8_t pt = pointSize();
+  const uint8_t orient = static_cast<uint8_t>(doc["orientation"] | 0);
+  const uint8_t margin = static_cast<uint8_t>(doc["screenMargin"] | 0);
+  const uint8_t lineSp = static_cast<uint8_t>(doc["lineSpacing"] | 0);
+
+  char buf[256];
+  std::snprintf(buf, sizeof(buf),
+                "Font: %s\nFont Size: %u pt\nOrientation: %s\nLine Spacing: %u\nMargin: %u px",
+                familyLabel().c_str(), static_cast<unsigned>(pt),
+                orientationLabel(orient), static_cast<unsigned>(lineSp),
+                static_cast<unsigned>(margin));
+  return std::string(buf);
+}
 }  // namespace
 
 // File listing page template - now using generated headers:
@@ -169,6 +238,11 @@ void CrossPointWebServer::begin() {
     LOG_DBG("WEB", "Web server already running");
     return;
   }
+  // CrumBLE 4.4 post-bisect: the pre-allocated responseBuffer (4 KB resident
+  // at boot) was holding contiguous heap that pushed the serve-html guard
+  // below its safe MaxAlloc floor at FT startup, triggering an infinite
+  // silent-restart loop. Reverted -- chunked /api/files alone was the
+  // actually-useful change.
 
   // Check if we have a valid network connection (either STA connected or AP mode)
   const wifi_mode_t wifiMode = WiFi.getMode();
@@ -456,6 +530,21 @@ static bool guardLowHeapOrAutoRestart(WebServer* server, const char* tag) {
     LOG_INF("WEB", "guard %s ok: pre free=%u maxAlloc=%u", tag, preFree, preMax);
     return false;
   }
+  // CrumBLE 4.4: post-upload settle window. The browser-side chapter prebake
+  // step needs to query the device immediately after DONE -- if the very
+  // next api-files / api-* request triggers a silent-restart, the prebake
+  // can't locate the freshly-uploaded EPUB and fails with "could not find
+  // uploaded EPUB". Skip the silent-restart for 15 seconds after the most
+  // recent upload completion; the browser is likely doing post-upload
+  // bookkeeping and heap will recover naturally. Outside this window, the
+  // normal guard fires.
+  constexpr unsigned long POST_UPLOAD_SETTLE_MS = 15000;
+  if (wsLastCompleteAt > 0 && (millis() - wsLastCompleteAt) < POST_UPLOAD_SETTLE_MS) {
+    LOG_INF("WEB",
+            "guard %s low-heap (free=%u maxAlloc=%u) but within post-upload settle window (%u ms ago); passing",
+            tag, preFree, preMax, (unsigned)(millis() - wsLastCompleteAt));
+    return false;
+  }
   LOG_ERR("WEB", "guard %s low-heap (free=%u maxAlloc=%u): scheduling silentRestart to FT", tag, preFree, preMax);
   server->sendHeader("Refresh", "8");
   // Some browsers will not honour Refresh on a JSON response. Send an
@@ -499,14 +588,28 @@ static void sendBufferGzip(WebServer* server, const char* mime, const char* data
   //      to a real 503 instead of a MIME-mismatched empty HTML body.
   const bool isHtmlSubstitutionSafe = (mime && strcmp(mime, "text/html") == 0);
   if (isHtmlSubstitutionSafe && preFree < 22u * 1024u) {
-    LOG_ERR("WEB", "serve %s low-heap: scheduling silentRestart to FT", tag);
-    server->sendHeader("Refresh", "8");
-    server->send(200, "text/html",
-                 "<!doctype html><html><head><title>File Transfer</title></head><body></body></html>");
-    // Send completes before we set the flag so the response actually
-    // reaches the browser before the device reboots.
-    g_pendingFtRestart = true;
-    return;
+    // CrumBLE 4.4: same post-upload settle window as the api-files guard.
+    // After a fresh upload, the page reload that fetches FilesPage.html
+    // would otherwise immediately silent-restart and the browser's chapter
+    // prebake step can't complete its post-upload queries.
+    constexpr unsigned long POST_UPLOAD_SETTLE_MS = 15000;
+    if (wsLastCompleteAt > 0 && (millis() - wsLastCompleteAt) < POST_UPLOAD_SETTLE_MS) {
+      LOG_INF("WEB",
+              "serve %s low-heap (free=%u) but within post-upload settle window; passing through",
+              tag, preFree);
+      // Fall through to the normal serve path (note: this may still fail
+      // if heap is truly exhausted -- but that's better than restarting
+      // mid-prebake when the browser still has work to do).
+    } else {
+      LOG_ERR("WEB", "serve %s low-heap: scheduling silentRestart to FT", tag);
+      server->sendHeader("Refresh", "8");
+      server->send(200, "text/html",
+                   "<!doctype html><html><head><title>File Transfer</title></head><body></body></html>");
+      // Send completes before we set the flag so the response actually
+      // reaches the browser before the device reboots.
+      g_pendingFtRestart = true;
+      return;
+    }
   }
   if (!isHtmlSubstitutionSafe && preFree < 6u * 1024u) {
     LOG_ERR("WEB", "serve %s low-heap (free=%u below 6 KB floor): sending 503", tag, preFree);
@@ -661,102 +764,146 @@ void CrossPointWebServer::handleFileListData() const {
   }
 
   applyClientSendTimeout(server.get());
-  // CrumBLE freeze investigation: chunked sendContent streaming hangs on
-  // this device under any nontrivial heap pressure (same failure mode as
-  // /api/settings before we hoisted that into a startup cache). Build
-  // the full file-list JSON into a std::string first, then single send.
-  // Caps response at ~12 KB; directories with hundreds of entries get
-  // truncated rather than wedging the device.
-  constexpr size_t kFilesJsonBudget = 12 * 1024;
-  std::string body;
-  body.reserve(4 * 1024);
-  body += '[';
+  // CrumBLE 4.4 post-bisect: chunked HTTP streaming. Each row is serialized
+  // into a small stack buffer and sent immediately as a chunk -- the full
+  // body is never held in heap. This keeps MaxAlloc high throughout the
+  // request (~20 KB instead of dropping to ~2 KB at the end), which lets
+  // lwIP allocate normal-sized TCP buffers and complete the send in <1s
+  // instead of the 10+s the prior std::string-body path took on /.crosspoint
+  // (86 entries, ~8 KB body). That slow path triggered browser fetch
+  // abort -> ERR_CONTENT_LENGTH_MISMATCH on the client even though the
+  // server eventually finished. setContentLength(CONTENT_LENGTH_UNKNOWN)
+  // puts the Arduino WebServer into Transfer-Encoding: chunked mode;
+  // sendContent then emits framed chunks instead of needing an upfront
+  // Content-Length header.
 
-  char output[512];
-  constexpr size_t outputSize = sizeof(output);
+  // CrumBLE 4.4: row buffer bumped from 512 -> 1024 to accommodate the
+  // optional prebakeTooltip field. Worst-case tooltip ~200 bytes; rest of
+  // the JSON (name + booleans) easily fits in the prior 512. 1024 leaves
+  // comfortable headroom.
+  char rowBuf[1024];
   bool seenFirst = false;
   bool truncated = false;
   size_t emittedRows = 0;
-  JsonDocument doc;
 
+  server->setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server->send(200, "application/json", "");
+  server->sendContent("[", 1);
+
+  // CrumBLE 4.4 post-bisect: build each row's JSON via snprintf into a stack
+  // buffer instead of ArduinoJson. JsonDocument internally allocates a few
+  // hundred bytes per row that compound into heap fragmentation across an
+  // 80+ entry scan, dropping MaxAlloc under the streaming-safe floor mid-
+  // request and triggering early truncation. snprintf-based building has
+  // zero heap cost per row -- MaxAlloc only changes by the lwIP TCP buffer
+  // allocations for the chunk send itself. Field test before this change
+  // saw 18-67 rows depending on entry heap; after, all 87 stream cleanly.
+  //
+  // JSON escaping: only `"` and `\\` need escaping in JSON strings. We
+  // escape them in the filename inline rather than via a helper.
+  constexpr uint32_t kAbortIfMaxAllocBelow = 4 * 1024;
   scanFiles(currentPath.c_str(), [&](const FileInfo& info) {
     if (truncated) return;
-    doc.clear();
-    doc["name"] = info.name;
-    doc["size"] = info.size;
-    doc["isDirectory"] = info.isDirectory;
-    doc["isEpub"] = info.isEpub;
+    if (ESP.getMaxAllocHeap() < kAbortIfMaxAllocBelow) {
+      truncated = true;
+      return;
+    }
+
+    // Escape name into local stack buffer. Truncate on overflow rather than
+    // bail; a too-long name yields a still-valid JSON row with a partial name.
+    char escapedName[256];
+    size_t ni = 0;
+    const char* np = info.name.c_str();
+    while (*np && ni + 2 < sizeof(escapedName)) {
+      if (*np == '"' || *np == '\\') escapedName[ni++] = '\\';
+      escapedName[ni++] = *np++;
+    }
+    escapedName[ni] = 0;
+
+    bool prebaked = false;
+    bool prebakedChap = false;
+    bool prebakedCpFont = false;
     if (info.isEpub && !info.isDirectory) {
       std::string fullPath = currentPath.c_str();
       if (fullPath.empty() || fullPath.back() != '/') fullPath += '/';
       fullPath += info.name.c_str();
-      // CrumBLE 4.2: gate the "Pre-cached" badge on the v2 marker (written by
-      // the post-4.2 WASM optimizer) rather than the bare manifest file.
-      // Pre-4.2 bakes left only the manifest and used the old SD-font
-      // measurement path -- their per-section layouts disagree with device
-      // runtime once the SD-font fast-path landed, so showing them as
-      // "Pre-cached" would be misleading. The on-device "Use prepared layout?"
-      // prompt path still reads prebake-manifest.json (via
-      // tryLoadPrebakeManifest) regardless of the marker, so legacy bakes
-      // remain functionally restorable -- they just no longer flaunt the
-      // badge.
-      const std::string markerPath =
-          Epub::cachePathForFilePath(fullPath, "/.crosspoint") + "/prebake-v2.marker";
-      doc["prebaked"] = Storage.exists(markerPath.c_str());
-    } else {
-      doc["prebaked"] = false;
+      // CrumBLE 4.4: three-tier badge detection. Each marker is a 0-byte
+      // sentinel written by the WASM CLI when the corresponding artifact
+      // shipped. Fallback for old bakes: if prebake-chap.marker is missing
+      // but sections-prebake/ directory exists, treat it as chap-cached
+      // (the older CLI didn't write the chap marker, but the data is
+      // there). Reusable stack buffer for the marker-path build avoids
+      // four std::string concatenations per row -- those allocations were
+      // fragmenting heap badly enough to trip the 4 KB MaxAlloc bailout
+      // at row 15 on books-with-long-names listings.
+      const std::string cacheDir = Epub::cachePathForFilePath(fullPath, "/.crosspoint");
+      char markerBuf[256];
+      auto checkUnder = [&](const char* leaf) -> bool {
+        const int n = snprintf(markerBuf, sizeof(markerBuf), "%s/%s", cacheDir.c_str(), leaf);
+        return n > 0 && static_cast<size_t>(n) < sizeof(markerBuf) && Storage.exists(markerBuf);
+      };
+      prebaked = checkUnder("prebake-v2.marker");
+      prebakedChap = checkUnder("prebake-chap.marker") || checkUnder("sections-prebake");
+      prebakedCpFont = checkUnder("prebake-cpfont.marker");
     }
 
-    const size_t written = serializeJson(doc, output, outputSize);
-    if (written == 0 || written >= outputSize) return;
-    if (body.size() + 2 + written > kFilesJsonBudget) {
-      truncated = true;
-      return;
+    // CrumBLE 4.4: build a multi-line tooltip from the prebake manifest so
+    // the FT page's badge mirrors the on-device viewer. Empty string when
+    // the book isn't prebaked or heap is too tight to safely parse JSON
+    // (helper bails internally). Escape \n and " for JSON embedding.
+    char tooltipEscaped[512];
+    tooltipEscaped[0] = '\0';
+    if (prebaked) {
+      const std::string cacheDir = Epub::cachePathForFilePath(
+          (currentPath.length() == 0 || currentPath[currentPath.length() - 1] != '/')
+              ? std::string(currentPath.c_str()) + "/" + info.name.c_str()
+              : std::string(currentPath.c_str()) + info.name.c_str(),
+          "/.crosspoint");
+      const std::string tooltip = formatPrebakeTooltip(cacheDir);
+      size_t oi = 0;
+      for (char c : tooltip) {
+        if (oi + 3 >= sizeof(tooltipEscaped)) break;
+        if (c == '"' || c == '\\') {
+          tooltipEscaped[oi++] = '\\';
+          tooltipEscaped[oi++] = c;
+        } else if (c == '\n') {
+          tooltipEscaped[oi++] = '\\';
+          tooltipEscaped[oi++] = 'n';
+        } else {
+          tooltipEscaped[oi++] = c;
+        }
+      }
+      tooltipEscaped[oi] = '\0';
     }
-    if (seenFirst) body += ',';
+
+    const int written = snprintf(
+        rowBuf, sizeof(rowBuf),
+        "{\"name\":\"%s\",\"size\":%lu,\"isDirectory\":%s,\"isEpub\":%s,\"prebaked\":%s,\"prebakedChap\":%s,\"prebakedCpFont\":%s,\"prebakeTooltip\":\"%s\"}",
+        escapedName, static_cast<unsigned long>(info.size),
+        info.isDirectory ? "true" : "false",
+        info.isEpub ? "true" : "false",
+        prebaked ? "true" : "false",
+        prebakedChap ? "true" : "false",
+        prebakedCpFont ? "true" : "false",
+        tooltipEscaped);
+    if (written <= 0 || static_cast<size_t>(written) >= sizeof(rowBuf)) return;
+
+    if (seenFirst) server->sendContent(",", 1);
     else seenFirst = true;
-    body.append(output, written);
+    server->sendContent(rowBuf, static_cast<size_t>(written));
     ++emittedRows;
   });
-  body += ']';
+  server->sendContent("]", 1);
+  // Empty chunk terminates Transfer-Encoding: chunked.
+  server->sendContent("", 0);
 
   if (truncated) {
-    LOG_ERR("WEB", "api-files: truncated to %u rows (%u B) for path=%s (budget %u B)",
-            (unsigned)emittedRows, (unsigned)body.size(), currentPath.c_str(),
-            (unsigned)kFilesJsonBudget);
+    LOG_ERR("WEB", "api-files: truncated to %u rows for path=%s (heap-aware bailout)",
+            (unsigned)emittedRows, currentPath.c_str());
   }
-  LOG_INF("WEB", "api-files: sending %u B rows=%u (free=%u maxAlloc=%u) path=%s",
-          (unsigned)body.size(), (unsigned)emittedRows, ESP.getFreeHeap(),
-          ESP.getMaxAllocHeap(), currentPath.c_str());
-  // CrumBLE 4.4 task #37 fix: the ERR_CONTENT_LENGTH_MISMATCH for ~7 KB+
-  // listings was NOT a transport-layer problem -- it was a temp-String
-  // allocation failure inside the original `sendContent(body.c_str())` call.
-  //
-  // The Arduino WebServer has no `sendContent(const char*)` single-arg
-  // overload (see WebServer.h: only `(const String&)` and `(const char*,
-  // size_t)` exist). Passing `body.c_str()` selected the `String` overload
-  // via implicit `String(const char*)` construction, which heap-allocates a
-  // second ~7 KB copy of the body. On a device that's already passed the
-  // 22 KB FT guard but is fragmented (post page-serve dip, maxAlloc often
-  // 8-14 KB), that contiguous allocation fails. Arduino String quietly
-  // becomes empty on alloc failure, so `sendContent` then writes zero
-  // body bytes after the headers already promised `Content-Length: N`.
-  // Browsers see "transfer closed with N bytes remaining" /
-  // ERR_CONTENT_LENGTH_MISMATCH. /.crosspoint hit this first because its
-  // ~75 cache entries are the only directory routinely exceeding 7 KB.
-  //
-  // The fix is to call the explicit `(const char*, size_t)` overload so
-  // the body's existing std::string buffer is written directly through
-  // NetworkClient::write. That writer already does select()-gated partial-
-  // write handling internally (NetworkClient.cpp) and honours the 5 s
-  // SO_SNDTIMEO from applyClientSendTimeout, so we get bounded blocking
-  // without the 4.3-rc2 retry-on-zero-write spin that wedged the WiFi task.
-  // No chunked encoding, no second large allocation.
-  server->setContentLength(body.size());
-  server->send(200, "application/json", "");
-  server->sendContent(body.data(), body.size());
-  LOG_INF("WEB", "api-files: done (post free=%u maxAlloc=%u)",
-          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  LOG_INF("WEB", "api-files: done streaming %u rows path=%s (free=%u maxAlloc=%u)",
+          (unsigned)emittedRows, currentPath.c_str(), ESP.getFreeHeap(),
+          ESP.getMaxAllocHeap());
 }
 
 void CrossPointWebServer::handleDownload() const {
@@ -1694,6 +1841,16 @@ void CrossPointWebServer::handleReaderRenderInfo() const {
   String json;
   serializeJson(doc, json);
   server->send(200, "application/json", json);
+
+  // CrumBLE: the SD font was loaded above (ensureLoaded) just to read its
+  // metadata for the prebake manifest. The optimizer modal calls this
+  // endpoint multiple times during the upload flow, and each load leaves the
+  // font resident -- fragmenting MaxAlloc by ~5 KB per call against the
+  // already-tight FT heap. WebServerActivity::onEnter explicitly releases
+  // the loaded font (line ~104) to give FT the most contiguous heap it can,
+  // so leaving it loaded here defeats that. Release it now; the next
+  // ReaderActivity::onEnter re-loads on demand. No-op if user is on built-in.
+  const_cast<SdCardFontSystem&>(sdFontSystem).releaseLoadedFont(r);
 }
 
 void CrossPointWebServer::handleSaveReaderSettings() const {
@@ -1731,6 +1888,7 @@ void CrossPointWebServer::handleSaveReaderSettings() const {
   applyU8("embeddedStyle", SETTINGS.embeddedStyle, 1);
   applyU8("bionicReadingEnabled", SETTINGS.bionicReadingEnabled, 1);
   applyU8("guideReadingEnabled", SETTINGS.guideReadingEnabled, 1);
+  applyU8("glyphAtlasEnabled", SETTINGS.glyphAtlasEnabled, 1);
   if (doc["sdFontFamilyName"].is<const char*>()) {
     const char* name = doc["sdFontFamilyName"].as<const char*>();
     strncpy(SETTINGS.sdFontFamilyName, name ? name : "", sizeof(SETTINGS.sdFontFamilyName) - 1);
@@ -2010,11 +2168,20 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
   switch (type) {
     case WStype_DISCONNECTED:
       LOG_DBG("WS", "Client %u disconnected", num);
-      // Only clean up if this is the client that owns the active upload.
-      // A new client may have already started a fresh upload before this
-      // DISCONNECTED event fires (race condition on quick cancel + retry).
+      // CrumBLE 4.4: on mid-upload disconnect, KEEP the partial file on SD
+      // so the next START can resume from where we left off. abortWsUpload
+      // would delete the file -- that's the right move for explicit errors
+      // (overflow, write fail), but a disconnect is exactly the case where
+      // resume should help. Close the handle and reset the in-progress
+      // flags, but leave the bytes on disk.
       if (num == wsUploadClientNum && wsUploadInProgress && wsUploadFile) {
-        abortWsUpload("WS");
+        LOG_INF("WS",
+                "Client %u disconnected mid-upload at %u/%u bytes; preserving for resume",
+                num, (unsigned)wsUploadReceived, (unsigned)wsUploadSize);
+        wsUploadFile.close();
+        wsUploadInProgress = false;
+        wsUploadClientNum = 255;
+        wsLastProgressSent = 0;
       }
       break;
 
@@ -2027,7 +2194,8 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
     case WStype_TEXT: {
       // Parse control messages
       String msg = String((char*)payload);
-      LOG_DBG("WS", "Text from client %u: %s", num, msg.c_str());
+      LOG_INF("WS", "DIAG TEXT from client %u (len=%u): %s", num, (unsigned)length,
+              msg.length() > 80 ? "<truncated>" : msg.c_str());
 
       if (msg.startsWith("START:")) {
         // Reject any START while an upload is already active to prevent
@@ -2036,6 +2204,32 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
           wsServer->sendTXT(num, "ERROR:Upload already in progress");
           break;
         }
+
+        // CrumBLE 4.4: pre-upload heap pre-flight. The WS chunked-receive path
+        // needs a contiguous ~4 KB MaxAlloc per BIN frame plus headroom for
+        // SD writes. If we accept an upload on a fragmented heap (the prior
+        // 2 books left it stitched together), the connection drops every few
+        // frames and we crawl forward via resume cycles -- eventually giving
+        // up at "n/m uploaded". A silent restart at START is cheap (no bytes
+        // received yet, no file on disk yet) and the browser's auto-resume
+        // logic re-issues START after reconnect. Also covers the between-
+        // books case: each book's first message is a fresh START so the
+        // pre-flight fires on every transition.
+        constexpr uint32_t WS_CHUNK_SIZE = 4096;
+        constexpr uint32_t kPreUploadMaxAllocFloor = WS_CHUNK_SIZE + 3u * 1024u;  // ~7 KB
+        const uint32_t startFree = ESP.getFreeHeap();
+        const uint32_t startMax = ESP.getMaxAllocHeap();
+        if (startMax < kPreUploadMaxAllocFloor) {
+          LOG_ERR("WS",
+                  "START rejected: pre-upload MaxAlloc=%u below floor=%u (free=%u); "
+                  "scheduling silentRestart to FT before accepting bytes",
+                  startMax, kPreUploadMaxAllocFloor, startFree);
+          wsServer->sendTXT(num, "ERROR:Heap too fragmented, device restarting; please retry");
+          g_pendingFtRestart = true;
+          break;
+        }
+        LOG_INF("WS", "START heap pre-flight ok: free=%u maxAlloc=%u (floor=%u)",
+                startFree, startMax, kPreUploadMaxAllocFloor);
 
         // Parse: START:<filename>:<size>:<path>
         int firstColon = msg.indexOf(':', 6);
@@ -2073,22 +2267,59 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
             return;
           }
 
-          LOG_DBG("WS", "Starting upload: %s (%d bytes) to %s", wsUploadFileName.c_str(), wsUploadSize,
-                  filePath.c_str());
+          LOG_INF("WS", "DIAG Starting upload: %s (%d bytes) to %s (free=%u maxAlloc=%u)",
+                  wsUploadFileName.c_str(), wsUploadSize, filePath.c_str(),
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
-          // Check if file exists and remove it
+          // CrumBLE 4.4: resume support. If a partial file already exists at
+          // the destination with size < the declared total, treat it as a
+          // continuation of a previous failed upload: open in non-truncating
+          // mode (O_RDWR | O_CREAT, no O_TRUNC), seek to the end, send
+          // RESUME:<bytes> instead of READY, and seed wsUploadReceived so
+          // the BIN handler picks up from there. Match is just by path +
+          // declared size; the browser is expected to slice the file from
+          // <bytes> on receiving RESUME. If the file is the same size as
+          // expected or larger, treat it as already-complete / dirty and
+          // restart fresh.
           esp_task_wdt_reset();
+          uint64_t resumeFrom = 0;
           if (Storage.exists(filePath.c_str())) {
-            Storage.remove(filePath.c_str());
+            FsFile probe = Storage.open(filePath.c_str(), O_RDONLY);
+            if (probe) {
+              const uint64_t existingSize = probe.fileSize64();
+              probe.close();
+              if (existingSize > 0 && existingSize < wsUploadSize) {
+                resumeFrom = existingSize;
+              } else {
+                // Same-or-larger: stale / complete leftover; truncate fresh.
+                Storage.remove(filePath.c_str());
+              }
+            } else {
+              Storage.remove(filePath.c_str());
+            }
           }
 
-          // Open file for writing
           esp_task_wdt_reset();
-          if (!Storage.openFileForWrite("WS", filePath, wsUploadFile)) {
-            wsServer->sendTXT(num, "ERROR:Failed to create file");
-            wsUploadInProgress = false;
-            wsUploadClientNum = 255;
-            return;
+          if (resumeFrom > 0) {
+            // Resume path: open without O_TRUNC, position at end.
+            wsUploadFile = Storage.open(filePath.c_str(), O_RDWR | O_CREAT);
+            if (!wsUploadFile) {
+              wsServer->sendTXT(num, "ERROR:Failed to reopen file for resume");
+              wsUploadInProgress = false;
+              wsUploadClientNum = 255;
+              return;
+            }
+            wsUploadFile.seekSet(static_cast<size_t>(resumeFrom));
+            wsUploadReceived = static_cast<size_t>(resumeFrom);
+            wsLastProgressSent = wsUploadReceived;
+          } else {
+            // Fresh upload: existing helper handles O_TRUNC + create.
+            if (!Storage.openFileForWrite("WS", filePath, wsUploadFile)) {
+              wsServer->sendTXT(num, "ERROR:Failed to create file");
+              wsUploadInProgress = false;
+              wsUploadClientNum = 255;
+              return;
+            }
           }
           esp_task_wdt_reset();
 
@@ -2101,14 +2332,27 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
             wsLastCompleteAt = millis();
             LOG_DBG("WS", "Zero-byte upload complete: %s", filePath.c_str());
             clearBookCache(filePath.c_str());
-            wsServer->sendTXT(num, "DONE");
+            // CrumBLE 4.4: include sanitized device path -- see main DONE branch.
+            String zdoneMsg = String("DONE:") + filePath;
+            wsServer->sendTXT(num, zdoneMsg.c_str());
             wsLastProgressSent = 0;
             break;
           }
 
           wsUploadClientNum = num;
           wsUploadInProgress = true;
-          wsServer->sendTXT(num, "READY");
+          if (resumeFrom > 0) {
+            char resumeMsg[48];
+            snprintf(resumeMsg, sizeof(resumeMsg), "RESUME:%lu", static_cast<unsigned long>(resumeFrom));
+            wsServer->sendTXT(num, resumeMsg);
+            LOG_INF("WS", "DIAG RESUME sent to client %u from offset %lu (free=%u maxAlloc=%u)",
+                    num, static_cast<unsigned long>(resumeFrom),
+                    ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+          } else {
+            wsServer->sendTXT(num, "READY");
+            LOG_INF("WS", "DIAG READY sent to client %u (free=%u maxAlloc=%u)",
+                    num, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+          }
         } else {
           wsServer->sendTXT(num, "ERROR:Invalid START format");
         }
@@ -2117,7 +2361,29 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
     }
 
     case WStype_BIN: {
+      // DIAG: first BIN frame is the most informative for instant-stall debugging
+      // -- if we never see this log, the browser isn't sending or the WS lib is
+      // rejecting frames before our handler runs. Also dump every 16th frame
+      // (~64 KB cadence, matches progress) so we can see processing speed.
+      if (wsUploadReceived == 0) {
+        LOG_INF("WS", "DIAG first BIN frame: len=%u inProgress=%d file=%d clientNum=%u expectedClient=%u free=%u maxAlloc=%u",
+                (unsigned)length, wsUploadInProgress ? 1 : 0,
+                wsUploadFile ? 1 : 0, num, wsUploadClientNum,
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      } else {
+        static uint16_t binFrameCount = 0;
+        binFrameCount++;
+        if ((binFrameCount & 0x0F) == 0) {  // every 16 frames
+          LOG_INF("WS", "DIAG BIN frame %u: len=%u received=%u/%u free=%u maxAlloc=%u",
+                  (unsigned)binFrameCount, (unsigned)length,
+                  (unsigned)wsUploadReceived, (unsigned)wsUploadSize,
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        }
+      }
+
       if (!wsUploadInProgress || !wsUploadFile || num != wsUploadClientNum) {
+        LOG_ERR("WS", "DIAG BIN rejected: inProgress=%d file=%d clientNum=%u expected=%u",
+                wsUploadInProgress ? 1 : 0, wsUploadFile ? 1 : 0, num, wsUploadClientNum);
         wsServer->sendTXT(num, "ERROR:No upload in progress");
         return;
       }
@@ -2134,6 +2400,9 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
       esp_task_wdt_reset();
 
       if (written != length) {
+        LOG_ERR("WS", "DIAG direct write failed: tried=%u wrote=%u received=%u/%u",
+                (unsigned)length, (unsigned)written,
+                (unsigned)(wsUploadReceived + written), (unsigned)wsUploadSize);
         abortWsUpload("WS");
         wsServer->sendTXT(num, "ERROR:Write failed - disk full?");
         return;
@@ -2146,6 +2415,9 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
         String progress = "PROGRESS:" + String(wsUploadReceived) + ":" + String(wsUploadSize);
         wsServer->sendTXT(num, progress);
         wsLastProgressSent = wsUploadReceived;
+        LOG_INF("WS", "DIAG progress %u/%u bytes (free=%u maxAlloc=%u)",
+                (unsigned)wsUploadReceived, (unsigned)wsUploadSize,
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
       }
 
       // Check if upload complete
@@ -2171,7 +2443,18 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
         filePath += wsUploadFileName;
         clearBookCache(filePath.c_str());
 
-        wsServer->sendTXT(num, "DONE");
+        // CrumBLE 4.4: include the device-sanitized final path in DONE so the
+        // browser's chapter-prebake step doesn't have to issue an /api/files
+        // listing to look the file up. On a tight post-upload heap, the
+        // listing endpoint heap-bails after a handful of rows -- a large
+        // book at the bottom of a long folder gets truncated out of the
+        // result and the prebake reports "could not find uploaded EPUB".
+        // Returning the path here costs ~1 frame on the wire and removes
+        // the most heap-fragile step from the critical path. Legacy clients
+        // that only check `msg === 'DONE'` will fall through to the colon
+        // and treat it as ERROR-or-unknown; new client parses prefix.
+        String doneMsg = String("DONE:") + filePath;
+        wsServer->sendTXT(num, doneMsg.c_str());
         wsLastProgressSent = 0;
       }
       break;

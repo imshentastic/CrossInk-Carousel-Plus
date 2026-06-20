@@ -111,13 +111,28 @@ void FontSelectionActivity::onEnter() {
     selectedIndex_ = SETTINGS.fontFamily < CrossPointSettings::BUILTIN_FONT_COUNT ? SETTINGS.fontFamily : 0;
   }
 
-  requestUpdate();
+  // CrumBLE 4.4 task #43: use immediate notify so the first render fires
+  // before the next user input. Without immediate=true, the requested
+  // update flag set here can be coalesced with the parent (ReaderOptions)
+  // activity's still-in-flight render notify, so the first FontSelection
+  // frame doesn't appear until the user presses up/down (which triggers
+  // its own requestUpdate). xTaskNotify with eIncrement is idempotent so
+  // an extra wake-up is harmless if the render task is already queued.
+  requestUpdate(/*immediate=*/true);
 }
 
 void FontSelectionActivity::onExit() { Activity::onExit(); }
 
 void FontSelectionActivity::loop() {
-  if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {
+  // CrumBLE 4.4 task #44: use wasReleased(Back) instead of wasPressed
+  // to stay consistent with the parent ReaderOptionsActivity (which also
+  // listens on Back release). Without this, the press event finishes
+  // FontSelection, ReaderOptions becomes the new current activity, and
+  // the matching release event still in mappedInput's queue immediately
+  // triggers ReaderOptions's own Back-on-release handler -- popping a
+  // second level back to the in-book main menu in a single user gesture.
+  // Confirm is already wasReleased for the same reason.
+  if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     finish();
     return;
   }

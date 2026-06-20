@@ -1,5 +1,6 @@
 #include "TextBlock.h"
 
+#include <Arduino.h>  // ESP.getMaxAllocHeap() for deserialize pre-flight
 #include <GfxRenderer.h>
 #include <Logging.h>
 #include <Serialization.h>
@@ -18,19 +19,18 @@ constexpr uint32_t SERIALIZED_MIN_WORD_METADATA_BYTES =
 constexpr uint32_t SERIALIZED_POST_WORD_MIN_METADATA_BYTES =
     sizeof(int16_t) + sizeof(EpdFontFamily::Style) + sizeof(uint8_t);
 
-uint16_t measureBackgroundWidth(const GfxRenderer& renderer, const int fontId, const std::string& word,
+uint16_t measureBackgroundWidth(const GfxRenderer& renderer, const int fontId, std::string_view word,
                                 const EpdFontFamily::Style style) {
   if (word.size() == 1 && word[0] == ' ') {
     return renderer.getSpaceWidth(fontId, style);
   }
-  return static_cast<uint16_t>(std::max(0, renderer.getTextAdvanceX(fontId, word.c_str(), style)));
+  return static_cast<uint16_t>(std::max(0, renderer.getTextAdvanceX(fontId, std::string(word).c_str(), style)));
 }
 
-bool isWhitespaceOnlyBackgroundToken(const std::string& word) {
+bool isWhitespaceOnlyBackgroundToken(std::string_view word) {
   if (word.empty()) {
     return false;
   }
-
   for (size_t i = 0; i < word.size();) {
     const auto c = static_cast<uint8_t>(word[i]);
     if (c == ' ' || c == '\r' || c == '\n' || c == '\t') {
@@ -41,14 +41,13 @@ bool isWhitespaceOnlyBackgroundToken(const std::string& word) {
       i += 2;
       continue;
     }
-    if (c == 0xE2 && i + 2 < word.size() && static_cast<uint8_t>(word[i + 1]) == 0x80 &&
-        static_cast<uint8_t>(word[i + 2]) == 0xAF) {
+    if (c == 0xE2 && i + 2 < word.size() && static_cast<uint8_t>(word[i + 2]) == 0xAF &&
+        static_cast<uint8_t>(word[i + 1]) == 0x80) {
       i += 3;
       continue;
     }
     return false;
   }
-
   return true;
 }
 
@@ -62,22 +61,20 @@ bool readBoundedString(FsFile& file, std::string& s) {
     LOG_ERR("TXB", "Deserialization failed: word length %lu exceeds maximum", static_cast<unsigned long>(len));
     return false;
   }
-
   const int remaining = file.available();
   if (remaining < 0 || static_cast<uint32_t>(remaining) < len) {
     LOG_ERR("TXB", "Deserialization failed: truncated word payload (%lu bytes requested, %d available)",
             static_cast<unsigned long>(len), remaining);
     return false;
   }
-
   if (len == 0) {
     s.clear();
     return true;
   }
-
   s.resize(len);
   if (file.read(&s[0], len) != static_cast<int>(len)) {
-    LOG_ERR("TXB", "Deserialization failed: could not read %lu-byte word payload", static_cast<unsigned long>(len));
+    LOG_ERR("TXB", "Deserialization failed: could not read %lu-byte word payload",
+            static_cast<unsigned long>(len));
     return false;
   }
   return true;
@@ -85,193 +82,279 @@ bool readBoundedString(FsFile& file, std::string& s) {
 
 }  // namespace
 
-void TextBlock::render(const GfxRenderer& renderer, const int fontId, const int x, const int y) const {
-  // Validate iterator bounds before rendering
-  const bool hasBionic = !wordBionicBoundary.empty();
-  const bool hasGuideDots = !wordGuideDotXOffset.empty();
-  if (words.size() != wordXpos.size() || words.size() != wordStyles.size() ||
-      words.size() != wordBackgroundBlack.size() ||
-      (hasBionic && (words.size() != wordBionicBoundary.size() || words.size() != wordBionicSuffixX.size())) ||
-      (!hasBionic && !wordBionicSuffixX.empty()) || (hasGuideDots && words.size() != wordGuideDotXOffset.size())) {
-    LOG_ERR("TXB",
-            "Render skipped: size mismatch (words=%u, xpos=%u, styles=%u, boundary=%u, suffixX=%u, dotX=%u, bg=%u)\n",
-            (uint32_t)words.size(), (uint32_t)wordXpos.size(), (uint32_t)wordStyles.size(),
-            (uint32_t)wordBionicBoundary.size(), (uint32_t)wordBionicSuffixX.size(),
-            (uint32_t)wordGuideDotXOffset.size(), (uint32_t)wordBackgroundBlack.size());
+uint32_t TextBlock::computeLayout(uint16_t wordCount, uint32_t wordContentBytes, bool hasBionic, bool hasGuideDots,
+                                  uint32_t& outOffWordOffsets, uint32_t& outOffWordXpos, uint32_t& outOffWordStyles,
+                                  uint32_t& outOffWordBackgroundBlack, uint32_t& outOffWordBionicBoundary,
+                                  uint32_t& outOffWordBionicSuffixX, uint32_t& outOffWordGuideDotXOffset,
+                                  uint32_t& outOffWordContents) {
+  // Layout (highest alignment first to avoid padding):
+  //   wordOffsets[wordCount+1]    uint32_t, 4-byte aligned
+  //   wordXpos[wordCount]         int16_t, 2-byte
+  //   wordBionicSuffixX[wc]       uint16_t, 2-byte    (if hasBionic)
+  //   wordGuideDotXOffset[wc]     uint16_t, 2-byte    (if hasGuideDots)
+  //   wordStyles[wordCount]       uint8_t,  1-byte
+  //   wordBackgroundBlack[wc]     uint8_t,  1-byte
+  //   wordBionicBoundary[wc]      uint8_t,  1-byte    (if hasBionic)
+  //   wordContents                char[],   1-byte (packed null-terminated)
+  uint32_t offset = 0;
+  outOffWordOffsets = offset;
+  offset += (static_cast<uint32_t>(wordCount) + 1) * sizeof(uint32_t);
+  outOffWordXpos = offset;
+  offset += static_cast<uint32_t>(wordCount) * sizeof(int16_t);
+  if (hasBionic) {
+    outOffWordBionicSuffixX = offset;
+    offset += static_cast<uint32_t>(wordCount) * sizeof(uint16_t);
+  } else {
+    outOffWordBionicSuffixX = 0;
+  }
+  if (hasGuideDots) {
+    outOffWordGuideDotXOffset = offset;
+    offset += static_cast<uint32_t>(wordCount) * sizeof(uint16_t);
+  } else {
+    outOffWordGuideDotXOffset = 0;
+  }
+  outOffWordStyles = offset;
+  offset += static_cast<uint32_t>(wordCount) * sizeof(EpdFontFamily::Style);
+  outOffWordBackgroundBlack = offset;
+  offset += static_cast<uint32_t>(wordCount) * sizeof(uint8_t);
+  if (hasBionic) {
+    outOffWordBionicBoundary = offset;
+    offset += static_cast<uint32_t>(wordCount) * sizeof(uint8_t);
+  } else {
+    outOffWordBionicBoundary = 0;
+  }
+  outOffWordContents = offset;
+  offset += wordContentBytes;
+  return offset;
+}
+
+TextBlock::TextBlock(std::vector<std::string> words, std::vector<int16_t> word_xpos,
+                     std::vector<EpdFontFamily::Style> word_styles, std::vector<uint8_t> bionic_boundary,
+                     std::vector<uint16_t> bionic_suffix_x, std::vector<uint16_t> guide_dot_x_offset,
+                     std::vector<uint8_t> background_black, const BlockStyle& blockStyle) {
+  blockStyle_ = blockStyle;
+  const uint16_t wc = static_cast<uint16_t>(words.size());
+  const bool hasBionic = !bionic_boundary.empty();
+  const bool hasGuideDots = !guide_dot_x_offset.empty();
+
+  // Size-mismatch check. If invalid, construct empty block (wordCount_ stays 0).
+  if (word_xpos.size() != wc || word_styles.size() != wc || background_black.size() != wc ||
+      (hasBionic && (bionic_boundary.size() != wc || bionic_suffix_x.size() != wc)) ||
+      (!hasBionic && !bionic_suffix_x.empty()) || (hasGuideDots && guide_dot_x_offset.size() != wc)) {
+    LOG_ERR("TXB", "Construction skipped: size mismatch (words=%u, xpos=%u, styles=%u, boundary=%u, suffixX=%u, dotX=%u, bg=%u)",
+            wc, static_cast<uint32_t>(word_xpos.size()), static_cast<uint32_t>(word_styles.size()),
+            static_cast<uint32_t>(bionic_boundary.size()), static_cast<uint32_t>(bionic_suffix_x.size()),
+            static_cast<uint32_t>(guide_dot_x_offset.size()), static_cast<uint32_t>(background_black.size()));
     return;
   }
 
-  for (size_t i = 0; i < words.size(); i++) {
-    const int wordX = wordXpos[i] + x;
-    const EpdFontFamily::Style currentStyle = wordStyles[i];
-    const uint8_t boundary = hasBionic ? wordBionicBoundary[i] : 0;
+  uint32_t wordContentBytes = 0;
+  for (const auto& w : words) {
+    wordContentBytes += static_cast<uint32_t>(w.size()) + 1;  // +1 for null terminator
+  }
 
-    if (wordBackgroundBlack[i] != 0 && isWhitespaceOnlyBackgroundToken(words[i])) {
-      const uint16_t backgroundWidth = measureBackgroundWidth(renderer, fontId, words[i], currentStyle);
+  uint32_t offWordOffsets, offWordXpos, offWordStyles, offWordBackgroundBlack;
+  uint32_t offWordBionicBoundary, offWordBionicSuffixX, offWordGuideDotXOffset, offWordContents;
+  const uint32_t totalBytes =
+      computeLayout(wc, wordContentBytes, hasBionic, hasGuideDots, offWordOffsets, offWordXpos, offWordStyles,
+                    offWordBackgroundBlack, offWordBionicBoundary, offWordBionicSuffixX, offWordGuideDotXOffset,
+                    offWordContents);
+
+  auto block = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[totalBytes]);
+  if (!block) {
+    LOG_ERR("TXB", "Construction OOM: failed to alloc %u-byte data block (wc=%u, contentBytes=%u)", totalBytes, wc,
+            wordContentBytes);
+    return;
+  }
+
+  uint8_t* base = block.get();
+  auto* wordOffsetsPtr = reinterpret_cast<uint32_t*>(base + offWordOffsets);
+  auto* wordXposPtr = reinterpret_cast<int16_t*>(base + offWordXpos);
+  auto* wordStylesPtr = reinterpret_cast<EpdFontFamily::Style*>(base + offWordStyles);
+  auto* wordBackgroundBlackPtr = reinterpret_cast<uint8_t*>(base + offWordBackgroundBlack);
+  uint8_t* wordBionicBoundaryPtr = hasBionic ? reinterpret_cast<uint8_t*>(base + offWordBionicBoundary) : nullptr;
+  uint16_t* wordBionicSuffixXPtr = hasBionic ? reinterpret_cast<uint16_t*>(base + offWordBionicSuffixX) : nullptr;
+  uint16_t* wordGuideDotXOffsetPtr =
+      hasGuideDots ? reinterpret_cast<uint16_t*>(base + offWordGuideDotXOffset) : nullptr;
+  char* wordContentsPtr = reinterpret_cast<char*>(base + offWordContents);
+
+  uint32_t curOffset = 0;
+  for (uint16_t i = 0; i < wc; ++i) {
+    wordOffsetsPtr[i] = curOffset;
+    const auto& w = words[i];
+    if (!w.empty()) {
+      std::memcpy(wordContentsPtr + curOffset, w.data(), w.size());
+    }
+    curOffset += static_cast<uint32_t>(w.size());
+    wordContentsPtr[curOffset++] = '\0';
+  }
+  wordOffsetsPtr[wc] = curOffset;
+
+  for (uint16_t i = 0; i < wc; ++i) wordXposPtr[i] = word_xpos[i];
+  for (uint16_t i = 0; i < wc; ++i) wordStylesPtr[i] = word_styles[i];
+  for (uint16_t i = 0; i < wc; ++i) wordBackgroundBlackPtr[i] = background_black[i];
+  if (hasBionic) {
+    for (uint16_t i = 0; i < wc; ++i) wordBionicBoundaryPtr[i] = bionic_boundary[i];
+    for (uint16_t i = 0; i < wc; ++i) wordBionicSuffixXPtr[i] = bionic_suffix_x[i];
+  }
+  if (hasGuideDots) {
+    for (uint16_t i = 0; i < wc; ++i) wordGuideDotXOffsetPtr[i] = guide_dot_x_offset[i];
+  }
+
+  dataBlock_ = std::move(block);
+  dataBlockSize_ = totalBytes;
+  wordCount_ = wc;
+  wordOffsets_ = wordOffsetsPtr;
+  wordContents_ = wordContentsPtr;
+  wordXpos_ = wordXposPtr;
+  wordStyles_ = wordStylesPtr;
+  wordBackgroundBlack_ = wordBackgroundBlackPtr;
+  wordBionicBoundary_ = wordBionicBoundaryPtr;
+  wordBionicSuffixX_ = wordBionicSuffixXPtr;
+  wordGuideDotXOffset_ = wordGuideDotXOffsetPtr;
+}
+
+void TextBlock::render(const GfxRenderer& renderer, const int fontId, const int x, const int y,
+                       const bool foregroundBlack) const {
+  if (wordCount_ == 0 || !dataBlock_) return;
+  const bool hasBionic = wordBionicBoundary_ != nullptr;
+  const bool hasGuideDots = wordGuideDotXOffset_ != nullptr;
+  const WordsView words = getWords();
+
+  for (uint16_t i = 0; i < wordCount_; ++i) {
+    const int wordX = wordXpos_[i] + x;
+    const EpdFontFamily::Style currentStyle = wordStyles_[i];
+    const uint8_t boundary = hasBionic ? wordBionicBoundary_[i] : 0;
+    const WordView word = words[i];
+
+    if (wordBackgroundBlack_[i] != 0 && isWhitespaceOnlyBackgroundToken(word)) {
+      const uint16_t backgroundWidth = measureBackgroundWidth(renderer, fontId, word, currentStyle);
       if (backgroundWidth > 0) {
-        renderer.fillRect(wordX, y, backgroundWidth, renderer.getFontAscenderSize(fontId), true);
+        renderer.fillRect(wordX, y, backgroundWidth, renderer.getFontAscenderSize(fontId), foregroundBlack);
       }
     }
 
     if (boundary > 0) {
-      // Bionic split: draw bold prefix (max 9 codepoints = 36 UTF-8 bytes + null).
-      // suffixX is pre-computed at cache creation time to avoid font metric lookups at render time.
       const auto boldStyle = static_cast<EpdFontFamily::Style>(currentStyle | EpdFontFamily::BOLD);
       char boldBuf[40];
-      const size_t boldLen = std::min<size_t>({static_cast<size_t>(boundary), words[i].size(), sizeof(boldBuf) - 1});
-      memcpy(boldBuf, words[i].c_str(), boldLen);
+      const size_t boldLen = std::min<size_t>({static_cast<size_t>(boundary), word.size(), sizeof(boldBuf) - 1});
+      std::memcpy(boldBuf, word.c_str(), boldLen);
       boldBuf[boldLen] = '\0';
-      renderer.drawText(fontId, wordX, y, boldBuf, true, boldStyle);
-      const int suffixX = wordX + wordBionicSuffixX[i];
-      renderer.drawText(fontId, suffixX, y, words[i].c_str() + boldLen, true, currentStyle);
+      renderer.drawText(fontId, wordX, y, boldBuf, foregroundBlack, boldStyle);
+      const int suffixX = wordX + wordBionicSuffixX_[i];
+      renderer.drawText(fontId, suffixX, y, word.c_str() + boldLen, foregroundBlack, currentStyle);
     } else {
-      renderer.drawText(fontId, wordX, y, words[i].c_str(), true, currentStyle);
+      renderer.drawText(fontId, wordX, y, word.c_str(), foregroundBlack, currentStyle);
     }
 
-    if (hasGuideDots && wordGuideDotXOffset[i] > 0) {
-      renderer.drawText(fontId, wordX + wordGuideDotXOffset[i], y, "\xc2\xb7", true, EpdFontFamily::REGULAR);
+    if (hasGuideDots && wordGuideDotXOffset_[i] > 0) {
+      renderer.drawText(fontId, wordX + wordGuideDotXOffset_[i], y, "\xc2\xb7", foregroundBlack, EpdFontFamily::REGULAR);
     }
 
     if ((currentStyle & EpdFontFamily::UNDERLINE) != 0) {
-      const std::string& w = words[i];
-      const int fullWordWidth = renderer.getTextWidth(fontId, w.c_str(), currentStyle);
-      // y is the top of the text line; add ascender to reach baseline, then offset 2px below
+      const int fullWordWidth = renderer.getTextWidth(fontId, word.c_str(), currentStyle);
       const int underlineY = y + renderer.getFontAscenderSize(fontId) + 2;
-
       int startX = wordX;
       int underlineWidth = fullWordWidth;
-
-      // if word starts with em-space ("\xe2\x80\x83"), account for the additional indent before drawing the line
-      if (w.size() >= 3 && static_cast<uint8_t>(w[0]) == 0xE2 && static_cast<uint8_t>(w[1]) == 0x80 &&
-          static_cast<uint8_t>(w[2]) == 0x83) {
-        const char* visiblePtr = w.c_str() + 3;
+      if (word.size() >= 3 && static_cast<uint8_t>(word[0]) == 0xE2 && static_cast<uint8_t>(word[1]) == 0x80 &&
+          static_cast<uint8_t>(word[2]) == 0x83) {
+        const char* visiblePtr = word.c_str() + 3;
         const int prefixWidth = renderer.getTextAdvanceX(fontId, "\xe2\x80\x83", currentStyle);
         const int visibleWidth = renderer.getTextWidth(fontId, visiblePtr, currentStyle);
         startX = wordX + prefixWidth;
         underlineWidth = visibleWidth;
       }
-
-      renderer.drawLine(startX, underlineY, startX + underlineWidth, underlineY, 3, true);
+      renderer.drawLine(startX, underlineY, startX + underlineWidth, underlineY, 3, foregroundBlack);
     }
 
     if ((currentStyle & EpdFontFamily::STRIKETHROUGH) != 0) {
-      const std::string& w = words[i];
-      const int fullWordWidth = renderer.getTextWidth(fontId, w.c_str(), currentStyle);
-      // Position at roughly mid-glyph height. Offset down from the half-ascender
-      // point to align with the visual centre of lowercase letters.
-      // Added a 6 pixel offset after testing on various fonts to improve the visual alignment of the strike-through
-      // line.
+      const int fullWordWidth = renderer.getTextWidth(fontId, word.c_str(), currentStyle);
       const int strikeY = y + renderer.getFontAscenderSize(fontId) / 2 + 6;
-
       int startX = wordX;
       int strikeWidth = fullWordWidth;
-
-      // Skip em-space prefix same as underline does
-      if (w.size() >= 3 && static_cast<uint8_t>(w[0]) == 0xE2 && static_cast<uint8_t>(w[1]) == 0x80 &&
-          static_cast<uint8_t>(w[2]) == 0x83) {
-        const char* visiblePtr = w.c_str() + 3;
+      if (word.size() >= 3 && static_cast<uint8_t>(word[0]) == 0xE2 && static_cast<uint8_t>(word[1]) == 0x80 &&
+          static_cast<uint8_t>(word[2]) == 0x83) {
+        const char* visiblePtr = word.c_str() + 3;
         const int prefixWidth = renderer.getTextAdvanceX(fontId, "\xe2\x80\x83", currentStyle);
         const int visibleWidth = renderer.getTextWidth(fontId, visiblePtr, currentStyle);
         startX = wordX + prefixWidth;
         strikeWidth = visibleWidth;
       }
-
-      renderer.drawLine(startX, strikeY, startX + strikeWidth, strikeY, 3, true);
+      renderer.drawLine(startX, strikeY, startX + strikeWidth, strikeY, 3, foregroundBlack);
     }
   }
 }
 
 bool TextBlock::serialize(FsFile& file) const {
-  const bool hasBionic = !wordBionicBoundary.empty();
-  const bool hasGuideDots = !wordGuideDotXOffset.empty();
-  if (words.size() != wordXpos.size() || words.size() != wordStyles.size() ||
-      words.size() != wordBackgroundBlack.size() ||
-      (hasBionic && (words.size() != wordBionicBoundary.size() || words.size() != wordBionicSuffixX.size())) ||
-      (!hasBionic && !wordBionicSuffixX.empty()) || (hasGuideDots && words.size() != wordGuideDotXOffset.size())) {
-    LOG_ERR(
-        "TXB",
-        "Serialization failed: size mismatch (words=%u, xpos=%u, styles=%u, boundary=%u, suffixX=%u, dotX=%u, bg=%u)\n",
-        static_cast<uint32_t>(words.size()), static_cast<uint32_t>(wordXpos.size()),
-        static_cast<uint32_t>(wordStyles.size()), static_cast<uint32_t>(wordBionicBoundary.size()),
-        static_cast<uint32_t>(wordBionicSuffixX.size()), static_cast<uint32_t>(wordGuideDotXOffset.size()),
-        static_cast<uint32_t>(wordBackgroundBlack.size()));
-    return false;
-  }
+  const bool hasBionic = wordBionicBoundary_ != nullptr;
+  const bool hasGuideDots = wordGuideDotXOffset_ != nullptr;
 
-  // Word data
-  if (!serialization::tryWritePod(file, static_cast<uint16_t>(words.size()))) {
+  if (!serialization::tryWritePod(file, wordCount_)) {
     LOG_ERR("TXB", "Serialization failed: could not write word count");
     return false;
   }
-  for (const auto& w : words) {
-    if (!serialization::tryWriteString(file, w)) {
+  const WordsView words = getWords();
+  for (uint16_t i = 0; i < wordCount_; ++i) {
+    const WordView w = words[i];
+    if (!serialization::tryWritePod(file, static_cast<uint32_t>(w.size()))) return false;
+    if (w.size() > 0 && file.write(reinterpret_cast<const uint8_t*>(w.data()), w.size()) != static_cast<int>(w.size())) {
       LOG_ERR("TXB", "Serialization failed: could not write word payload");
       return false;
     }
   }
-  for (auto x : wordXpos) {
-    if (!serialization::tryWritePod(file, x)) return false;
+  for (uint16_t i = 0; i < wordCount_; ++i) {
+    if (!serialization::tryWritePod(file, wordXpos_[i])) return false;
   }
-  for (auto s : wordStyles) {
-    if (!serialization::tryWritePod(file, s)) return false;
+  for (uint16_t i = 0; i < wordCount_; ++i) {
+    if (!serialization::tryWritePod(file, wordStyles_[i])) return false;
   }
-  if (!serialization::tryWritePod(file, static_cast<uint8_t>(hasBionic ? 1 : 0))) {
-    return false;
-  }
+  if (!serialization::tryWritePod(file, static_cast<uint8_t>(hasBionic ? 1 : 0))) return false;
   if (hasBionic) {
-    for (auto b : wordBionicBoundary) {
-      if (!serialization::tryWritePod(file, b)) return false;
+    for (uint16_t i = 0; i < wordCount_; ++i) {
+      if (!serialization::tryWritePod(file, wordBionicBoundary_[i])) return false;
     }
-    for (auto sx : wordBionicSuffixX) {
-      if (!serialization::tryWritePod(file, sx)) return false;
+    for (uint16_t i = 0; i < wordCount_; ++i) {
+      if (!serialization::tryWritePod(file, wordBionicSuffixX_[i])) return false;
     }
   }
-  if (!serialization::tryWritePod(file, static_cast<uint8_t>(hasGuideDots ? 1 : 0))) {
-    return false;
-  }
+  if (!serialization::tryWritePod(file, static_cast<uint8_t>(hasGuideDots ? 1 : 0))) return false;
   if (hasGuideDots) {
-    for (auto dx : wordGuideDotXOffset) {
-      if (!serialization::tryWritePod(file, dx)) return false;
+    for (uint16_t i = 0; i < wordCount_; ++i) {
+      if (!serialization::tryWritePod(file, wordGuideDotXOffset_[i])) return false;
     }
   }
-  for (auto bg : wordBackgroundBlack) {
-    if (!serialization::tryWritePod(file, bg)) return false;
+  for (uint16_t i = 0; i < wordCount_; ++i) {
+    if (!serialization::tryWritePod(file, wordBackgroundBlack_[i])) return false;
   }
 
-  // Style (alignment + margins/padding/indent)
-  return serialization::tryWritePod(file, blockStyle.alignment) &&
-         serialization::tryWritePod(file, blockStyle.textAlignDefined) &&
-         serialization::tryWritePod(file, blockStyle.marginTop) &&
-         serialization::tryWritePod(file, blockStyle.marginBottom) &&
-         serialization::tryWritePod(file, blockStyle.marginLeft) &&
-         serialization::tryWritePod(file, blockStyle.marginRight) &&
-         serialization::tryWritePod(file, blockStyle.paddingTop) &&
-         serialization::tryWritePod(file, blockStyle.paddingBottom) &&
-         serialization::tryWritePod(file, blockStyle.paddingLeft) &&
-         serialization::tryWritePod(file, blockStyle.paddingRight) &&
-         serialization::tryWritePod(file, blockStyle.textIndent) &&
-         serialization::tryWritePod(file, blockStyle.textIndentDefined);
+  return serialization::tryWritePod(file, blockStyle_.alignment) &&
+         serialization::tryWritePod(file, blockStyle_.textAlignDefined) &&
+         serialization::tryWritePod(file, blockStyle_.marginTop) &&
+         serialization::tryWritePod(file, blockStyle_.marginBottom) &&
+         serialization::tryWritePod(file, blockStyle_.marginLeft) &&
+         serialization::tryWritePod(file, blockStyle_.marginRight) &&
+         serialization::tryWritePod(file, blockStyle_.paddingTop) &&
+         serialization::tryWritePod(file, blockStyle_.paddingBottom) &&
+         serialization::tryWritePod(file, blockStyle_.paddingLeft) &&
+         serialization::tryWritePod(file, blockStyle_.paddingRight) &&
+         serialization::tryWritePod(file, blockStyle_.textIndent) &&
+         serialization::tryWritePod(file, blockStyle_.textIndentDefined);
 }
 
+// CrumBLE 4.4 post-bisect: deserialize allocates ONE compact data block
+// and streams the on-disk fields directly into it. Two-pass:
+//   Pass 1: scan word length prefixes (skipping content bytes) to compute
+//           total content bytes + locate hasBionic / hasGuideDots flags.
+//   Pass 2: seek back, allocate the compact block sized exactly to the
+//           computed layout, stream fields into the block.
+// No temporary std::vectors. Peak allocation per TextBlock collapses from
+// 7+ small vector allocs + N per-word std::string allocs to ONE alloc.
 std::unique_ptr<TextBlock> TextBlock::deserialize(FsFile& file) {
   uint16_t wc;
-  std::vector<std::string> words;
-  std::vector<int16_t> wordXpos;
-  std::vector<EpdFontFamily::Style> wordStyles;
-  std::vector<uint8_t> wordBionicBoundary;
-  std::vector<uint16_t> wordBionicSuffixX;
-  std::vector<uint16_t> wordGuideDotXOffset;
-  std::vector<uint8_t> wordBackgroundBlack;
-  BlockStyle blockStyle;
-
-  // Word count
   if (!serialization::tryReadPod(file, wc)) {
     LOG_ERR("TXB", "Deserialization failed: could not read word count");
     return nullptr;
   }
-
-  // A TextBlock is one rendered line of text, so counts far above a few hundred are not legitimate.
-  // Clamp aggressively here so corrupted cache data cannot trigger huge STL allocations on the ESP32-C3.
   if (wc > MAX_WORDS_PER_TEXT_BLOCK) {
     LOG_ERR("TXB", "Deserialization failed: word count %u exceeds maximum", wc);
     return nullptr;
@@ -286,63 +369,129 @@ std::unique_ptr<TextBlock> TextBlock::deserialize(FsFile& file) {
     return nullptr;
   }
 
-  // Word data
-  words.resize(wc);
-  wordXpos.resize(wc);
-  wordStyles.resize(wc);
-  wordBackgroundBlack.resize(wc);
-  for (auto& w : words) {
-    if (!readBoundedString(file, w)) {
+  // ---- Pass 1: scan word lengths + locate flags without consuming bytes ----
+  const uint32_t wordSectionStart = file.position();
+  uint32_t totalContentBytes = 0;
+  for (uint16_t i = 0; i < wc; ++i) {
+    uint32_t len = 0;
+    if (!serialization::tryReadPod(file, len)) {
+      LOG_ERR("TXB", "Deserialization failed: could not read word %u length prefix", i);
+      return nullptr;
+    }
+    if (len > MAX_SERIALIZED_WORD_BYTES) {
+      LOG_ERR("TXB", "Deserialization failed: word %u length %lu exceeds maximum", i, static_cast<unsigned long>(len));
+      return nullptr;
+    }
+    totalContentBytes += len + 1;  // +1 for null terminator we add in-block
+    // Skip the content bytes without reading them.
+    if (len > 0 && !file.seek(file.position() + len)) {
+      LOG_ERR("TXB", "Deserialization failed: could not seek past word %u content", i);
       return nullptr;
     }
   }
-
-  const uint32_t remainingMetadataBytes = static_cast<uint32_t>(wc) * SERIALIZED_POST_WORD_MIN_METADATA_BYTES +
-                                          sizeof(uint8_t) + sizeof(uint8_t) + SERIALIZED_TEXT_BLOCK_TAIL_BYTES;
-  const int remainingAfterWords = file.available();
-  if (remainingAfterWords < 0 || static_cast<uint32_t>(remainingAfterWords) < remainingMetadataBytes) {
-    LOG_ERR("TXB", "Deserialization failed: truncated post-word metadata (%lu bytes needed, %d available)",
-            static_cast<unsigned long>(remainingMetadataBytes), remainingAfterWords);
+  // Skip wordXpos + wordStyles
+  if (!file.seek(file.position() + static_cast<uint32_t>(wc) * sizeof(int16_t) +
+                 static_cast<uint32_t>(wc) * sizeof(EpdFontFamily::Style))) {
     return nullptr;
   }
-
-  for (auto& x : wordXpos) {
-    if (!serialization::tryReadPod(file, x)) return nullptr;
-  }
-  for (auto& s : wordStyles) {
-    if (!serialization::tryReadPod(file, s)) return nullptr;
-  }
-  uint8_t hasBionic = 0;
-  if (!serialization::tryReadPod(file, hasBionic) || hasBionic > 1) {
+  uint8_t hasBionicByte = 0;
+  if (!serialization::tryReadPod(file, hasBionicByte) || hasBionicByte > 1) {
     LOG_ERR("TXB", "Deserialization failed: invalid bionic metadata flag");
     return nullptr;
   }
+  const bool hasBionic = (hasBionicByte == 1);
   if (hasBionic) {
-    wordBionicBoundary.resize(wc);
-    wordBionicSuffixX.resize(wc);
-    for (auto& b : wordBionicBoundary) {
-      if (!serialization::tryReadPod(file, b)) return nullptr;
-    }
-    for (auto& sx : wordBionicSuffixX) {
-      if (!serialization::tryReadPod(file, sx)) return nullptr;
+    if (!file.seek(file.position() + static_cast<uint32_t>(wc) * sizeof(uint8_t) +
+                   static_cast<uint32_t>(wc) * sizeof(uint16_t))) {
+      return nullptr;
     }
   }
-  uint8_t hasGuideDots = 0;
-  if (!serialization::tryReadPod(file, hasGuideDots) || hasGuideDots > 1) {
+  uint8_t hasGuideDotsByte = 0;
+  if (!serialization::tryReadPod(file, hasGuideDotsByte) || hasGuideDotsByte > 1) {
     LOG_ERR("TXB", "Deserialization failed: invalid guide-dot metadata flag");
     return nullptr;
   }
-  if (hasGuideDots) {
-    wordGuideDotXOffset.resize(wc);
-    for (auto& dx : wordGuideDotXOffset) {
-      if (!serialization::tryReadPod(file, dx)) return nullptr;
+  const bool hasGuideDots = (hasGuideDotsByte == 1);
+
+  // ---- Pass 2: compute layout, allocate single block, stream into it ----
+  uint32_t offWordOffsets, offWordXpos, offWordStyles, offWordBackgroundBlack;
+  uint32_t offWordBionicBoundary, offWordBionicSuffixX, offWordGuideDotXOffset, offWordContents;
+  const uint32_t totalBytes =
+      computeLayout(wc, totalContentBytes, hasBionic, hasGuideDots, offWordOffsets, offWordXpos, offWordStyles,
+                    offWordBackgroundBlack, offWordBionicBoundary, offWordBionicSuffixX, offWordGuideDotXOffset,
+                    offWordContents);
+
+  // Pre-flight: skip the alloc entirely if MaxAlloc can't cover the block.
+  // 128 byte margin for allocator metadata overhead.
+  if (ESP.getMaxAllocHeap() < totalBytes + 128) {
+    LOG_ERR("TXB", "Refusing dataBlock alloc(%u): maxAlloc=%u < needed=%u (wc=%u)", totalBytes,
+            ESP.getMaxAllocHeap(), totalBytes + 128, wc);
+    return nullptr;
+  }
+  auto block = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[totalBytes]);
+  if (!block) {
+    LOG_ERR("TXB", "dataBlock alloc(%u) returned nullptr", totalBytes);
+    return nullptr;
+  }
+  uint8_t* base = block.get();
+  auto* wordOffsetsPtr = reinterpret_cast<uint32_t*>(base + offWordOffsets);
+  auto* wordXposPtr = reinterpret_cast<int16_t*>(base + offWordXpos);
+  auto* wordStylesPtr = reinterpret_cast<EpdFontFamily::Style*>(base + offWordStyles);
+  auto* wordBackgroundBlackPtr = reinterpret_cast<uint8_t*>(base + offWordBackgroundBlack);
+  uint8_t* wordBionicBoundaryPtr = hasBionic ? reinterpret_cast<uint8_t*>(base + offWordBionicBoundary) : nullptr;
+  uint16_t* wordBionicSuffixXPtr = hasBionic ? reinterpret_cast<uint16_t*>(base + offWordBionicSuffixX) : nullptr;
+  uint16_t* wordGuideDotXOffsetPtr =
+      hasGuideDots ? reinterpret_cast<uint16_t*>(base + offWordGuideDotXOffset) : nullptr;
+  char* wordContentsPtr = reinterpret_cast<char*>(base + offWordContents);
+
+  // Seek back to the word section and stream-read into block.
+  if (!file.seek(wordSectionStart)) {
+    LOG_ERR("TXB", "Deserialization failed: could not seek back to word section");
+    return nullptr;
+  }
+  uint32_t curOffset = 0;
+  for (uint16_t i = 0; i < wc; ++i) {
+    uint32_t len = 0;
+    if (!serialization::tryReadPod(file, len)) return nullptr;
+    wordOffsetsPtr[i] = curOffset;
+    if (len > 0) {
+      if (file.read(reinterpret_cast<uint8_t*>(wordContentsPtr) + curOffset, len) != static_cast<int>(len)) {
+        LOG_ERR("TXB", "Deserialization failed: could not stream-read word %u content", i);
+        return nullptr;
+      }
+      curOffset += len;
+    }
+    wordContentsPtr[curOffset++] = '\0';
+  }
+  wordOffsetsPtr[wc] = curOffset;
+
+  for (uint16_t i = 0; i < wc; ++i) {
+    if (!serialization::tryReadPod(file, wordXposPtr[i])) return nullptr;
+  }
+  for (uint16_t i = 0; i < wc; ++i) {
+    if (!serialization::tryReadPod(file, wordStylesPtr[i])) return nullptr;
+  }
+  uint8_t skipFlag = 0;
+  if (!serialization::tryReadPod(file, skipFlag)) return nullptr;  // hasBionic, already known
+  if (hasBionic) {
+    for (uint16_t i = 0; i < wc; ++i) {
+      if (!serialization::tryReadPod(file, wordBionicBoundaryPtr[i])) return nullptr;
+    }
+    for (uint16_t i = 0; i < wc; ++i) {
+      if (!serialization::tryReadPod(file, wordBionicSuffixXPtr[i])) return nullptr;
     }
   }
-  for (auto& bg : wordBackgroundBlack) {
-    if (!serialization::tryReadPod(file, bg)) return nullptr;
+  if (!serialization::tryReadPod(file, skipFlag)) return nullptr;  // hasGuideDots, already known
+  if (hasGuideDots) {
+    for (uint16_t i = 0; i < wc; ++i) {
+      if (!serialization::tryReadPod(file, wordGuideDotXOffsetPtr[i])) return nullptr;
+    }
+  }
+  for (uint16_t i = 0; i < wc; ++i) {
+    if (!serialization::tryReadPod(file, wordBackgroundBlackPtr[i])) return nullptr;
   }
 
-  // Style (alignment + margins/padding/indent)
+  BlockStyle blockStyle;
   if (!serialization::tryReadPod(file, blockStyle.alignment) ||
       !serialization::tryReadPod(file, blockStyle.textAlignDefined) ||
       !serialization::tryReadPod(file, blockStyle.marginTop) ||
@@ -359,13 +508,13 @@ std::unique_ptr<TextBlock> TextBlock::deserialize(FsFile& file) {
     return nullptr;
   }
 
-  auto* textBlock = new (std::nothrow) TextBlock(
-      std::move(words), std::move(wordXpos), std::move(wordStyles), std::move(wordBionicBoundary),
-      std::move(wordBionicSuffixX), std::move(wordGuideDotXOffset), std::move(wordBackgroundBlack), blockStyle);
+  auto* textBlock = new (std::nothrow) TextBlock(std::move(block), totalBytes, wc, wordOffsetsPtr, wordContentsPtr,
+                                                  wordXposPtr, wordStylesPtr, wordBionicBoundaryPtr,
+                                                  wordBionicSuffixXPtr, wordGuideDotXOffsetPtr,
+                                                  wordBackgroundBlackPtr, blockStyle);
   if (!textBlock) {
-    LOG_ERR("TXB", "Deserialization failed: could not allocate TextBlock");
+    LOG_ERR("TXB", "Deserialization failed: could not allocate TextBlock wrapper");
     return nullptr;
   }
-
   return std::unique_ptr<TextBlock>(textBlock);
 }

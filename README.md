@@ -59,6 +59,8 @@ Books normally index their chapter structure on first open and re-index when you
 
 The previous Bluetooth-image-cache (`.pxc`) and chapter-text flattening features are still included as part of the optimizer's pre-cache pipeline.
 
+**Hover any pre-baked book's badge in the File Manager** to see a tooltip with the baked-in layout (font, font size, orientation, line spacing, margin). Long-press the badge on-device for the same view. The pre-cache toggle is now named **Pre-Bake (Image, Chapter, Custom Font)** with a bullet-list description so it's clearer what gets baked.
+
 ### Bluetooth remote page-turner
 
 Pairing is done from WITHIN A BOOK ONLY! Click on the "Confirm" button while inside a book to open the reader menu. Navigate to Bluetooth and follow the instructions there to pair a BT HID remote (e.g. an [IINE GameBrick](https://www.amazon.com/dp/B0CK4DNQM4) or Free2) and use it as a wireless page-turner. BLE auto-disables when you exit the book to keep heap pressure off the parser, so you will need to reconnect again when you enter a new book.
@@ -142,6 +144,7 @@ Back from any nested submenu pops one level up; back from the root exits to Home
 - **Auto-retry on chapter-layout abort** — if the parser trips the low-heap floor with BLE consuming its ~58 KB share, CrumBLE silently drops BLE, retries the layout with the recovered headroom, and lets the existing auto-reconnect logic re-pair on your next remote press.
 - **Glyph buffer pre-grown at every BT-enable site** so the font scratch's high-water mark is allocated BEFORE NimBLE eats heap, preventing the mid-page-turn allocation failures that used to drop the BT link on text-heavy chapters.
 - **Large-library + home stability** (v3.0.x) — streaming library index that survives big libraries, crash-proofed series detection, a Lyra Carousel heap-race crash fix, cover-thumbnail revalidation so a single book can't get stuck on a placeholder, and transparent-PNG sleep screens that reliably show the clean last book page.
+- **Additional features** — Dark Reader Mode, Text Darkness, Paragraph Spacing, Retry Failed Covers
 
 For the full changelog, see [CHANGELOG.md](./CHANGELOG.md).
 

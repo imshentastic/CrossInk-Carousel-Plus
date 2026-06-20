@@ -29,12 +29,14 @@ void FileBrowserActionActivity::onEnter() {
 }
 
 void FileBrowserActionActivity::loop() {
-  // CrumBLE 4.2: the Optimized header is selectable when this activity
-  // was opened with headerRightLabel == "Optimized". When that's true,
-  // selectedIndex == -1 means the header is focused. Other right-label
-  // text (e.g. the shelf-header menu's sort indicator) stays passive --
-  // the gate keeps the new nav path from affecting unrelated menus.
-  const bool headerSelectable = (headerRightLabel == "Optimized");
+  // CrumBLE 4.4: the prebake badge header is selectable when this activity
+  // was opened with one of the v4.4 tier labels (IMG, IMG+CHAP,
+  // IMG+CHAP+CP.FONT). selectedIndex == -1 then means the header is focused
+  // -- pressing Confirm fires ViewOptimizedDetails. We match on the
+  // leading "IMG" so all tiers gate identically. Other right-label text
+  // (sort indicators, etc.) doesn't start with "IMG".
+  const bool headerSelectable = !headerRightLabel.empty() &&
+                                 headerRightLabel.compare(0, 3, "IMG") == 0;
 
   if (ignoreConfirmRelease) {
     if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
@@ -145,8 +147,22 @@ void FileBrowserActionActivity::render(RenderLock&&) {
   const bool tallHeader = metrics.headerHeight > 60;
   const int titleY = metrics.topPadding + (tallHeader ? metrics.batteryBarHeight + 3 : kCompactTitleY);
   const int titleBottomPadding = tallHeader ? kTallHeaderTitleBottomPadding : kCompactHeaderTitleBottomPadding;
+  // CrumBLE 4.4: when the prebake-status badge ("IMG"-prefixed) is present,
+  // give it its OWN row below the title block instead of sharing line 1
+  // with the title (no-subtitle case) or line 2 with the subtitle. The
+  // header's bottom edge -- the visible divider before the action list --
+  // moves down accordingly. Without this, long filenames on a never-opened
+  // book (where title=filename and there's no author subtitle) get squeezed
+  // to roughly half-width because the badge reserves the other half. With
+  // it, the title gets full width on every line and the badge sits flush
+  // right on its own row above the divider. Other right-labels (e.g. the
+  // shelf-header sort-mode label) stay inline -- only the IMG-prefixed
+  // prebake badge moves down.
+  const bool badgeOnOwnRow = !headerRightLabel.empty() && headerRightLabel.compare(0, 3, "IMG") == 0;
+  const int badgeRowHeight = badgeOnOwnRow ? (subtitleLineHeight + kTitleLineGap) : 0;
   const int actionHeaderHeight =
-      std::max(metrics.headerHeight, titleY - metrics.topPadding + titleBlockHeight + titleBottomPadding);
+      std::max(metrics.headerHeight,
+               titleY - metrics.topPadding + titleBlockHeight + badgeRowHeight + titleBottomPadding);
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, actionHeaderHeight}, "");
 
   for (int i = 0; i < static_cast<int>(titleLines.size()); ++i) {
@@ -179,34 +195,46 @@ void FileBrowserActionActivity::render(RenderLock&&) {
   // line 2. Otherwise it rides line 1 as before.
   if (!headerRightLabel.empty()) {
     constexpr int kRightLabelFontId = UI_10_FONT_ID;
-    const bool drawBolt = (headerRightLabel == "Optimized");
+    // Match all three v4.4 tiers (IMG, IMG+CHAP, IMG+CHAP+CP.FONT) by the
+    // "IMG" prefix -- same gate as headerSelectable above. The bolt glyph
+    // is drawn next to the label as the "optimized" indicator, since the
+    // device's UI font doesn't render U+2713 ✓.
+    const bool drawBolt = !headerRightLabel.empty() &&
+                          headerRightLabel.compare(0, 3, "IMG") == 0;
     // CrumBLE 4.2: when the user navigates UP from item 0 onto the
-    // header, paint the label + bolt inside a filled black box with
-    // inverted (white) text/glyph so it reads as "selected" the same way
-    // the regular menu rows do. headerFocused is only true when the
-    // header is interactive (== "Optimized"), so other right-labels stay
-    // passive.
+    // header, paint the label inside a filled black box with inverted
+    // (white) text so it reads as "selected" like the regular rows.
     const bool headerFocused = drawBolt && (selectedIndex == -1);
     constexpr int kBoltWidth = 8;
     constexpr int kBoltHeight = 13;
     constexpr int kBoltGap = 3;
     const int reserveForBolt = drawBolt ? (kBoltWidth + kBoltGap) : 0;
-    // Reserve a wider chunk on line 2 (where the subtitle author text
-    // often runs long); narrower on line 1 (where the title text is what
-    // matters and the right label is decorative).
-    //
-    // On line 2 we can also push the right edge ALL the way to the side
-    // padding (not just titleMaxWidth's right edge): the battery readout
-    // only occupies line 1, so kBatteryTextReserveWidth is irrelevant on
-    // the subtitle row. This gives ~90 extra px on the right and lets the
-    // label sit flush against the screen margin instead of floating at
-    // 2/3 of the line.
-    const int rightAnchorX = hasSubtitle ? (pageWidth - metrics.contentSidePadding) : (titleX + titleMaxWidth);
-    const int textBudget = std::max(0, (hasSubtitle ? (titleMaxWidth * 2 / 3) : (titleMaxWidth / 2)) - reserveForBolt);
+    // CrumBLE 4.4: when the prebake badge gets its own row (badgeOnOwnRow
+    // above), it has the FULL header width to itself -- no battery icon,
+    // no title text competing on the same line. Anchor flush right and
+    // budget the full width (minus paddings + bolt reserve). Other right-
+    // labels (sort mode, etc.) stay inline with the legacy budget split.
+    const int rightAnchorX =
+        (badgeOnOwnRow || hasSubtitle) ? (pageWidth - metrics.contentSidePadding) : (titleX + titleMaxWidth);
+    const int legacyBudget = (hasSubtitle ? (titleMaxWidth * 2 / 3) : (titleMaxWidth / 2)) - reserveForBolt;
+    const int ownRowBudget = pageWidth - 2 * metrics.contentSidePadding - reserveForBolt;
+    const int textBudget = std::max(0, badgeOnOwnRow ? ownRowBudget : legacyBudget);
     const std::string rightLabel = renderer.truncatedText(kRightLabelFontId, headerRightLabel.c_str(), textBudget);
     const int rw = renderer.getTextWidth(kRightLabelFontId, rightLabel.c_str(), EpdFontFamily::REGULAR);
-    const int rx = rightAnchorX - rw - reserveForBolt;
-    const int labelY = hasSubtitle ? subtitleY : titleY;
+    // CrumBLE 4.4: bolt moved to the LEFT of the text. The block-as-a-whole
+    // (bolt + gap + text) right-aligns to rightAnchorX; the bolt sits
+    // immediately to the left of the text. Order on screen left-to-right:
+    // [bolt][gap][text]. Matches the FT page's "⚡IMG+CHAP+CP.FONT" layout.
+    const int rx = rightAnchorX - rw;
+    // labelY: own row sits below the existing title block (one
+    // subtitleLineHeight + gap further down). Otherwise legacy behavior:
+    // line 2 if there's a subtitle, line 1 otherwise.
+    const int titleBlockEndY =
+        titleY + static_cast<int>(titleLines.size()) * titleLineHeight +
+        std::max(0, static_cast<int>(titleLines.size()) - 1) * kTitleLineGap +
+        (hasSubtitle ? (kTitleLineGap + subtitleLineHeight) : 0);
+    const int labelY = badgeOnOwnRow ? (titleBlockEndY + kTitleLineGap)
+                                     : (hasSubtitle ? subtitleY : titleY);
 
     // Draw the selection box BEFORE the text so the text/glyph render on
     // top of the filled background. Padding picked to look balanced with
@@ -214,7 +242,8 @@ void FileBrowserActionActivity::render(RenderLock&&) {
     if (headerFocused) {
       constexpr int kPadX = 3;
       constexpr int kPadY = 2;
-      const int boxX = rx - kPadX;
+      // Box covers bolt + gap + text. Bolt sits at (rx - kBoltGap - kBoltWidth).
+      const int boxX = rx - reserveForBolt - kPadX;
       const int boxY = labelY - kPadY;
       const int boxW = rw + reserveForBolt + 2 * kPadX;
       const int boxH = subtitleLineHeight + 2 * kPadY;
@@ -233,7 +262,8 @@ void FileBrowserActionActivity::render(RenderLock&&) {
       // form the canonical Z kink at the middle -- and bottom apex on
       // lower-left at (bx+1,13). Sharp points on both ends; no flat
       // edges meeting the bounding box.
-      const int bx = rx + rw + kBoltGap;
+      // bx is the LEFT edge of the bolt glyph; sits to the left of text.
+      const int bx = rx - kBoltGap - kBoltWidth;
       // Center the bolt vertically against the label's line height. The
       // ratio of (lineHeight - boltHeight) / 2 nudges by half the slack
       // so the glyph reads as a glyph rather than floating to the cap

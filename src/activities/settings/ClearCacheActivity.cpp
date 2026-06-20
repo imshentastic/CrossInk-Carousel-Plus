@@ -102,7 +102,12 @@ void ClearCacheActivity::clearCache() {
 
       file.close();  // Close before attempting to delete
 
-      if (Storage.removeDir(fullPath.c_str())) {
+      // CrumBLE 4.4 (ported from CrossInk v1.3.3): preserve per-book stats
+      // across a global Clear Reading Cache. Global stats were already safe
+      // (stored elsewhere); this change keeps per-book streaks/totals too.
+      // To delete an individual book's stats, the user picks "Delete Book's
+      // Reading Stats" from the reader menu or file-browser long-press menu.
+      if (clearBookCacheDirectoryPreservingStats(std::string(fullPath.c_str()))) {
         clearedCount++;
       } else {
         LOG_ERR("CLEAR_CACHE", "Failed to remove: %s", fullPath.c_str());

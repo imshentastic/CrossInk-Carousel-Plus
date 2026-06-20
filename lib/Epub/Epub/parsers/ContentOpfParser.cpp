@@ -197,7 +197,12 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
       if (strcmp(atts[i], "id") == 0) {
         itemId = atts[i + 1];
       } else if (strcmp(atts[i], "href") == 0) {
-        href = FsHelpers::normalisePath(self->baseContentPath + atts[i + 1]);
+        // CrumBLE 4.4: percent-decode before ZIP lookup. OPF hrefs are IRIs
+        // per EPUB spec, so a chapter file literally named "title page.xhtml"
+        // appears here as "title%20page.xhtml". Without decoding, BMC's size
+        // probe and SCT's content stream both miss the ZIP entry, and entry
+        // into the book hangs at "Failed to stream item contents".
+        href = FsHelpers::normalisePath(self->baseContentPath + FsHelpers::urlDecode(atts[i + 1]));
       } else if (strcmp(atts[i], "media-type") == 0) {
         mediaType = atts[i + 1];
       } else if (strcmp(atts[i], "properties") == 0) {
@@ -319,7 +324,8 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
       if (strcmp(atts[i], "type") == 0) {
         type = atts[i + 1];
       } else if (strcmp(atts[i], "href") == 0) {
-        guideHref = FsHelpers::normalisePath(self->baseContentPath + atts[i + 1]);
+        // CrumBLE 4.4: see manifest-item href above -- same percent-decode.
+        guideHref = FsHelpers::normalisePath(self->baseContentPath + FsHelpers::urlDecode(atts[i + 1]));
       }
     }
     if (!guideHref.empty()) {

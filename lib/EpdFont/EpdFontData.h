@@ -161,8 +161,88 @@ constexpr bool isReplacementFallback(uint32_t cp) { return cp == 0xFFFD; }
 constexpr bool isSpaceFallback(uint32_t cp) {
   return cp == 0x00A0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200A) || cp == 0x202F || cp == 0x205F || cp == 0x3000;
 }
+// Typography fallback table (v4.3 task #28). When a font lacks a fancy
+// punctuation codepoint, alias it to the nearest ASCII equivalent so the
+// renderer's glyph lookup finds a real glyph instead of producing '?'.
+// EpdFontFamily::getFallbackCodepoint runs this on every miss, AND a
+// successful alias still has to be present in the font itself for the
+// renderer to draw it -- but for the SD-font atlas / embedded-subset
+// path the ASCII targets ('. - " ' , * `) appear in almost every section
+// (they are the bread-and-butter glyphs of any prose chapter), so the
+// alias closes the visible '?' gap in practice. Tried-and-failed
+// substitutions still bottom out at REPLACEMENT_GLYPH per the existing
+// getFallbackCodepoint flow.
 constexpr uint32_t aliasCodepoint(uint32_t cp) {
-  return cp == MODIFIER_LETTER_TURNED_COMMA ? LEFT_SINGLE_QUOTATION_MARK : cp;
+  switch (cp) {
+    // Pre-existing alias: the Hawaiian okina / Latin extended turned comma
+    // both look like a left single quote; keep mapping it to the typographic
+    // single quote so any font shipping the typographic glyph wins. The
+    // smart-quote branches below alias that target back to ASCII when the
+    // font lacks it.
+    case MODIFIER_LETTER_TURNED_COMMA:
+      return LEFT_SINGLE_QUOTATION_MARK;
+
+    // Smart single quotes / similar -> ASCII apostrophe (U+0027)
+    case 0x2018:  // LEFT SINGLE QUOTATION MARK
+    case 0x2019:  // RIGHT SINGLE QUOTATION MARK
+    case 0x201A:  // SINGLE LOW-9 QUOTATION MARK
+    case 0x201B:  // SINGLE HIGH-REVERSED-9 QUOTATION MARK
+    case 0x2032:  // PRIME
+      return 0x27;
+
+    // Smart double quotes / similar -> ASCII quotation mark (U+0022)
+    case 0x201C:  // LEFT DOUBLE QUOTATION MARK
+    case 0x201D:  // RIGHT DOUBLE QUOTATION MARK
+    case 0x201E:  // DOUBLE LOW-9 QUOTATION MARK
+    case 0x201F:  // DOUBLE HIGH-REVERSED-9 QUOTATION MARK
+    case 0x2033:  // DOUBLE PRIME
+      return 0x22;
+
+    // Dashes (incl. non-breaking hyphen) -> ASCII hyphen-minus (U+002D).
+    // Loses semantic length distinction (em vs en) -- acceptable trade for
+    // not showing '?' in dialogue dashes and parentheticals.
+    case 0x2010:  // HYPHEN
+    case 0x2011:  // NON-BREAKING HYPHEN
+    case 0x2012:  // FIGURE DASH
+    case 0x2013:  // EN DASH
+    case 0x2014:  // EM DASH
+    case 0x2015:  // HORIZONTAL BAR
+    case 0x2212:  // MINUS SIGN (math)
+      return 0x2D;
+
+    // Bullets, geometric shapes, decoration glyphs -> ASCII asterisk
+    // (U+002A). Covers the scene-break decorator chars publishers use
+    // to separate scenes within a chapter (diamonds, stars, hollow
+    // shapes) -- ChareInk and similarly-trimmed SD fonts often ship
+    // without these specific geometric blocks. The renderer-level
+    // getFallbackCodepoint miss-handler path will try to load the '*'
+    // glyph on demand from the .cpfont's full intervals if the prewarmed
+    // mini set didn't include it.
+    case 0x2022:  // BULLET
+    case 0x2023:  // TRIANGULAR BULLET
+    case 0x25CF:  // BLACK CIRCLE
+    case 0x25E6:  // WHITE BULLET
+    case 0x25C6:  // BLACK DIAMOND
+    case 0x25C7:  // WHITE DIAMOND
+    case 0x25C8:  // WHITE DIAMOND CONTAINING BLACK SMALL DIAMOND
+    case 0x25CA:  // LOZENGE
+    case 0x2666:  // BLACK DIAMOND SUIT
+    case 0x2662:  // WHITE DIAMOND SUIT
+    case 0x2605:  // BLACK STAR
+    case 0x2606:  // WHITE STAR
+    case 0x2731:  // HEAVY ASTERISK
+    case 0x2732:  // OPEN CENTRE ASTERISK
+    case 0x2735:  // EIGHT POINTED PINWHEEL STAR
+      return 0x2A;
+
+    // Horizontal ellipsis -> ASCII period (U+002E). 1:1 alias loses the
+    // three-dot appearance; ASCII '.' is in every chapter so this beats '?'.
+    case 0x2026:
+      return 0x2E;
+
+    default:
+      return cp;
+  }
 }
 
 inline uint16_t solidAdvanceX(const EpdFontData* data, const EpdGlyph* emGlyph) {

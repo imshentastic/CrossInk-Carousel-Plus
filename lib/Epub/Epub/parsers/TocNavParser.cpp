@@ -126,7 +126,10 @@ void XMLCALL TocNavParser::endElement(void* userData, const XML_Char* name) {
   if (strcmp(name, "a") == 0 && self->state == IN_ANCHOR) {
     // Create TOC entry when closing anchor tag (we have all data now)
     if (!self->currentLabel.empty() && !self->currentHref.empty()) {
-      std::string href = FsHelpers::normalisePath(self->baseContentPath + self->currentHref);
+      // CrumBLE 4.4: percent-decode so the resulting href matches the
+       // (now-decoded) manifest hrefs that the cache uses to resolve TOC
+       // targets to spine indices. See ContentOpfParser.cpp note.
+      std::string href = FsHelpers::normalisePath(self->baseContentPath + FsHelpers::urlDecode(self->currentHref));
       std::string anchor;
 
       const size_t pos = href.find('#');

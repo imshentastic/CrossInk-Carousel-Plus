@@ -666,6 +666,8 @@ uint8_t CrossPointSettings::getReaderFontPointSize(const FONT_SIZE size) {
   switch (size) {
     case TEENSY:
       return 8;
+    case ITTY_BITTY:
+      return 9;
     case TINY:
       return 10;
     case SMALL:

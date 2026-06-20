@@ -86,25 +86,10 @@ void drawGridHeader(const GfxRenderer& renderer, const int pageWidth, const char
   renderer.drawLine(rect.x, rect.y + rect.height - 2, rect.x + rect.width - 1, rect.y + rect.height - 2, 2, true);
 }
 
-// Some EPUBs leave an empty author with a stray trailing ";" (a
-// separator without a value after it) or just whitespace-around-semis.
-// Strip them so callers can treat the result as a real empty author
-// and skip the "no author" rendering. Idempotent on well-formed input.
-std::string normalizeAuthorMeta(std::string s) {
-  while (!s.empty()) {
-    const char c = s.back();
-    if (c == ' ' || c == '\t' || c == ';' || c == ',' || c == '\r' || c == '\n') {
-      s.pop_back();
-    } else {
-      break;
-    }
-  }
-  // Also trim leading whitespace / separators so " ; Author" -> "Author".
-  size_t i = 0;
-  while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == ';' || s[i] == '\r' || s[i] == '\n')) ++i;
-  if (i > 0) s.erase(0, i);
-  return s;
-}
+// CrumBLE 4.4: normalizeAuthorMeta moved to RecentBooksStore.h so the
+// storage layer applies it on input. The local definition was removed to
+// avoid two copies drifting apart; callers in this file now use the
+// shared free function (same name, transparent to callers).
 
 // Strip the directory + extension from an EPUB path so we can use the
 // bare filename as a fallback when the book has no metadata title.

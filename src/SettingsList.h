@@ -16,58 +16,77 @@
 #include "KOReaderCredentialStore.h"
 #include "activities/settings/SettingsActivity.h"
 
-inline StrId fontSizeLabelForPointSize(const uint8_t pointSize) {
-  switch (pointSize) {
-    case 8:
-      return StrId::STR_TEENSY;
-    case 9:
-      return StrId::STR_ITTY_BITTY;
-    case 10:
-      return StrId::STR_TINY;
-    case 12:
-      return StrId::STR_SMALL;
-    case 14:
-      return StrId::STR_MEDIUM;
-    case 16:
-      return StrId::STR_LARGE;
-    case 18:
-      return StrId::STR_X_LARGE;
-    case 20:
-      return StrId::STR_HUGE;
-    default:
-      return StrId::STR_NONE_OPT;
-  }
+// CrumBLE 4.4 (ported from upstream CrossInk v1.3.2): font sizes now display
+// as "<pt> pt" instead of friendly names like "Tiny" / "Small" / "Medium".
+// This lets SD-card font sizes interleave intuitively with built-in sizes
+// (the user sees "10 pt / 12 pt / 14 pt" everywhere instead of a mix of
+// "Tiny / Small / Medium" and bare "11 pt / 13 pt").
+inline std::string fontSizePointLabel(const uint8_t pointSize) {
+  return std::to_string(static_cast<int>(pointSize)) + " pt";
 }
 
 inline SettingInfo buildBuiltinFontSizeSetting() {
-  return SettingInfo::Enum(StrId::STR_FONT_SIZE, &CrossPointSettings::fontSize,
-                           {
+  SettingInfo s;
+  s.nameId = StrId::STR_FONT_SIZE;
+  s.type = SettingType::ENUM;
+  s.valuePtr = &CrossPointSettings::fontSize;
+  s.key = "fontSize";
+  s.category = StrId::STR_CAT_READER;
+
+  // Order mirrors the prior StrId list: TINY, SMALL, MEDIUM, LARGE, X_LARGE,
+  // TEENSY, HUGE, ITTY_BITTY -- matches the user's current muscle memory of
+  // where each size sits in the cycle.
+  using S = CrossPointSettings;
+  struct Entry { S::FONT_SIZE raw; bool include; };
+  const Entry entries[] = {
 #ifndef OMIT_TINY_FONT
-                               StrId::STR_TINY,
+      {S::TINY, true},
+#else
+      {S::TINY, false},
 #endif
 #ifndef OMIT_SMALL_FONT
-                               StrId::STR_SMALL,
+      {S::SMALL, true},
+#else
+      {S::SMALL, false},
 #endif
 #ifndef OMIT_MEDIUM_FONT
-                               StrId::STR_MEDIUM,
+      {S::MEDIUM, true},
+#else
+      {S::MEDIUM, false},
 #endif
 #ifndef OMIT_LARGE_FONT
-                               StrId::STR_LARGE,
+      {S::LARGE, true},
+#else
+      {S::LARGE, false},
 #endif
 #ifndef OMIT_XLARGE_FONT
-                               StrId::STR_X_LARGE,
+      {S::EXTRA_LARGE, true},
+#else
+      {S::EXTRA_LARGE, false},
 #endif
 #ifndef OMIT_TEENSY_FONT
-                               StrId::STR_TEENSY,
+      {S::TEENSY, true},
+#else
+      {S::TEENSY, false},
 #endif
 #ifndef OMIT_HUGE_FONT
-                               StrId::STR_HUGE,
+      {S::HUGE_SIZE, true},
+#else
+      {S::HUGE_SIZE, false},
 #endif
 #ifndef OMIT_ITTY_BITTY_FONT
-                               StrId::STR_ITTY_BITTY,
+      {S::ITTY_BITTY, true},
+#else
+      {S::ITTY_BITTY, false},
 #endif
-                           },
-                           "fontSize", StrId::STR_CAT_READER);
+  };
+
+  for (const auto& e : entries) {
+    if (!e.include) continue;
+    s.enumStringValues.push_back(fontSizePointLabel(S::getReaderFontPointSize(e.raw)));
+    s.enumRawValues.push_back(static_cast<uint8_t>(e.raw));
+  }
+  return s;
 }
 
 inline SettingInfo buildSdFontSizeSetting(const SdCardFontFamilyInfo& family) {
@@ -82,8 +101,8 @@ inline SettingInfo buildSdFontSizeSetting(const SdCardFontFamilyInfo& family) {
   s.enumStringValues.reserve(sizes.size());
   s.enumRawValues.reserve(sizes.size());
   for (size_t i = 0; i < sizes.size(); i++) {
-    const StrId labelId = fontSizeLabelForPointSize(sizes[i]);
-    s.enumStringValues.push_back(labelId != StrId::STR_NONE_OPT ? I18N.get(labelId) : std::to_string(sizes[i]) + " pt");
+    // CrumBLE 4.4: same pt-label format as builtin sizes; no special-casing.
+    s.enumStringValues.push_back(fontSizePointLabel(sizes[i]));
     s.enumRawValues.push_back(static_cast<uint8_t>(i));
   }
   return s;
@@ -451,17 +470,39 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                             StrId::STR_CAT_READER));
     add(SettingInfo::Toggle(StrId::STR_TEXT_AA, &CrossPointSettings::textAntiAliasing, "textAntiAliasing",
                             StrId::STR_CAT_READER));
+    add(SettingInfo::Toggle(StrId::STR_READER_DARK_MODE, &CrossPointSettings::readerDarkMode, "readerDarkMode",
+                            StrId::STR_CAT_READER));
+    // CrumBLE 4.4 (ported from CPR-vCodex): Text Darkness, 4-way enum.
+    // Affects only the 2-bit grayscale glyph blit (visible when Text AA is on).
+    add(SettingInfo::Enum(StrId::STR_TEXT_DARKNESS, &CrossPointSettings::textDarkness,
+                          {StrId::STR_TEXT_DARKNESS_NORMAL, StrId::STR_TEXT_DARKNESS_LEGACY_BW,
+                           StrId::STR_TEXT_DARKNESS_DARK, StrId::STR_TEXT_DARKNESS_EXTRA_DARK},
+                          "textDarkness", StrId::STR_CAT_READER));
     add(SettingInfo::Enum(StrId::STR_IMAGES, &CrossPointSettings::imageRendering,
                           {StrId::STR_IMAGES_DISPLAY, StrId::STR_IMAGES_PLACEHOLDER, StrId::STR_IMAGES_SUPPRESS},
                           "imageRendering", StrId::STR_CAT_READER));
-    add(SettingInfo::Toggle(StrId::STR_EXTRA_SPACING, &CrossPointSettings::extraParagraphSpacing,
-                            "extraParagraphSpacing", StrId::STR_CAT_READER));
+    // CrumBLE 4.4: promoted from a two-state toggle ("Extra Spacing") to a
+    // three-way enum ("Paragraph Spacing"). 0/TIGHT = classic text-indent
+    // paragraphs with no vertical gap; 1/NORMAL = block-style paragraphs with
+    // a lineHeight/2 gap (the prior toggle-on default); 2/WIDE = block-style
+    // with a full lineHeight gap. The on-disk byte format is unchanged so
+    // existing configs and section caches with 0/1 round-trip identically.
+    add(SettingInfo::Enum(StrId::STR_EXTRA_SPACING, &CrossPointSettings::extraParagraphSpacing,
+                          {StrId::STR_TIGHT, StrId::STR_NORMAL, StrId::STR_WIDE},
+                          "extraParagraphSpacing", StrId::STR_CAT_READER));
     add(SettingInfo::Toggle(StrId::STR_FORCE_PARAGRAPH_INDENTS, &CrossPointSettings::forceParagraphIndents,
                             "forceParagraphIndents", StrId::STR_CAT_READER));
     add(SettingInfo::Toggle(StrId::STR_BIONIC_READING, &CrossPointSettings::bionicReadingEnabled,
                             "bionicReadingEnabled", StrId::STR_CAT_READER));
     add(SettingInfo::Toggle(StrId::STR_GUIDE_READING, &CrossPointSettings::guideReadingEnabled, "guideReadingEnabled",
                             StrId::STR_CAT_READER));
+    // CrumBLE 4.4: persistence-only registration (no on-device Settings UI).
+    // Diagnostic toggle to A/B test whether the v40 glyph atlas install path
+    // is the source of the FT upload heap regression. Default ON keeps the
+    // optimized render path; flip OFF via /api/save-reader-settings to fall
+    // back to the v39 embedded subset (or full SD-font fetch) path.
+    add(SettingInfo::Toggle(StrId::STR_NONE_OPT, &CrossPointSettings::glyphAtlasEnabled,
+                            "glyphAtlasEnabled"));
 
     // --- Controls ---
     add(SettingInfo::Enum(StrId::STR_SIDE_BTN_LAYOUT, &CrossPointSettings::sideButtonLayout,

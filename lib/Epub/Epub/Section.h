@@ -72,6 +72,23 @@ class Section {
   uint32_t glyphAtlasSize_ = 0;
   uint32_t glyphAtlasCpfontHash_ = 0;
 
+  // CrumBLE 4.4 v41: alternate glyph atlas slot. The primary slot above is
+  // baked at the bit-depth chosen by --atlas-bit-depth or by the prebake's
+  // auto-pick (1-bit for <16pt, 2-bit for ≥16pt). The alternate slot holds
+  // the OTHER bit-depth for the same set of glyphs, so the reader can pick:
+  //
+  //   * BT cold        -> install the 2-bit atlas (better visual)
+  //   * BT enabled     -> install the 1-bit atlas (smaller, fits tight heap)
+  //
+  // Either slot may be zero when the bake produced only one bit-depth (e.g.
+  // small-size bake where 2-bit visual gain is not worth the section-file
+  // bloat). The runtime install path falls back gracefully: prefer the slot
+  // matching the BT-state preference, else use whichever slot is non-zero.
+  // v40 files leave these at 0; their single atlas lives in the primary slot.
+  uint32_t glyphAtlasAltOffset_ = 0;
+  uint32_t glyphAtlasAltSize_ = 0;
+  uint32_t glyphAtlasAltCpfontHash_ = 0;
+
   // CrumBLE 4.4: parsed in-RAM glyph atlas for one style. Populated by
   // tryInstallGlyphAtlas() when the section carries an atlas block and
   // its cpfontContentHash matches the active SdCardFont. The `entries`
@@ -164,7 +181,7 @@ class Section {
   // the lifetime of the install.
   void synthesizeAtlasFontData(GlyphAtlasSlot& slot);
 
-  bool writeSectionFileHeader(int fontId, float lineCompression, bool extraParagraphSpacing, bool forceParagraphIndents,
+  bool writeSectionFileHeader(int fontId, float lineCompression, uint8_t extraParagraphSpacing, bool forceParagraphIndents,
                               uint8_t paragraphAlignment, uint16_t viewportWidth, uint16_t viewportHeight,
                               bool hyphenationEnabled, bool embeddedStyle, uint8_t imageRendering,
                               bool bionicReadingEnabled, bool guideReadingEnabled);
@@ -175,7 +192,7 @@ class Section {
   // mismatch / parse failure, returns false WITHOUT calling clearCache --
   // the caller (loadSectionFile) decides whether the live cache should be
   // cleared, so we never accidentally delete the prebake fallback.
-  bool tryLoadFromPath(const std::string& path, int fontId, float lineCompression, bool extraParagraphSpacing,
+  bool tryLoadFromPath(const std::string& path, int fontId, float lineCompression, uint8_t extraParagraphSpacing,
                        bool forceParagraphIndents, uint8_t paragraphAlignment, uint16_t viewportWidth,
                        uint16_t viewportHeight, bool hyphenationEnabled, bool embeddedStyle, uint8_t imageRendering,
                        bool bionicReadingEnabled, bool guideReadingEnabled);
@@ -197,12 +214,12 @@ class Section {
   // file is tried first, then sections-prebake/ as a read-only fallback.
   // Default-false preserves call-site compatibility for any caller that
   // hasn't been updated to thread the SETTINGS toggle through.
-  bool loadSectionFile(int fontId, float lineCompression, bool extraParagraphSpacing, bool forceParagraphIndents,
+  bool loadSectionFile(int fontId, float lineCompression, uint8_t extraParagraphSpacing, bool forceParagraphIndents,
                        uint8_t paragraphAlignment, uint16_t viewportWidth, uint16_t viewportHeight,
                        bool hyphenationEnabled, bool embeddedStyle, uint8_t imageRendering, bool bionicReadingEnabled,
                        bool guideReadingEnabled, bool prebakeFallbackEnabled = false);
   bool clearCache() const;
-  bool createSectionFile(int fontId, float lineCompression, bool extraParagraphSpacing, bool forceParagraphIndents,
+  bool createSectionFile(int fontId, float lineCompression, uint8_t extraParagraphSpacing, bool forceParagraphIndents,
                          uint8_t paragraphAlignment, uint16_t viewportWidth, uint16_t viewportHeight,
                          bool hyphenationEnabled, bool embeddedStyle, uint8_t imageRendering, bool bionicReadingEnabled,
                          bool guideReadingEnabled, const std::function<void()>& popupFn = nullptr,
@@ -242,6 +259,12 @@ class Section {
   uint32_t glyphAtlasOffset() const { return glyphAtlasOffset_; }
   uint32_t glyphAtlasSize() const { return glyphAtlasSize_; }
   uint32_t glyphAtlasCpfontHash() const { return glyphAtlasCpfontHash_; }
+  // v41: alternate atlas slot (the OTHER bit-depth, when the bake emitted
+  // both). See field comment above for the BT-aware install rationale.
+  bool hasGlyphAtlasAlt() const { return glyphAtlasAltOffset_ != 0 && glyphAtlasAltSize_ != 0; }
+  uint32_t glyphAtlasAltOffset() const { return glyphAtlasAltOffset_; }
+  uint32_t glyphAtlasAltSize() const { return glyphAtlasAltSize_; }
+  uint32_t glyphAtlasAltCpfontHash() const { return glyphAtlasAltCpfontHash_; }
 
   // CrumBLE 4.4: read the glyph atlas block from the section file and
   // populate glyphAtlasSlots_ + glyphAtlasBitmap_. Validates against
@@ -251,7 +274,12 @@ class Section {
   // or SD-font miss handler path. Returns true iff at least one style
   // slot was populated. Idempotent: a second call with the same hash
   // re-installs cleanly.
-  bool tryInstallGlyphAtlas(uint32_t cpfontContentHash);
+  // CrumBLE 4.4 v41: when preferLowBitDepth=true (typical caller: reader
+  // with BT enabled), install the primary (1-bit) slot. When false (BT
+  // cold), install the alt (2-bit) slot if non-zero, else fall through
+  // to the primary. Pre-v41 sections only have the primary slot, so the
+  // behavior is unchanged for old prebakes.
+  bool tryInstallGlyphAtlas(uint32_t cpfontContentHash, bool preferLowBitDepth = false);
 
   // True after a successful tryInstallGlyphAtlas(); false otherwise.
   bool glyphAtlasInstalled() const { return glyphAtlasInstalled_; }

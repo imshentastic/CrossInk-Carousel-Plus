@@ -12,9 +12,14 @@ class HalDisplay {
 
   // Refresh modes
   enum RefreshMode {
-    FULL_REFRESH,  // Full refresh with complete waveform
-    HALF_REFRESH,  // Half refresh (1720ms) - balanced quality and speed
-    FAST_REFRESH   // Fast refresh using custom LUT
+    FULL_REFRESH,       // Full refresh with complete waveform
+    HALF_REFRESH,       // Half refresh (1720ms) - balanced quality and speed
+    HALF_REFRESH_DEEP,  // Same waveform as HALF_REFRESH but with an extra X3
+                        // resync cycle. Use ONLY for transitions where
+                        // accumulated panel polarity drift is visible (e.g.
+                        // reader -> home after a long dark-mode session).
+                        // Costs ~770ms more on X3; no-op vs HALF on X4.
+    FAST_REFRESH        // Fast refresh using custom LUT
   };
 
   // Pass seamless=true on any path where the panel already shows the

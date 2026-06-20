@@ -93,17 +93,29 @@ static_assert(sizeof(BlockHeader) == 12, "BlockHeader must be 12 bytes on the wi
 static_assert(sizeof(StyleHeader) == 12, "StyleHeader must be 12 bytes on the wire");
 static_assert(sizeof(GlyphEntry) == 12, "GlyphEntry must be 12 bytes on the wire");
 
-// Helpers for packed bitmap addressing. The bitmap payload is row-major:
-// for each glyph, height consecutive rows of (width + padBits) / 8 bytes
-// each, where padBits rounds the row up to a byte boundary. This matches
-// the SD-card font format used today, so the existing 1-bit blit code path
-// in EpdFont can be reused unchanged.
+// Helpers for packed bitmap addressing. The bitmap payload is a CONTINUOUS
+// bitstream (no per-row alignment) so a single (y*width + x) pixel index
+// addresses straight into it. This matches GfxRenderer::renderCharImpl's
+// blit loop (see GfxRenderer.cpp, the "pixelPosition" variable: pixel index
+// runs 0..(width*height-1) across rows, and the byte address is
+// pixelPosition >> 3 for 1-bit / >> 2 for 2-bit). The FontDecompressor's
+// compactSingleGlyph likewise produces continuous bitstream output -- so
+// builtin fonts feed the same renderer with the same packing convention.
+// Byte-aligning rows would silently misalign every row past the first for
+// any glyph whose width isn't a multiple of 8 (for 1-bit) or 4 (for 2-bit).
+//
+// rowBytes() is retained only as a per-row helper for callers that walk
+// individual rows; the canonical glyph size is glyphBytes(), which uses
+// continuous packing.
 constexpr uint16_t rowBytes(uint8_t widthPx, uint8_t bitDepth) {
   return static_cast<uint16_t>((widthPx * bitDepth + 7) / 8);
 }
 
 constexpr uint16_t glyphBytes(uint8_t widthPx, uint8_t heightPx, uint8_t bitDepth) {
-  return static_cast<uint16_t>(rowBytes(widthPx, bitDepth)) * heightPx;
+  // Continuous packing: total bits = width * height * bitDepth, rounded up
+  // to the next whole byte for the glyph as a whole (not per-row).
+  return static_cast<uint16_t>(
+      (static_cast<uint32_t>(widthPx) * static_cast<uint32_t>(heightPx) * bitDepth + 7) / 8);
 }
 
 }  // namespace glyphatlas

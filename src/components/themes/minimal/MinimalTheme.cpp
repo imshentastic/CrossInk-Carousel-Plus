@@ -432,7 +432,7 @@ void MinimalTheme::drawList(const GfxRenderer& renderer, Rect rect, int itemCoun
 void MinimalTheme::setHomeButtonHintSelection(const int selectedIndex) { homeButtonHintSelection = selectedIndex; }
 
 void MinimalTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, const char* btn2, const char* btn3,
-                                   const char* btn4, const bool allowInvertedText) const {
+                                   const char* btn4, const bool allowInvertedText, const bool darkMode) const {
   const GfxRenderer::Orientation origOrientation = renderer.getOrientation();
   const bool invertText = allowInvertedText && origOrientation == GfxRenderer::Orientation::PortraitInverted;
   renderer.setOrientation(invertText ? GfxRenderer::Orientation::PortraitInverted : GfxRenderer::Orientation::Portrait);
@@ -451,22 +451,31 @@ void MinimalTheme::drawButtonHints(GfxRenderer& renderer, const char* btn1, cons
   const int selectedIndex = homeButtonHintSelection;
   homeButtonHintSelection = -1;
 
+  // CrumBLE 4.4: dark-mode-aware hint buttons. Default keeps the existing
+  // white/gray/black palette; in dark mode the button fill flips to black,
+  // the outline to white, and the label text to white -- consistent with
+  // dark-mode reader page underneath. Selection still shifts contrast.
+  const Color defaultFill = darkMode ? Color::Black : Color::White;
+  const Color selectedFill = darkMode ? Color::DarkGray : Color::LightGray;
+  const bool strokeInk = !darkMode;
+  const bool textBlack = !darkMode;
+
   for (int i = 0; i < 4; i++) {
     const int x = buttonPositions[invertText ? 3 - i : i];
     const bool hasLabel = labels[i] != nullptr && labels[i][0] != '\0';
     if (hasLabel) {
-      const Color background = i == selectedIndex ? Color::LightGray : Color::White;
+      const Color background = i == selectedIndex ? selectedFill : defaultFill;
       renderer.fillRoundedRect(x, pageHeight - buttonY, buttonWidth, buttonHeight, kButtonCornerRadius, background);
       renderer.drawRoundedRect(x, pageHeight - buttonY, buttonWidth, buttonHeight, 1, kButtonCornerRadius, true, true,
-                               false, false, true);
+                               false, false, strokeInk);
       const int textWidth = renderer.getTextWidth(SMALL_FONT_ID, labels[i]);
       const int textX = x + (buttonWidth - 1 - textWidth) / 2;
-      renderer.drawText(SMALL_FONT_ID, textX, pageHeight - buttonY + textYOffset, labels[i]);
+      renderer.drawText(SMALL_FONT_ID, textX, pageHeight - buttonY + textYOffset, labels[i], textBlack);
     } else {
       const int smallButtonY = invertText ? 0 : pageHeight - smallButtonHeight;
-      renderer.fillRoundedRect(x, smallButtonY, buttonWidth, smallButtonHeight, kButtonCornerRadius, Color::White);
+      renderer.fillRoundedRect(x, smallButtonY, buttonWidth, smallButtonHeight, kButtonCornerRadius, defaultFill);
       renderer.drawRoundedRect(x, smallButtonY, buttonWidth, smallButtonHeight, 1, kButtonCornerRadius, true, true,
-                               false, false, true);
+                               false, false, strokeInk);
     }
   }
 

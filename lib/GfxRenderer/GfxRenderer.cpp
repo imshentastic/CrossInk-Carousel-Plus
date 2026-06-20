@@ -489,17 +489,60 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
           // 0 -> black, 1 -> dark grey, 2 -> light grey, 3 -> white
           const uint8_t bmpVal = 3 - ((byte >> bit_index) & 0x3);
 
-          if (renderMode == GfxRenderer::BW && bmpVal < 3) {
-            // Black (also paints over the grays in BW mode)
-            renderer.drawPixel(screenX, screenY, pixelState);
-          } else if (renderMode == GfxRenderer::GRAYSCALE_MSB && (bmpVal == 1 || bmpVal == 2)) {
-            // Light gray (also mark the MSB if it's going to be a dark gray too)
-            // Dedicated X3 gray LUTs now provide proper 4-level gray on both devices
-            // We have to flag pixels in reverse for the gray buffers, as 0 leave alone, 1 update
-            renderer.drawPixel(screenX, screenY, false);
-          } else if (renderMode == GfxRenderer::GRAYSCALE_LSB && bmpVal == 1) {
-            // Dark gray
-            renderer.drawPixel(screenX, screenY, false);
+          // CrumBLE 4.4 (ported from CPR-vCodex): Text Darkness affects the
+          // 2-bit grayscale glyph blit only. The font emits bmpVal=0/1/2/3
+          // (black / dark / light / white after the inversion above). Each
+          // darkness mode chooses which AA buckets get inked on the MSB and
+          // LSB planes -- denser modes promote more buckets, lighter modes
+          // pull them back.
+          if (renderMode == GfxRenderer::BW) {
+            if (bmpVal < 3) {
+              renderer.drawPixel(screenX, screenY, pixelState);
+              // CrumBLE 4.4: Extra Dark (mode 3) also thickens the BW glyph
+              // by 1 pixel along the glyph's horizontal axis. Diverges from
+              // CPR-vCodex 1:1 -- their Extra Dark only adjusts the grayscale
+              // hit pattern, which can be too subtle to perceive on X3. The
+              // outline pixel makes the bolder weight visible regardless of
+              // Text AA state. Skipped for the lightest AA bucket (bmpVal=2)
+              // so we don't smear the outermost glyph edges into adjacent
+              // characters. Glyph-space "next column" maps to screen coords
+              // differently per rotation; compute accordingly.
+              if (renderer.getTextDarkness() >= 3 && bmpVal <= 1) {
+                int outlineX, outlineY;
+                if constexpr (rotation == TextRotation::Rotated90CW) {
+                  outlineX = screenX;
+                  outlineY = screenY - 1;  // glyphX+1 -> screenY-1 in rotated layout
+                } else {
+                  outlineX = screenX + 1;
+                  outlineY = screenY;
+                }
+                renderer.drawPixel(outlineX, outlineY, pixelState);
+              }
+            }
+          } else {
+            bool hitMsb = false;
+            bool hitLsb = false;
+            switch (renderer.getTextDarkness()) {
+              case 1:  // Legacy BW: lighter, pre-CrumBLE 4.4 overlay.
+                hitMsb = (bmpVal == 2);
+                hitLsb = (bmpVal == 1);
+                break;
+              case 2:  // Dark: promote both AA buckets to denser ink.
+              case 3:  // Extra Dark: same hit pattern as Dark for now.
+                hitMsb = (bmpVal == 1 || bmpVal == 2);
+                hitLsb = (bmpVal == 1 || bmpVal == 2);
+                break;
+              case 0:  // Normal: CrossInk-style solid text with smooth AA.
+              default:
+                hitMsb = (bmpVal == 1 || bmpVal == 2);
+                hitLsb = (bmpVal == 1);
+                break;
+            }
+            if (renderMode == GfxRenderer::GRAYSCALE_MSB && hitMsb) {
+              renderer.drawPixel(screenX, screenY, false);
+            } else if (renderMode == GfxRenderer::GRAYSCALE_LSB && hitLsb) {
+              renderer.drawPixel(screenX, screenY, false);
+            }
           }
         }
       }
