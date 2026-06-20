@@ -154,16 +154,16 @@ bool isMatchingFirmwareAssetName(const char* assetName) {
 // a contiguous chunk). Loading only the roots GitHub actually uses keeps the
 // alloc footprint inside the heap we have.
 //
-// Roots embedded (all 20+ year horizons):
-//   - USERTrust ECC Certification Authority (api.github.com's CURRENT chain
-//     terminates here via Sectigo intermediates, valid 2010-2038)
-//   - DigiCert Global Root CA (GitHub's historical CA, valid 2006-2031;
-//     keep as fallback in case they rotate back)
-//   - ISRG Root X1 (Let's Encrypt root, in case GitHub ever rotates issuers
-//     again to LE for any internal/CDN endpoint)
-// If GitHub switches to a CA that doesn't chain to any of these, OTA breaks
-// until next firmware ships -- SD-card update is the recovery path. Multiple
-// roots reduces single-CA-rotation risk substantially.
+// Single root embedded: USERTrust ECC Certification Authority. GitHub's
+// chain currently terminates here via Sectigo intermediates (valid 2010-2038).
+//
+// Why not multiple roots: each cert in cert_pem is parsed eagerly into
+// mbedtls' trust chain, and the RSA-2048/4096 BIGNUM allocations for
+// DigiCert + ISRG push us over the contiguous-heap budget at handshake time
+// (saw MBEDTLS_ERR_PK_ALLOC_FAILED with three roots embedded). USERTrust is
+// ECC P-384 -- one EC point + curve params, ~1KB scratch -- so it fits.
+// If GitHub rotates to a non-Sectigo issuer, OTA breaks; SD-card update is
+// the recovery path. Real but unlikely on a 5-year horizon.
 constexpr const char kPinnedRootsPem[] =
     // USERTrust ECC Certification Authority (Sectigo - GitHub's current chain root)
     "-----BEGIN CERTIFICATE-----\n"
@@ -181,62 +181,6 @@ constexpr const char kPinnedRootsPem[] =
     "VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAwNoADBlAjA2Z6EWCNzklwBBHU6+4WMB\n"
     "zzuqQhFkoJ2UOQIReVx7Hfpkue4WQrO/isIJxOzksU0CMQDpKmFHjFJKS04YcPbW\n"
     "RNZu9YO6bVi9JNlWSOrvxKJGgYhqOkbRqZtNyWHa0V1Xahg=\n"
-    "-----END CERTIFICATE-----\n"
-    // DigiCert Global Root CA
-    "-----BEGIN CERTIFICATE-----\n"
-    "MIIDrzCCApegAwIBAgIQCDvgVpBCRrGhdWrJWZHHSjANBgkqhkiG9w0BAQUFADBh\n"
-    "MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3\n"
-    "d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBD\n"
-    "QTAeFw0wNjExMTAwMDAwMDBaFw0zMTExMTAwMDAwMDBaMGExCzAJBgNVBAYTAlVT\n"
-    "MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j\n"
-    "b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IENBMIIBIjANBgkqhkiG\n"
-    "9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4jvhEXLeqKTTo1eqUKKPC3eQyaKl7hLOllsB\n"
-    "CSDMAZOnTjC3U/dDxGkAV53ijSLdhwZAAIEJzs4bg7/fzTtxRuLWZscFs3YnFo97\n"
-    "nh6Vfe63SKMI2tavegw5BmV/Sl0fvBf4q77uKNd0f3p4mVmFaG5cIzJLv07A6Fpt\n"
-    "43C/dxC//AH2hdmoRBBYMql1GNXRor5H4idq9Joz+EkIYIvUX7Q6hL+hqkpMfT7P\n"
-    "T19sdl6gSzeRntwi5m3OFBqOasv+zbMUZBfHWymeMXwhuNAEPwSURwiyazpgGet1\n"
-    "8YV0/+VBOL5JjPKMtV1+jNZ0fF5T7Z7+czGtZf3WIYV5KqdNxQIDAQABo2MwYTAO\n"
-    "BgNVHQ8BAf8EBAMCAYYwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUA95QNVbR\n"
-    "TLtm8KPiGxvDl7I90VUwHwYDVR0jBBgwFoAUA95QNVbRTLtm8KPiGxvDl7I90VUw\n"
-    "DQYJKoZIhvcNAQEFBQADggEBAMucN6pIExIK+t1EnE9SsPTfrgT1eXkIoyQY/Esr\n"
-    "hMAtudXH/vTBH1jLuG2cenTnmCmrEbXjcKChzUyImZOMkXDiqw8cvpOp/2PV5Adg\n"
-    "06O/nVsJ8dWO41P0jmP6P6fbtGbfYmbW0W5BjfIttep3Sp+dWOIrWcBAI+0tKIJF\n"
-    "PnlUkiaY4IBIqDfv8NZ5YBberOgOzW6sRBc4L0na4UU+Krk2U886UAb3LujEV0ls\n"
-    "YSEY1QSteDwsOoBrp+uvFRTp2InBuThs4pFsiv9kuXclVzDAGySj4dzp30d8tbQk\n"
-    "CAUw7C29C79Fv1C5qfPrmAESrciIxpg0X40KPMbp1ZWVbd4=\n"
-    "-----END CERTIFICATE-----\n"
-    // ISRG Root X1 (Let's Encrypt)
-    "-----BEGIN CERTIFICATE-----\n"
-    "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\n"
-    "GCc=\n"
     "-----END CERTIFICATE-----\n";
 
 esp_err_t http_client_set_header_cb(esp_http_client_handle_t http_client) {
