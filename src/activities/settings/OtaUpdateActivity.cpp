@@ -7,6 +7,8 @@
 #include <WiFi.h>
 #include <esp_heap_caps.h>
 
+#include <cstring>
+
 #include <algorithm>
 
 namespace {
@@ -67,6 +69,22 @@ void OtaUpdateActivity::onWifiSelectionComplete(const bool success) {
   // Release the boot-time heap reserve right before the HTTPS handshake so
   // mbedtls gets the guaranteed contiguous chunk it needs for X.509 verify.
   releaseHeapReserve();
+
+  // CrumBLE 4.6: install-pending mode -- a prior boot completed
+  // checkForUpdate and the user confirmed install. We silent-restarted to
+  // give the install download its own fresh heap. Skip the check and jump
+  // directly to install with the cached URL/version.
+  if (installPending_) {
+    installPending_ = false;
+    LOG_INF("OTA", "WiFi reconnected for install -- skipping check, going straight to install");
+    requestInstallFromLoop_ = true;
+    {
+      RenderLock lock(*this);
+      state = WAITING_CONFIRMATION;  // loop() picks up requestInstallFromLoop_ and transitions
+    }
+    requestUpdate(true);
+    return;
+  }
 
   LOG_DBG("OTA", "WiFi connected, checking for update");
 
@@ -137,6 +155,20 @@ void OtaUpdateActivity::onEnter() {
   if (isContinuingFromSilentReboot()) {
     LOG_INF("OTA", "Post-silent-restart entry: maxAlloc=%u (proceeding)", maxAlloc);
     clearSilentRebootContinuationFlag();
+  }
+
+  // CrumBLE 4.6: if a prior boot completed checkForUpdate and the user
+  // confirmed install, we silent-restarted to give the install download a
+  // fresh heap. Pull the cached URL/size/version back into OtaUpdater so
+  // installUpdate can run without re-doing the check.
+  char pendingUrl[256];
+  uint32_t pendingSize = 0;
+  char pendingVersion[40];
+  if (consumePendingOtaInstall(pendingUrl, sizeof(pendingUrl), &pendingSize, pendingVersion,
+                               sizeof(pendingVersion))) {
+    LOG_INF("OTA", "Install pending from prior boot: version=%s size=%u", pendingVersion, pendingSize);
+    updater.preloadInstallState(pendingUrl, pendingSize, pendingVersion);
+    installPending_ = true;
   }
 
   // Grab the defrag reserve BEFORE WiFi.mode allocates -- so WiFi's LWIP
@@ -244,61 +276,87 @@ void OtaUpdateActivity::render(RenderLock&&) {
   renderer.displayBuffer();
 }
 
+void OtaUpdateActivity::runInstall() {
+  {
+    RenderLock lock(*this);
+    state = UPDATE_IN_PROGRESS;
+  }
+  if (requestUpdateAndWait() != RequestUpdateResult::Rendered) {
+    LOG_ERR("OTA", "Update progress screen could not be rendered synchronously; aborting OTA install");
+    {
+      RenderLock lock(*this);
+      state = FAILED;
+    }
+    requestUpdate(true);
+    return;
+  }
+  // Heap reserve around install is handled inside OtaUpdater::installUpdate
+  // (acquired before esp_https_ota_begin to defrag URL/HTTP client init,
+  // released right after begin so perform has the freed block for TLS).
+  LOG_INF("OTA", "Pre-install heap: free=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  const auto res = updater.installUpdate(
+      [](void* ctx) {
+        // immediate=true notifies the render task directly. The default deferred path only
+        // sets a flag consumed at the end of ActivityManager::loop(), which never runs while
+        // installUpdate() blocks this task.
+        static_cast<OtaUpdateActivity*>(ctx)->requestUpdate(true);
+      },
+      this);
+
+  if (res != OtaUpdater::OK) {
+    LOG_DBG("OTA", "Update failed: %d", res);
+    {
+      RenderLock lock(*this);
+      state = FAILED;
+    }
+    requestUpdate();
+    return;
+  }
+
+  {
+    RenderLock lock(*this);
+    state = FINISHED;
+  }
+  const auto renderResult = requestUpdateAndWait();
+  if (renderResult == RequestUpdateResult::Rendered) {
+    // Hold the completion screen briefly so the user sees it, then restart.
+    delay(3000);
+  } else {
+    LOG_ERR("OTA", "Completion screen could not be rendered synchronously; restarting without sync confirmation");
+  }
+  {
+    RenderLock lock(*this);
+    state = SHUTTING_DOWN;
+  }
+}
+
 void OtaUpdateActivity::loop() {
   if (state == WAITING_CONFIRMATION) {
+    // CrumBLE 4.6: install-pending path. We came back from a silent-restart
+    // that was triggered after the user confirmed install on a prior boot.
+    // Skip the Confirm wait -- consent was given pre-restart -- and fire
+    // installUpdate immediately on the now-fresh heap.
+    if (requestInstallFromLoop_) {
+      requestInstallFromLoop_ = false;
+      LOG_INF("OTA", "Auto-installing post-silent-restart (user already confirmed)");
+      runInstall();
+      return;
+    }
     if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-      LOG_DBG("OTA", "New update available, starting download...");
-      {
-        RenderLock lock(*this);
-        state = UPDATE_IN_PROGRESS;
-      }
-      if (requestUpdateAndWait() != RequestUpdateResult::Rendered) {
-        LOG_ERR("OTA", "Update progress screen could not be rendered synchronously; aborting OTA install");
-        {
-          RenderLock lock(*this);
-          state = FAILED;
-        }
-        requestUpdate(true);
-        return;
-      }
-      // Heap reserve around install is handled inside OtaUpdater::installUpdate
-      // (acquired before esp_https_ota_begin to defrag URL/HTTP client init,
-      // released right after begin so perform has the freed block for TLS).
-      LOG_INF("OTA", "Pre-install heap: free=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-      const auto res = updater.installUpdate(
-          [](void* ctx) {
-            // immediate=true notifies the render task directly. The default deferred path only
-            // sets a flag consumed at the end of ActivityManager::loop(), which never runs while
-            // installUpdate() blocks this task.
-            static_cast<OtaUpdateActivity*>(ctx)->requestUpdate(true);
-          },
-          this);
-
-      if (res != OtaUpdater::OK) {
-        LOG_DBG("OTA", "Update failed: %d", res);
-        {
-          RenderLock lock(*this);
-          state = FAILED;
-        }
-        requestUpdate();
-        return;
-      }
-
-      {
-        RenderLock lock(*this);
-        state = FINISHED;
-      }
-      const auto renderResult = requestUpdateAndWait();
-      if (renderResult == RequestUpdateResult::Rendered) {
-        // Hold the completion screen briefly so the user sees it, then restart.
-        delay(3000);
-      } else {
-        LOG_ERR("OTA", "Completion screen could not be rendered synchronously; restarting without sync confirmation");
-      }
-      {
-        RenderLock lock(*this);
-        state = SHUTTING_DOWN;
-      }
+      // CrumBLE 4.6: silent-restart between check and install so the install
+      // download's HTTPS handshake runs on a fresh ~94KB heap. The check
+      // residue (LWIP keep-alive + http client state) eats ~17KB that mbedtls
+      // SSL setup needs. The URL/size/version are persisted to RTC; the
+      // next boot's onEnter pulls them back and goes straight to install.
+      LOG_INF("OTA", "User confirmed install -- silent-restarting to fresh heap for install handshake");
+      // WiFi is up and holding LWIP state. Disconnect cleanly so the
+      // post-restart boot doesn't race the prior session's tear-down.
+      WiFi.disconnect(false);
+      delay(30);
+      silentRestartToOtaInstall(updater.getOtaUrl().c_str(),
+                                static_cast<uint32_t>(updater.getOtaSize()),
+                                updater.getLatestVersion().c_str());
+      return;  // unreachable: silentRestartToOtaInstall calls ESP.restart()
     }
 
     if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {

@@ -33,6 +33,17 @@ class OtaUpdateActivity : public Activity {
   void acquireHeapReserve();
   void releaseHeapReserve();
 
+  // CrumBLE 4.6: install-pending flow.
+  //   installPending_ = true means onEnter ran with a queued install state
+  //   from the prior boot's checkForUpdate (via consumePendingOtaInstall).
+  //   onWifiSelectionComplete sees this and routes to install instead of
+  //   running another check. requestInstallFromLoop_ tells loop() to fire
+  //   installUpdate on the next tick (Confirm is implicit -- user already
+  //   confirmed pre-restart).
+  bool installPending_ = false;
+  bool requestInstallFromLoop_ = false;
+  void runInstall();
+
   void onWifiSelectionComplete(bool success);
 
  public:

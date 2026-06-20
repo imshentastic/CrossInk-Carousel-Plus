@@ -27,6 +27,10 @@ class OtaUpdater {
 
   size_t getOtaSize() const { return otaSize; }
 
+  // CrumBLE 4.6: needed by OtaUpdateActivity to persist install state across
+  // a silent-restart between check and install.
+  const std::string& getOtaUrl() const { return otaUrl; }
+
   size_t getProcessedSize() const { return processedSize; }
 
   size_t getTotalSize() const { return totalSize; }
@@ -37,4 +41,15 @@ class OtaUpdater {
   OtaUpdaterError checkForUpdate();
   OtaUpdaterError installUpdate(ProgressCallback onProgress = nullptr, void* ctx = nullptr,
                                 std::atomic<bool>* cancelRequested = nullptr);
+
+  // CrumBLE 4.6: restore install-ready state from a prior checkForUpdate that
+  // ran on the boot before a silent-restart. The activity calls this in
+  // onEnter when consumePendingOtaInstall returns true.
+  void preloadInstallState(const char* url, size_t size, const char* version) {
+    otaUrl = url ? url : "";
+    otaSize = size;
+    totalSize = size;
+    latestVersion = version ? version : "";
+    updateAvailable = true;
+  }
 };

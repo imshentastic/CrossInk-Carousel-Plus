@@ -127,3 +127,16 @@ void clearSilentRebootContinuationFlag();
 // ~40-50KB contiguous on top of WiFi's ~58KB share). Silent-restart lands
 // on a clean ~115KB heap so the SSL handshake fits.
 void silentRestartToOtaUpdate();
+
+// CrumBLE 4.6: silent restart that resumes mid-OTA -- after the user has
+// confirmed install on the "New update available" screen. Skips the check
+// phase; URL + size + version are persisted to RTC and pulled back into
+// OtaUpdater on the next boot. Used because the install download's own
+// HTTPS handshake (separate connection to GitHub's CDN) needs a fresh
+// ~50KB contiguous heap budget that the post-check residue eats.
+void silentRestartToOtaInstall(const char* url, uint32_t size, const char* version);
+// Read-and-clear the queued install state. Returns true if a valid install
+// is pending (target=OTA_INSTALL and URL non-empty); fills out the args.
+// Safe to call once per boot.
+bool consumePendingOtaInstall(char* outUrl, size_t outUrlSize, uint32_t* outSize, char* outVersion,
+                              size_t outVersionSize);

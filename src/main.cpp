@@ -426,6 +426,14 @@ RTC_NOINIT_ATTR uint32_t silentRebootTargetSpine;
 // CrumBLE 4.4 post-bisect: word string for OpenDefinition action. 63
 // chars + null is enough for any single dictionary lookup word.
 RTC_NOINIT_ATTR char silentRebootDefinitionWord[64];
+// CrumBLE 4.6: OTA install state persisted across silent-restart. After the
+// check-for-update handshake confirms a new version and the user accepts,
+// we silent-restart so the install begins with a fresh ~94KB heap budget --
+// the post-check residue + LWIP keep-alive eats ~17KB that mbedtls SSL
+// setup needs for the install download's own handshake.
+RTC_NOINIT_ATTR char silentRebootOtaUrl[256];
+RTC_NOINIT_ATTR uint32_t silentRebootOtaSize;
+RTC_NOINIT_ATTR char silentRebootOtaVersion[40];
 constexpr uint32_t SILENT_REBOOT_MAGIC = 0xC1EAB007;
 constexpr uint32_t SILENT_REBOOT_TARGET_HOME = 0;
 constexpr uint32_t SILENT_REBOOT_TARGET_READER = 1;
@@ -441,6 +449,14 @@ constexpr uint32_t SILENT_REBOOT_TARGET_FILE_TRANSFER = 2;
 // through. They re-select WiFi but on a fresh ~115KB heap the mbedtls SSL
 // setup (~40-50KB cert + handshake) fits comfortably.
 constexpr uint32_t SILENT_REBOOT_TARGET_OTA_UPDATE = 3;
+// CrumBLE 4.6: silent-restart between check-for-update and install. After
+// check completes and the user confirms install, we silent-restart so the
+// install's own HTTPS handshake (separate connection to the CDN) runs on a
+// fresh heap rather than fighting with the post-check residue (~17KB lost
+// to LWIP keep-alive + HTTP client cleanup). On this boot the saved URL +
+// size + version are pulled from silentRebootOta* RTC vars and fed straight
+// to OtaUpdater so the install bypasses the check phase.
+constexpr uint32_t SILENT_REBOOT_TARGET_OTA_INSTALL = 4;
 
 // How the device is coming back to life, resolved once at boot. Both resume
 // flows suppress the splash and leave the panel holding its pre-boot frame; a
@@ -494,6 +510,29 @@ void silentRestartToOtaUpdate() {
   ESP.restart();
 }
 
+void silentRestartToOtaInstall(const char* url, uint32_t size, const char* version) {
+  if (deepSleepInProgress) return;
+  silentRebootTarget = SILENT_REBOOT_TARGET_OTA_INSTALL;
+  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  silentRebootOtaSize = size;
+  if (url) {
+    strncpy(silentRebootOtaUrl, url, sizeof(silentRebootOtaUrl) - 1);
+    silentRebootOtaUrl[sizeof(silentRebootOtaUrl) - 1] = '\0';
+  } else {
+    silentRebootOtaUrl[0] = '\0';
+  }
+  if (version) {
+    strncpy(silentRebootOtaVersion, version, sizeof(silentRebootOtaVersion) - 1);
+    silentRebootOtaVersion[sizeof(silentRebootOtaVersion) - 1] = '\0';
+  } else {
+    silentRebootOtaVersion[0] = '\0';
+  }
+  LOG_INF("MAIN", "Silent restart (target=ota-install) — fresh heap for install handshake");
+  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+  delay(50);
+  ESP.restart();
+}
+
 void setSilentRebootFtModeHint(uint32_t mode) {
   silentRebootFtModeHint = mode;
 }
@@ -509,6 +548,33 @@ uint32_t consumeSilentRebootFtModeHint() {
   const uint32_t v = g_pendingFtModeHintSnapshot;
   g_pendingFtModeHintSnapshot = 0;
   return v;
+}
+
+// CrumBLE 4.6: snapshot of the pending OTA install state, populated in
+// setup() from RTC vars when target=SILENT_REBOOT_TARGET_OTA_INSTALL.
+// consumePendingOtaInstall returns once and self-clears.
+static char g_pendingOtaUrl[256] = {0};
+static uint32_t g_pendingOtaSize = 0;
+static char g_pendingOtaVersion[40] = {0};
+static bool g_pendingOtaInstallReady = false;
+
+bool consumePendingOtaInstall(char* outUrl, size_t outUrlSize, uint32_t* outSize, char* outVersion,
+                              size_t outVersionSize) {
+  if (!g_pendingOtaInstallReady) return false;
+  g_pendingOtaInstallReady = false;
+  if (outUrl && outUrlSize > 0) {
+    strncpy(outUrl, g_pendingOtaUrl, outUrlSize - 1);
+    outUrl[outUrlSize - 1] = '\0';
+  }
+  if (outVersion && outVersionSize > 0) {
+    strncpy(outVersion, g_pendingOtaVersion, outVersionSize - 1);
+    outVersion[outVersionSize - 1] = '\0';
+  }
+  if (outSize) *outSize = g_pendingOtaSize;
+  g_pendingOtaUrl[0] = '\0';
+  g_pendingOtaVersion[0] = '\0';
+  g_pendingOtaSize = 0;
+  return true;
 }
 
 // Forward declaration: the silent-restart functions below snapshot the
@@ -1177,7 +1243,7 @@ void setup() {
   // Bound the target range too — RTC_NOINIT memory is uninitialized on cold boot.
   const bool isSilentReboot = (silentRebootMagic == SILENT_REBOOT_MAGIC);
   const uint32_t snapshotTarget =
-      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_OTA_UPDATE) ? silentRebootTarget : 0;
+      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_OTA_INSTALL) ? silentRebootTarget : 0;
   // Snapshot the FT mode hint into a normal variable before clearing
   // RTC state, so the FT activity's onEnter can read it via
   // consumeSilentRebootFtModeHint(). Only honour it on a confirmed
@@ -1207,11 +1273,34 @@ void setup() {
     }
   }
 
+  // CrumBLE 4.6: snapshot OTA install state from RTC. Module-scope globals
+  // declared above; consumePendingOtaInstall() pulls them back when
+  // OtaUpdateActivity's onEnter runs.
+  g_pendingOtaInstallReady = false;
+  g_pendingOtaUrl[0] = '\0';
+  g_pendingOtaVersion[0] = '\0';
+  g_pendingOtaSize = 0;
+  if (isSilentReboot && snapshotTarget == SILENT_REBOOT_TARGET_OTA_INSTALL) {
+    silentRebootOtaUrl[sizeof(silentRebootOtaUrl) - 1] = '\0';
+    silentRebootOtaVersion[sizeof(silentRebootOtaVersion) - 1] = '\0';
+    if (silentRebootOtaUrl[0] != '\0') {
+      strncpy(g_pendingOtaUrl, silentRebootOtaUrl, sizeof(g_pendingOtaUrl) - 1);
+      g_pendingOtaUrl[sizeof(g_pendingOtaUrl) - 1] = '\0';
+      strncpy(g_pendingOtaVersion, silentRebootOtaVersion, sizeof(g_pendingOtaVersion) - 1);
+      g_pendingOtaVersion[sizeof(g_pendingOtaVersion) - 1] = '\0';
+      g_pendingOtaSize = silentRebootOtaSize;
+      g_pendingOtaInstallReady = true;
+    }
+  }
+
   silentRebootMagic = 0;
   silentRebootTarget = 0;
   silentRebootFtModeHint = 0;
   silentRebootReaderPostAction = 0;
   silentRebootTargetSpine = 0;
+  silentRebootOtaUrl[0] = '\0';
+  silentRebootOtaVersion[0] = '\0';
+  silentRebootOtaSize = 0;
 
   // CrumBLE 4.5: lean-boot path for silent-restart-to-OTA. The mbedtls SSL
   // handshake to api.github.com needs ~40-50 KB contiguous on top of WiFi's
@@ -1221,7 +1310,8 @@ void setup() {
   // loads when we know the next activity is OTA hands the handshake the
   // full ~115 KB clean heap. Anything skipped here is reloaded by the
   // normal boot that follows OtaUpdateActivity::onExit's silentRestart().
-  const bool isOtaSilentReboot = (isSilentReboot && snapshotTarget == SILENT_REBOOT_TARGET_OTA_UPDATE);
+  const bool isOtaSilentReboot = (isSilentReboot && (snapshotTarget == SILENT_REBOOT_TARGET_OTA_UPDATE ||
+                                                     snapshotTarget == SILENT_REBOOT_TARGET_OTA_INSTALL));
   g_leanBootForOta = isOtaSilentReboot;
 
   gpio.begin();
@@ -1514,14 +1604,20 @@ void setup() {
     // (Hotspot vs Join) again -- that screen is the FT activity's normal
     // first step on entry.
     activityManager.goToFileTransfer();
-  } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_OTA_UPDATE) {
-    // CrumBLE 4.5: heap-defrag restart from OtaUpdateActivity's pre-flight.
-    // Route straight to OTA Update so the user doesn't see Home flash
-    // through. Lean-boot guards above (isOtaSilentReboot) already skipped
-    // the heap-heavy stores/library so the post-boot heap available to
-    // the mbedtls SSL handshake matches a fresh power-on rather than the
-    // ~65 KB MaxAlloc seen on a full boot.
-    LOG_INF("BOOT", "Lean-boot OTA dispatch: heap=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  } else if (resume == BootResume::Silent && (snapshotTarget == SILENT_REBOOT_TARGET_OTA_UPDATE ||
+                                              snapshotTarget == SILENT_REBOOT_TARGET_OTA_INSTALL)) {
+    // CrumBLE 4.5/4.6: heap-defrag restart from OtaUpdateActivity. Route
+    // straight to OTA so the user doesn't see Home flash through.
+    // OTA_UPDATE target = restart from the pre-flight bottom; the activity
+    // starts in WIFI_SELECTION and runs check then install.
+    // OTA_INSTALL target = restart after user confirmed install on a check
+    // that already succeeded; consumePendingOtaInstall() in the activity
+    // restores URL/size/version from RTC and the activity jumps straight
+    // to install (skipping check) so the second handshake gets the same
+    // fresh ~94 KB MaxAlloc the first one had.
+    LOG_INF("BOOT", "Lean-boot OTA dispatch: target=%s heap=%u maxAlloc=%u",
+            snapshotTarget == SILENT_REBOOT_TARGET_OTA_INSTALL ? "install" : "update", ESP.getFreeHeap(),
+            ESP.getMaxAllocHeap());
     activityManager.goToOtaUpdate();
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_READER &&
              !APP_STATE.openEpubPath.empty()) {
