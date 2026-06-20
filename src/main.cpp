@@ -1024,7 +1024,7 @@ void enterDeepSleep(bool fromTimeout) {
   powerManager.startDeepSleep(gpio);
 }
 
-void setupDisplayAndFonts(bool seamless = false) {
+void setupDisplayAndFonts(bool seamless = false, bool leanForOta = false) {
 #ifdef SIMULATOR
   (void)seamless;
   display.begin();
@@ -1034,6 +1034,10 @@ void setupDisplayAndFonts(bool seamless = false) {
   renderer.begin();
   activityManager.begin();
   LOG_DBG("MAIN", "Display initialized");
+  if (leanForOta) {
+    LOG_INF("MEM", "Boot step setupDisplayAndFonts post-display: free=%u maxAlloc=%u", ESP.getFreeHeap(),
+            ESP.getMaxAllocHeap());
+  }
 
   // Initialize font decompressor for compressed reader fonts
   if (!fontDecompressor.init()) {
@@ -1127,8 +1131,21 @@ void setupDisplayAndFonts(bool seamless = false) {
   renderer.insertFont(UI_12_FONT_ID, ui12FontFamily);
   renderer.insertFont(SMALL_FONT_ID, smallFontFamily);
 
-  // Discover and load SD card fonts
-  sdFontSystem.begin(renderer);
+  if (leanForOta) {
+    LOG_INF("MEM", "Boot step setupDisplayAndFonts post-font-register: free=%u maxAlloc=%u", ESP.getFreeHeap(),
+            ESP.getMaxAllocHeap());
+  }
+
+  // Discover and load SD card fonts. Skipped on lean-boot OTA path -- SD font
+  // discovery scans the SD card and (if user has a saved sdFontFamilyName) the
+  // load can allocate 20+ KB for glyph headers/cache. None of it is needed to
+  // render the OTA progress screen, which uses only UI fonts.
+  if (!leanForOta) {
+    sdFontSystem.begin(renderer);
+  } else {
+    LOG_INF("MEM", "Boot step setupDisplayAndFonts skipped sdFontSystem.begin: free=%u maxAlloc=%u", ESP.getFreeHeap(),
+            ESP.getMaxAllocHeap());
+  }
 
   LOG_DBG("MAIN", "Fonts setup");
 }
@@ -1393,7 +1410,11 @@ void setup() {
                             : !APP_STATE.showBootScreen ? BootResume::QuickResume
                                                         : BootResume::Splash;
 
-  setupDisplayAndFonts(resume != BootResume::Splash);
+  if (isOtaSilentReboot) {
+    LOG_INF("MEM", "Boot step pre-setupDisplayAndFonts: free=%u maxAlloc=%u", ESP.getFreeHeap(),
+            ESP.getMaxAllocHeap());
+  }
+  setupDisplayAndFonts(resume != BootResume::Splash, isOtaSilentReboot);
 
   // CrumBLE 4.3 option 3: page-heap reserve was acquired at boot here, but
   // that starves the File Transfer web server (HTML serve needs ~20 KB
