@@ -257,6 +257,7 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
 
   esp_http_client_config_t client_config = {
       .url = latestReleaseUrl,
+      .cert_pem = kPinnedRootsPem,
       .event_handler = event_handler,
       // 4096 holds the API response headers; the 32KB body streams through the
       // parser in chunks so RX needn't be larger. TX only carries our GET.
@@ -264,7 +265,6 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
       .buffer_size = 4096,
       .buffer_size_tx = 1024,
       .user_data = &releaseParser,
-      .cert_pem = kPinnedRootsPem,
       .skip_cert_common_name_check = true,
       .keep_alive_enable = true,
   };
@@ -377,13 +377,13 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
 
   esp_http_client_config_t client_config = {
       .url = otaUrl.c_str(),
+      .cert_pem = kPinnedRootsPem,
       .timeout_ms = 15000,
       // 4096 holds the github->CDN redirect headers (the 512 default truncates
       // them); TX only carries our GET. Both are contiguous blocks contending
       // with the TLS handshake on a tight internal arena, so keep them minimal.
       .buffer_size = 4096,
       .buffer_size_tx = 1024,
-      .cert_pem = kPinnedRootsPem,
       .skip_cert_common_name_check = true,
       .keep_alive_enable = true,
   };
