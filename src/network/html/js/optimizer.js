@@ -1970,6 +1970,12 @@ async function showOptimizerPreflightModal(renderInfo, fileName) {
     { v: 1, label: 'Normal' },
     { v: 2, label: 'Wide' },
   ];
+  // CrumBLE 4.4: was a bool, now a 3-way enum mirroring LINE_SPACING.
+  const PARAGRAPH_SPACING = [
+    { v: 0, label: 'Tight' },
+    { v: 1, label: 'Normal' },
+    { v: 2, label: 'Wide' },
+  ];
   const PARAGRAPH_ALIGNMENT = [
     { v: 0, label: 'Justified' },
     { v: 1, label: 'Left' },
@@ -2117,7 +2123,7 @@ async function showOptimizerPreflightModal(renderInfo, fileName) {
     makeSelect('Line spacing', 'lineSpacing', LINE_SPACING, renderInfo.lineSpacing | 0);
     makeSelect('Paragraph alignment', 'paragraphAlignment', PARAGRAPH_ALIGNMENT, renderInfo.paragraphAlignment | 0);
     makeSelect('Image rendering', 'imageRendering', IMAGE_RENDERING, renderInfo.imageRendering | 0);
-    makeBool('Extra paragraph spacing', 'extraParagraphSpacing', renderInfo.extraParagraphSpacing | 0);
+    makeSelect('Paragraph spacing', 'extraParagraphSpacing', PARAGRAPH_SPACING, renderInfo.extraParagraphSpacing | 0);
     makeBool('Force paragraph indents', 'forceParagraphIndents', renderInfo.forceParagraphIndents | 0);
     makeBool('Hyphenation', 'hyphenationEnabled', renderInfo.hyphenationEnabled | 0);
     makeBool('Embedded CSS', 'embeddedStyle', renderInfo.embeddedStyle | 0);
@@ -2477,10 +2483,20 @@ async function prebakeChapters(epubBlob, deviceFilePath, progressCallback) {
         }
         const fontBytes = new Uint8Array(await fontResp.arrayBuffer());
         Module.FS.writeFile(sdFontPath, fontBytes);
+        // CrumBLE 4.4: --emit-section-glyph-subsets gates BOTH the v39 EGS
+        // emit AND the v40 glyph atlas emit on the CLI side. Without it the
+        // section files come out v40-format but with the atlas trailer at
+        // 0/0/0 -- the device then has nothing to install at section open
+        // and falls back to live SD-font glyph reads (which crater the
+        // heap on chapter boundaries -> question marks in the reader).
+        // This was the whole reason for shipping atlas in the first place,
+        // so when the user pays the SD-font prebake cost they should get
+        // the atlas payload too.
         cliArgs.unshift('--sd-font-path', sdFontPath,
                         '--sd-font-family', fname,
-                        '--sd-font-size', String(pt));
-        log(`SD font passed to WASM: path=${sdFontPath} family=${fname} pt=${pt}`, '', 'PRE');
+                        '--sd-font-size', String(pt),
+                        '--emit-section-glyph-subsets');
+        log(`SD font passed to WASM: path=${sdFontPath} family=${fname} pt=${pt} + atlas/EGS emit enabled`, '', 'PRE');
       } catch (e) {
         log(`SD font fetch failed (${e.message || e}) -- bake will use default font; prebake will not load cleanly`,
             '', 'WARN');

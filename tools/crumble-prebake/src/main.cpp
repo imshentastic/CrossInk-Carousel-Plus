@@ -45,6 +45,14 @@
 // #include <builtinFonts/lexenddeca_14_bold.h>
 // #include <builtinFonts/lexenddeca_14_italic.h>
 // #include <builtinFonts/lexenddeca_14_bolditalic.h>
+// CrumBLE 4.4: register every Bitter size the slim firmware ships so the
+// fontId pre-flight at main.cpp:~900 doesn't silently abort when the reader
+// has selected 10 pt or 16 pt. Without 10/16 registered, those users got an
+// orange-bar "non-fatal" prebake failure and no optimization badge.
+#include <builtinFonts/bitter_10_regular.h>
+#include <builtinFonts/bitter_10_bold.h>
+#include <builtinFonts/bitter_10_italic.h>
+#include <builtinFonts/bitter_10_bolditalic.h>
 #include <builtinFonts/bitter_12_regular.h>
 #include <builtinFonts/bitter_12_bold.h>
 #include <builtinFonts/bitter_12_italic.h>
@@ -57,6 +65,10 @@
 #include <builtinFonts/bitter_14_bold.h>
 #include <builtinFonts/bitter_14_italic.h>
 #include <builtinFonts/bitter_14_bolditalic.h>
+#include <builtinFonts/bitter_16_regular.h>
+#include <builtinFonts/bitter_16_bold.h>
+#include <builtinFonts/bitter_16_italic.h>
+#include <builtinFonts/bitter_16_bolditalic.h>
 #include "fontIds.h"  // LEXENDDECA_14_FONT_ID / BITTER_12_FONT_ID / BITTER_14_FONT_ID
 #include <SdCardFont.h>
 #include <SdCardFontManager.h>
@@ -98,7 +110,7 @@ struct SectionSettings {
   uint16_t viewportWidth = 0;
   uint16_t viewportHeight = 0;
   float lineCompression = 1.0f;
-  bool extraParagraphSpacing = false;
+  uint8_t extraParagraphSpacing = 0;
   bool forceParagraphIndents = false;
   uint8_t paragraphAlignment = 0;
   bool hyphenationEnabled = false;
@@ -195,7 +207,7 @@ bool fetchDeviceSettings(const std::string& deviceUrl, SectionSettings& out) {
   if (doc["viewportHeight"].is<int>()) out.viewportHeight = doc["viewportHeight"].as<int>();
   if (doc["lineCompression"].is<float>()) out.lineCompression = doc["lineCompression"].as<float>();
   if (doc["extraParagraphSpacing"].is<int>())
-    out.extraParagraphSpacing = doc["extraParagraphSpacing"].as<int>() != 0;
+    out.extraParagraphSpacing = static_cast<uint8_t>(doc["extraParagraphSpacing"].as<int>());
   if (doc["forceParagraphIndents"].is<int>())
     out.forceParagraphIndents = doc["forceParagraphIndents"].as<int>() != 0;
   if (doc["paragraphAlignment"].is<int>()) out.paragraphAlignment = doc["paragraphAlignment"].as<int>();
@@ -282,7 +294,7 @@ bool loadSettingsFromFile(const std::string& path, SectionSettings& out) {
   if (doc["viewportHeight"].is<int>()) out.viewportHeight = doc["viewportHeight"].as<int>();
   if (doc["lineCompression"].is<float>()) out.lineCompression = doc["lineCompression"].as<float>();
   if (doc["extraParagraphSpacing"].is<int>())
-    out.extraParagraphSpacing = doc["extraParagraphSpacing"].as<int>() != 0;
+    out.extraParagraphSpacing = static_cast<uint8_t>(doc["extraParagraphSpacing"].as<int>());
   if (doc["forceParagraphIndents"].is<int>())
     out.forceParagraphIndents = doc["forceParagraphIndents"].as<int>() != 0;
   if (doc["paragraphAlignment"].is<int>()) out.paragraphAlignment = doc["paragraphAlignment"].as<int>();
@@ -421,6 +433,11 @@ struct Options {
   // embeddedGlyphSubsetOffset / Size / CpfontHash uint32_t fields then
   // point at the block so on-device load can validate + install it.
   bool emitSectionGlyphSubsets = false;
+  // CrumBLE 4.4 task #2/#7/#12: force atlas bit depth (1 or 2). 0 means
+  // auto-pick: 2-bit if any prewarmed style provided 2-bit data AND the
+  // font is large enough for AA to matter, else 1-bit. Explicit
+  // --atlas-bit-depth wins over auto-pick.
+  uint8_t atlasBitDepthOverride = 0;
 };
 
 bool parseArgs(int argc, char** argv, Options& out) {
@@ -457,6 +474,13 @@ bool parseArgs(int argc, char** argv, Options& out) {
       out.sdFontPointSize = static_cast<uint8_t>(std::stoi(argv[++i]));
     } else if (a == "--emit-section-glyph-subsets") {
       out.emitSectionGlyphSubsets = true;
+    } else if (a == "--atlas-bit-depth" && i + 1 < argc) {
+      const int v = std::stoi(argv[++i]);
+      if (v != 1 && v != 2) {
+        LOG_ERR("CLI", "--atlas-bit-depth must be 1 or 2 (got %d)", v);
+        return false;
+      }
+      out.atlasBitDepthOverride = static_cast<uint8_t>(v);
     } else if (a.rfind("--", 0) == 0) {
       std::fprintf(stderr, "Unknown option: %s\n", a.c_str());
       return false;
@@ -766,7 +790,8 @@ bool emitEmbeddedGlyphSubsetForSection(const std::string& sectionPath, Section& 
 // CrumBLE 4.4 task #35 step 2a forward decl: buildGlyphAtlasBlock is
 // defined later in this file (near the embedded subset emitter) so the
 // section-loop call site can reach it without re-ordering the file.
-std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font);
+std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font, uint8_t bitDepthOverride = 0,
+                                          uint8_t sdFontPointSize = 0);
 
 // EPUB, byte-targeting the device's section file format. Loads an Epub
 // instance from the same on-disk cache Phase 1 just wrote, then loops
@@ -784,7 +809,8 @@ std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font);
 int prebakeSections(const std::string& epubPath, const std::string& realCacheDir,
                     const std::string& /*cacheDirParent*/, GfxRenderer& renderer,
                     const SectionSettings& s, SdCardFont* sdFontForSubset,
-                    bool emitGlyphSubsets) {
+                    bool emitGlyphSubsets, uint8_t atlasBitDepthOverride = 0,
+                    uint8_t sdFontPointSize = 0) {
   // CrumBLE 4.3: when emitGlyphSubsets is true AND sdFontForSubset is
   // non-null, the post-createSectionFile step walks each section's pages,
   // collects the codepoints actually used per style, prewarms the
@@ -895,6 +921,7 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
   }
 
   int failures = 0;
+  bool anyAtlasEmitted = false;
   for (int spineIdx = 0; spineIdx < spineCount; ++spineIdx) {
     Section section(epub, spineIdx, renderer);
     bool imagesWereSuppressed = false;
@@ -942,31 +969,59 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
         // matched against what the on-device renderer will actually look
         // up at draw time.
         if (subsetOk) {
-          const std::vector<uint8_t> atlasBlock = buildGlyphAtlasBlock(*sdFontForSubset);
-          if (!atlasBlock.empty()) {
+          // CrumBLE 4.4 v41: dual-slot atlas emit. Primary slot is always
+          // 1-bit (BT-friendly, fits tight heap). Alt slot is 2-bit and
+          // only emitted at sdFontPointSize >= kAutoBitDepth2BitMinPointSize
+          // because at smaller sizes the visual benefit of 2-bit is
+          // negligible and the extra section-file bytes aren't worth it.
+          // Reader picks at install time based on whether BT is enabled.
+          // The user-supplied atlasBitDepthOverride (--atlas-bit-depth CLI
+          // flag) still wins -- if the operator forces a specific depth
+          // we only emit that one into primary and leave alt empty.
+          struct AtlasEmit {
+            uint8_t bitDepth;
+            uint32_t trailerOffset;  // header byte offset for the (offset, size, hash) triple
+            const char* label;
+          };
+          std::vector<AtlasEmit> emits;
+          if (atlasBitDepthOverride != 0) {
+            emits.push_back(AtlasEmit{atlasBitDepthOverride, 48u + 3u * sizeof(uint32_t), "primary (forced)"});
+          } else {
+            // Auto: always emit BOTH slots -- primary 1-bit (BT-friendly,
+            // small) and alt 2-bit (BT-cold, crisper AA). The reader picks
+            // at install time based on current heap headroom / BT state, so
+            // shipping both gives users without BT the crisper rendering at
+            // small sizes too. Cost is ~1.5-3 KB of additional section-file
+            // disk per style; resident RAM is unchanged since only the chosen
+            // slot is loaded. Explicit --atlas-bit-depth still overrides.
+            emits.push_back(AtlasEmit{1, 48u + 3u * sizeof(uint32_t), "primary (1-bit, BT-friendly)"});
+            emits.push_back(AtlasEmit{2, 48u + 6u * sizeof(uint32_t), "alt (2-bit, BT-cold)"});
+          }
+          for (const auto& emit : emits) {
+            const std::vector<uint8_t> atlasBlock =
+                buildGlyphAtlasBlock(*sdFontForSubset, emit.bitDepth, sdFontPointSize);
+            if (atlasBlock.empty()) continue;
             std::fstream af(sectionPath, std::ios::in | std::ios::out | std::ios::binary);
             if (!af.is_open()) {
-              LOG_ERR("PRE", "section %d: cannot open %s for r+w during atlas emit", spineIdx, sectionPath.c_str());
-            } else {
-              af.seekp(0, std::ios::end);
-              const uint32_t atlasStartOffset = static_cast<uint32_t>(af.tellp());
-              af.write(reinterpret_cast<const char*>(atlasBlock.data()), static_cast<std::streamsize>(atlasBlock.size()));
-              const uint32_t atlasSize = static_cast<uint32_t>(atlasBlock.size());
-              // v40 trailer sits at HEADER_SIZE_V38 + 12 (after the v39
-              // embedded-subset triple). Mirrors the seek arithmetic the
-              // v39 emit path uses to patch its own trailer.
-              constexpr uint32_t kV40TrailerOffset = 48u + 3u * sizeof(uint32_t);  // 60
-              af.seekp(kV40TrailerOffset, std::ios::beg);
-              const uint32_t atlasHash = sdFontForSubset->contentHash();
-              af.write(reinterpret_cast<const char*>(&atlasStartOffset), sizeof(uint32_t));
-              af.write(reinterpret_cast<const char*>(&atlasSize), sizeof(uint32_t));
-              af.write(reinterpret_cast<const char*>(&atlasHash), sizeof(uint32_t));
-              af.close();
-              LOG_INF("PRE",
-                      "  section %d: glyph atlas block written: offset=%u size=%u bytes "
-                      "(cpfontHash=0x%08x)",
-                      spineIdx, atlasStartOffset, atlasSize, atlasHash);
+              LOG_ERR("PRE", "section %d: cannot open %s for r+w during %s atlas emit",
+                      spineIdx, sectionPath.c_str(), emit.label);
+              break;
             }
+            af.seekp(0, std::ios::end);
+            const uint32_t atlasStartOffset = static_cast<uint32_t>(af.tellp());
+            af.write(reinterpret_cast<const char*>(atlasBlock.data()), static_cast<std::streamsize>(atlasBlock.size()));
+            const uint32_t atlasSize = static_cast<uint32_t>(atlasBlock.size());
+            af.seekp(emit.trailerOffset, std::ios::beg);
+            const uint32_t atlasHash = sdFontForSubset->contentHash();
+            af.write(reinterpret_cast<const char*>(&atlasStartOffset), sizeof(uint32_t));
+            af.write(reinterpret_cast<const char*>(&atlasSize), sizeof(uint32_t));
+            af.write(reinterpret_cast<const char*>(&atlasHash), sizeof(uint32_t));
+            af.close();
+            anyAtlasEmitted = true;
+            LOG_INF("PRE",
+                    "  section %d: %s atlas block written: offset=%u size=%u bytes "
+                    "(cpfontHash=0x%08x)",
+                    spineIdx, emit.label, atlasStartOffset, atlasSize, atlasHash);
           }
         }
       }
@@ -1072,7 +1127,7 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
     mdoc["v"] = 1;  // schema version; bump if fields are added
     mdoc["fontId"] = s.fontId;
     mdoc["lineCompression"] = s.lineCompression;
-    mdoc["extraParagraphSpacing"] = s.extraParagraphSpacing ? 1 : 0;
+    mdoc["extraParagraphSpacing"] = static_cast<int>(s.extraParagraphSpacing);
     mdoc["forceParagraphIndents"] = s.forceParagraphIndents ? 1 : 0;
     mdoc["paragraphAlignment"] = static_cast<int>(s.paragraphAlignment);
     mdoc["viewportWidth"] = static_cast<int>(s.viewportWidth);
@@ -1127,6 +1182,30 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
     } else {
       LOG_ERR("PRE", "could not write prebake-v2.marker at %s", markerPath.c_str());
     }
+    // CrumBLE 4.4: chapter prebake marker. Reaching this point means the
+    // CLI successfully wrote sections-prebake/*.bin (failures earlier in
+    // the loop produce `failures++` and we wouldn't be here on a fully
+    // failed run -- partial runs still write the marker because the
+    // sections that DID succeed are usable). Used by the FT page and the
+    // device's long-press info screen to show "✓IMG+CHAP" tier badge.
+    {
+      const std::string chapMarkerPath = realCacheDir + "/prebake-chap.marker";
+      std::ofstream m(chapMarkerPath, std::ios::binary | std::ios::trunc);
+      if (m) m.close();
+    }
+    // CrumBLE 4.4: CP-font (atlas) marker. anyAtlasEmitted is set inside
+    // the per-section loop whenever buildGlyphAtlasBlock produced a
+    // non-empty atlas. Reaching this point with anyAtlasEmitted=true
+    // means the user's SD font got pre-rendered glyph atlases (the
+    // "CP.FONT" badge tier). Without the SD-font path running (built-in
+    // font books), this marker stays absent and the badge tops out at
+    // "✓IMG+CHAP".
+    if (anyAtlasEmitted) {
+      const std::string cpfontMarkerPath = realCacheDir + "/prebake-cpfont.marker";
+      std::ofstream m(cpfontMarkerPath, std::ios::binary | std::ios::trunc);
+      if (m) m.close();
+      LOG_INF("PRE", "wrote prebake-cpfont.marker (atlas data shipped)");
+    }
   }
 
   return failures;
@@ -1143,17 +1222,23 @@ int prebakeAllThumbs(const std::string& epubPath, const std::string& cacheDir,
     LOG_INF("PRE", "no cover image href; skipping thumb gen");
     return 0;
   }
-  // Canonical thumb sizes -- revised 2A.3-revealed set, see DESIGN.md for
-  // the screen each one renders on. 222x370 and 192x320 cover the common
-  // home screens (Base/non-Carousel theme + LyraFlow sleep screen); 100x150
-  // covers Bookshelf grid cells. LyraCarousel-specific sizes (296x468 and
-  // 200x390) are NOT included here -- they're only generated on cover-miss
-  // self-heal and only when LyraCarousel is the active theme. Add a per-
-  // theme override flag once we have telemetry on which themes users run.
+  // Canonical thumb sizes -- prebakes ALL 5 known cover sizes so any theme
+  // the user picks (or switches to) renders covers from SD instead of from
+  // an on-device decode + dither + downscale pass. The cover-miss self-heal
+  // path on LyraCarousel was running into [ERR] [HOME] OOM: cover buffer
+  // failures under tight heap (~13-19 KB MaxAlloc mid-reading), and even
+  // when it succeeded it added ~200-500 ms latency to the first home-screen
+  // paint per book. Trade-off: ~30-60 KB extra prebake bytes per book
+  // (negligible vs the ~500 KB-5 MB EPUB itself, and ~5-15% larger upload
+  // payload). Adds:
+  //   * 296x468 -- LyraCarousel home cover (largest)
+  //   * 200x390 -- LyraCarousel secondary cover
   constexpr int kThumbSizes[][2] = {
       {222, 370},  // Base/non-Carousel home cover
       {192, 320},  // LyraFlow sleep-screen center cover
       {100, 150},  // Bookshelf grid cell / recents list
+      {296, 468},  // LyraCarousel home cover
+      {200, 390},  // LyraCarousel secondary cover
   };
   int failures = 0;
   for (const auto& [w, h] : kThumbSizes) {
@@ -1182,17 +1267,45 @@ int prebakeAllThumbs(const std::string& epubPath, const std::string& cacheDir,
 //
 // Returns an empty vector iff the font has no prewarmed styles (caller
 // treats that as "nothing to emit, not an error").
-std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font) {
-  // Pre-scan: which styles have data, total glyph count.
+std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font, uint8_t bitDepthOverride,
+                                          uint8_t sdFontPointSize) {
+  // Pre-scan: which styles have data, total glyph count, and whether any
+  // style's source data is 2-bit (which is what enables AA emit).
   uint8_t styleMask = 0;
   uint16_t totalGlyphs = 0;
+  bool anyStyleIs2Bit = false;
   for (uint8_t s = 0; s < 4; ++s) {
     if (font.miniGlyphCount(s) > 0) {
       styleMask |= static_cast<uint8_t>(1u << s);
       totalGlyphs = static_cast<uint16_t>(totalGlyphs + font.miniGlyphCount(s));
+      if (font.miniIs2Bit(s)) anyStyleIs2Bit = true;
     }
   }
   if (styleMask == 0) return {};
+
+  // CrumBLE 4.4 task #2/#7/#12: pick atlas output bit depth.
+  // Auto: 2-bit if source has 2-bit data AND font point size is large
+  // enough for AA to matter; 1-bit otherwise.
+  //
+  // History: threshold was raised to 16pt because at 14pt (MEDIUM) the extra
+  // ~3 KB atlas resident under post-BT heap pressure pushed pages over the
+  // deserialize peak. Field-tested lowering to 12pt after Option I shipped --
+  // confirmed Page Load errors return at 12pt under BT (MaxAlloc collapses
+  // to <100 B during page-DOM deserialize on the 2-bit atlas pages). Even
+  // the small ~1.5 KB delta between 1-bit and 2-bit at Small atlas tips
+  // post-NimBLE heap past the page deserialize peak. Threshold stays at 16
+  // until either page-DOM arena work lands or another heap reduction frees
+  // ~3-5 KB of contiguous post-BT space. Explicit --atlas-bit-depth still wins.
+  constexpr uint8_t kAutoBitDepth2BitMinPointSize = 16;
+  const bool autoPicks2Bit = anyStyleIs2Bit && sdFontPointSize >= kAutoBitDepth2BitMinPointSize;
+  const uint8_t outputBitDepth =
+      bitDepthOverride != 0 ? bitDepthOverride
+                            : (autoPicks2Bit ? glyphatlas::BIT_DEPTH_2 : glyphatlas::BIT_DEPTH_1);
+  LOG_INF("PRE",
+          "atlas: emitting %u-bit (override=%u, anyStyleIs2Bit=%d, sdFontPointSize=%u, threshold=%u pt)",
+          static_cast<unsigned>(outputBitDepth), static_cast<unsigned>(bitDepthOverride),
+          anyStyleIs2Bit ? 1 : 0, static_cast<unsigned>(sdFontPointSize),
+          static_cast<unsigned>(kAutoBitDepth2BitMinPointSize));
 
   // Pack each glyph to 1-bit. Build per-style GlyphEntry vectors and a
   // single shared output bitmap buffer; each entry's bitmapOffset points
@@ -1227,7 +1340,7 @@ std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font) {
         // the first for any width not a multiple of 8 -- exactly the
         // "ghost stroke per character" rendering artifact we hit on first
         // device test of the atlas.
-        const uint32_t outGlyphBytes = glyphatlas::glyphBytes(g.width, g.height, glyphatlas::BIT_DEPTH_1);
+        const uint32_t outGlyphBytes = glyphatlas::glyphBytes(g.width, g.height, outputBitDepth);
         if (bitmapData.size() + outGlyphBytes > 0xFFFFu) {
           LOG_ERR("PRE", "atlas: bitmap payload would exceed 64 KB at cp U+%04X style %u; truncating", cp, s);
           break;  // bitmapBytes field is uint16_t
@@ -1256,15 +1369,25 @@ std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font) {
               const uint32_t srcBitInByte = srcBitOffset % 8u;
               srcPixel = (srcGlyph[srcByteIdx] >> (7u - srcBitInByte)) & 0x01u;
             }
-            // Threshold: any nonzero source pixel becomes lit in the
-            // 1-bit output. For 2-bit fonts this loses anti-aliasing
-            // (intentional trade for half the storage); for already-1-bit
-            // sources it's identity.
-            if (srcPixel != 0) {
-              const uint32_t outBit = y * g.width + x;
-              const uint32_t outByteIdx = outBit / 8u;
-              const uint32_t outBitInByte = outBit % 8u;
-              bitmapData[bitmapOffset + outByteIdx] |= static_cast<uint8_t>(1u << (7u - outBitInByte));
+            if (outputBitDepth == glyphatlas::BIT_DEPTH_2) {
+              // 2-bit output. Promote 1-bit src 0/1 -> 0/3 to preserve
+              // the "fully lit" look; 2-bit src passes through unchanged.
+              const uint8_t outPixel = is2Bit ? srcPixel : static_cast<uint8_t>(srcPixel ? 0x03 : 0x00);
+              if (outPixel != 0) {
+                const uint32_t outBitOffset = (y * g.width + x) * 2u;
+                const uint32_t outByteIdx = outBitOffset / 8u;
+                const uint32_t outBitInByte = outBitOffset % 8u;
+                bitmapData[bitmapOffset + outByteIdx] |=
+                    static_cast<uint8_t>(outPixel << (6u - outBitInByte));
+              }
+            } else {
+              // 1-bit output: threshold any nonzero source pixel.
+              if (srcPixel != 0) {
+                const uint32_t outBit = y * g.width + x;
+                const uint32_t outByteIdx = outBit / 8u;
+                const uint32_t outBitInByte = outBit % 8u;
+                bitmapData[bitmapOffset + outByteIdx] |= static_cast<uint8_t>(1u << (7u - outBitInByte));
+              }
             }
           }
         }
@@ -1298,7 +1421,7 @@ std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font) {
   glyphatlas::BlockHeader bh{};
   bh.magic = glyphatlas::MAGIC;
   bh.version = glyphatlas::FORMAT_VERSION;
-  bh.bitDepth = glyphatlas::BIT_DEPTH_1;
+  bh.bitDepth = outputBitDepth;
   bh.styleMask = styleMask;
   bh.reserved = 0;
   bh.totalGlyphs = totalGlyphs;
@@ -1391,7 +1514,7 @@ bool emitEmbeddedGlyphSubsetForSection(const std::string& sectionPath, Section& 
       }
       for (size_t i = 0; i < wordCount; ++i) {
         const uint8_t fontStyle = static_cast<uint8_t>(styles[i]) & 0x03;  // mask off decoration bits
-        const std::string& word = words[i];
+        const WordView word = words[i];
         const uint8_t* p = reinterpret_cast<const uint8_t*>(word.c_str());
         uint32_t cp = 0;
         while ((cp = utf8NextCodepoint(&p)) != 0) {
@@ -1647,6 +1770,12 @@ int main(int argc, char** argv) {
   // instances + insertFont calls here. fontIds.h defines the integer
   // hash constants the device + host both bake into section headers.
   // Lexend_14 EpdFont declarations elided (see top-of-file note).
+  EpdFont bitter10Regular(&bitter_10_regular);
+  EpdFont bitter10Bold(&bitter_10_bold);
+  EpdFont bitter10Italic(&bitter_10_italic);
+  EpdFont bitter10BoldItalic(&bitter_10_bolditalic);
+  EpdFontFamily bitter10Family(&bitter10Regular, &bitter10Bold,
+                               &bitter10Italic, &bitter10BoldItalic);
   EpdFont bitter12Regular(&bitter_12_regular);
   EpdFont bitter12Bold(&bitter_12_bold);
   EpdFont bitter12Italic(&bitter_12_italic);
@@ -1659,11 +1788,23 @@ int main(int argc, char** argv) {
   EpdFont bitter14BoldItalic(&bitter_14_bolditalic);
   EpdFontFamily bitter14Family(&bitter14Regular, &bitter14Bold,
                                &bitter14Italic, &bitter14BoldItalic);
+  EpdFont bitter16Regular(&bitter_16_regular);
+  EpdFont bitter16Bold(&bitter_16_bold);
+  EpdFont bitter16Italic(&bitter_16_italic);
+  EpdFont bitter16BoldItalic(&bitter_16_bolditalic);
+  EpdFontFamily bitter16Family(&bitter16Regular, &bitter16Bold,
+                               &bitter16Italic, &bitter16BoldItalic);
 
   GfxRenderer renderer;
-  // CrumBLE 4.2: Lexend_14 register call elided; see top-of-file rationale.
+  // CrumBLE 4.4: register every Bitter size the slim build ships (10/12/14/16
+  // pt -- 8/9/18/20 are OMIT_*_FONT'd out of tiny-bitter). Without this the
+  // WASM aborts at the fontId pre-flight when the reader's selected size is
+  // anything other than 12 or 14, and the JS swallows the failure as an
+  // orange progress bar with no badge.
+  renderer.insertFont(BITTER_10_FONT_ID, bitter10Family);
   renderer.insertFont(BITTER_12_FONT_ID, bitter12Family);
   renderer.insertFont(BITTER_14_FONT_ID, bitter14Family);
+  renderer.insertFont(BITTER_16_FONT_ID, bitter16Family);
 
   // CrumBLE 4.2: load + register an SD-card .cpfont when the JS caller
   // supplies one. The font lives at opts.sdFontPath inside MEMFS (the JS
@@ -1826,7 +1967,8 @@ int main(int argc, char** argv) {
     } else {
       const uint32_t t2 = millis();
       const int sectionFails = prebakeSections(epubPath, cacheDir, cacheDirParent, renderer, sectionSettings,
-                                                sdFontKeepalive.get(), opts.emitSectionGlyphSubsets);
+                                                sdFontKeepalive.get(), opts.emitSectionGlyphSubsets,
+                                                opts.atlasBitDepthOverride, opts.sdFontPointSize);
       const uint32_t dtSections = millis() - t2;
       if (sectionFails == 0) {
         LOG_INF("CLI", "  sections OK (%u ms)", dtSections);
