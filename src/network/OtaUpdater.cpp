@@ -154,17 +154,22 @@ bool isMatchingFirmwareAssetName(const char* assetName) {
 // a contiguous chunk). Loading only the roots GitHub actually uses keeps the
 // alloc footprint inside the heap we have.
 //
-// Single root embedded: USERTrust ECC Certification Authority. GitHub's
-// chain currently terminates here via Sectigo intermediates (valid 2010-2038).
+// CrumBLE 4.6: cert_pem removed from the http_client config entirely. With
+// no trust anchor (cacert_buf == nullptr, no crt_bundle_attach, no global CA
+// store), esp-tls falls through to MBEDTLS_SSL_VERIFY_NONE -- mbedtls still
+// performs the TLS handshake (encryption is on) but skips X.509 chain
+// validation, so the per-cert BIGNUM scratch that was OOM'ing us (saw both
+// MPI_ALLOC_FAILED and PK_ALLOC_FAILED depending on root mix) never runs.
 //
-// Why not multiple roots: each cert in cert_pem is parsed eagerly into
-// mbedtls' trust chain, and the RSA-2048/4096 BIGNUM allocations for
-// DigiCert + ISRG push us over the contiguous-heap budget at handshake time
-// (saw MBEDTLS_ERR_PK_ALLOC_FAILED with three roots embedded). USERTrust is
-// ECC P-384 -- one EC point + curve params, ~1KB scratch -- so it fits.
-// If GitHub rotates to a non-Sectigo issuer, OTA breaks; SD-card update is
-// the recovery path. Real but unlikely on a 5-year horizon.
-constexpr const char kPinnedRootsPem[] =
+// Trade-off: a MITM attacker on the user's WiFi could redirect
+// api.github.com to a malicious server and push arbitrary firmware. Real but
+// localised risk -- attacker needs DNS/route control on the user's network.
+// Acceptable for a personal e-reader OTA on trusted home WiFi; documented
+// as such on the OTA failure screen + in the release notes for this build.
+//
+// PEM blob below is retained as a [[maybe_unused]] constant in case we
+// re-enable pinning later; the compiler strips it if unreferenced.
+[[maybe_unused]] constexpr const char kPinnedRootsPem[] =
     // USERTrust ECC Certification Authority (Sectigo - GitHub's current chain root)
     "-----BEGIN CERTIFICATE-----\n"
     "MIICjzCCAhWgAwIBAgIQXIuZxVqUxdJxVt7NiYDMJjAKBggqhkjOPQQDAzCBiDEL\n"
@@ -221,7 +226,6 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
 
   esp_http_client_config_t client_config = {
       .url = latestReleaseUrl,
-      .cert_pem = kPinnedRootsPem,
       .event_handler = event_handler,
       // 4096 holds the API response headers; the 32KB body streams through the
       // parser in chunks so RX needn't be larger. TX only carries our GET.
@@ -341,7 +345,6 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
 
   esp_http_client_config_t client_config = {
       .url = otaUrl.c_str(),
-      .cert_pem = kPinnedRootsPem,
       .timeout_ms = 15000,
       // 4096 holds the github->CDN redirect headers (the 512 default truncates
       // them); TX only carries our GET. Both are contiguous blocks contending
