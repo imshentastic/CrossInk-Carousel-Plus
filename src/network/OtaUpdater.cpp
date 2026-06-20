@@ -8,6 +8,8 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback, void*, s
 #else
 #include <Logging.h>
 #include <ReleaseJsonParser.h>
+#include <esp_err.h>
+#include <mbedtls/ssl.h>
 
 #include <cstring>
 
@@ -154,19 +156,26 @@ bool isMatchingFirmwareAssetName(const char* assetName) {
 // a contiguous chunk). Loading only the roots GitHub actually uses keeps the
 // alloc footprint inside the heap we have.
 //
-// CrumBLE 4.6: cert_pem removed from the http_client config entirely. With
-// no trust anchor (cacert_buf == nullptr, no crt_bundle_attach, no global CA
-// store), esp-tls falls through to MBEDTLS_SSL_VERIFY_NONE -- mbedtls still
-// performs the TLS handshake (encryption is on) but skips X.509 chain
-// validation, so the per-cert BIGNUM scratch that was OOM'ing us (saw both
-// MPI_ALLOC_FAILED and PK_ALLOC_FAILED depending on root mix) never runs.
+// CrumBLE 4.6: esp-tls rejects an http_client config with no trust anchor
+// ("No server verification option set in esp_tls_cfg_t structure"), so we
+// can't just drop cert_pem. Instead, hand it a stub crt_bundle_attach
+// callback that flips authmode to MBEDTLS_SSL_VERIFY_NONE on the mbedtls
+// config and returns OK without loading any cert. esp-tls's check is
+// satisfied; mbedtls's chain validation is skipped entirely -- no per-cert
+// BIGNUM/MPI scratch (which is what was OOM'ing us at -0x10 / -0x3F80
+// regardless of how many roots we pinned).
 //
 // Trade-off: a MITM attacker on the user's WiFi could redirect
 // api.github.com to a malicious server and push arbitrary firmware. Real but
 // localised risk -- attacker needs DNS/route control on the user's network.
-// Acceptable for a personal e-reader OTA on trusted home WiFi; documented
-// as such on the OTA failure screen + in the release notes for this build.
-//
+// Acceptable for a personal e-reader OTA on trusted home WiFi; documented as
+// such in release notes.
+extern "C" esp_err_t otaSkipCertVerifyAttach(void* conf) {
+  auto* sslConf = static_cast<mbedtls_ssl_config*>(conf);
+  mbedtls_ssl_conf_authmode(sslConf, MBEDTLS_SSL_VERIFY_NONE);
+  return ESP_OK;
+}
+
 // PEM blob below is retained as a [[maybe_unused]] constant in case we
 // re-enable pinning later; the compiler strips it if unreferenced.
 [[maybe_unused]] constexpr const char kPinnedRootsPem[] =
@@ -234,6 +243,7 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
       .buffer_size_tx = 1024,
       .user_data = &releaseParser,
       .skip_cert_common_name_check = true,
+      .crt_bundle_attach = otaSkipCertVerifyAttach,
       .keep_alive_enable = true,
   };
 
@@ -352,6 +362,7 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
       .buffer_size = 4096,
       .buffer_size_tx = 1024,
       .skip_cert_common_name_check = true,
+      .crt_bundle_attach = otaSkipCertVerifyAttach,
       .keep_alive_enable = true,
   };
 
