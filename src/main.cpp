@@ -558,6 +558,12 @@ static int g_pendingResumeSpine = -1;
 // restart. Lets activities skip cold-boot ceremony (e.g. the e-ink panel
 // is still holding the pre-restart popup; don't repaint over it).
 static bool g_continuingFromSilentReboot = false;
+// CrumBLE 4.5: lean-boot OTA flag, set true in setup() when we're booting
+// straight to OTA via silent-restart. Read in loop() to skip the BT singleton
+// instantiation + HID activity processing -- OTA never enables BT and even
+// the singleton's static state + first-call init burns heap that mbedtls'
+// X.509 cert parsing needs.
+static bool g_leanBootForOta = false;
 
 void silentRestartToReaderWithAction(ReaderPostBootAction action) {
   if (deepSleepInProgress) return;
@@ -1199,6 +1205,7 @@ void setup() {
   // full ~115 KB clean heap. Anything skipped here is reloaded by the
   // normal boot that follows OtaUpdateActivity::onExit's silentRestart().
   const bool isOtaSilentReboot = (isSilentReboot && snapshotTarget == SILENT_REBOOT_TARGET_OTA_UPDATE);
+  g_leanBootForOta = isOtaSilentReboot;
 
   gpio.begin();
   powerManager.begin();
@@ -1562,6 +1569,15 @@ void loop() {
   halTiltSensor.update(SETTINGS.tiltPageTurn, SETTINGS.orientation, activityManager.isReaderActivity());
 
   gBluetoothReaderContext = activityManager.isReaderActivity();
+  // CrumBLE 4.5: skip the entire BT singleton + HID processing block when on a
+  // lean-boot OTA path. Even just `getInstance()` instantiates the manager
+  // (member state + first-call init logging "BluetoothHIDManager instance
+  // created") and the auto-reconnect / disable-drain bookkeeping calls below
+  // each allocate more. OTA never touches BT and the next normal boot (after
+  // OtaUpdateActivity::onExit silentRestart to home) restores BT in the usual
+  // loop tick. Skipping reclaims ~5-15 KB that mbedtls cert parsing needs.
+  bool bleRecentActivity = false;
+  if (!g_leanBootForOta) {
   auto& btMgr = BluetoothHIDManager::getInstance();
   const bool userInputDetectedForBt = gpio.wasAnyPressed() || gpio.wasAnyReleased();
   btMgr.updateActivity();
@@ -1631,7 +1647,8 @@ void loop() {
     APP_STATE.pendingAlertGoHomeOnBack.store(false, std::memory_order_relaxed);
     APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
   }
-  const bool bleRecentActivity = btMgr.hasRecentActivity();
+  bleRecentActivity = btMgr.hasRecentActivity();
+  }  // end !g_leanBootForOta BT block
 
   renderer.setFadingFix(SETTINGS.fadingFix);
   renderer.setTextDarkness(SETTINGS.textDarkness);
