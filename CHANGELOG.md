@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- **Progressive JPEG EPUB covers now render smoothly in generated BMP cover assets.** The cover/thumbnail BMP path already detected progressive JPEGs and forced the required 1/8 JPEGDEC decode, but it still upscaled that reduced grid with blocky sampling. `JpegToBmpConverter` now uses a progressive-only bilinear smoothing pass before dithering when those covers are enlarged for home thumbnails and sleep covers, matching the higher-quality behavior already used in the framebuffer renderer while keeping memory bounded to a small line buffer.
+
 ## [crumble-v4.2.1] - 2026-06-06
 
 Single firmware: `crumble-firmware-4.2.1.bin` (Bitter built-in, slim, fits the 6.25 MB OTA partition). The Lexend Deca and CharEink families remain installable as SD-card `.cpfont` bundles; the Bluetooth + SD-card font architectural fix (per-section glyph subset baking) is on the v4.3 roadmap.
