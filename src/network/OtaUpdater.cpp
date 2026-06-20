@@ -359,14 +359,16 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   esp_http_client_config_t client_config = {
       .url = otaUrl.c_str(),
       .timeout_ms = 15000,
-      // 4096 holds the github->CDN redirect headers (the 512 default truncates
-      // them); TX only carries our GET. Both are contiguous blocks contending
-      // with the TLS handshake on a tight internal arena, so keep them minimal.
-      .buffer_size = 4096,
-      .buffer_size_tx = 1024,
+      // CrumBLE 4.6: shrunk to the minimum that still parses the redirect-chain
+      // headers (CDN redirect from github.com -> objects.githubusercontent.com
+      // is ~400 bytes of headers). esp_https_ota allocates a SEPARATE 16KB
+      // upgrade data buffer on top of this; we need every spare byte at
+      // install time so mbedtls' IN/OUT + LWIP scratch + the upgrade buffer
+      // can all coexist. keep_alive removed -- single-shot download, no reuse.
+      .buffer_size = 1024,
+      .buffer_size_tx = 256,
       .skip_cert_common_name_check = true,
       .crt_bundle_attach = otaSkipCertVerifyAttach,
-      .keep_alive_enable = true,
   };
 
   esp_https_ota_config_t ota_config = {
