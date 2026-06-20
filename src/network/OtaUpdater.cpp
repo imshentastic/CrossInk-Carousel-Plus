@@ -154,14 +154,34 @@ bool isMatchingFirmwareAssetName(const char* assetName) {
 // a contiguous chunk). Loading only the roots GitHub actually uses keeps the
 // alloc footprint inside the heap we have.
 //
-// Roots embedded:
-//   - DigiCert Global Root CA (api.github.com's current chain, valid 2006-2031)
-//   - ISRG Root X1 (Let's Encrypt root, in case GitHub ever rotates issuers)
-// Both are 20-year roots with multi-year rotation horizons. If GitHub switches
-// to a CA neither of these chains to, OTA breaks until next firmware ships --
-// SD-card update is the recovery path. Trade-off documented in the OTA fix
-// commit history.
+// Roots embedded (all 20+ year horizons):
+//   - USERTrust ECC Certification Authority (api.github.com's CURRENT chain
+//     terminates here via Sectigo intermediates, valid 2010-2038)
+//   - DigiCert Global Root CA (GitHub's historical CA, valid 2006-2031;
+//     keep as fallback in case they rotate back)
+//   - ISRG Root X1 (Let's Encrypt root, in case GitHub ever rotates issuers
+//     again to LE for any internal/CDN endpoint)
+// If GitHub switches to a CA that doesn't chain to any of these, OTA breaks
+// until next firmware ships -- SD-card update is the recovery path. Multiple
+// roots reduces single-CA-rotation risk substantially.
 constexpr const char kPinnedRootsPem[] =
+    // USERTrust ECC Certification Authority (Sectigo - GitHub's current chain root)
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIICjzCCAhWgAwIBAgIQXIuZxVqUxdJxVt7NiYDMJjAKBggqhkjOPQQDAzCBiDEL\n"
+    "MAkGA1UEBhMCVVMxEzARBgNVBAgTCk5ldyBKZXJzZXkxFDASBgNVBAcTC0plcnNl\n"
+    "eSBDaXR5MR4wHAYDVQQKExVUaGUgVVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNVBAMT\n"
+    "JVVTRVJUcnVzdCBFQ0MgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkwHhcNMTAwMjAx\n"
+    "MDAwMDAwWhcNMzgwMTE4MjM1OTU5WjCBiDELMAkGA1UEBhMCVVMxEzARBgNVBAgT\n"
+    "Ck5ldyBKZXJzZXkxFDASBgNVBAcTC0plcnNleSBDaXR5MR4wHAYDVQQKExVUaGUg\n"
+    "VVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNVBAMTJVVTRVJUcnVzdCBFQ0MgQ2VydGlm\n"
+    "aWNhdGlvbiBBdXRob3JpdHkwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAAQarFRaqflo\n"
+    "I+d61SRvU8Za2EurxtW20eZzca7dnNYMYf3boIkDuAUU7FfO7l0/4iGzzvfUinng\n"
+    "o4N+LZfQYcTxmdwlkWOrfzCjtHDix6EznPO/LlxTsV+zfTJ/ijTjeXmjQjBAMB0G\n"
+    "A1UdDgQWBBQ64QmG1M8ZwpZ2dEl23OA1xmNjmjAOBgNVHQ8BAf8EBAMCAQYwDwYD\n"
+    "VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAwNoADBlAjA2Z6EWCNzklwBBHU6+4WMB\n"
+    "zzuqQhFkoJ2UOQIReVx7Hfpkue4WQrO/isIJxOzksU0CMQDpKmFHjFJKS04YcPbW\n"
+    "RNZu9YO6bVi9JNlWSOrvxKJGgYhqOkbRqZtNyWHa0V1Xahg=\n"
+    "-----END CERTIFICATE-----\n"
     // DigiCert Global Root CA
     "-----BEGIN CERTIFICATE-----\n"
     "MIIDrzCCApegAwIBAgIQCDvgVpBCRrGhdWrJWZHHSjANBgkqhkiG9w0BAQUFADBh\n"
