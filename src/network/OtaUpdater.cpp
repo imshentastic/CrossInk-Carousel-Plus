@@ -264,8 +264,8 @@ OtaUpdater::OtaUpdaterError OtaUpdater::checkForUpdate() {
       .buffer_size = 4096,
       .buffer_size_tx = 1024,
       .user_data = &releaseParser,
-      .skip_cert_common_name_check = true,
       .cert_pem = kPinnedRootsPem,
+      .skip_cert_common_name_check = true,
       .keep_alive_enable = true,
   };
 
@@ -383,8 +383,8 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
       // with the TLS handshake on a tight internal arena, so keep them minimal.
       .buffer_size = 4096,
       .buffer_size_tx = 1024,
-      .skip_cert_common_name_check = true,
       .cert_pem = kPinnedRootsPem,
+      .skip_cert_common_name_check = true,
       .keep_alive_enable = true,
   };
 
