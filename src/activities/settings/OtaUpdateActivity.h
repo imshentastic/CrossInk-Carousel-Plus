@@ -22,6 +22,17 @@ class OtaUpdateActivity : public Activity {
   unsigned int lastUpdaterPercentage = UNINITIALIZED_PERCENTAGE;
   OtaUpdater updater;
 
+  // CrumBLE 4.5: heap defragmentation reserve. Grabbed in onEnter (before
+  // WiFi.mode allocates ~37KB) and released right before each HTTPS request
+  // so WiFi's LWIP/mbedTLS scratch fragments AROUND it, leaving a guaranteed
+  // ~50KB contiguous chunk for the SSL handshake / X.509 cert chain math.
+  // Without this the post-WiFi MaxAlloc drops to ~36KB and cert verify OOMs
+  // at MPI alloc inside RSA bignum parsing (-0x10 / MPI_ALLOC_FAILED).
+  void* heapReserve = nullptr;
+  size_t heapReserveSize = 0;
+  void acquireHeapReserve();
+  void releaseHeapReserve();
+
   void onWifiSelectionComplete(bool success);
 
  public:

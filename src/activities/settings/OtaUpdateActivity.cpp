@@ -5,6 +5,21 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <WiFi.h>
+#include <esp_heap_caps.h>
+
+#include <algorithm>
+
+namespace {
+// Target reserve size: a hair over the mbedtls SSL handshake + X.509 verify
+// peak (~40-50KB for RSA-2048 cert chains). Allocating this much before WiFi
+// goes up forces LWIP/mbedTLS scratch to fragment around it, so when we free
+// the reserve right before esp_http_client_perform, mbedTLS has the chunk it
+// needs in one piece. The 16KB floor avoids holding crumbs (any reserve
+// smaller than the actual handshake peak doesn't help and just wastes heap).
+constexpr size_t kHeapReserveTarget = 50u * 1024u;
+constexpr size_t kHeapReserveMinUseful = 16u * 1024u;
+constexpr size_t kHeapReserveHeadroom = 8u * 1024u;  // leave for non-WiFi allocs
+}  // namespace
 
 #include "AppVersion.h"
 #include "MappedInputManager.h"
@@ -14,12 +29,44 @@
 #include "fontIds.h"
 #include "network/OtaUpdater.h"
 
+void OtaUpdateActivity::acquireHeapReserve() {
+  if (heapReserve) return;
+  const size_t maxAvail = ESP.getMaxAllocHeap();
+  if (maxAvail < kHeapReserveMinUseful + kHeapReserveHeadroom) {
+    LOG_INF("OTA", "Heap reserve: maxAlloc=%u too small, skipping", maxAvail);
+    return;
+  }
+  const size_t want = std::min(kHeapReserveTarget, maxAvail - kHeapReserveHeadroom);
+  heapReserve = heap_caps_malloc(want, MALLOC_CAP_8BIT);
+  if (heapReserve) {
+    heapReserveSize = want;
+    LOG_INF("OTA", "Heap reserve: held %u bytes (maxAlloc before=%u after=%u)", want, maxAvail,
+            ESP.getMaxAllocHeap());
+  } else {
+    LOG_INF("OTA", "Heap reserve: alloc failed for %u bytes (maxAlloc=%u)", want, maxAvail);
+  }
+}
+
+void OtaUpdateActivity::releaseHeapReserve() {
+  if (!heapReserve) return;
+  const size_t freed = heapReserveSize;
+  heap_caps_free(heapReserve);
+  heapReserve = nullptr;
+  heapReserveSize = 0;
+  LOG_INF("OTA", "Heap reserve: released %u bytes (maxAlloc=%u)", freed, ESP.getMaxAllocHeap());
+}
+
 void OtaUpdateActivity::onWifiSelectionComplete(const bool success) {
   if (!success) {
     LOG_ERR("OTA", "WiFi connection failed, exiting");
+    releaseHeapReserve();
     finish();
     return;
   }
+
+  // Release the boot-time heap reserve right before the HTTPS handshake so
+  // mbedtls gets the guaranteed contiguous chunk it needs for X.509 verify.
+  releaseHeapReserve();
 
   LOG_DBG("OTA", "WiFi connected, checking for update");
 
@@ -91,6 +138,12 @@ void OtaUpdateActivity::onEnter() {
     LOG_INF("OTA", "Post-silent-restart entry: maxAlloc=%u (proceeding)", maxAlloc);
     clearSilentRebootContinuationFlag();
   }
+
+  // Grab the defrag reserve BEFORE WiFi.mode allocates -- so WiFi's LWIP
+  // buffers + esp_netif state fragment around the reserve instead of through
+  // the only large contiguous block. Released right before the HTTPS handshake
+  // (in onWifiSelectionComplete), giving mbedTLS a guaranteed ~50KB chunk.
+  acquireHeapReserve();
 
   // Turn on WiFi immediately
   LOG_DBG("OTA", "Turning on WiFi...");
@@ -208,6 +261,13 @@ void OtaUpdateActivity::loop() {
         requestUpdate(true);
         return;
       }
+      // Re-acquire the defrag reserve for the install download's own HTTPS
+      // handshake (the firmware blob is on objects.githubusercontent.com via
+      // redirect, separate connection). Released right before the actual
+      // install call below. Best-effort: if heap has settled enough that we
+      // can't reserve, the install handshake will try anyway.
+      acquireHeapReserve();
+      releaseHeapReserve();
       const auto res = updater.installUpdate(
           [](void* ctx) {
             // immediate=true notifies the render task directly. The default deferred path only
