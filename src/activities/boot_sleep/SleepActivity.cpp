@@ -3,6 +3,7 @@
 #include <Epub.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
+#include <HalGPIO.h>
 #include <HalStorage.h>
 #include <I18n.h>
 #include <PNGdec.h>
@@ -36,10 +37,14 @@ constexpr int sleepBuildInfoSideMargin = 20;
 // CrumBLE 4.4: cycle counter survives deep-sleep wakes (resets on power loss,
 // like the other silentReboot* RTC_NOINIT_ATTR slots in main.cpp). Used to
 // pick HALF every Nth cycle to scrub ghost buildup, FAST the rest of the time.
-// Conservative N=3 keeps ghost clears frequent while still ~halving the
-// average wall-clock cost of a sleep cycle on both X3 and X4.
 RTC_NOINIT_ATTR uint32_t sleepCycleCounter;
-constexpr uint32_t kSleepCycleHalfEveryN = 3;
+// CrumBLE 4.5.1: chip-specific cadence. X3's panel handles 2-in-a-row FAST
+// refreshes cleanly, so HALF every 3rd cycle (FAST FAST FAST HALF) is fine.
+// X4's panel leaves more residue from FAST refreshes; cycle every 2 (FAST
+// FAST HALF) to scrub ghosting more often. Picked at call time via gpio
+// since constexpr can't depend on runtime device detect.
+constexpr uint32_t kSleepCycleHalfEveryN_X3 = 3;
+constexpr uint32_t kSleepCycleHalfEveryN_X4 = 2;
 
 // Snapshot of the last reader-rendered framebuffer, written on EpubReaderActivity::onExit
 // and read by cycleScreensaverFromDeepSleep so the cold-boot cycle path can show the last
@@ -831,9 +836,11 @@ void SleepActivity::cycleScreensaverFromDeepSleep(GfxRenderer& renderer) {
   // CrumBLE 4.4: pick FAST_REFRESH for most cycles; HALF every Nth.
   // FAST is ~470 ms vs HALF's ~770 ms (plus the X3 resync) -- ~half the
   // wall-clock cost on every cycle that hits this branch. Periodic HALF
-  // sweeps panel ghost buildup that FAST diffs leave behind.
+  // sweeps panel ghost buildup that FAST diffs leave behind. 4.5.1: N
+  // tuned per chip -- X4 panel needs more frequent HALF sweeps.
+  const uint32_t halfEveryN = gpio.deviceIsX3() ? kSleepCycleHalfEveryN_X3 : kSleepCycleHalfEveryN_X4;
   ++sleepCycleCounter;
-  const bool useHalf = (sleepCycleCounter % kSleepCycleHalfEveryN) == 0;
+  const bool useHalf = (sleepCycleCounter % halfEveryN) == 0;
   const HalDisplay::RefreshMode cycleRefresh =
       useHalf ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
   LOG_DBG("SLP", "Cycle refresh: %s (count=%u)", useHalf ? "HALF" : "FAST",
