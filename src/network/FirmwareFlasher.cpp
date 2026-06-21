@@ -344,12 +344,19 @@ RelocateResult maybeRelocateLanOtaToOta0(ProgressCb onProgress, void* ctx) {
   // the partition we're NOT running from -- that's ota_0 here. Re-validate
   // because the bin survived a reboot cycle; cheap insurance.
   const Result r = flashFromSdPath(kFirmwarePendingPath, onProgress, ctx, false);
+  // CrumBLE 4.5.2: always delete the SD bin after a relocation attempt,
+  // success or fail. Preserving it on failure for "retry on next boot"
+  // made sense for transient power-loss recovery, but on a permanent
+  // failure (corrupt bin, partition write error, missing destination
+  // partition) it loops the device on the 'Finalizing update' screen
+  // forever. The user is still on a functional ota_1 install -- they
+  // just don't get the re-anchor to ota_0 this round, which is a UX
+  // regression for the NEXT USB-flash attempt but not a brick.
+  Storage.remove(kFirmwarePendingPath);
   if (r != Result::OK) {
-    LOG_ERR("FLASH", "LAN-OTA relocate failed: %s -- bin preserved for retry", resultName(r));
+    LOG_ERR("FLASH", "LAN-OTA relocate failed: %s -- bin removed, staying on current partition", resultName(r));
     return RelocateResult::FAILED;
   }
-
-  Storage.remove(kFirmwarePendingPath);
   LOG_INF("FLASH", "LAN-OTA relocate ok -- restart will land on ota_0");
   return RelocateResult::RELOCATED;
 }
