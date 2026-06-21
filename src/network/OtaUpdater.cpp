@@ -368,12 +368,16 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   {
     esp_http_client_config_t redirect_cfg = {
         .url = otaUrl.c_str(),
-        .method = HTTP_METHOD_HEAD,
+        .method = HTTP_METHOD_GET,  // GET (with disable_auto_redirect) so the
+                                    // header parser processes the 302 response
+                                    // fully; HEAD on some IDF builds skips
+                                    // the header-store step.
         .timeout_ms = 10000,
         .disable_auto_redirect = true,
         .max_redirection_count = 0,
-        .buffer_size = 1024,
-        .buffer_size_tx = 256,
+        .buffer_size = 4096,        // GitHub's 302 response carries ~2-3 KB of
+                                    // headers (Set-Cookie + the long Location).
+        .buffer_size_tx = 1024,
         .skip_cert_common_name_check = true,
         .crt_bundle_attach = otaSkipCertVerifyAttach,
     };
@@ -382,13 +386,16 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
       const esp_err_t rerr = esp_http_client_perform(rh);
       const int code = esp_http_client_get_status_code(rh);
       LOG_INF("OTA", "Redirect probe: err=%s status=%d", esp_err_to_name(rerr), code);
-      if (rerr == ESP_OK && (code == 301 || code == 302 || code == 303 || code == 307 || code == 308)) {
-        char* loc = nullptr;
-        if (esp_http_client_get_header(rh, "Location", &loc) == ESP_OK && loc && loc[0] != '\0') {
-          resolvedUrl = loc;
-          LOG_INF("OTA", "Resolved redirect: %u chars host=%.40s...", static_cast<unsigned>(resolvedUrl.size()),
-                  resolvedUrl.c_str());
-        }
+      char* loc = nullptr;
+      const esp_err_t herr = esp_http_client_get_header(rh, "Location", &loc);
+      LOG_INF("OTA", "Redirect probe: Location-header err=%s ptr=%s len=%u", esp_err_to_name(herr),
+              loc ? (loc[0] ? "non-empty" : "empty") : "null",
+              static_cast<unsigned>(loc ? strlen(loc) : 0));
+      if (rerr == ESP_OK && (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) && herr == ESP_OK &&
+          loc && loc[0] != '\0') {
+        resolvedUrl = loc;
+        LOG_INF("OTA", "Resolved redirect: %u chars first40=%.40s", static_cast<unsigned>(resolvedUrl.size()),
+                resolvedUrl.c_str());
       }
       esp_http_client_cleanup(rh);
     }
@@ -404,7 +411,7 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
       // need 4 KB; 1 KB truncated them with "HTTP_CLIENT: Out of buffer". TX
       // only carries our small Range GET so 256 B is fine.
       .buffer_size = 4096,
-      .buffer_size_tx = 256,
+      .buffer_size_tx = 1024,
       .skip_cert_common_name_check = true,
       .crt_bundle_attach = otaSkipCertVerifyAttach,
   };
