@@ -408,7 +408,7 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
 
   esp_http_client_config_t client_config = {
       .url = resolvedUrl.c_str(),
-      .timeout_ms = 15000,
+      .timeout_ms = 60000,
       // GitHub's redirect headers (github.com -> objects.githubusercontent.com)
       // need 4 KB; 1 KB truncated them with "HTTP_CLIENT: Out of buffer". TX
       // only carries our small Range GET so 256 B is fine.
@@ -440,6 +440,8 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   LOG_INF("OTA", "Install begin: free=%u maxAlloc=%u (no reserve held -- fresh heap from silent-restart)",
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   esp_err = esp_https_ota_begin(&ota_config, &ota_handle);
+  LOG_INF("OTA", "esp_https_ota_begin returned: %s (free=%u maxAlloc=%u)", esp_err_to_name(esp_err),
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   if (esp_err != ESP_OK) {
     LOG_DBG("OTA", "HTTP OTA Begin Failed: %s", esp_err_to_name(esp_err));
@@ -447,6 +449,8 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   }
 
   int lastReportedPct = -1;
+  unsigned long lastPerformLog = millis();
+  size_t lastLoggedSize = 0;
   do {
     if (isCancellationRequested()) {
       LOG_INF("OTA", "Update cancelled");
@@ -456,6 +460,14 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
 
     esp_err = esp_https_ota_perform(ota_handle);
     processedSize = esp_https_ota_get_image_len_read(ota_handle);
+    // Every 3s, log perform status so we can see the download moving (or not).
+    if (millis() - lastPerformLog > 3000) {
+      LOG_INF("OTA", "Perform tick: err=%s processed=%u delta=%u free=%u maxAlloc=%u", esp_err_to_name(esp_err),
+              static_cast<unsigned>(processedSize), static_cast<unsigned>(processedSize - lastLoggedSize),
+              ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      lastPerformLog = millis();
+      lastLoggedSize = processedSize;
+    }
     // Fire the callback only on whole-percent change. Without this it fired
     // every ~100ms perform iteration, waking the render task whose framebuffer
     // work contends with TLS on the same internal arena. E-ink can't repaint
