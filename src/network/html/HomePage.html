@@ -107,34 +107,33 @@
   <body>
     <h1 class="crossink-header">CrumBLE</h1>
 
-    <div class="nav-links">
+    <div class="nav-links" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
       <a href="/" class="active">Home</a>
       <a href="/files">File Manager</a>
       <a href="/settings">Settings</a>
       <a href="/fonts">Fonts</a>
+      <a id="update-notice" href="#" style="display:none; background:#3a8c5f; color:white; padding:4px 10px; border-radius:12px; text-decoration:none; font-size:0.8em; font-weight:500;">
+        &#9650; Update v<span id="update-notice-version"></span>
+      </a>
     </div>
 
-    <div id="update-banner" class="card" style="display:none; border-left:4px solid #3a8c5f; background:#f3faf6;">
-      <h2 style="margin-top:0;">Firmware update available</h2>
-      <div class="info-row">
-        <span class="label">Current</span>
-        <span class="value" id="update-current"></span>
-      </div>
-      <div class="info-row">
-        <span class="label">Latest</span>
-        <span class="value" id="update-latest"></span>
-      </div>
-      <div class="info-row">
-        <span class="label">Size</span>
-        <span class="value" id="update-size"></span>
-      </div>
-      <button id="update-btn" style="margin-top:12px; padding:10px 18px; font-size:1em; cursor:pointer;">Update Now</button>
-      <div id="update-status" style="margin-top:12px; font-size:0.9em; color:var(--label-color);"></div>
-      <div id="update-progress-wrap" style="display:none; margin-top:8px;">
-        <div style="height:8px; background:#e4e8ec; border-radius:4px; overflow:hidden;">
-          <div id="update-progress-bar" style="height:100%; width:0%; background:#3a8c5f; transition:width 200ms ease;"></div>
+    <div id="update-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:100; align-items:center; justify-content:center; padding:20px;">
+      <div style="background:white; border-radius:8px; padding:24px; max-width:480px; width:100%; box-shadow:0 8px 32px rgba(0,0,0,0.2);">
+        <h2 style="margin-top:0; margin-bottom:4px;">Update firmware to v<span id="modal-version"></span></h2>
+        <p style="color:var(--label-color); font-size:0.9em; margin-top:0;">Your browser can't download from GitHub directly (CORS), so this takes two clicks:</p>
+        <ol style="padding-left:20px; line-height:1.8;">
+          <li>Click to download: <a id="modal-download-link" href="" target="_blank" download style="color:#3a8c5f;">firmware.bin</a></li>
+          <li>Select the downloaded file: <input type="file" id="modal-file-input" accept=".bin" style="display:block; margin-top:6px;"></li>
+        </ol>
+        <div id="modal-progress-wrap" style="display:none; margin-top:16px;">
+          <div style="height:8px; background:#e4e8ec; border-radius:4px; overflow:hidden;">
+            <div id="modal-progress-bar" style="height:100%; width:0%; background:#3a8c5f; transition:width 200ms ease;"></div>
+          </div>
+          <p id="modal-status" style="font-size:0.85em; color:var(--label-color); margin:6px 0 0;">0%</p>
         </div>
-        <div id="update-progress-text" style="font-size:0.8em; color:var(--label-color); margin-top:4px;">0%</div>
+        <div style="text-align:right; margin-top:20px;">
+          <button id="modal-cancel" style="padding:8px 16px; font-size:0.9em; cursor:pointer;">Close</button>
+        </div>
       </div>
     </div>
 
@@ -177,33 +176,24 @@
       }
     }
 
-    // ---- LAN-OTA update banner --------------------------------------------
-    // Auto-check GitHub for a newer release; if newer, render the banner and
-    // wire Update Now to: download bin (browser) -> upload over WS to
-    // /.crosspoint/firmware-pending.bin -> INSTALL_FIRMWARE -> wait for reboot.
+    // ---- LAN-OTA update notice (compact, file-picker based) --------------
+    // CORS prevents browser JS from fetching the bin directly from
+    // release-assets.githubusercontent.com, so we ask the user to download
+    // it natively (one click on the link) and then drop it in a file input.
+    // No fetch attempted = no CORS pitfall.
     const RELEASES_URL = 'https://api.github.com/repos/imshentastic/CrumBLE/releases/latest';
     const FW_PENDING_PATH = '/.crosspoint';
     const FW_PENDING_NAME = 'firmware-pending.bin';
     const WS_CHUNK = 4096;
 
-    // "CrumBLE 4.5.0 (CrossInk 1.3.0)" -> "4.5.0"
-    function parseDeviceVersion(s) {
-      const m = (s || '').match(/CrumBLE\s+([0-9.]+)/);
-      return m ? m[1] : null;
-    }
-    // "crumble-v4.5.1" -> "4.5.1"
-    function parseTag(tag) {
-      const m = (tag || '').match(/([0-9]+\.[0-9]+\.[0-9]+)/);
-      return m ? m[1] : null;
-    }
+    function parseDeviceVersion(s) { const m = (s || '').match(/CrumBLE\s+([0-9.]+)/); return m ? m[1] : null; }
+    function parseTag(tag) { const m = (tag || '').match(/([0-9]+\.[0-9]+\.[0-9]+)/); return m ? m[1] : null; }
     function cmpSemver(a, b) {
       const pa = a.split('.').map(Number), pb = b.split('.').map(Number);
-      for (let i = 0; i < 3; i++) {
-        const da = pa[i] || 0, db = pb[i] || 0;
-        if (da !== db) return da - db;
-      }
+      for (let i = 0; i < 3; i++) { const da = pa[i] || 0, db = pb[i] || 0; if (da !== db) return da - db; }
       return 0;
     }
+    function wsUrl() { return 'ws://' + window.location.hostname + ':81/'; }
 
     async function checkForUpdate(deviceVersionString) {
       const cur = parseDeviceVersion(deviceVersionString);
@@ -219,57 +209,49 @@
       const asset = (release.assets || []).find(a => a.name.endsWith('.bin'));
       if (!asset) return;
 
-      document.getElementById('update-current').textContent = cur;
-      document.getElementById('update-latest').textContent = latest;
-      document.getElementById('update-size').textContent = (asset.size / 1024 / 1024).toFixed(2) + ' MB';
-      const btn = document.getElementById('update-btn');
-      btn.onclick = () => runUpdate(asset, latest);
-      document.getElementById('update-banner').style.display = '';
+      document.getElementById('update-notice-version').textContent = latest;
+      const notice = document.getElementById('update-notice');
+      notice.style.display = '';
+      notice.onclick = (e) => { e.preventDefault(); openUpdateModal(asset, latest); };
     }
 
-    function setStatus(text) { document.getElementById('update-status').textContent = text; }
-    function setProgress(pct) {
-      document.getElementById('update-progress-wrap').style.display = '';
-      document.getElementById('update-progress-bar').style.width = pct + '%';
-      document.getElementById('update-progress-text').textContent = pct.toFixed(1) + '%';
+    function openUpdateModal(asset, latest) {
+      document.getElementById('modal-version').textContent = latest;
+      const link = document.getElementById('modal-download-link');
+      link.href = asset.browser_download_url;
+      link.textContent = asset.name + ' (' + (asset.size / 1024 / 1024).toFixed(2) + ' MB)';
+      const fileInput = document.getElementById('modal-file-input');
+      fileInput.value = '';
+      fileInput.onchange = (e) => { if (e.target.files[0]) runInstall(e.target.files[0], latest); };
+      document.getElementById('modal-progress-wrap').style.display = 'none';
+      document.getElementById('update-modal').style.display = 'flex';
+      document.getElementById('modal-cancel').onclick = () => { document.getElementById('update-modal').style.display = 'none'; };
     }
 
-    async function runUpdate(asset, latestVersion) {
-      if (!confirm('Update to ' + latestVersion + '?\n\nThe device will restart after installing. Do not close this tab or unplug the device.')) return;
-      const btn = document.getElementById('update-btn');
-      btn.disabled = true; btn.style.opacity = '0.5';
+    function setModalStatus(text) { document.getElementById('modal-status').textContent = text; }
+    function setModalProgress(pct, text) {
+      document.getElementById('modal-progress-wrap').style.display = '';
+      document.getElementById('modal-progress-bar').style.width = pct + '%';
+      document.getElementById('modal-status').textContent = text || (pct.toFixed(1) + '%');
+    }
 
+    async function runInstall(file, latestVersion) {
+      if (file.size < 65536) {
+        setModalStatus('File too small (' + file.size + ' bytes). Did you select the right .bin?');
+        return;
+      }
       try {
-        // Step 1: download bin in browser
-        setStatus('Downloading firmware from GitHub...');
-        const dl = await fetch(asset.browser_download_url);
-        if (!dl.ok) throw new Error('GitHub download failed: ' + dl.status);
-        const blob = await dl.blob();
-        if (blob.size < 65536) throw new Error('Downloaded file too small (' + blob.size + ' bytes)');
-        setStatus('Downloaded ' + (blob.size / 1024 / 1024).toFixed(2) + ' MB. Uploading to device...');
-
-        // Step 2: upload via WS to the firmware-pending path
-        await uploadFirmwareWs(new File([blob], FW_PENDING_NAME), (sent, total) => {
-          setProgress(sent / total * 100);
+        setModalProgress(0, 'Uploading ' + (file.size / 1024 / 1024).toFixed(2) + ' MB to device...');
+        await uploadFirmwareWs(file, (sent, total) => {
+          setModalProgress(sent / total * 100, 'Uploading: ' + (sent / 1024 / 1024).toFixed(2) + ' / ' + (total / 1024 / 1024).toFixed(2) + ' MB');
         });
-        setStatus('Upload complete. Asking device to install...');
-
-        // Step 3: send INSTALL_FIRMWARE, wait for INSTALL_QUEUED
+        setModalProgress(100, 'Upload complete. Asking device to install...');
         await sendInstallFirmware();
-        setStatus('Installing... device will restart in about 1 minute. This page will reconnect automatically.');
-        setProgress(100);
-
-        // Step 4: poll for device coming back online with the new version
+        setModalProgress(100, 'Installing... device will restart in about 1 minute. This page will reload when v' + latestVersion + ' is detected.');
         pollForReboot(latestVersion);
       } catch (e) {
-        setStatus('Update failed: ' + e.message);
-        btn.disabled = false; btn.style.opacity = '';
+        setModalStatus('Update failed: ' + e.message);
       }
-    }
-
-    function wsUrl() {
-      const host = window.location.hostname;
-      return 'ws://' + host + ':81/';
     }
 
     function uploadFirmwareWs(file, onProgress) {
@@ -277,9 +259,7 @@
         const ws = new WebSocket(wsUrl());
         ws.binaryType = 'arraybuffer';
         let started = false;
-        ws.onopen = () => {
-          ws.send(`START:${file.name}:${file.size}:${FW_PENDING_PATH}`);
-        };
+        ws.onopen = () => { ws.send(`START:${FW_PENDING_NAME}:${file.size}:${FW_PENDING_PATH}`); };
         ws.onmessage = async (ev) => {
           const msg = ev.data;
           let resumeOffset = 0;
@@ -303,13 +283,8 @@
                 if (onProgress) onProgress(offset, file.size);
               }
             } catch (e) { ws.close(); reject(e); }
-          } else if (msg === 'DONE' || msg.startsWith('DONE:')) {
-            ws.close();
-            resolve();
-          } else if (msg.startsWith('ERROR:')) {
-            ws.close();
-            reject(new Error(msg.substring(6)));
-          }
+          } else if (msg === 'DONE' || msg.startsWith('DONE:')) { ws.close(); resolve(); }
+          else if (msg.startsWith('ERROR:')) { ws.close(); reject(new Error(msg.substring(6))); }
         };
         ws.onerror = () => { if (!started) reject(new Error('WS connection failed')); };
         ws.onclose = () => { if (!started) reject(new Error('WS closed before READY')); };
@@ -319,33 +294,27 @@
     function sendInstallFirmware() {
       return new Promise((resolve, reject) => {
         const ws = new WebSocket(wsUrl());
+        let resolved = false;
         ws.onopen = () => ws.send('INSTALL_FIRMWARE');
         ws.onmessage = (ev) => {
-          const msg = ev.data;
-          if (msg === 'INSTALL_QUEUED') { ws.close(); resolve(); }
-          else if (msg.startsWith('INSTALL_ERROR:')) { ws.close(); reject(new Error(msg.substring(14))); }
+          if (ev.data === 'INSTALL_QUEUED') { resolved = true; ws.close(); resolve(); }
+          else if (ev.data.startsWith('INSTALL_ERROR:')) { resolved = true; ws.close(); reject(new Error(ev.data.substring(14))); }
         };
-        ws.onerror = () => reject(new Error('WS error during INSTALL_FIRMWARE'));
-        ws.onclose = (ev) => {
-          // If device already restarted before sending us a response, that's actually success.
-          if (ev.wasClean) return;
-          // Give it 2s to send INSTALL_QUEUED, else fail.
-          setTimeout(() => reject(new Error('No response to INSTALL_FIRMWARE')), 2000);
-        };
+        ws.onerror = () => { if (!resolved) reject(new Error('WS error during INSTALL_FIRMWARE')); };
+        ws.onclose = () => { if (!resolved) setTimeout(() => reject(new Error('No response to INSTALL_FIRMWARE')), 1500); };
       });
     }
 
     async function pollForReboot(expectedVersion) {
-      // Device takes ~60s to flash + boot. Start polling after 30s.
       await new Promise(r => setTimeout(r, 30000));
-      for (let i = 0; i < 90; i++) {  // poll up to 3 more minutes
+      for (let i = 0; i < 90; i++) {
         try {
           const r = await fetch('/api/status', { cache: 'no-store' });
           if (r.ok) {
             const d = await r.json();
             const v = parseDeviceVersion(d.version);
             if (v && cmpSemver(v, expectedVersion) >= 0) {
-              setStatus('Update complete! Device is running v' + v + '. Reloading...');
+              setModalProgress(100, 'Update complete! Device is running v' + v + '. Reloading...');
               setTimeout(() => window.location.reload(), 1500);
               return;
             }
@@ -353,7 +322,7 @@
         } catch (e) { /* expected during reboot */ }
         await new Promise(r => setTimeout(r, 2000));
       }
-      setStatus('Device did not come back online. Reload the page to check status.');
+      setModalStatus('Device did not come back online. Reload the page to check status.');
     }
     // ----------------------------------------------------------------------
 
@@ -362,8 +331,6 @@
       const ver = document.getElementById('version').textContent;
       checkForUpdate(ver);
     }
-
-    // Fetch status on page load + check for update
     window.onload = fetchStatusAndCheckUpdate;
   </script>
   </body>

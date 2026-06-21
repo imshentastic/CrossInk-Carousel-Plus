@@ -1608,11 +1608,34 @@
 <body>
 <h1 class="crossink-header">CrumBLE</h1>
 
-<div class="nav-links">
+<div class="nav-links" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
   <a href="/">Home</a>
   <a href="/files" class="active">File Manager</a>
   <a href="/settings">Settings</a>
   <a href="/fonts">Fonts</a>
+  <a id="update-notice" href="#" style="display:none; background:#3a8c5f; color:white; padding:4px 10px; border-radius:12px; text-decoration:none; font-size:0.8em; font-weight:500;">
+    &#9650; Update v<span id="update-notice-version"></span>
+  </a>
+</div>
+
+<div id="update-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:100; align-items:center; justify-content:center; padding:20px;">
+  <div style="background:white; border-radius:8px; padding:24px; max-width:480px; width:100%; box-shadow:0 8px 32px rgba(0,0,0,0.2);">
+    <h2 style="margin-top:0; margin-bottom:4px;">Update firmware to v<span id="modal-version"></span></h2>
+    <p style="color:#777; font-size:0.9em; margin-top:0;">Your browser can't download from GitHub directly (CORS), so this takes two clicks:</p>
+    <ol style="padding-left:20px; line-height:1.8;">
+      <li>Click to download: <a id="modal-download-link" href="" target="_blank" download style="color:#3a8c5f;">firmware.bin</a></li>
+      <li>Select the downloaded file: <input type="file" id="modal-file-input" accept=".bin" style="display:block; margin-top:6px;"></li>
+    </ol>
+    <div id="modal-progress-wrap" style="display:none; margin-top:16px;">
+      <div style="height:8px; background:#e4e8ec; border-radius:4px; overflow:hidden;">
+        <div id="modal-progress-bar" style="height:100%; width:0%; background:#3a8c5f; transition:width 200ms ease;"></div>
+      </div>
+      <p id="modal-status" style="font-size:0.85em; color:#777; margin:6px 0 0;">0%</p>
+    </div>
+    <div style="text-align:right; margin-top:20px;">
+      <button id="modal-cancel" style="padding:8px 16px; font-size:0.9em; cursor:pointer;">Close</button>
+    </div>
+  </div>
 </div>
 
 <div class="page-header">
@@ -4266,6 +4289,156 @@ function retryAllFailedUploads() {
     xhr.send(formData);
   }
   hydrate();
+</script>
+<script>
+  // ---- LAN-OTA update notice (mirrored from HomePage) ------------------
+  const LANOTA_RELEASES_URL = 'https://api.github.com/repos/imshentastic/CrumBLE/releases/latest';
+  const LANOTA_FW_PENDING_PATH = '/.crosspoint';
+  const LANOTA_FW_PENDING_NAME = 'firmware-pending.bin';
+  const LANOTA_WS_CHUNK = 4096;
+
+  function lanotaParseDeviceVersion(s) { const m = (s || '').match(/CrumBLE\s+([0-9.]+)/); return m ? m[1] : null; }
+  function lanotaParseTag(tag) { const m = (tag || '').match(/([0-9]+\.[0-9]+\.[0-9]+)/); return m ? m[1] : null; }
+  function lanotaCmpSemver(a, b) {
+    const pa = a.split('.').map(Number), pb = b.split('.').map(Number);
+    for (let i = 0; i < 3; i++) { const da = pa[i] || 0, db = pb[i] || 0; if (da !== db) return da - db; }
+    return 0;
+  }
+  function lanotaWsUrl() { return 'ws://' + window.location.hostname + ':81/'; }
+
+  async function lanotaCheck() {
+    let curStr;
+    try {
+      const r = await fetch('/api/status', { cache: 'no-store' });
+      if (!r.ok) return;
+      curStr = (await r.json()).version;
+    } catch (e) { return; }
+    const cur = lanotaParseDeviceVersion(curStr);
+    if (!cur) return;
+    let release;
+    try {
+      const r = await fetch(LANOTA_RELEASES_URL, { cache: 'no-store' });
+      if (!r.ok) return;
+      release = await r.json();
+    } catch (e) { return; }
+    const latest = lanotaParseTag(release.tag_name);
+    if (!latest || lanotaCmpSemver(latest, cur) <= 0) return;
+    const asset = (release.assets || []).find(a => a.name.endsWith('.bin'));
+    if (!asset) return;
+    document.getElementById('update-notice-version').textContent = latest;
+    const notice = document.getElementById('update-notice');
+    notice.style.display = '';
+    notice.onclick = (e) => { e.preventDefault(); lanotaOpenModal(asset, latest); };
+  }
+
+  function lanotaOpenModal(asset, latest) {
+    document.getElementById('modal-version').textContent = latest;
+    const link = document.getElementById('modal-download-link');
+    link.href = asset.browser_download_url;
+    link.textContent = asset.name + ' (' + (asset.size / 1024 / 1024).toFixed(2) + ' MB)';
+    const fileInput = document.getElementById('modal-file-input');
+    fileInput.value = '';
+    fileInput.onchange = (e) => { if (e.target.files[0]) lanotaRunInstall(e.target.files[0], latest); };
+    document.getElementById('modal-progress-wrap').style.display = 'none';
+    document.getElementById('update-modal').style.display = 'flex';
+    document.getElementById('modal-cancel').onclick = () => { document.getElementById('update-modal').style.display = 'none'; };
+  }
+
+  function lanotaSetProgress(pct, text) {
+    document.getElementById('modal-progress-wrap').style.display = '';
+    document.getElementById('modal-progress-bar').style.width = pct + '%';
+    document.getElementById('modal-status').textContent = text || (pct.toFixed(1) + '%');
+  }
+
+  async function lanotaRunInstall(file, latestVersion) {
+    if (file.size < 65536) { document.getElementById('modal-status').textContent = 'File too small (' + file.size + ' bytes). Did you select the right .bin?'; return; }
+    try {
+      lanotaSetProgress(0, 'Uploading ' + (file.size / 1024 / 1024).toFixed(2) + ' MB to device...');
+      await lanotaUploadWs(file, (sent, total) => {
+        lanotaSetProgress(sent / total * 100, 'Uploading: ' + (sent / 1024 / 1024).toFixed(2) + ' / ' + (total / 1024 / 1024).toFixed(2) + ' MB');
+      });
+      lanotaSetProgress(100, 'Upload complete. Asking device to install...');
+      await lanotaSendInstall();
+      lanotaSetProgress(100, 'Installing... device will restart in about 1 minute. This page will reload when v' + latestVersion + ' is detected.');
+      lanotaPollReboot(latestVersion);
+    } catch (e) {
+      document.getElementById('modal-status').textContent = 'Update failed: ' + e.message;
+    }
+  }
+
+  function lanotaUploadWs(file, onProgress) {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(lanotaWsUrl());
+      ws.binaryType = 'arraybuffer';
+      let started = false;
+      ws.onopen = () => { ws.send(`START:${LANOTA_FW_PENDING_NAME}:${file.size}:${LANOTA_FW_PENDING_PATH}`); };
+      ws.onmessage = async (ev) => {
+        const msg = ev.data;
+        let resumeOffset = 0;
+        if (msg.startsWith('RESUME:')) { resumeOffset = parseInt(msg.substring(7), 10) || 0; }
+        if (msg === 'READY' || msg.startsWith('RESUME:')) {
+          started = true;
+          await new Promise(r => setTimeout(r, 50));
+          let offset = resumeOffset;
+          if (onProgress) onProgress(offset, file.size);
+          try {
+            while (offset < file.size && ws.readyState === WebSocket.OPEN) {
+              const chunkSize = Math.min(LANOTA_WS_CHUNK, file.size - offset);
+              const chunk = file.slice(offset, offset + chunkSize);
+              const buf = await chunk.arrayBuffer();
+              while (ws.bufferedAmount > LANOTA_WS_CHUNK / 2 && ws.readyState === WebSocket.OPEN) {
+                await new Promise(r => setTimeout(r, 5));
+              }
+              if (ws.readyState !== WebSocket.OPEN) throw new Error('WS closed mid-upload');
+              ws.send(buf);
+              offset += chunkSize;
+              if (onProgress) onProgress(offset, file.size);
+            }
+          } catch (e) { ws.close(); reject(e); }
+        } else if (msg === 'DONE' || msg.startsWith('DONE:')) { ws.close(); resolve(); }
+        else if (msg.startsWith('ERROR:')) { ws.close(); reject(new Error(msg.substring(6))); }
+      };
+      ws.onerror = () => { if (!started) reject(new Error('WS connection failed')); };
+      ws.onclose = () => { if (!started) reject(new Error('WS closed before READY')); };
+    });
+  }
+
+  function lanotaSendInstall() {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(lanotaWsUrl());
+      let resolved = false;
+      ws.onopen = () => ws.send('INSTALL_FIRMWARE');
+      ws.onmessage = (ev) => {
+        if (ev.data === 'INSTALL_QUEUED') { resolved = true; ws.close(); resolve(); }
+        else if (ev.data.startsWith('INSTALL_ERROR:')) { resolved = true; ws.close(); reject(new Error(ev.data.substring(14))); }
+      };
+      ws.onerror = () => { if (!resolved) reject(new Error('WS error during INSTALL_FIRMWARE')); };
+      ws.onclose = () => { if (!resolved) setTimeout(() => reject(new Error('No response to INSTALL_FIRMWARE')), 1500); };
+    });
+  }
+
+  async function lanotaPollReboot(expectedVersion) {
+    await new Promise(r => setTimeout(r, 30000));
+    for (let i = 0; i < 90; i++) {
+      try {
+        const r = await fetch('/api/status', { cache: 'no-store' });
+        if (r.ok) {
+          const d = await r.json();
+          const v = lanotaParseDeviceVersion(d.version);
+          if (v && lanotaCmpSemver(v, expectedVersion) >= 0) {
+            lanotaSetProgress(100, 'Update complete! Device is running v' + v + '. Reloading...');
+            setTimeout(() => window.location.reload(), 1500);
+            return;
+          }
+        }
+      } catch (e) {}
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    document.getElementById('modal-status').textContent = 'Device did not come back online. Reload the page to check status.';
+  }
+
+  // Kick off the version check after the rest of the page has hydrated.
+  setTimeout(lanotaCheck, 500);
 </script>
 </body>
 </html>
