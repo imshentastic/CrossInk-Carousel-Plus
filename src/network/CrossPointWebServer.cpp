@@ -86,6 +86,14 @@ bool wsUploadInProgress = false;
 // returned (so the response physically reaches the browser before the
 // device reboots).
 bool g_pendingFtRestart = false;
+
+// CrumBLE 4.6 LAN-OTA: set by the WS INSTALL_FIRMWARE handler. FT
+// activity consumes this on next loop() and pushes the install-progress
+// activity which flashes /.crosspoint/firmware-pending.bin into the
+// next OTA partition + restarts. Fixed path (not parameterized) so the
+// browser can't trigger an arbitrary-SD-file flash.
+bool g_pendingFirmwareInstall = false;
+constexpr const char* kFirmwarePendingPath = "/.crosspoint/firmware-pending.bin";
 }  // namespace anon
 
 bool consumeFtRestartRequest() {
@@ -95,6 +103,12 @@ bool consumeFtRestartRequest() {
 }
 
 bool peekFtRestartRequest() { return g_pendingFtRestart; }
+
+bool consumeFirmwareInstallRequest() {
+  if (!g_pendingFirmwareInstall) return false;
+  g_pendingFirmwareInstall = false;
+  return true;
+}
 
 namespace {
 uint8_t wsUploadClientNum = 255;  // 255 = no active upload client
@@ -2356,6 +2370,36 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
         } else {
           wsServer->sendTXT(num, "ERROR:Invalid START format");
         }
+      } else if (msg == "INSTALL_FIRMWARE") {
+        // CrumBLE 4.6 LAN-OTA: frontend uploaded firmware-pending.bin via the
+        // existing book-upload pipeline; now asks us to flash it. We only
+        // queue the request here -- the actual flashFromSdPath is blocking
+        // (~60s) and would block the WS event loop, so the FT activity's
+        // loop() picks up the consumeFirmwareInstallRequest() and pushes
+        // the install-progress activity which does the actual flash + restart.
+        if (wsUploadInProgress) {
+          wsServer->sendTXT(num, "INSTALL_ERROR:Upload still in progress");
+          break;
+        }
+        if (!Storage.exists(kFirmwarePendingPath)) {
+          wsServer->sendTXT(num, "INSTALL_ERROR:firmware-pending.bin not found");
+          break;
+        }
+        FsFile probe = Storage.open(kFirmwarePendingPath, O_RDONLY);
+        if (!probe) {
+          wsServer->sendTXT(num, "INSTALL_ERROR:Cannot open firmware-pending.bin");
+          break;
+        }
+        const uint64_t pendingSize = probe.fileSize64();
+        probe.close();
+        if (pendingSize < 65536) {  // any real firmware is much bigger; reject obvious garbage early
+          wsServer->sendTXT(num, "INSTALL_ERROR:firmware-pending.bin too small");
+          break;
+        }
+        LOG_INF("WS", "INSTALL_FIRMWARE queued: %s (%llu bytes)", kFirmwarePendingPath,
+                static_cast<unsigned long long>(pendingSize));
+        g_pendingFirmwareInstall = true;
+        wsServer->sendTXT(num, "INSTALL_QUEUED");
       }
       break;
     }

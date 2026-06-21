@@ -114,6 +114,30 @@
       <a href="/fonts">Fonts</a>
     </div>
 
+    <div id="update-banner" class="card" style="display:none; border-left:4px solid #3a8c5f; background:#f3faf6;">
+      <h2 style="margin-top:0;">Firmware update available</h2>
+      <div class="info-row">
+        <span class="label">Current</span>
+        <span class="value" id="update-current"></span>
+      </div>
+      <div class="info-row">
+        <span class="label">Latest</span>
+        <span class="value" id="update-latest"></span>
+      </div>
+      <div class="info-row">
+        <span class="label">Size</span>
+        <span class="value" id="update-size"></span>
+      </div>
+      <button id="update-btn" style="margin-top:12px; padding:10px 18px; font-size:1em; cursor:pointer;">Update Now</button>
+      <div id="update-status" style="margin-top:12px; font-size:0.9em; color:var(--label-color);"></div>
+      <div id="update-progress-wrap" style="display:none; margin-top:8px;">
+        <div style="height:8px; background:#e4e8ec; border-radius:4px; overflow:hidden;">
+          <div id="update-progress-bar" style="height:100%; width:0%; background:#3a8c5f; transition:width 200ms ease;"></div>
+        </div>
+        <div id="update-progress-text" style="font-size:0.8em; color:var(--label-color); margin-top:4px;">0%</div>
+      </div>
+    </div>
+
     <div class="card">
       <h2>Device Status</h2>
       <div class="info-row">
@@ -153,8 +177,194 @@
       }
     }
 
-    // Fetch status on page load
-    window.onload = fetchStatus;
+    // ---- LAN-OTA update banner --------------------------------------------
+    // Auto-check GitHub for a newer release; if newer, render the banner and
+    // wire Update Now to: download bin (browser) -> upload over WS to
+    // /.crosspoint/firmware-pending.bin -> INSTALL_FIRMWARE -> wait for reboot.
+    const RELEASES_URL = 'https://api.github.com/repos/imshentastic/CrumBLE/releases/latest';
+    const FW_PENDING_PATH = '/.crosspoint';
+    const FW_PENDING_NAME = 'firmware-pending.bin';
+    const WS_CHUNK = 4096;
+
+    // "CrumBLE 4.5.0 (CrossInk 1.3.0)" -> "4.5.0"
+    function parseDeviceVersion(s) {
+      const m = (s || '').match(/CrumBLE\s+([0-9.]+)/);
+      return m ? m[1] : null;
+    }
+    // "crumble-v4.5.1" -> "4.5.1"
+    function parseTag(tag) {
+      const m = (tag || '').match(/([0-9]+\.[0-9]+\.[0-9]+)/);
+      return m ? m[1] : null;
+    }
+    function cmpSemver(a, b) {
+      const pa = a.split('.').map(Number), pb = b.split('.').map(Number);
+      for (let i = 0; i < 3; i++) {
+        const da = pa[i] || 0, db = pb[i] || 0;
+        if (da !== db) return da - db;
+      }
+      return 0;
+    }
+
+    async function checkForUpdate(deviceVersionString) {
+      const cur = parseDeviceVersion(deviceVersionString);
+      if (!cur) return;
+      let release;
+      try {
+        const r = await fetch(RELEASES_URL, { cache: 'no-store' });
+        if (!r.ok) return;
+        release = await r.json();
+      } catch (e) { return; }
+      const latest = parseTag(release.tag_name);
+      if (!latest || cmpSemver(latest, cur) <= 0) return;
+      const asset = (release.assets || []).find(a => a.name.endsWith('.bin'));
+      if (!asset) return;
+
+      document.getElementById('update-current').textContent = cur;
+      document.getElementById('update-latest').textContent = latest;
+      document.getElementById('update-size').textContent = (asset.size / 1024 / 1024).toFixed(2) + ' MB';
+      const btn = document.getElementById('update-btn');
+      btn.onclick = () => runUpdate(asset, latest);
+      document.getElementById('update-banner').style.display = '';
+    }
+
+    function setStatus(text) { document.getElementById('update-status').textContent = text; }
+    function setProgress(pct) {
+      document.getElementById('update-progress-wrap').style.display = '';
+      document.getElementById('update-progress-bar').style.width = pct + '%';
+      document.getElementById('update-progress-text').textContent = pct.toFixed(1) + '%';
+    }
+
+    async function runUpdate(asset, latestVersion) {
+      if (!confirm('Update to ' + latestVersion + '?\n\nThe device will restart after installing. Do not close this tab or unplug the device.')) return;
+      const btn = document.getElementById('update-btn');
+      btn.disabled = true; btn.style.opacity = '0.5';
+
+      try {
+        // Step 1: download bin in browser
+        setStatus('Downloading firmware from GitHub...');
+        const dl = await fetch(asset.browser_download_url);
+        if (!dl.ok) throw new Error('GitHub download failed: ' + dl.status);
+        const blob = await dl.blob();
+        if (blob.size < 65536) throw new Error('Downloaded file too small (' + blob.size + ' bytes)');
+        setStatus('Downloaded ' + (blob.size / 1024 / 1024).toFixed(2) + ' MB. Uploading to device...');
+
+        // Step 2: upload via WS to the firmware-pending path
+        await uploadFirmwareWs(new File([blob], FW_PENDING_NAME), (sent, total) => {
+          setProgress(sent / total * 100);
+        });
+        setStatus('Upload complete. Asking device to install...');
+
+        // Step 3: send INSTALL_FIRMWARE, wait for INSTALL_QUEUED
+        await sendInstallFirmware();
+        setStatus('Installing... device will restart in about 1 minute. This page will reconnect automatically.');
+        setProgress(100);
+
+        // Step 4: poll for device coming back online with the new version
+        pollForReboot(latestVersion);
+      } catch (e) {
+        setStatus('Update failed: ' + e.message);
+        btn.disabled = false; btn.style.opacity = '';
+      }
+    }
+
+    function wsUrl() {
+      const host = window.location.hostname;
+      return 'ws://' + host + ':81/';
+    }
+
+    function uploadFirmwareWs(file, onProgress) {
+      return new Promise((resolve, reject) => {
+        const ws = new WebSocket(wsUrl());
+        ws.binaryType = 'arraybuffer';
+        let started = false;
+        ws.onopen = () => {
+          ws.send(`START:${file.name}:${file.size}:${FW_PENDING_PATH}`);
+        };
+        ws.onmessage = async (ev) => {
+          const msg = ev.data;
+          let resumeOffset = 0;
+          if (msg.startsWith('RESUME:')) { resumeOffset = parseInt(msg.substring(7), 10) || 0; }
+          if (msg === 'READY' || msg.startsWith('RESUME:')) {
+            started = true;
+            await new Promise(r => setTimeout(r, 50));
+            let offset = resumeOffset;
+            if (onProgress) onProgress(offset, file.size);
+            try {
+              while (offset < file.size && ws.readyState === WebSocket.OPEN) {
+                const chunkSize = Math.min(WS_CHUNK, file.size - offset);
+                const chunk = file.slice(offset, offset + chunkSize);
+                const buf = await chunk.arrayBuffer();
+                while (ws.bufferedAmount > WS_CHUNK / 2 && ws.readyState === WebSocket.OPEN) {
+                  await new Promise(r => setTimeout(r, 5));
+                }
+                if (ws.readyState !== WebSocket.OPEN) throw new Error('WS closed mid-upload');
+                ws.send(buf);
+                offset += chunkSize;
+                if (onProgress) onProgress(offset, file.size);
+              }
+            } catch (e) { ws.close(); reject(e); }
+          } else if (msg === 'DONE' || msg.startsWith('DONE:')) {
+            ws.close();
+            resolve();
+          } else if (msg.startsWith('ERROR:')) {
+            ws.close();
+            reject(new Error(msg.substring(6)));
+          }
+        };
+        ws.onerror = () => { if (!started) reject(new Error('WS connection failed')); };
+        ws.onclose = () => { if (!started) reject(new Error('WS closed before READY')); };
+      });
+    }
+
+    function sendInstallFirmware() {
+      return new Promise((resolve, reject) => {
+        const ws = new WebSocket(wsUrl());
+        ws.onopen = () => ws.send('INSTALL_FIRMWARE');
+        ws.onmessage = (ev) => {
+          const msg = ev.data;
+          if (msg === 'INSTALL_QUEUED') { ws.close(); resolve(); }
+          else if (msg.startsWith('INSTALL_ERROR:')) { ws.close(); reject(new Error(msg.substring(14))); }
+        };
+        ws.onerror = () => reject(new Error('WS error during INSTALL_FIRMWARE'));
+        ws.onclose = (ev) => {
+          // If device already restarted before sending us a response, that's actually success.
+          if (ev.wasClean) return;
+          // Give it 2s to send INSTALL_QUEUED, else fail.
+          setTimeout(() => reject(new Error('No response to INSTALL_FIRMWARE')), 2000);
+        };
+      });
+    }
+
+    async function pollForReboot(expectedVersion) {
+      // Device takes ~60s to flash + boot. Start polling after 30s.
+      await new Promise(r => setTimeout(r, 30000));
+      for (let i = 0; i < 90; i++) {  // poll up to 3 more minutes
+        try {
+          const r = await fetch('/api/status', { cache: 'no-store' });
+          if (r.ok) {
+            const d = await r.json();
+            const v = parseDeviceVersion(d.version);
+            if (v && cmpSemver(v, expectedVersion) >= 0) {
+              setStatus('Update complete! Device is running v' + v + '. Reloading...');
+              setTimeout(() => window.location.reload(), 1500);
+              return;
+            }
+          }
+        } catch (e) { /* expected during reboot */ }
+        await new Promise(r => setTimeout(r, 2000));
+      }
+      setStatus('Device did not come back online. Reload the page to check status.');
+    }
+    // ----------------------------------------------------------------------
+
+    async function fetchStatusAndCheckUpdate() {
+      await fetchStatus();
+      const ver = document.getElementById('version').textContent;
+      checkForUpdate(ver);
+    }
+
+    // Fetch status on page load + check for update
+    window.onload = fetchStatusAndCheckUpdate;
   </script>
   </body>
 </html>

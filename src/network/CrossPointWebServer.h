@@ -26,6 +26,13 @@ bool consumeFtRestartRequest();
 // allocator craters because the response never gets a chance to send).
 bool peekFtRestartRequest();
 
+// CrumBLE 4.6 LAN-OTA: set by the WS INSTALL_FIRMWARE handler after a
+// browser-uploaded firmware-pending.bin has been validated and is ready
+// to flash. The FT activity polls this from loop() and switches to the
+// install-progress activity, which calls firmware_flash::flashFromSdPath
+// + ESP.restart(). One-shot consume; the second call returns false.
+bool consumeFirmwareInstallRequest();
+
 // Structure to hold file information
 struct FileInfo {
   String name;

@@ -20,6 +20,9 @@
 #include "NetworkModeSelectionActivity.h"
 #include "SdCardFontSystem.h"
 #include "SilentRestart.h"
+#include "network/CrossPointWebServer.h"
+#include "network/FirmwareFlasher.h"
+#include <HalStorage.h>
 #include "WifiSelectionActivity.h"
 #include "activities/network/CalibreConnectActivity.h"
 #include "components/UITheme.h"
@@ -570,6 +573,43 @@ void CrossPointWebServerActivity::loop() {
         }
       }
       lastHandleClientTime = millis();
+    }
+
+    // CrumBLE 4.6 LAN-OTA: WS handler queued an install. The pending
+    // firmware-pending.bin has already been size-validated; we now stop
+    // serving HTTP/WS (the long blocking flash + reboot would drop those
+    // connections anyway) and call firmware_flash::flashFromSdPath which
+    // validates the image, streams it to the next OTA partition, and
+    // flips the bootloader. Reboot on success; on failure delete the bad
+    // file and surface an alert + fall back to FT.
+    if (consumeFirmwareInstallRequest()) {
+      LOG_INF("WEBACT", "LAN-OTA install requested -- stopping servers and flashing");
+      // Give the WS server a beat to flush the INSTALL_QUEUED reply we just
+      // sent before we tear down sockets -- otherwise the frontend never
+      // sees the ack and hangs waiting for it.
+      delay(150);
+      stopWebServer();
+      MDNS.end();
+      if (dnsServer) {
+        dnsServer->stop();
+        delete dnsServer;
+        dnsServer = nullptr;
+      }
+      const firmware_flash::Result fr = firmware_flash::flashFromSdPath(
+          "/.crosspoint/firmware-pending.bin", nullptr, nullptr, false);
+      Storage.remove("/.crosspoint/firmware-pending.bin");  // cleanup either way
+      if (fr == firmware_flash::Result::OK) {
+        LOG_INF("WEBACT", "LAN-OTA flash OK -- restarting into new image");
+        delay(500);
+        ESP.restart();  // never returns
+        return;
+      }
+      LOG_ERR("WEBACT", "LAN-OTA flash failed: %s", firmware_flash::resultName(fr));
+      strncpy(APP_STATE.pendingAlertTitle, "Update failed", sizeof(APP_STATE.pendingAlertTitle) - 1);
+      strncpy(APP_STATE.pendingAlertBody, firmware_flash::resultName(fr), sizeof(APP_STATE.pendingAlertBody) - 1);
+      APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
+      exitToOrigin();
+      return;
     }
 
     // CrumBLE: sendBufferGzip flagged a low-heap serve; the response has
