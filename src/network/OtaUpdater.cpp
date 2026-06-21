@@ -9,8 +9,10 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback, void*, s
 #include <Arduino.h>
 #include <Logging.h>
 #include <ReleaseJsonParser.h>
+#include <WiFi.h>
 #include <esp_err.h>
 #include <esp_heap_caps.h>
+#include <esp_wifi.h>
 #include <mbedtls/ssl.h>
 
 #include <algorithm>
@@ -354,6 +356,21 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   processedSize = 0;
 
   LOG_INF("OTA", "Install URL (%u chars): %s", static_cast<unsigned>(otaUrl.size()), otaUrl.c_str());
+
+  // CrumBLE 4.6: diagnose WiFi state at install time. 5+ sec per recv() is the
+  // signature of WIFI_PS_MIN_MODEM (radio sleeps between DTIM beacons) OR a
+  // very low SNR link where TCP retransmits dominate. Log both so we know
+  // which to chase.
+  {
+    wifi_ps_type_t curPs = WIFI_PS_NONE;
+    esp_wifi_get_ps(&curPs);
+    LOG_INF("OTA", "WiFi state pre-install: ps_mode=%d rssi=%d (PS_NONE=0 PS_MIN_MODEM=1 PS_MAX_MODEM=2)",
+            static_cast<int>(curPs), WiFi.RSSI());
+  }
+  // Disable WiFi power save for the ENTIRE install path (including redirect
+  // probe) -- the existing guard at install_begin was already too late if the
+  // PS mode affected our existing connection's QoS.
+  esp_wifi_set_ps(WIFI_PS_NONE);
 
   // CrumBLE 4.6: pre-resolve the GitHub redirect ourselves so esp_https_ota
   // doesn't see a 302 response. GitHub redirects releases/download URLs to
