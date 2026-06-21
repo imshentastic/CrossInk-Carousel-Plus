@@ -16,6 +16,13 @@
 struct RecentBook;
 struct Rect;
 
+// CrumBLE 4.6: called from Settings' Regenerate All Covers action so the
+// next Home entry drops its carousel frame cache + Flow snapshot buffer
+// and re-reads thumbs from SD (which we just nuked). Without this, Home
+// returns from Settings via the fast snapshot path and shows the old
+// pre-tone bitmaps even though Bookshelf has updated.
+void invalidateHomeCoverCachesGlobal();
+
 class HomeActivity final : public Activity {
  public:
   // CrumBLE 4.4: bumped 1->2. With 1 frame, every Left/Right press was a

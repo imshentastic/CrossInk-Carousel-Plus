@@ -14,6 +14,7 @@
 #include "ClearCacheActivity.h"
 #include "CoverThumbStatus.h"
 #include "CrossPointSettings.h"
+#include "activities/home/HomeActivity.h"
 #include "components/themes/lyra/LyraFlowTheme.h"
 #include "I18n.h"
 #include "FontDownloadActivity.h"
@@ -492,15 +493,23 @@ void SettingsActivity::toggleCurrentSetting() {
         // current Cover Tone setting. Walk + delete is sub-second; the actual
         // regen happens lazily on the next bookshelf paint.
         const int removed = CoverThumbStatus::regenerateAllCovers();
-        // CrumBLE 4.6 fix: nuking the SD thumbs isn't enough -- the renderer's
-        // in-RAM image cache still holds the OLD pre-tone bitmaps and serves
-        // them on the next render. Force-drop the cache so the next paint
-        // re-reads from SD, hits the missing thumb, and regenerates with the
-        // current tone curve.
+        // CrumBLE 4.6 fix: nuking the SD thumbs isn't enough -- multiple
+        // in-RAM caches hold the OLD pre-tone bitmaps and serve them on
+        // the next render. Drop them all so the next paint re-reads from
+        // SD (which we just nuked), forcing thumb regen with the current
+        // tone curve.
+        //  - renderer.imageCache: shared bitmap cache (covers both Home and
+        //    Bookshelf paint paths)
+        //  - LyraFlow side-tile cache: pre-baked carousel side covers
+        //  - HomeActivity carousel/snapshot caches (invalidated lazily on
+        //    next onEnter via the gHomeCoversInvalidated flag, since
+        //    HomeActivity may be on the back stack with no live instance
+        //    here)
         renderer.clearImageCache();
         if (static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) == CrossPointSettings::UI_THEME::LYRA_FLOW) {
           static_cast<const LyraFlowTheme&>(GUI).clearCarouselSideTiles();
         }
+        invalidateHomeCoverCachesGlobal();
         char msg[96];
         std::snprintf(msg, sizeof(msg), tr(STR_COVERS_RETRY_DONE), removed);
         GUI.drawPopup(renderer, msg);

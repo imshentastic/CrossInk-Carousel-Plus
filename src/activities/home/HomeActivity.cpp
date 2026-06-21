@@ -12,6 +12,7 @@
 #include <Xtc.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -485,7 +486,18 @@ class CarouselCache {
 };
 
 CarouselCache gCarouselCache;
+
+// CrumBLE 4.6: set by invalidateHomeCoverCachesGlobal() (called from
+// Settings' Regenerate All Covers) so that the next HomeActivity::onEnter
+// drops its per-instance coverBuffer snapshot and rebuilds the carousel
+// from freshly-regenerated SD thumbs.
+std::atomic<bool> gHomeCoversInvalidated{false};
 }  // namespace
+
+void invalidateHomeCoverCachesGlobal() {
+  gCarouselCache.invalidate();
+  gHomeCoversInvalidated.store(true, std::memory_order_release);
+}
 
 static_assert(HomeActivity::kMaxCachedBooks >= LyraCarouselMetrics::values.homeRecentBooksCount,
               "kMaxCachedBooks must cover all carousel slots");
@@ -2014,6 +2026,16 @@ void HomeActivity::showShelfHeaderActionMenu() {
 
 void HomeActivity::onEnter() {
   Activity::onEnter();
+
+  // CrumBLE 4.6: if Cover Tone / Regenerate All Covers fired while Home was
+  // on the back stack, drop the snapshot + carousel cache so we re-read the
+  // freshly-regenerated thumbs instead of restoring the pre-tone bitmap.
+  if (gHomeCoversInvalidated.exchange(false, std::memory_order_acq_rel)) {
+    freeCoverBuffer();
+    coverBufferStored = false;
+    gCarouselCache.invalidate();
+    freeCarouselFrames();
+  }
 
   // CrumBLE 4.2: rehydrate the in-RAM collection / series stores if a
   // previous activity (reader, File Transfer) called releaseMemory() to
