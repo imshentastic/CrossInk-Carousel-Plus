@@ -390,6 +390,11 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
     }
     LOG_INF("OTA", "Re-associated in %lums status=%d rssi=%d", millis() - reconnStart,
             static_cast<int>(WiFi.status()), WiFi.RSSI());
+    // Post-reassoc stabilization: ARP cache, DNS cache, and any AP-side
+    // state machinery need a beat before we can reliably open new sockets.
+    // Without this delay the redirect probe sometimes hits
+    // 'transport_base: Failed to open a new connection' for 10+ seconds.
+    delay(500);
   }
 
   // CrumBLE 4.6: pre-resolve the GitHub redirect ourselves so esp_https_ota
@@ -402,15 +407,16 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   // the resolved URL straight into esp_https_ota, the OTA stack never sees
   // a redirect and the panicking code path is skipped.
   std::string resolvedUrl = otaUrl;
-  {
-    // Probe config: minimal -- the GET-method version with 4 KB buffer panicked
-    // in esp_http_client_init (the HEAD/1KB combo from prior build did not).
-    // Keep HEAD; capture the Location via an event handler instead of
-    // get_header so we don't need a big buffer to retain headers post-perform.
+  bool probeResolved = false;
+  // Retry the probe up to 3 times -- post-reassoc WiFi state can be flaky
+  // and probe sometimes hits 'transport_base: Failed to open' on the first
+  // try. Each attempt has a 5s timeout (was 10s) so failures don't waste
+  // 30s before falling through.
+  for (int probeAttempt = 0; probeAttempt < 3 && !probeResolved; ++probeAttempt) {
     esp_http_client_config_t redirect_cfg = {
         .url = otaUrl.c_str(),
         .method = HTTP_METHOD_HEAD,
-        .timeout_ms = 10000,
+        .timeout_ms = 5000,
         .disable_auto_redirect = true,
         .max_redirection_count = 0,
         .event_handler = [](esp_http_client_event_t* ev) -> esp_err_t {
@@ -431,13 +437,25 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
       const esp_err_t rerr = esp_http_client_perform(rh);
       const int code = esp_http_client_get_status_code(rh);
       const bool resolved = (resolvedUrl != otaUrl);
-      LOG_INF("OTA", "Redirect probe: err=%s status=%d resolved=%s len=%u", esp_err_to_name(rerr), code,
-              resolved ? "yes" : "no", static_cast<unsigned>(resolvedUrl.size()));
+      LOG_INF("OTA", "Redirect probe attempt %d: err=%s status=%d resolved=%s len=%u", probeAttempt + 1,
+              esp_err_to_name(rerr), code, resolved ? "yes" : "no", static_cast<unsigned>(resolvedUrl.size()));
       if (resolved) {
         LOG_INF("OTA", "Resolved redirect first60=%.60s", resolvedUrl.c_str());
+        probeResolved = true;
       }
       esp_http_client_cleanup(rh);
     }
+    if (!probeResolved) {
+      delay(500);  // back off before retry to let the connection settle
+    }
+  }
+  if (!probeResolved) {
+    // Falling through to install with the un-resolved github.com URL would
+    // make esp_https_ota handle the 302 in-band, which means a Location-header
+    // parse that's known to OOM under 1KB heap pressure on this tight install.
+    // Better to abort cleanly and let the user retry the OTA.
+    LOG_ERR("OTA", "Redirect probe failed after 3 attempts -- aborting install");
+    return INTERNAL_UPDATE_ERROR;
   }
 
   esp_https_ota_handle_t ota_handle = NULL;
@@ -446,15 +464,13 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   esp_http_client_config_t client_config = {
       .url = resolvedUrl.c_str(),
       .timeout_ms = 60000,
-      // CrumBLE 4.6: 2 KB receive / 1.5 KB transmit. With PS_NONE applied via
-      // re-association, the heap is stable enough to afford the 2KB cascade
-      // (2 KB recv + 2 KB cascaded upgrade buf). Doubling the receive buffer
-      // doubles per-call payload, which is the win during fast windows where
-      // avg=75ms/call gave 13 KB/s at 1 KB -- now should give 26 KB/s peak.
-      // Slow-window calls don't change (they're blocked on socket data, not
-      // payload size). Direct-CDN response headers easily fit in 2 KB. TX
-      // sized to hold the ~940 char resolved URL in the GET request line.
-      .buffer_size = 2048,
+      // CrumBLE 4.6: 1 KB receive / 1.5 KB transmit. Reverted from 2 KB --
+      // the 2KB cascade flaked when the redirect probe failed and install
+      // had to handle the github.com -> CDN redirect in-band (extra
+      // Location-parse allocs pushed past the heap edge with 2KB+2KB
+      // buffers). 1KB recv with the upgrade-buf cascade is the only
+      // configuration we've shown to reliably fit alongside mbedtls SSL.
+      .buffer_size = 1024,
       .buffer_size_tx = 1536,
       .skip_cert_common_name_check = true,
       .crt_bundle_attach = otaSkipCertVerifyAttach,
