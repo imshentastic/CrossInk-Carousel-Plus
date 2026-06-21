@@ -60,4 +60,36 @@ Result validateImageFile(const char* sdPath, size_t partitionSize);
 
 const char* resultName(Result r);
 
+// CrumBLE 4.6 LAN-OTA re-anchor pass.
+//
+// Problem this solves: ESP-IDF's OTA APIs flash the "other" partition each
+// install (ota_0 -> ota_1 -> ota_0 ...). So after a LAN-OTA, the device
+// boots from ota_1. Users who later USB-flash via the CrossPoint web
+// flasher (which always writes ota_0 only and doesn't touch otadata) need
+// a double-flash to recover -- a non-obvious regression we'd be causing.
+//
+// Fix: on the first boot of a LAN-OTA-installed firmware, detect we're
+// running from a non-ota_0 partition AND the source bin is still sitting
+// at /.crosspoint/firmware-pending.bin on SD (the LAN-OTA install path
+// leaves it there for this pass). Re-flash the same bin into ota_0
+// (esp_ota_get_next_update_partition returns ota_0 while we're on ota_1),
+// switch otadata to point at ota_0, then reboot. Net result: every
+// LAN-OTA-installed device ends up anchored on ota_0, exactly where USB
+// flashes write, so subsequent USB flashes work in a single pass.
+//
+// Behaviour matrix:
+//   - bin missing             -> NOT_NEEDED (normal boot)
+//   - bin present, on ota_0   -> NOT_NEEDED (cleanup deletes bin)
+//   - bin present, on ota_1   -> attempts relocation; RELOCATED on success
+//     (caller MUST ESP.restart() so new ota_0 takes over)
+//   - relocation write fails  -> FAILED (bin preserved for next-boot retry)
+enum class RelocateResult { NOT_NEEDED, RELOCATED, FAILED };
+RelocateResult maybeRelocateLanOtaToOta0(ProgressCb onProgress, void* ctx);
+
+// True iff a relocation pass will run on the next maybeRelocateLanOtaToOta0
+// call (bin present AND we're booted from non-ota_0). Lets the boot path
+// render a "Finalizing update..." screen ONLY when work will actually
+// happen, instead of flashing it for normal boots.
+bool relocateLanOtaPending();
+
 }  // namespace firmware_flash

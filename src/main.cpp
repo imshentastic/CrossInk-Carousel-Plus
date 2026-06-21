@@ -66,6 +66,7 @@ inline esp_sleep_wakeup_cause_t esp_sleep_get_wakeup_cause() { return ESP_SLEEP_
 
 #include "AppVersion.h"
 #include "CoverThumbStatus.h"
+#include "network/FirmwareFlasher.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "SilentRestart.h"  // CrumBLE 4.4: ReaderPostBootAction enum + decls
@@ -1505,6 +1506,35 @@ void setup() {
             ESP.getMaxAllocHeap());
   }
   setupDisplayAndFonts(resume != BootResume::Splash, isOtaSilentReboot);
+
+  // CrumBLE 4.6 LAN-OTA re-anchor: if the device just booted from ota_1
+  // because of a recent LAN-OTA install, flash the same bin into ota_0 so
+  // future USB flashes via the CrossPoint web flasher (which writes ota_0
+  // and doesn't touch otadata) take effect on first try. ~60-120s blocking.
+  // See network/FirmwareFlasher.h:maybeRelocateLanOtaToOta0 for the full
+  // rationale. Skip on lean-OTA silent reboots -- those are for the
+  // LAN-OTA INSTALL pass, not the post-install boot; the install path
+  // already reboots and lands here on the first non-lean boot.
+  if (!isOtaSilentReboot && firmware_flash::relocateLanOtaPending()) {
+    LOG_INF("MAIN", "LAN-OTA relocate-to-ota_0 needed -- rendering finalize screen");
+    renderer.clearScreen();
+    const int sw = renderer.getScreenWidth();
+    const int sh = renderer.getScreenHeight();
+    const int h = renderer.getLineHeight(UI_10_FONT_ID);
+    renderer.drawCenteredText(UI_10_FONT_ID, sh / 2 - h * 2, "Finalizing update");
+    renderer.drawCenteredText(UI_10_FONT_ID, sh / 2, "Writing recovery copy to flash...");
+    renderer.drawCenteredText(UI_10_FONT_ID, sh / 2 + h, "Device will restart automatically.");
+    renderer.drawCenteredText(UI_10_FONT_ID, sh / 2 + h * 2, "Do not unplug.");
+    renderer.displayBuffer();
+    (void)sw;
+    const auto reloc = firmware_flash::maybeRelocateLanOtaToOta0(nullptr, nullptr);
+    if (reloc == firmware_flash::RelocateResult::RELOCATED) {
+      LOG_INF("MAIN", "LAN-OTA relocate ok -- restarting into ota_0");
+      delay(500);
+      ESP.restart();  // does not return
+    }
+    LOG_ERR("MAIN", "LAN-OTA relocate skipped/failed -- continuing on current partition");
+  }
 
   // CrumBLE 4.3 option 3: page-heap reserve was acquired at boot here, but
   // that starves the File Transfer web server (HTML serve needs ~20 KB

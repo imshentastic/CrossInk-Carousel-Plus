@@ -615,13 +615,20 @@ void CrossPointWebServerActivity::loop() {
       }
       const firmware_flash::Result fr = firmware_flash::flashFromSdPath(
           "/.crosspoint/firmware-pending.bin", nullptr, nullptr, false);
-      Storage.remove("/.crosspoint/firmware-pending.bin");  // cleanup either way
+      // CrumBLE 4.6 re-anchor: do NOT delete the SD bin here. After this
+      // restart the device boots from ota_1 -- main.cpp::setup() detects
+      // the bin still on SD + non-ota_0 running partition and re-flashes
+      // to ota_0 so future USB-flashes land on the expected partition.
+      // The relocate pass deletes the bin on success. If THIS install
+      // itself failed (no flash happened), wipe the bin so a bogus retry
+      // doesn't loop.
       if (fr == firmware_flash::Result::OK) {
-        LOG_INF("WEBACT", "LAN-OTA flash OK -- restarting into new image");
+        LOG_INF("WEBACT", "LAN-OTA flash OK -- restarting; re-anchor pass will run on next boot");
         delay(500);
         ESP.restart();  // never returns
         return;
       }
+      Storage.remove("/.crosspoint/firmware-pending.bin");
       LOG_ERR("WEBACT", "LAN-OTA flash failed: %s", firmware_flash::resultName(fr));
       strncpy(APP_STATE.pendingAlertTitle, "Update failed", sizeof(APP_STATE.pendingAlertTitle) - 1);
       strncpy(APP_STATE.pendingAlertBody, firmware_flash::resultName(fr), sizeof(APP_STATE.pendingAlertBody) - 1);

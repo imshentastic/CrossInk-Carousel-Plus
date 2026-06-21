@@ -308,4 +308,50 @@ Result flashFromSdPath(const char* sdPath, ProgressCb onProgress, void* ctx, boo
   return Result::OK;
 }
 
+namespace {
+constexpr const char* kFirmwarePendingPath = "/.crosspoint/firmware-pending.bin";
+
+// True iff the running app partition is OTA_0 (the slot USB flashers write).
+bool runningFromOta0() {
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  if (!running) return false;
+  return running->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0;
+}
+}  // namespace
+
+bool relocateLanOtaPending() {
+  if (!Storage.exists(kFirmwarePendingPath)) return false;
+  return !runningFromOta0();
+}
+
+RelocateResult maybeRelocateLanOtaToOta0(ProgressCb onProgress, void* ctx) {
+  if (!Storage.exists(kFirmwarePendingPath)) return RelocateResult::NOT_NEEDED;
+
+  if (runningFromOta0()) {
+    // Either a prior relocation already ran and we forgot to clean up, or
+    // the user uploaded a bin then USB-flashed before the LAN-OTA install
+    // path ran. Either way, the bin is now stale -- drop it.
+    LOG_INF("FLASH", "Stale firmware-pending.bin on ota_0 -- removing");
+    Storage.remove(kFirmwarePendingPath);
+    return RelocateResult::NOT_NEEDED;
+  }
+
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  LOG_INF("FLASH", "LAN-OTA relocate: running from %s, copying SD bin to ota_0",
+          running ? running->label : "?");
+
+  // flashFromSdPath targets esp_ota_get_next_update_partition(), which is
+  // the partition we're NOT running from -- that's ota_0 here. Re-validate
+  // because the bin survived a reboot cycle; cheap insurance.
+  const Result r = flashFromSdPath(kFirmwarePendingPath, onProgress, ctx, false);
+  if (r != Result::OK) {
+    LOG_ERR("FLASH", "LAN-OTA relocate failed: %s -- bin preserved for retry", resultName(r));
+    return RelocateResult::FAILED;
+  }
+
+  Storage.remove(kFirmwarePendingPath);
+  LOG_INF("FLASH", "LAN-OTA relocate ok -- restart will land on ota_0");
+  return RelocateResult::RELOCATED;
+}
+
 }  // namespace firmware_flash
