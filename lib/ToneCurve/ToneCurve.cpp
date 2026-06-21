@@ -4,48 +4,44 @@
 
 namespace {
 
-// MILD: gamma 1.5 -- out = pow(in/255, 1/1.5) * 255. Lifts midtones a bit
-// (a source 128 maps to ~167) without crushing extremes. Safe default for
-// most cover types including comics/manga.
+// CrumBLE 4.6: tone curves are RANGE-COMPRESSION ("clamping"), not contrast
+// expansion. The complaint we're addressing is "covers look dark and
+// crushed-to-black on e-ink" -- source color covers, mastered for LCD/OLED,
+// land mostly in the 0-128 range after grayscale conversion, and 1-bit
+// Atkinson dither collapses all of <50 to solid black. Compressing the
+// source range to [lo..hi] before dither means the dither has more
+// middle-gray values to stipple with -- crushed-black areas become visibly
+// gray-stippled, and over-bright whites get visible texture too.
+//
+// Linear remap: output = lo + (input/255) * (hi - lo).
+//
+// MILD: gentle compression to 30..225. Source 0 -> 30 (~12% white stipple
+// after dither); source 128 -> ~125 (unchanged); source 255 -> 225 (~88%
+// white). Subtle softening of extremes, preserves most local contrast.
 void fillMildLut(uint8_t lut[256]) {
-  constexpr double kInvGamma = 1.0 / 1.5;
+  constexpr double kLo = 30.0;
+  constexpr double kHi = 225.0;
+  constexpr double kSpan = kHi - kLo;
   for (int i = 0; i < 256; ++i) {
-    const double v = std::pow(i / 255.0, kInvGamma) * 255.0;
+    const double v = kLo + (i / 255.0) * kSpan;
     const int q = static_cast<int>(v + 0.5);
     lut[i] = static_cast<uint8_t>(q < 0 ? 0 : q > 255 ? 255 : q);
   }
 }
 
-// STRONG: two-stage curve mirroring the user's Photoshop sleep-image trick.
-// Stage 1 -- compress source dynamic range so detail in deep blacks (<85)
-// and bright whites (>200) doesn't compete with the midtones we care about
-// on e-ink. Inputs <85 clip to 0; inputs >200 clip to 255; the 85..200
-// band gets stretched across 0..255.
-// Stage 2 -- sigmoid contrast (S-curve) re-spreads the now-compressed
-// midtones around their new center to restore local contrast.
-// Net effect: noticeably brighter midtones with preserved edge contrast.
+// STRONG: aggressive compression to 60..200. Source 0 -> 60 (~24% white
+// stipple); source 128 -> ~130 (unchanged); source 255 -> 200 (~78% white).
+// Heavily-disperse multi-gray look; dark dust-jacket photos that previously
+// rendered as black silhouettes become visibly grayscale-textured covers.
+// Cost: max local contrast is reduced (200/60 ratio vs 255/0), so sharp
+// graphic-novel art may look slightly washed.
 void fillStrongLut(uint8_t lut[256]) {
-  constexpr int kInLo = 85;
-  constexpr int kInHi = 200;
-  constexpr double kRange = kInHi - kInLo;
-  constexpr double kCenter = 128.0;
-  constexpr double kSlope = 0.025;  // tuned: sharper than 0.02, gentler than 0.04
-
+  constexpr double kLo = 60.0;
+  constexpr double kHi = 200.0;
+  constexpr double kSpan = kHi - kLo;
   for (int i = 0; i < 256; ++i) {
-    // Stage 1: linear stretch of [85..200] -> [0..255]
-    double stretched;
-    if (i <= kInLo) {
-      stretched = 0.0;
-    } else if (i >= kInHi) {
-      stretched = 255.0;
-    } else {
-      stretched = (i - kInLo) * 255.0 / kRange;
-    }
-
-    // Stage 2: sigmoid S-curve around midpoint
-    const double s = 255.0 / (1.0 + std::exp(-(stretched - kCenter) * kSlope));
-
-    const int q = static_cast<int>(s + 0.5);
+    const double v = kLo + (i / 255.0) * kSpan;
+    const int q = static_cast<int>(v + 0.5);
     lut[i] = static_cast<uint8_t>(q < 0 ? 0 : q > 255 ? 255 : q);
   }
 }
