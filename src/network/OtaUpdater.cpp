@@ -369,8 +369,28 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   }
   // Disable WiFi power save for the ENTIRE install path (including redirect
   // probe) -- the existing guard at install_begin was already too late if the
-  // PS mode affected our existing connection's QoS.
-  esp_wifi_set_ps(WIFI_PS_NONE);
+  // PS mode affected our existing connection's QoS. Some drivers only apply
+  // PS mode on re-association, so we disconnect and reconnect to force it.
+  {
+    const esp_err_t setErr = esp_wifi_set_ps(WIFI_PS_NONE);
+    wifi_ps_type_t afterPs = WIFI_PS_NONE;
+    esp_wifi_get_ps(&afterPs);
+    LOG_INF("OTA", "esp_wifi_set_ps(NONE): err=%s now=%d", esp_err_to_name(setErr), static_cast<int>(afterPs));
+
+    // Force re-association so the new PS mode actually applies on the
+    // existing connection. WiFi.reconnect() does disconnect + connect
+    // without losing the saved credentials. Total cost: ~1-2 seconds.
+    LOG_INF("OTA", "Re-associating WiFi to apply PS_NONE...");
+    const unsigned long reconnStart = millis();
+    WiFi.disconnect(false, false);
+    delay(100);
+    WiFi.reconnect();
+    while (WiFi.status() != WL_CONNECTED && millis() - reconnStart < 5000) {
+      delay(50);
+    }
+    LOG_INF("OTA", "Re-associated in %lums status=%d rssi=%d", millis() - reconnStart,
+            static_cast<int>(WiFi.status()), WiFi.RSSI());
+  }
 
   // CrumBLE 4.6: pre-resolve the GitHub redirect ourselves so esp_https_ota
   // doesn't see a 302 response. GitHub redirects releases/download URLs to
