@@ -359,13 +359,10 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   esp_http_client_config_t client_config = {
       .url = otaUrl.c_str(),
       .timeout_ms = 15000,
-      // CrumBLE 4.6: shrunk to the minimum that still parses the redirect-chain
-      // headers (CDN redirect from github.com -> objects.githubusercontent.com
-      // is ~400 bytes of headers). esp_https_ota allocates a SEPARATE 16KB
-      // upgrade data buffer on top of this; we need every spare byte at
-      // install time so mbedtls' IN/OUT + LWIP scratch + the upgrade buffer
-      // can all coexist. keep_alive removed -- single-shot download, no reuse.
-      .buffer_size = 1024,
+      // GitHub's redirect headers (github.com -> objects.githubusercontent.com)
+      // need 4 KB; 1 KB truncated them with "HTTP_CLIENT: Out of buffer". TX
+      // only carries our small Range GET so 256 B is fine.
+      .buffer_size = 4096,
       .buffer_size_tx = 256,
       .skip_cert_common_name_check = true,
       .crt_bundle_attach = otaSkipCertVerifyAttach,
@@ -374,6 +371,15 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   esp_https_ota_config_t ota_config = {
       .http_config = &client_config,
       .http_client_init_cb = http_client_set_header_cb,
+      // CrumBLE 4.6: chunked download via HTTP Range requests. Each chunk is
+      // its own short-lived HTTP+TLS exchange, so the per-chunk peak (SSL
+      // IN/OUT buffers + 8 KB upgrade buf) is much smaller than a single
+      // continuous 6.5 MB download (~16 KB upgrade buf held throughout).
+      // Trade-off: ~N handshakes instead of 1, which is slow on this device
+      // (~5-8 s per handshake) but unblocks the install on tight heap.
+      .bulk_flash_erase = false,
+      .partial_http_download = true,
+      .max_http_request_size = 8192,
   };
 
   WifiPowerSaveGuard wifiPowerSaveGuard;
