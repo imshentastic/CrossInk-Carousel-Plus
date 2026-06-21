@@ -409,15 +409,15 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   esp_http_client_config_t client_config = {
       .url = resolvedUrl.c_str(),
       .timeout_ms = 60000,
-      // CrumBLE 4.6: 2 KB receive / 512 B transmit. Larger buffers cascade --
-      // esp_https_ota allocates ota_upgrade_buf = MAX(buffer_size, ~290) so
-      // 4 KB here means 4 KB upgrade buf ON TOP OF the 4 KB receive buf, and
-      // after mbedtls SSL state (~32 KB) is up the second 4 KB alloc fails
-      // with ESP_ERR_NO_MEM. Now that we go straight to the CDN (no redirect
-      // to parse), 2 KB headroom on receive is plenty for the CDN response
-      // headers.
+      // CrumBLE 4.6: 2 KB receive / 1.5 KB transmit. Larger buffer_size
+      // cascades into ota_upgrade_buf = MAX(buffer_size, ~290), so we keep
+      // receive at 2 KB to avoid the upgrade buf eating into mbedtls'
+      // working set. buffer_size_tx must hold the full GET request line --
+      // the resolved CDN URL is ~940 chars plus the GET verb + headers, so
+      // 512 B truncates with HTTP_CLIENT: Out of buffer. 1.5 KB fits with
+      // headroom; tx doesn't cascade into other allocs.
       .buffer_size = 2048,
-      .buffer_size_tx = 512,
+      .buffer_size_tx = 1536,
       .skip_cert_common_name_check = true,
       .crt_bundle_attach = otaSkipCertVerifyAttach,
   };
