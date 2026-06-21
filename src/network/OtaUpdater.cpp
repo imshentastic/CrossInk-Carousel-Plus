@@ -353,6 +353,10 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
 
   processedSize = 0;
 
+  // CrumBLE 4.6: dump the URL we're about to install so we can rule out RTC
+  // corruption as a source of the http_utils panic.
+  LOG_INF("OTA", "Install URL (%u chars): %s", static_cast<unsigned>(otaUrl.size()), otaUrl.c_str());
+
   esp_https_ota_handle_t ota_handle = NULL;
   esp_err_t esp_err;
 
@@ -368,18 +372,15 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
       .crt_bundle_attach = otaSkipCertVerifyAttach,
   };
 
+  // CrumBLE 4.6: partial_http_download was triggering the
+  // http_utils_append_string panic on the bypass-fragments-with-multiple-
+  // ranges code path; reverted to single-shot download for now. With the
+  // silent-restart-to-install fix, heap should be clean enough for the
+  // standard path; the upgrade buffer alloc is only 256 B in single-shot
+  // mode (vs max_http_request_size in partial mode).
   esp_https_ota_config_t ota_config = {
       .http_config = &client_config,
       .http_client_init_cb = http_client_set_header_cb,
-      // CrumBLE 4.6: chunked download via HTTP Range requests. Each chunk is
-      // its own short-lived HTTP+TLS exchange, so the per-chunk peak (SSL
-      // IN/OUT buffers + 8 KB upgrade buf) is much smaller than a single
-      // continuous 6.5 MB download (~16 KB upgrade buf held throughout).
-      // Trade-off: ~N handshakes instead of 1, which is slow on this device
-      // (~5-8 s per handshake) but unblocks the install on tight heap.
-      .bulk_flash_erase = false,
-      .partial_http_download = true,
-      .max_http_request_size = 8192,
   };
 
   WifiPowerSaveGuard wifiPowerSaveGuard;
