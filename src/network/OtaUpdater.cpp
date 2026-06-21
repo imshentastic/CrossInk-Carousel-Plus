@@ -373,6 +373,9 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
     esp_http_client_config_t redirect_cfg = {
         .url = otaUrl.c_str(),
         .method = HTTP_METHOD_HEAD,
+        .timeout_ms = 10000,
+        .disable_auto_redirect = true,
+        .max_redirection_count = 0,
         .event_handler = [](esp_http_client_event_t* ev) -> esp_err_t {
           if (ev->event_id == HTTP_EVENT_ON_HEADER && ev->header_key &&
               strcasecmp(ev->header_key, "Location") == 0 && ev->header_value && ev->user_data) {
@@ -380,9 +383,6 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
           }
           return ESP_OK;
         },
-        .timeout_ms = 10000,
-        .disable_auto_redirect = true,
-        .max_redirection_count = 0,
         .buffer_size = 1024,
         .buffer_size_tx = 256,
         .user_data = &resolvedUrl,
