@@ -446,14 +446,15 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   esp_http_client_config_t client_config = {
       .url = resolvedUrl.c_str(),
       .timeout_ms = 60000,
-      // CrumBLE 4.6: 1 KB receive / 1.5 KB transmit. We're at the heap edge
-      // -- buffer_size 2048 was flaky (worked when MaxAlloc=53KB pre-install,
-      // failed at 49KB). buffer_size_alloc cascades into ota_upgrade_buf =
-      // MAX(buffer_size, ~290), so 1KB receive + 1KB upgrade frees 2KB vs
-      // 2KB+2KB. Direct-CDN response headers fit easily in 1KB (no Set-Cookie
-      // chain). TX kept at 1.5KB to hold the long resolved URL in the GET
-      // request line.
-      .buffer_size = 1024,
+      // CrumBLE 4.6: 2 KB receive / 1.5 KB transmit. With PS_NONE applied via
+      // re-association, the heap is stable enough to afford the 2KB cascade
+      // (2 KB recv + 2 KB cascaded upgrade buf). Doubling the receive buffer
+      // doubles per-call payload, which is the win during fast windows where
+      // avg=75ms/call gave 13 KB/s at 1 KB -- now should give 26 KB/s peak.
+      // Slow-window calls don't change (they're blocked on socket data, not
+      // payload size). Direct-CDN response headers easily fit in 2 KB. TX
+      // sized to hold the ~940 char resolved URL in the GET request line.
+      .buffer_size = 2048,
       .buffer_size_tx = 1536,
       .skip_cert_common_name_check = true,
       .crt_bundle_attach = otaSkipCertVerifyAttach,
