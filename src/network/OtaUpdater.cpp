@@ -483,7 +483,13 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
         onProgress(ctx);
       }
     }
-    delay(100);  // TODO: should we replace this with something better?
+    // CrumBLE 4.6: yield once per iteration (1 ms) instead of delay(100). The
+    // 100ms throttled throughput to ~300 B/s on tight-heap installs because
+    // each perform call only reads a small TLS record before mbedtls blocks
+    // on socket. Letting the perform loop spin as fast as possible (with a
+    // single FreeRTOS scheduler tick) lets the limited-buffer mbedtls drain
+    // packets the second they arrive instead of sleeping past them.
+    vTaskDelay(pdMS_TO_TICKS(1));
   } while (esp_err == ESP_ERR_HTTPS_OTA_IN_PROGRESS);
 
   if (isCancellationRequested()) {
