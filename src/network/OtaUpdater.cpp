@@ -353,15 +353,52 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
 
   processedSize = 0;
 
-  // CrumBLE 4.6: dump the URL we're about to install so we can rule out RTC
-  // corruption as a source of the http_utils panic.
   LOG_INF("OTA", "Install URL (%u chars): %s", static_cast<unsigned>(otaUrl.size()), otaUrl.c_str());
+
+  // CrumBLE 4.6: pre-resolve the GitHub redirect ourselves so esp_https_ota
+  // doesn't see a 302 response. GitHub redirects releases/download URLs to
+  // objects.githubusercontent.com via a ~500-1000 byte Location header that
+  // esp_http_client parses into client->location via repeated
+  // http_utils_append_string realloc cycles -- on tight heap this was
+  // asserting at http_utils.c:72 (`mem_check(old_str)`). By doing one tiny
+  // HEAD request to GitHub ourselves, capturing the Location, and feeding
+  // the resolved URL straight into esp_https_ota, the OTA stack never sees
+  // a redirect and the panicking code path is skipped.
+  std::string resolvedUrl = otaUrl;
+  {
+    esp_http_client_config_t redirect_cfg = {
+        .url = otaUrl.c_str(),
+        .method = HTTP_METHOD_HEAD,
+        .timeout_ms = 10000,
+        .disable_auto_redirect = true,
+        .max_redirection_count = 0,
+        .buffer_size = 1024,
+        .buffer_size_tx = 256,
+        .skip_cert_common_name_check = true,
+        .crt_bundle_attach = otaSkipCertVerifyAttach,
+    };
+    esp_http_client_handle_t rh = esp_http_client_init(&redirect_cfg);
+    if (rh) {
+      const esp_err_t rerr = esp_http_client_perform(rh);
+      const int code = esp_http_client_get_status_code(rh);
+      LOG_INF("OTA", "Redirect probe: err=%s status=%d", esp_err_to_name(rerr), code);
+      if (rerr == ESP_OK && (code == 301 || code == 302 || code == 303 || code == 307 || code == 308)) {
+        char* loc = nullptr;
+        if (esp_http_client_get_header(rh, "Location", &loc) == ESP_OK && loc && loc[0] != '\0') {
+          resolvedUrl = loc;
+          LOG_INF("OTA", "Resolved redirect: %u chars host=%.40s...", static_cast<unsigned>(resolvedUrl.size()),
+                  resolvedUrl.c_str());
+        }
+      }
+      esp_http_client_cleanup(rh);
+    }
+  }
 
   esp_https_ota_handle_t ota_handle = NULL;
   esp_err_t esp_err;
 
   esp_http_client_config_t client_config = {
-      .url = otaUrl.c_str(),
+      .url = resolvedUrl.c_str(),
       .timeout_ms = 15000,
       // GitHub's redirect headers (github.com -> objects.githubusercontent.com)
       // need 4 KB; 1 KB truncated them with "HTTP_CLIENT: Out of buffer". TX
