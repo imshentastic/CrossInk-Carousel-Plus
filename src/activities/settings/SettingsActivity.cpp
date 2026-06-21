@@ -14,6 +14,7 @@
 #include "ClearCacheActivity.h"
 #include "CoverThumbStatus.h"
 #include "CrossPointSettings.h"
+#include "components/themes/lyra/LyraFlowTheme.h"
 #include "I18n.h"
 #include "FontDownloadActivity.h"
 #include "FontSelectionActivity.h"
@@ -491,6 +492,15 @@ void SettingsActivity::toggleCurrentSetting() {
         // current Cover Tone setting. Walk + delete is sub-second; the actual
         // regen happens lazily on the next bookshelf paint.
         const int removed = CoverThumbStatus::regenerateAllCovers();
+        // CrumBLE 4.6 fix: nuking the SD thumbs isn't enough -- the renderer's
+        // in-RAM image cache still holds the OLD pre-tone bitmaps and serves
+        // them on the next render. Force-drop the cache so the next paint
+        // re-reads from SD, hits the missing thumb, and regenerates with the
+        // current tone curve.
+        renderer.clearImageCache();
+        if (static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) == CrossPointSettings::UI_THEME::LYRA_FLOW) {
+          static_cast<const LyraFlowTheme&>(GUI).clearCarouselSideTiles();
+        }
         char msg[96];
         std::snprintf(msg, sizeof(msg), tr(STR_COVERS_RETRY_DONE), removed);
         GUI.drawPopup(renderer, msg);
