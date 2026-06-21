@@ -409,14 +409,14 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   esp_http_client_config_t client_config = {
       .url = resolvedUrl.c_str(),
       .timeout_ms = 60000,
-      // CrumBLE 4.6: 2 KB receive / 1.5 KB transmit. Larger buffer_size
-      // cascades into ota_upgrade_buf = MAX(buffer_size, ~290), so we keep
-      // receive at 2 KB to avoid the upgrade buf eating into mbedtls'
-      // working set. buffer_size_tx must hold the full GET request line --
-      // the resolved CDN URL is ~940 chars plus the GET verb + headers, so
-      // 512 B truncates with HTTP_CLIENT: Out of buffer. 1.5 KB fits with
-      // headroom; tx doesn't cascade into other allocs.
-      .buffer_size = 2048,
+      // CrumBLE 4.6: 1 KB receive / 1.5 KB transmit. We're at the heap edge
+      // -- buffer_size 2048 was flaky (worked when MaxAlloc=53KB pre-install,
+      // failed at 49KB). buffer_size_alloc cascades into ota_upgrade_buf =
+      // MAX(buffer_size, ~290), so 1KB receive + 1KB upgrade frees 2KB vs
+      // 2KB+2KB. Direct-CDN response headers fit easily in 1KB (no Set-Cookie
+      // chain). TX kept at 1.5KB to hold the long resolved URL in the GET
+      // request line.
+      .buffer_size = 1024,
       .buffer_size_tx = 1536,
       .skip_cert_common_name_check = true,
       .crt_bundle_attach = otaSkipCertVerifyAttach,
