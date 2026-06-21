@@ -575,6 +575,27 @@ void CrossPointWebServerActivity::loop() {
       lastHandleClientTime = millis();
     }
 
+    // CrumBLE 4.5.2: WS upload DONE flagged the library as needing a
+    // refresh. Wait until no upload is in progress (so an N-book upload
+    // burst triggers ONE walk, not N), then markStale + ensureWalked.
+    // The walk picks up new files AND runs populateAuthorKeysIfNeeded
+    // (which reads the WASM prebake's book.bin author or falls back to
+    // OPF peek for sideloaded EPUBs). Net result: Sort by Author works
+    // on the new book the moment it lands in Home, without the user
+    // needing to open it first.
+    if (consumePendingLibraryRefreshRequest()) {
+      // The flag was set when the last WS upload's DONE handler ran, which
+      // also sets wsUploadInProgress=false in the same callback -- so by
+      // the time we consume here, the upload has already settled. If a NEW
+      // upload sneaks in between consume and walk, the walk picks up that
+      // file too (incremental SD scan) and the next upload's DONE re-sets
+      // the flag, which we'll consume again next iteration. Safe to run
+      // the walk unconditionally.
+      LOG_INF("WEBACT", "Upload settled -- re-walking library to refresh author keys");
+      LibraryIndex::getInstance().markStale();
+      LibraryIndex::getInstance().ensureWalked();
+    }
+
     // CrumBLE 4.6 LAN-OTA: WS handler queued an install. The pending
     // firmware-pending.bin has already been size-validated; we now stop
     // serving HTTP/WS (the long blocking flash + reboot would drop those

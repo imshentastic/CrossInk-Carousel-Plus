@@ -33,6 +33,15 @@ bool peekFtRestartRequest();
 // + ESP.restart(). One-shot consume; the second call returns false.
 bool consumeFirmwareInstallRequest();
 
+// CrumBLE 4.5.2: set by the WS upload DONE handler so the FT activity
+// can trigger LibraryIndex::markStale + ensureWalked once the upload
+// burst settles. Catches newly-uploaded books in the library index
+// AND populates their author keys (from book.bin if the WASM prebake
+// ran, else from the OPF peek). Without this, the new book stays
+// unindexed until the user visits Home, and Sort by Author leaves it
+// at the back. Consumed one-shot.
+bool consumePendingLibraryRefreshRequest();
+
 // Structure to hold file information
 struct FileInfo {
   String name;

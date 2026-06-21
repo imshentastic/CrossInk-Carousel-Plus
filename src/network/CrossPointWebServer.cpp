@@ -94,6 +94,13 @@ bool g_pendingFtRestart = false;
 // browser can't trigger an arbitrary-SD-file flash.
 bool g_pendingFirmwareInstall = false;
 constexpr const char* kFirmwarePendingPath = "/.crosspoint/firmware-pending.bin";
+
+// CrumBLE 4.5.2: flipped to true by the WS upload DONE handler whenever
+// a book completes. FT activity loop consumes it (when wsUploadInProgress
+// is false, so an upload burst doesn't trigger N walks) and re-walks
+// the library so new books pick up their author keys without waiting
+// for the user to visit Home.
+bool g_pendingLibraryRefresh = false;
 }  // namespace anon
 
 bool consumeFtRestartRequest() {
@@ -107,6 +114,12 @@ bool peekFtRestartRequest() { return g_pendingFtRestart; }
 bool consumeFirmwareInstallRequest() {
   if (!g_pendingFirmwareInstall) return false;
   g_pendingFirmwareInstall = false;
+  return true;
+}
+
+bool consumePendingLibraryRefreshRequest() {
+  if (!g_pendingLibraryRefresh) return false;
+  g_pendingLibraryRefresh = false;
   return true;
 }
 
@@ -2489,6 +2502,14 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
         if (!filePath.endsWith("/")) filePath += "/";
         filePath += wsUploadFileName;
         clearBookCache(filePath.c_str());
+
+        // CrumBLE 4.5.2: signal the FT activity to re-walk the library
+        // once the upload burst settles. Picks up the new book in
+        // LibraryIndex AND populates its author key (cache-hit from the
+        // WASM prebake's book.bin if present, OPF peek otherwise) so
+        // Sort by Author works immediately rather than waiting for the
+        // user to visit Home + the lazy ensureWalked there.
+        g_pendingLibraryRefresh = true;
 
         // CrumBLE 4.4: include the device-sanitized final path in DONE so the
         // browser's chapter-prebake step doesn't have to issue an /api/files
