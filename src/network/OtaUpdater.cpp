@@ -409,11 +409,15 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   esp_http_client_config_t client_config = {
       .url = resolvedUrl.c_str(),
       .timeout_ms = 60000,
-      // GitHub's redirect headers (github.com -> objects.githubusercontent.com)
-      // need 4 KB; 1 KB truncated them with "HTTP_CLIENT: Out of buffer". TX
-      // only carries our small Range GET so 256 B is fine.
-      .buffer_size = 4096,
-      .buffer_size_tx = 1024,
+      // CrumBLE 4.6: 2 KB receive / 512 B transmit. Larger buffers cascade --
+      // esp_https_ota allocates ota_upgrade_buf = MAX(buffer_size, ~290) so
+      // 4 KB here means 4 KB upgrade buf ON TOP OF the 4 KB receive buf, and
+      // after mbedtls SSL state (~32 KB) is up the second 4 KB alloc fails
+      // with ESP_ERR_NO_MEM. Now that we go straight to the CDN (no redirect
+      // to parse), 2 KB headroom on receive is plenty for the CDN response
+      // headers.
+      .buffer_size = 2048,
+      .buffer_size_tx = 512,
       .skip_cert_common_name_check = true,
       .crt_bundle_attach = otaSkipCertVerifyAttach,
   };
