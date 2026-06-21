@@ -35,6 +35,11 @@ class Epub {
   // cache. SeriesIndex caches across sessions instead.
   std::string lastSeriesName;
   std::string lastSeriesIndex;
+  // CrumBLE 4.5.2: author captured by the cheap extractSeriesFromOpf
+  // peek (which also reads dc:creator since it's in the same metadata
+  // block). Lets the AuthorAlpha sort backfill keys for books whose
+  // full book.bin cache hasn't been built yet (never opened).
+  std::string lastAuthorPeek;
 
   void migrateLegacyCachePath(const std::string& cacheDir) const;
   bool findContentOpfFile(std::string* contentOpfFile) const;
@@ -72,6 +77,11 @@ class Epub {
   // persists into SeriesIndex.  Returns true if the OPF was readable
   // (regardless of whether series info was found).
   bool extractSeriesFromOpf();
+  // CrumBLE 4.5.2: author captured during the same extractSeriesFromOpf
+  // peek (dc:creator lives in the same metadata block). Returns the
+  // raw author string (not the sort key) -- caller normalises via
+  // LibraryIndex::lastNameLowerForKey.
+  const std::string& getLastAuthorPeek() const { return lastAuthorPeek; }
   std::string getCoverBmpPath(bool cropped = false) const;
   bool generateCoverBmp(bool cropped = false) const;
   std::string getThumbBmpPath() const;

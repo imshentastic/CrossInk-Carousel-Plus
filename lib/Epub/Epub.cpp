@@ -45,7 +45,7 @@ constexpr int kDefaultThumbHeight = 180;
 // metadata state transitions; manifest/spine/guide elements are
 // ignored entirely (no state change, no character-data dispatch).
 class SeriesOnlyOpfParser : public Print {
-  enum State { START, IN_PACKAGE, IN_METADATA, IN_SERIES_NAME, IN_SERIES_INDEX };
+  enum State { START, IN_PACKAGE, IN_METADATA, IN_SERIES_NAME, IN_SERIES_INDEX, IN_DC_CREATOR };
   XML_Parser parser = nullptr;
   State state = START;
   size_t remainingSize;
@@ -58,6 +58,16 @@ class SeriesOnlyOpfParser : public Print {
     }
     if (self->state == IN_PACKAGE && (strcmp(name, "metadata") == 0 || strcmp(name, "opf:metadata") == 0)) {
       self->state = IN_METADATA;
+      return;
+    }
+    // CrumBLE 4.5.2: also capture dc:creator so AuthorAlpha sort can fill
+    // its key cache without doing a full Epub::load + book.bin build on
+    // never-opened books. Author appears in the metadata block alongside
+    // series, so the existing </metadata> early-exit covers both.
+    if (self->state == IN_METADATA &&
+        (strcmp(name, "dc:creator") == 0 || strcmp(name, "creator") == 0)) {
+      self->state = IN_DC_CREATOR;
+      self->author.clear();
       return;
     }
     if (self->state == IN_METADATA && (strcmp(name, "meta") == 0 || strcmp(name, "opf:meta") == 0)) {
@@ -95,19 +105,36 @@ class SeriesOnlyOpfParser : public Print {
       self->state = IN_METADATA;
       return;
     }
+    if (self->state == IN_DC_CREATOR &&
+        (strcmp(name, "dc:creator") == 0 || strcmp(name, "creator") == 0)) {
+      self->state = IN_METADATA;
+      return;
+    }
     if (self->state == IN_METADATA && (strcmp(name, "metadata") == 0 || strcmp(name, "opf:metadata") == 0)) {
-      // Series tags appear early in the metadata block; stop parsing
-      // once metadata closes — the rest of the OPF (manifest, spine,
-      // guide) is irrelevant for series detection and would just burn
+      // Series + author tags appear early in the metadata block; stop
+      // parsing once metadata closes -- the rest of the OPF (manifest,
+      // spine, guide) is irrelevant for the peek and would just burn
       // CPU. Returning XML_StopParser would be cleaner but expat's
       // status code propagates and the caller would log a false error.
       self->state = START;
     }
   }
 
+  static void XMLCALL characterData(void* ud, const XML_Char* s, int len) {
+    auto* self = static_cast<SeriesOnlyOpfParser*>(ud);
+    if (self->state == IN_DC_CREATOR) {
+      self->author.append(s, len);
+    } else if (self->state == IN_SERIES_NAME) {
+      self->seriesName.append(s, len);
+    } else if (self->state == IN_SERIES_INDEX) {
+      self->seriesIndex.append(s, len);
+    }
+  }
+
  public:
   std::string seriesName;
   std::string seriesIndex;
+  std::string author;
 
   explicit SeriesOnlyOpfParser(size_t xmlSize) : remainingSize(xmlSize) {}
   ~SeriesOnlyOpfParser() override {
@@ -118,6 +145,7 @@ class SeriesOnlyOpfParser : public Print {
     if (!parser) return false;
     XML_SetUserData(parser, this);
     XML_SetElementHandler(parser, startElement, endElement);
+    XML_SetCharacterDataHandler(parser, characterData);
     return true;
   }
   size_t write(uint8_t b) override { return write(&b, 1); }
@@ -612,9 +640,12 @@ bool Epub::extractSeriesFromOpf() {
   if (!parser.setup()) return false;
   if (!readItemContentsToStream(contentOpfFilePath, parser, 1024)) return false;
   // Save into the instance fields the caller will read via the
-  // existing getSeriesName/getSeriesIndex accessors.
+  // existing getSeriesName/getSeriesIndex accessors. CrumBLE 4.5.2:
+  // also stash author so AuthorAlpha sort can backfill its key cache
+  // without a separate OPF parse pass.
   lastSeriesName = parser.seriesName;
   lastSeriesIndex = parser.seriesIndex;
+  lastAuthorPeek = parser.author;
   // Strip leading/trailing whitespace that EPUB 3 belongs-to-collection
   // text bodies often carry due to pretty-printed XML.
   auto trim = [](std::string& s) {
@@ -628,6 +659,7 @@ bool Epub::extractSeriesFromOpf() {
   };
   trim(lastSeriesName);
   trim(lastSeriesIndex);
+  trim(lastAuthorPeek);
   return true;
 }
 

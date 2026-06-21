@@ -614,21 +614,29 @@ void LibraryIndex::setAuthorFromRaw(const std::string& path, const std::string& 
 }
 
 void LibraryIndex::populateAuthorKeysIfNeeded() {
-  // CrumBLE 4.2.1 hotfix: for any entry whose author key is still empty
-  // (typical right after a v1 -> v2 upgrade, or after a new book is added by
-  // a rescan), open the book's metadata cache and extract the author. We
-  // intentionally avoid Epub::load(buildIfMissing=true) so an uncached EPUB
-  // does NOT trigger a full content.opf rebuild here -- that would block
-  // begin() for minutes on first boot after upgrade. Books without a cached
-  // book.bin (never opened by the reader) keep an empty key and stay
-  // sorted to the end of AuthorAlpha until the user opens them once.
+  // CrumBLE 4.5.2: two-pass fill so the AuthorAlpha sort works for books
+  // the user has NEVER opened. The original 4.2.1 path only handled books
+  // whose book.bin cache existed (Epub::load(buildIfMissing=false)); never-
+  // opened books stayed empty and clustered at the end of the sort, making
+  // the feature appear broken on fresh libraries.
   //
-  // Heap-aware: pre-flight per book at 30 KB maxAllocHeap (matches the
-  // v4.2.1 AuthorAlpha sort fix) and yield every 8 books so we don't trip
-  // the IDLE WDT on large libraries. Saves the index once at the end.
+  //   Pass 1 (cheap path): if book.bin exists, read the cached author --
+  //   ~milliseconds, no zip open. Same as the 4.2.1 hotfix.
+  //
+  //   Pass 2 (fallback): for books WITHOUT a cache, extractSeriesFromOpf()
+  //   peeks just container.xml + content.opf (no spine/CSS/manifest build).
+  //   ~50-100 ms per book, ~10-15 KB transient heap -- cheap enough to fit
+  //   under chronic-low-heap conditions where the full load() would OOM.
+  //   Author lands in epub.getLastAuthorPeek() alongside the series fields.
+  //
+  // Heap-aware: per-book pre-flight at 15 KB maxAllocHeap (was 30 KB --
+  // halved because the peek path is much lighter than full load). Yields
+  // every 8 books to feed the IDLE WDT on large libraries.
   constexpr size_t kYieldEvery = 8;
-  constexpr uint32_t kPopulateMinMaxAlloc = 30 * 1024;
+  constexpr uint32_t kPopulateMinMaxAlloc = 15 * 1024;
   size_t populated = 0;
+  size_t peeked = 0;
+  size_t skippedHeap = 0;
   for (size_t i = 0; i < entries.size(); ++i) {
     LibraryEntry& e = entries[i];
     // Already cached -> skip (this is what makes the method cheap on warm
@@ -638,28 +646,41 @@ void LibraryIndex::populateAuthorKeysIfNeeded() {
     if (!FsHelpers::hasEpubExtension(path)) continue;  // only EPUBs have author metadata here
 
     if (ESP.getMaxAllocHeap() < kPopulateMinMaxAlloc) {
-      LOG_INF("LIB",
-              "populateAuthorKeysIfNeeded: stopping at %zu/%zu (maxAlloc=%u below %u) -- retry on next walk",
-              i, entries.size(), ESP.getMaxAllocHeap(), static_cast<unsigned>(kPopulateMinMaxAlloc));
+      skippedHeap++;
+      if (skippedHeap == 1) {
+        LOG_INF("LIB",
+                "populateAuthorKeysIfNeeded: heap-skipped at %zu/%zu (maxAlloc=%u below %u) -- retry on next walk",
+                i, entries.size(), ESP.getMaxAllocHeap(), static_cast<unsigned>(kPopulateMinMaxAlloc));
+      }
       break;
     }
+    std::string raw;
     {
       Epub epub(path, "/.crosspoint");
-      // buildIfMissing=false: skip books with no cached metadata.
-      // skipLoadingCss=true: we only need the author string.
+      // Pass 1: cheap cache hit.
       if (epub.load(/*buildIfMissing=*/false, /*skipLoadingCss=*/true)) {
-        const std::string key = lastNameLowerForKey(epub.getAuthor());
-        if (!key.empty()) {
-          e.authorKeyOffset = appendAuthorKey(std::string_view{key});
-          populated++;
-        }
+        raw = epub.getAuthor();
+      } else if (epub.extractSeriesFromOpf()) {
+        // Pass 2: cache miss -- peek the OPF directly. ~50-100 ms.
+        raw = epub.getLastAuthorPeek();
+        peeked++;
       }
     }  // Force Epub dtor before the yield so freed allocations are visible
        // to the heap consolidator on the next tick.
+    if (!raw.empty()) {
+      const std::string key = lastNameLowerForKey(raw);
+      if (!key.empty()) {
+        e.authorKeyOffset = appendAuthorKey(std::string_view{key});
+        populated++;
+      }
+    }
     if ((i & (kYieldEvery - 1)) == 0) vTaskDelay(1);
   }
   if (populated > 0) {
-    LOG_INF("LIB", "populateAuthorKeysIfNeeded: cached %zu new author key(s), saving index", populated);
+    LOG_INF("LIB", "populateAuthorKeysIfNeeded: cached %zu key(s) (%zu via OPF peek), saving index",
+            populated, peeked);
     saveToFile();
+  } else {
+    LOG_DBG("LIB", "populateAuthorKeysIfNeeded: 0 new keys (peeked=%zu heap-skipped=%zu)", peeked, skippedHeap);
   }
 }
