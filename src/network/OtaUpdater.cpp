@@ -366,18 +366,26 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   // a redirect and the panicking code path is skipped.
   std::string resolvedUrl = otaUrl;
   {
+    // Probe config: minimal -- the GET-method version with 4 KB buffer panicked
+    // in esp_http_client_init (the HEAD/1KB combo from prior build did not).
+    // Keep HEAD; capture the Location via an event handler instead of
+    // get_header so we don't need a big buffer to retain headers post-perform.
     esp_http_client_config_t redirect_cfg = {
         .url = otaUrl.c_str(),
-        .method = HTTP_METHOD_GET,  // GET (with disable_auto_redirect) so the
-                                    // header parser processes the 302 response
-                                    // fully; HEAD on some IDF builds skips
-                                    // the header-store step.
+        .method = HTTP_METHOD_HEAD,
+        .event_handler = [](esp_http_client_event_t* ev) -> esp_err_t {
+          if (ev->event_id == HTTP_EVENT_ON_HEADER && ev->header_key &&
+              strcasecmp(ev->header_key, "Location") == 0 && ev->header_value && ev->user_data) {
+            *static_cast<std::string*>(ev->user_data) = ev->header_value;
+          }
+          return ESP_OK;
+        },
         .timeout_ms = 10000,
         .disable_auto_redirect = true,
         .max_redirection_count = 0,
-        .buffer_size = 4096,        // GitHub's 302 response carries ~2-3 KB of
-                                    // headers (Set-Cookie + the long Location).
-        .buffer_size_tx = 1024,
+        .buffer_size = 1024,
+        .buffer_size_tx = 256,
+        .user_data = &resolvedUrl,
         .skip_cert_common_name_check = true,
         .crt_bundle_attach = otaSkipCertVerifyAttach,
     };
@@ -385,17 +393,11 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
     if (rh) {
       const esp_err_t rerr = esp_http_client_perform(rh);
       const int code = esp_http_client_get_status_code(rh);
-      LOG_INF("OTA", "Redirect probe: err=%s status=%d", esp_err_to_name(rerr), code);
-      char* loc = nullptr;
-      const esp_err_t herr = esp_http_client_get_header(rh, "Location", &loc);
-      LOG_INF("OTA", "Redirect probe: Location-header err=%s ptr=%s len=%u", esp_err_to_name(herr),
-              loc ? (loc[0] ? "non-empty" : "empty") : "null",
-              static_cast<unsigned>(loc ? strlen(loc) : 0));
-      if (rerr == ESP_OK && (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) && herr == ESP_OK &&
-          loc && loc[0] != '\0') {
-        resolvedUrl = loc;
-        LOG_INF("OTA", "Resolved redirect: %u chars first40=%.40s", static_cast<unsigned>(resolvedUrl.size()),
-                resolvedUrl.c_str());
+      const bool resolved = (resolvedUrl != otaUrl);
+      LOG_INF("OTA", "Redirect probe: err=%s status=%d resolved=%s len=%u", esp_err_to_name(rerr), code,
+              resolved ? "yes" : "no", static_cast<unsigned>(resolvedUrl.size()));
+      if (resolved) {
+        LOG_INF("OTA", "Resolved redirect first60=%.60s", resolvedUrl.c_str());
       }
       esp_http_client_cleanup(rh);
     }
