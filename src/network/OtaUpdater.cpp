@@ -455,6 +455,8 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
   int lastReportedPct = -1;
   unsigned long lastPerformLog = millis();
   size_t lastLoggedSize = 0;
+  unsigned long performBusyUs = 0;     // cumulative time inside perform()
+  unsigned long performCallCount = 0;  // perform() invocations this window
   do {
     if (isCancellationRequested()) {
       LOG_INF("OTA", "Update cancelled");
@@ -462,15 +464,25 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
       return CANCELLED_ERROR;
     }
 
+    const unsigned long performStart = micros();
     esp_err = esp_https_ota_perform(ota_handle);
+    performBusyUs += micros() - performStart;
+    performCallCount++;
     processedSize = esp_https_ota_get_image_len_read(ota_handle);
     // Every 3s, log perform status so we can see the download moving (or not).
     if (millis() - lastPerformLog > 3000) {
-      LOG_INF("OTA", "Perform tick: err=%s processed=%u delta=%u free=%u maxAlloc=%u", esp_err_to_name(esp_err),
-              static_cast<unsigned>(processedSize), static_cast<unsigned>(processedSize - lastLoggedSize),
-              ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      const unsigned long elapsedMs = millis() - lastPerformLog;
+      const unsigned avgCallUs = performCallCount > 0 ? performBusyUs / performCallCount : 0;
+      const unsigned busyPct = elapsedMs > 0 ? (performBusyUs / 1000) * 100 / elapsedMs : 0;
+      LOG_INF("OTA",
+              "Perform tick: err=%s processed=%u delta=%u free=%u maxAlloc=%u calls=%lu avg=%uus busy=%u%%",
+              esp_err_to_name(esp_err), static_cast<unsigned>(processedSize),
+              static_cast<unsigned>(processedSize - lastLoggedSize), ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
+              performCallCount, avgCallUs, busyPct);
       lastPerformLog = millis();
       lastLoggedSize = processedSize;
+      performBusyUs = 0;
+      performCallCount = 0;
     }
     // Fire the callback only on whole-percent change. Without this it fired
     // every ~100ms perform iteration, waking the render task whose framebuffer
