@@ -483,13 +483,14 @@ OtaUpdater::OtaUpdaterError OtaUpdater::installUpdate(ProgressCallback onProgres
         onProgress(ctx);
       }
     }
-    // CrumBLE 4.6: yield once per iteration (1 ms) instead of delay(100). The
-    // 100ms throttled throughput to ~300 B/s on tight-heap installs because
-    // each perform call only reads a small TLS record before mbedtls blocks
-    // on socket. Letting the perform loop spin as fast as possible (with a
-    // single FreeRTOS scheduler tick) lets the limited-buffer mbedtls drain
-    // packets the second they arrive instead of sleeping past them.
-    vTaskDelay(pdMS_TO_TICKS(1));
+    // CrumBLE 4.6: no explicit yield. pdMS_TO_TICKS(1) rounded UP to one
+    // 10ms tick at the default 100Hz FreeRTOS rate -- capping us at ~100
+    // perform calls/sec and 1-5 KB/s actual throughput. perform() calls
+    // mbedtls_ssl_read -> recv() which blocks on the socket; LWIP/WiFi
+    // run during that block. Back-to-back perform calls when data is
+    // already buffered are fine on the single-core C3 -- there's nothing
+    // time-critical to preempt during a silent-restart OTA install (loop
+    // task watchdog is disabled, BT is off, Bookshelf isn't loaded).
   } while (esp_err == ESP_ERR_HTTPS_OTA_IN_PROGRESS);
 
   if (isCancellationRequested()) {
