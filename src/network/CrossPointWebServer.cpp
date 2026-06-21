@@ -687,7 +687,10 @@ void CrossPointWebServer::handleStatus() const {
   // CrumBLE: "version" is the CrumBLE marketing version (4.0, 4.1, ...)
   // shown on HomePage's Device Status. Upstream CrossInk's sync point
   // ships as a separate field for technical context.
-  doc["version"] = "CrumBLE " CRUMBLE_VERSION " (CrossInk " CROSSINK_VERSION ")";
+  // CrumBLE 4.5: dropped the "(CrossInk X.Y.Z-tiny-bitter)" suffix from the
+  // FT-page display string. The LAN-OTA version check parses "CrumBLE X.Y.Z"
+  // out of this value -- shortening it doesn't break that regex.
+  doc["version"] = "CrumBLE " CRUMBLE_VERSION;
   doc["ip"] = ipAddr;
   doc["mode"] = apMode ? "AP" : "STA";
   doc["rssi"] = apMode ? 0 : WiFi.RSSI();

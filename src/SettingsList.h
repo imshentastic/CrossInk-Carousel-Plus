@@ -414,14 +414,12 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
     // the BookshelfPicker's "Title Placement" row, not in Settings UI.
     add(SettingInfo::Enum(StrId::STR_BOOKSHELF_TITLE_PLACEMENT, &CrossPointSettings::bookshelfTitlePlacement,
                           {StrId::STR_PLACEMENT_BOTTOM, StrId::STR_PLACEMENT_TOP}, "bookshelfTitlePlacement"));
-    // CrumBLE 4.6: tone curve applied to cover thumbs when the firmware
-    // regenerates them. Off = identity (existing thumbs unchanged); Mild =
-    // gentle gamma lift; Strong = compress range + sigmoid contrast. New
-    // thumbs from this point on use the selected curve; existing thumbs need
-    // the "Regenerate All Covers" action or the per-book Retry to refresh.
-    add(SettingInfo::Enum(StrId::STR_COVER_TONE, &CrossPointSettings::coverToneCurve,
-                          {StrId::STR_COVER_TONE_OFF, StrId::STR_COVER_TONE_MILD, StrId::STR_COVER_TONE_STRONG},
-                          "coverToneCurve", StrId::STR_CAT_DISPLAY));
+    // CrumBLE 4.6: Cover Tone setting disabled before 4.5.0 ship -- range
+    // compression LUTs (Mild=30..225, Strong=60..200) produced no perceptible
+    // difference on 1-bit Atkinson dither at thumbnail sizes during testing.
+    // Setting field + ToneCurve LUT module + converter coverTone params stay
+    // (dead code) so re-enabling is just uncommenting this Enum registration
+    // and the per-tick poll in main.cpp.
     add(SettingInfo::Toggle(StrId::STR_SUNLIGHT_FADING_FIX, &CrossPointSettings::fadingFix, "fadingFix",
                             StrId::STR_CAT_DISPLAY));
 

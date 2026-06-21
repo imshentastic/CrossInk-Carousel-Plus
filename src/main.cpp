@@ -1769,9 +1769,11 @@ void loop() {
 
   renderer.setFadingFix(SETTINGS.fadingFix);
   renderer.setTextDarkness(SETTINGS.textDarkness);
-  // Poll per-tick so a Settings change takes effect before the next cover render
-  // without needing a reboot.
-  Epub::setCoverToneCurve(SETTINGS.coverToneCurve);
+  // CrumBLE 4.6: Cover Tone Curve disabled before 4.5.0 ship -- per-tick
+  // poll commented out so the converter coverTone defaults to 0 (Off /
+  // identity) regardless of stale coverToneCurve in user settings.json.
+  // Re-enable alongside the SettingsList.h Enum registration.
+  // Epub::setCoverToneCurve(SETTINGS.coverToneCurve);
 
   if (Serial && millis() - lastMemPrint >= 10000) {
     LOG_INF("MEM", "Free: %d bytes, Total: %d bytes, Min Free: %d bytes, MaxAlloc: %d bytes", ESP.getFreeHeap(),

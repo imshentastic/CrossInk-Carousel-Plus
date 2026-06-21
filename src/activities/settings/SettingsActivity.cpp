@@ -69,7 +69,11 @@ bool isVersionBreakChar(const char c) { return c == ' ' || c == '-' || c == '+' 
 
 void drawSystemVersionFooter(const GfxRenderer& renderer, const int pageWidth, const int pageHeight,
                              const ThemeMetrics& metrics) {
-  static constexpr const char* versionLabel = "CrumBLE " CRUMBLE_VERSION " (CrossInk " CROSSINK_VERSION ")";
+  // CrumBLE 4.5: dropped the "(CrossInk X.Y.Z-tiny-bitter)" upstream-sync
+  // suffix from the user-visible System footer. CROSSINK_VERSION stays in
+  // the User-Agent header for OTA / bug-report correlation, just not shown
+  // to end users.
+  static constexpr const char* versionLabel = "CrumBLE " CRUMBLE_VERSION;
   const std::string label = versionLabel;
   const int maxWidth = pageWidth - systemVersionFooterSideMargin * 2;
   const int bottomLineY =
@@ -174,14 +178,11 @@ void SettingsActivity::rebuildSettingsLists() {
   pushByName(displayGeneral, allSettings, StrId::STR_HIDE_BATTERY);
   pushByName(displayGeneral, allSettings, StrId::STR_REFRESH_FREQ);
   pushByName(displayGeneral, allSettings, StrId::STR_SUNLIGHT_FADING_FIX);
-  pushByName(displayGeneral, allSettings, StrId::STR_COVER_TONE);
-  // CrumBLE 4.6: cover maintenance actions live with Cover Tone -- same
-  // feature area. Retry Failed Covers re-attempts books whose cover gen
-  // previously failed (sweeps thumb_failed_v3_*.marker). Regenerate All
-  // Covers nukes every thumb_<W>x<H>.bmp so they re-render with the
-  // current Cover Tone curve on next bookshelf render.
+  // CrumBLE 4.6: Cover Tone setting + Regenerate All Covers action both
+  // pulled before 4.5.0 ship -- the LUTs produced no perceptible difference
+  // on 1-bit dither during testing. Retry Failed Covers stays since it's
+  // useful on its own (re-attempts books with failed cover gen).
   displayGeneral.push_back(SettingInfo::Action(StrId::STR_RETRY_FAILED_COVERS, SettingAction::RetryFailedCovers));
-  displayGeneral.push_back(SettingInfo::Action(StrId::STR_REGENERATE_COVERS, SettingAction::RegenerateAllCovers));
 
   std::vector<SettingInfo> displayChildren;
   displayChildren.push_back(SettingInfo::Submenu(StrId::STR_SLEEP_SCREEN, std::move(displaySleepScreen)));
