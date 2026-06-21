@@ -172,6 +172,14 @@ void SettingsActivity::rebuildSettingsLists() {
   pushByName(displayGeneral, allSettings, StrId::STR_HIDE_BATTERY);
   pushByName(displayGeneral, allSettings, StrId::STR_REFRESH_FREQ);
   pushByName(displayGeneral, allSettings, StrId::STR_SUNLIGHT_FADING_FIX);
+  pushByName(displayGeneral, allSettings, StrId::STR_COVER_TONE);
+  // CrumBLE 4.6: cover maintenance actions live with Cover Tone -- same
+  // feature area. Retry Failed Covers re-attempts books whose cover gen
+  // previously failed (sweeps thumb_failed_v3_*.marker). Regenerate All
+  // Covers nukes every thumb_<W>x<H>.bmp so they re-render with the
+  // current Cover Tone curve on next bookshelf render.
+  displayGeneral.push_back(SettingInfo::Action(StrId::STR_RETRY_FAILED_COVERS, SettingAction::RetryFailedCovers));
+  displayGeneral.push_back(SettingInfo::Action(StrId::STR_REGENERATE_COVERS, SettingAction::RegenerateAllCovers));
 
   std::vector<SettingInfo> displayChildren;
   displayChildren.push_back(SettingInfo::Submenu(StrId::STR_SLEEP_SCREEN, std::move(displaySleepScreen)));
@@ -272,16 +280,6 @@ void SettingsActivity::rebuildSettingsLists() {
   systemChildren.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
   systemChildren.push_back(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate));
   systemChildren.push_back(SettingInfo::Action(StrId::STR_CLEAR_READING_CACHE, SettingAction::ClearCache));
-  // CrumBLE 4.4: manual retry for books whose cover gen previously failed
-  // (most commonly the EOCD-scan-too-small bug fixed in 4.4). Sweeps
-  // thumb_failed_v3_*.marker files so the bookshelf re-attempts on next
-  // visit.
-  systemChildren.push_back(SettingInfo::Action(StrId::STR_RETRY_FAILED_COVERS, SettingAction::RetryFailedCovers));
-  // CrumBLE 4.6: applies the current Cover Tone curve to existing books by
-  // deleting every cached thumb_<W>x<H>.bmp; the bookshelf regenerates them
-  // on next render using the device-side converter (which now honours
-  // SETTINGS.coverToneCurve via Epub::setCoverToneCurve).
-  systemChildren.push_back(SettingInfo::Action(StrId::STR_REGENERATE_COVERS, SettingAction::RegenerateAllCovers));
 
   rootSettings_.push_back(SettingInfo::Submenu(StrId::STR_CAT_SYSTEM, std::move(systemChildren)));
 }

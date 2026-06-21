@@ -1606,34 +1606,36 @@
   </style>
 </head>
 <body>
-<h1 class="crossink-header">CrumBLE</h1>
+<div style="display:flex; align-items:flex-end; justify-content:space-between; gap:16px; flex-wrap:wrap; border-bottom: 2px solid var(--accent-color); padding-bottom: 10px;">
+  <h1 class="crossink-header" style="border:none; padding:0; margin:0;">CrumBLE</h1>
+  <a id="update-notice" href="#" style="display:none; background:#2f8a5b; color:white; padding:10px 20px; border-radius:8px; text-decoration:none; font-size:1.05em; font-weight:600; box-shadow:0 2px 8px rgba(47,138,91,0.4);">
+    &#9650; Click to update v<span id="update-notice-version"></span>
+  </a>
+</div>
 
-<div class="nav-links" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+<div class="nav-links">
   <a href="/">Home</a>
   <a href="/files" class="active">File Manager</a>
   <a href="/settings">Settings</a>
   <a href="/fonts">Fonts</a>
-  <a id="update-notice" href="#" style="display:none; background:#3a8c5f; color:white; padding:4px 10px; border-radius:12px; text-decoration:none; font-size:0.8em; font-weight:500;">
-    &#9650; Update v<span id="update-notice-version"></span>
-  </a>
 </div>
 
-<div id="update-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:100; align-items:center; justify-content:center; padding:20px;">
-  <div style="background:white; border-radius:8px; padding:24px; max-width:480px; width:100%; box-shadow:0 8px 32px rgba(0,0,0,0.2);">
-    <h2 style="margin-top:0; margin-bottom:4px;">Update firmware to v<span id="modal-version"></span></h2>
-    <p style="color:#777; font-size:0.9em; margin-top:0;">Your browser can't download from GitHub directly (CORS), so this takes two clicks:</p>
-    <ol style="padding-left:20px; line-height:1.8;">
-      <li>Click to download: <a id="modal-download-link" href="" target="_blank" download style="color:#3a8c5f;">firmware.bin</a></li>
-      <li>Select the downloaded file: <input type="file" id="modal-file-input" accept=".bin" style="display:block; margin-top:6px;"></li>
+<div id="update-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:100; align-items:center; justify-content:center; padding:20px;">
+  <div style="background:#ffffff; color:#1a1a1a; border-radius:8px; padding:24px; max-width:480px; width:100%; box-shadow:0 8px 32px rgba(0,0,0,0.4);">
+    <h2 style="margin-top:0; margin-bottom:4px; color:#1a1a1a; font-size:1.4em;">Update firmware to v<span id="modal-version"></span></h2>
+    <p style="color:#555; font-size:0.9em; margin-top:0;">Your browser can't download from GitHub directly (CORS), so this takes two clicks:</p>
+    <ol style="padding-left:20px; line-height:1.8; color:#1a1a1a;">
+      <li>Click to download: <a id="modal-download-link" href="" target="_blank" download style="color:#1f6b45; font-weight:600;">firmware.bin</a></li>
+      <li>Select the downloaded file: <input type="file" id="modal-file-input" accept=".bin" style="display:block; margin-top:6px; color:#1a1a1a;"></li>
     </ol>
     <div id="modal-progress-wrap" style="display:none; margin-top:16px;">
-      <div style="height:8px; background:#e4e8ec; border-radius:4px; overflow:hidden;">
-        <div id="modal-progress-bar" style="height:100%; width:0%; background:#3a8c5f; transition:width 200ms ease;"></div>
+      <div style="height:10px; background:#e4e8ec; border-radius:5px; overflow:hidden;">
+        <div id="modal-progress-bar" style="height:100%; width:0%; background:#2f8a5b; transition:width 200ms ease;"></div>
       </div>
-      <p id="modal-status" style="font-size:0.85em; color:#777; margin:6px 0 0;">0%</p>
+      <p id="modal-status" style="font-size:0.9em; color:#333; margin:8px 0 0;">0%</p>
     </div>
     <div style="text-align:right; margin-top:20px;">
-      <button id="modal-cancel" style="padding:8px 16px; font-size:0.9em; cursor:pointer;">Close</button>
+      <button id="modal-cancel" style="padding:8px 16px; font-size:0.9em; cursor:pointer; background:#eaeaea; color:#1a1a1a; border:1px solid #c8c8c8; border-radius:4px;">Close</button>
     </div>
   </div>
 </div>
@@ -4354,15 +4356,33 @@ function retryAllFailedUploads() {
     if (file.size < 65536) { document.getElementById('modal-status').textContent = 'File too small (' + file.size + ' bytes). Did you select the right .bin?'; return; }
     try {
       lanotaSetProgress(0, 'Uploading ' + (file.size / 1024 / 1024).toFixed(2) + ' MB to device...');
-      await lanotaUploadWs(file, (sent, total) => {
-        lanotaSetProgress(sent / total * 100, 'Uploading: ' + (sent / 1024 / 1024).toFixed(2) + ' / ' + (total / 1024 / 1024).toFixed(2) + ' MB');
-      });
+      // Auto-retry on WS drop. Server-side RESUME means each retry picks up
+      // from the last successfully-received byte, no progress lost.
+      const MAX_ATTEMPTS = 8;
+      let lastErr;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          await lanotaUploadWs(file, (sent, total) => {
+            lanotaSetProgress(sent / total * 100,
+              'Uploading: ' + (sent / 1024 / 1024).toFixed(2) + ' / ' + (total / 1024 / 1024).toFixed(2) + ' MB' +
+              (attempt > 1 ? ' (attempt ' + attempt + ')' : ''));
+          });
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+          if (attempt >= MAX_ATTEMPTS) break;
+          document.getElementById('modal-status').textContent = 'Connection dropped (' + e.message + '). Auto-retrying in 2s... (attempt ' + (attempt + 1) + '/' + MAX_ATTEMPTS + ')';
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      }
+      if (lastErr) throw lastErr;
       lanotaSetProgress(100, 'Upload complete. Asking device to install...');
       await lanotaSendInstall();
       lanotaSetProgress(100, 'Installing... device will restart in about 1 minute. This page will reload when v' + latestVersion + ' is detected.');
       lanotaPollReboot(latestVersion);
     } catch (e) {
-      document.getElementById('modal-status').textContent = 'Update failed: ' + e.message;
+      document.getElementById('modal-status').textContent = 'Update failed after retries: ' + e.message;
     }
   }
 

@@ -421,7 +421,7 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
     // the "Regenerate All Covers" action or the per-book Retry to refresh.
     add(SettingInfo::Enum(StrId::STR_COVER_TONE, &CrossPointSettings::coverToneCurve,
                           {StrId::STR_COVER_TONE_OFF, StrId::STR_COVER_TONE_MILD, StrId::STR_COVER_TONE_STRONG},
-                          "coverToneCurve", StrId::STR_CAT_SYSTEM));
+                          "coverToneCurve", StrId::STR_CAT_DISPLAY));
     add(SettingInfo::Toggle(StrId::STR_SUNLIGHT_FADING_FIX, &CrossPointSettings::fadingFix, "fadingFix",
                             StrId::STR_CAT_DISPLAY));
 

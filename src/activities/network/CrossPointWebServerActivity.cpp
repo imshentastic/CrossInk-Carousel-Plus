@@ -584,6 +584,24 @@ void CrossPointWebServerActivity::loop() {
     // file and surface an alert + fall back to FT.
     if (consumeFirmwareInstallRequest()) {
       LOG_INF("WEBACT", "LAN-OTA install requested -- stopping servers and flashing");
+      // Render device-side "Installing firmware..." screen so the user sees
+      // something on the e-ink during the ~30-60s blocking flash. E-ink
+      // holds the image without further updates, so a one-shot render
+      // before flashFromSdPath is enough.
+      {
+        const auto& metrics = UITheme::getInstance().getMetrics();
+        const auto pageWidth = renderer.getScreenWidth();
+        const auto pageHeight = renderer.getScreenHeight();
+        renderer.clearScreen();
+        GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight},
+                       "Installing Firmware", nullptr);
+        const auto h10 = renderer.getLineHeight(UI_10_FONT_ID);
+        const auto centerY = pageHeight / 2;
+        renderer.drawCenteredText(UI_10_FONT_ID, centerY - h10, "Writing new firmware to flash...");
+        renderer.drawCenteredText(UI_10_FONT_ID, centerY + h10 / 2, "Device will restart automatically.");
+        renderer.drawCenteredText(UI_10_FONT_ID, centerY + h10 * 2, "Do not unplug.");
+        renderer.displayBuffer();
+      }
       // Give the WS server a beat to flush the INSTALL_QUEUED reply we just
       // sent before we tear down sockets -- otherwise the frontend never
       // sees the ack and hangs waiting for it.
