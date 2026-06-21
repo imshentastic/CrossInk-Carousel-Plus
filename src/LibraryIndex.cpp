@@ -168,6 +168,24 @@ bool LibraryIndex::isBookPath(const std::string& path) {
   for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   // Firmware diagnostics — crash dump written by the panic handler.
   if (lower == "crash_report.txt") return false;
+  // CrumBLE 4.5.1: a community report described All Books surfacing
+  // "unknown files" -- the .txt / .md filter is intentionally permissive
+  // for users who DO want plain-text books, but it also picks up the
+  // README / LICENSE / etc. files that publishers commonly ship inside
+  // book folders. Drop the most common non-book filenames by stem
+  // (basename without extension) so they don't masquerade as books.
+  // Match by exact stem to keep "my-readme.txt" as a user's actual note.
+  const size_t lastDot = lower.find_last_of('.');
+  const std::string stem = (lastDot != std::string::npos) ? lower.substr(0, lastDot) : lower;
+  static constexpr const char* kNonBookStems[] = {
+      "readme",  "read_me",   "read me",      "license",   "licence",      "copying",
+      "copyright", "changelog", "change_log",  "changes",   "history",      "install",
+      "installation", "instructions",          "notice",    "notices",      "contributing",
+      "contributors", "authors",  "credits",   "todo",      "version",      "manifest",
+  };
+  for (const char* nb : kNonBookStems) {
+    if (stem == nb) return false;
+  }
   // Reserved for future system files. Extend rather than scatter checks
   // throughout the walker.
   return true;
