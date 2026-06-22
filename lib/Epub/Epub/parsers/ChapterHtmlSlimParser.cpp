@@ -49,6 +49,32 @@ static constexpr const char* const SKIP_TAGS[] = {"head"};
 
 bool isWhitespace(const char c) { return c == ' ' || c == '\r' || c == '\n' || c == '\t'; }
 
+// CrumBLE 4.5.3 CJK: identifies Unicode codepoints that should be emitted
+// as standalone word tokens by the parser, so the existing word-based
+// line-breaker wraps at every CJK character (matching standard typography).
+// Without this, paragraphs without ASCII whitespace -- the norm for
+// Chinese / Japanese / Korean -- hit only the MAX_WORD_SIZE-driven flush
+// and wrap at ~64-char chunks instead of per-character.
+//
+// Ranges follow aBER0724/crosspoint-reader-cjk:
+//   U+3000..303F   CJK Punctuation
+//   U+3040..309F   Hiragana
+//   U+30A0..30FF   Katakana
+//   U+3400..4DBF   CJK Unified Ideographs Extension A
+//   U+4E00..9FFF   CJK Unified Ideographs (the big block)
+//   U+F900..FAFF   CJK Compatibility Ideographs
+//   U+FF00..FFEF   Fullwidth Forms (includes fullwidth ASCII + Halfwidth Katakana)
+bool isCjkCodepointForSplit(const uint32_t cp) {
+  if (cp >= 0x4E00 && cp <= 0x9FFF) return true;
+  if (cp >= 0x3400 && cp <= 0x4DBF) return true;
+  if (cp >= 0x3000 && cp <= 0x303F) return true;
+  if (cp >= 0x3040 && cp <= 0x309F) return true;
+  if (cp >= 0x30A0 && cp <= 0x30FF) return true;
+  if (cp >= 0xF900 && cp <= 0xFAFF) return true;
+  if (cp >= 0xFF00 && cp <= 0xFFEF) return true;
+  return false;
+}
+
 bool matches(const char* tag_name, const char* const* possible_tags, size_t count) {
   for (size_t i = 0; i < count; i++) {
     if (strcmp(tag_name, possible_tags[i]) == 0) {
@@ -1627,6 +1653,64 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
 
       i += 2;  // Skip the remaining two bytes (0x80 0xAF)
       continue;
+    }
+
+    // CrumBLE 4.5.3 CJK: detect Han / kana / fullwidth codepoints and emit
+    // each as its own word token. The smart-quote / em-dash substitution
+    // below covers U+2010..2027 (Latin range, not CJK) so they don't
+    // collide. Fullwidth ASCII variants (U+FF01..FF5E) DO fall in the CJK
+    // range and are intentionally kept as-is here so they render with the
+    // CJK font's glyph instead of being ASCII-substituted (only relevant
+    // when reading a mixed CJK book).
+    {
+      const unsigned char b0 = static_cast<unsigned char>(s[i]);
+      int charLen = 0;
+      if ((b0 & 0x80) == 0) charLen = 1;
+      else if ((b0 & 0xE0) == 0xC0) charLen = 2;
+      else if ((b0 & 0xF0) == 0xE0) charLen = 3;
+      else if ((b0 & 0xF8) == 0xF0) charLen = 4;
+      if (charLen >= 2 && i + charLen <= len) {
+        uint32_t cp = 0;
+        if (charLen == 2) {
+          cp = (static_cast<uint32_t>(b0 & 0x1F) << 6) |
+               (static_cast<uint32_t>(static_cast<unsigned char>(s[i + 1])) & 0x3Fu);
+        } else if (charLen == 3) {
+          cp = (static_cast<uint32_t>(b0 & 0x0F) << 12) |
+               ((static_cast<uint32_t>(static_cast<unsigned char>(s[i + 1])) & 0x3Fu) << 6) |
+               (static_cast<uint32_t>(static_cast<unsigned char>(s[i + 2])) & 0x3Fu);
+        } else {
+          cp = (static_cast<uint32_t>(b0 & 0x07) << 18) |
+               ((static_cast<uint32_t>(static_cast<unsigned char>(s[i + 1])) & 0x3Fu) << 12) |
+               ((static_cast<uint32_t>(static_cast<unsigned char>(s[i + 2])) & 0x3Fu) << 6) |
+               (static_cast<uint32_t>(static_cast<unsigned char>(s[i + 3])) & 0x3Fu);
+        }
+        // Ideographic space (U+3000) is a real word boundary -- same shape
+        // as the ASCII whitespace branch above.
+        if (cp == 0x3000) {
+          if (self->partWordBufferIndex > 0) {
+            self->flushPartWordBuffer();
+          }
+          self->nextWordContinues = false;
+          i += charLen - 1;  // outer i++ consumes the last byte
+          continue;
+        }
+        if (isCjkCodepointForSplit(cp)) {
+          // Flush any buffered Latin (mixed-run case), then emit this CJK
+          // char through partWordBuffer + flushPartWordBuffer so the
+          // active CSS font style (italic/bold/etc) is preserved -- the
+          // flush helper reads currentCssStyle. Calling addWord() directly
+          // would lose that and force REGULAR.
+          if (self->partWordBufferIndex > 0) {
+            self->flushPartWordBuffer();
+          }
+          for (int j = 0; j < charLen; j++) {
+            self->partWordBuffer[self->partWordBufferIndex++] = s[i + j];
+          }
+          self->flushPartWordBuffer();
+          i += charLen - 1;
+          continue;
+        }
+      }
     }
 
     // CrumBLE 4.4 task #28: typographic punctuation -> ASCII substitution.
