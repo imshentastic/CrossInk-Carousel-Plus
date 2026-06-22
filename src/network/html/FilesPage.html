@@ -4358,7 +4358,7 @@ function retryAllFailedUploads() {
       lanotaSetProgress(0, 'Uploading ' + (file.size / 1024 / 1024).toFixed(2) + ' MB to device...');
       // Auto-retry on WS drop. Server-side RESUME means each retry picks up
       // from the last successfully-received byte, no progress lost.
-      const MAX_ATTEMPTS = 8;
+      const MAX_ATTEMPTS = 16;
       let lastErr;
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
@@ -4378,7 +4378,25 @@ function retryAllFailedUploads() {
       }
       if (lastErr) throw lastErr;
       lanotaSetProgress(100, 'Upload complete. Asking device to install...');
-      await lanotaSendInstall();
+      // 500ms breather + retry the install handoff. The prior WS connection
+      // is still closing on the device side, and the new WS for
+      // INSTALL_FIRMWARE can lose its response in the cleanup race.
+      await new Promise(r => setTimeout(r, 500));
+      const INSTALL_ATTEMPTS = 5;
+      let installErr;
+      for (let attempt = 1; attempt <= INSTALL_ATTEMPTS; attempt++) {
+        try {
+          await lanotaSendInstall();
+          installErr = null;
+          break;
+        } catch (e) {
+          installErr = e;
+          if (attempt >= INSTALL_ATTEMPTS) break;
+          document.getElementById('modal-status').textContent = 'Install handoff failed (' + e.message + '). Retrying in 1s... (' + (attempt + 1) + '/' + INSTALL_ATTEMPTS + ')';
+          await new Promise(r => setTimeout(r, 1000));
+        }
+      }
+      if (installErr) throw installErr;
       lanotaSetProgress(100, 'Installing... device will restart in about 1 minute. This page will reload when v' + latestVersion + ' is detected.');
       lanotaPollReboot(latestVersion);
     } catch (e) {
@@ -4427,13 +4445,18 @@ function retryAllFailedUploads() {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(lanotaWsUrl());
       let resolved = false;
+      const settle = (fn, err) => { if (resolved) return; resolved = true; try { ws.close(); } catch (_) {} clearTimeout(deadline); fn(err); };
+      // Hard 3s deadline. If the device's WS handler is in the cleanup
+      // race after upload DONE, INSTALL_FIRMWARE can sit in the socket
+      // buffer and never get processed. Caller's retry loop catches this.
+      const deadline = setTimeout(() => settle(reject, new Error('Install handoff timeout (3s)')), 3000);
       ws.onopen = () => ws.send('INSTALL_FIRMWARE');
       ws.onmessage = (ev) => {
-        if (ev.data === 'INSTALL_QUEUED') { resolved = true; ws.close(); resolve(); }
-        else if (ev.data.startsWith('INSTALL_ERROR:')) { resolved = true; ws.close(); reject(new Error(ev.data.substring(14))); }
+        if (ev.data === 'INSTALL_QUEUED') { settle(resolve); }
+        else if (ev.data.startsWith && ev.data.startsWith('INSTALL_ERROR:')) { settle(reject, new Error(ev.data.substring(14))); }
       };
-      ws.onerror = () => { if (!resolved) reject(new Error('WS error during INSTALL_FIRMWARE')); };
-      ws.onclose = () => { if (!resolved) setTimeout(() => reject(new Error('No response to INSTALL_FIRMWARE')), 1500); };
+      ws.onerror = () => settle(reject, new Error('WS error during INSTALL_FIRMWARE'));
+      ws.onclose = () => settle(reject, new Error('WS closed without INSTALL_QUEUED'));
     });
   }
 
