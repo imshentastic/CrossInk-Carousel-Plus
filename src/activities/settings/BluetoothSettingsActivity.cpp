@@ -106,6 +106,19 @@ void BluetoothSettingsActivity::onExit() {
   if (btMgr) {
     btMgr->setLearnInputCallback(nullptr);
     btMgr->setInputCallback(nullptr);
+    // CrumBLE 4.5.3: with this activity now reachable from Settings (not
+    // just from the reader), exiting to Home/Settings would otherwise leave
+    // NimBLE running and holding ~60KB of heap -- Home/carousel/Bookshelf
+    // has historically OOM'd under that load (the reason FT mode does
+    // aggressive BT teardown and BT-scan needs the silent-restart-to-
+    // recover path). Disable here so Home renders on a clean heap. The
+    // bond + SETTINGS.bluetoothEnabled persist, so when the user opens a
+    // book the reader's onEnter auto-re-enables and reconnects to the
+    // bonded device in ~5-10s -- no UX regression vs leaving it on.
+    if (btMgr->isEnabled()) {
+      LOG_INF("BT", "Disabling BT on settings exit to free heap for Home");
+      btMgr->disable();
+    }
   }
   Activity::onExit();
 }
