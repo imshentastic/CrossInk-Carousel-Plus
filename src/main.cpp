@@ -1269,8 +1269,10 @@ void setup() {
   // Read-and-clear so a panic later in setup() doesn't loop into silent reboot.
   // Bound the target range too — RTC_NOINIT memory is uninitialized on cold boot.
   const bool isSilentReboot = (silentRebootMagic == SILENT_REBOOT_MAGIC);
+  // CrumBLE 4.5.4 fix: bound was OTA_INSTALL (4) which snapped BT_SETTINGS (5)
+  // to 0 -- silent-restart-from-BT landed on home instead of BT Settings.
   const uint32_t snapshotTarget =
-      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_OTA_INSTALL) ? silentRebootTarget : 0;
+      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_BT_SETTINGS) ? silentRebootTarget : 0;
   // Snapshot the FT mode hint into a normal variable before clearing
   // RTC state, so the FT activity's onEnter can read it via
   // consumeSilentRebootFtModeHint(). Only honour it on a confirmed

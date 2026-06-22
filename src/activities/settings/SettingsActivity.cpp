@@ -253,12 +253,6 @@ void SettingsActivity::rebuildSettingsLists() {
   controlsChildren.push_back(SettingInfo::Submenu(StrId::STR_POWER_BUTTON, std::move(controlsPower)));
   controlsChildren.push_back(SettingInfo::Submenu(StrId::STR_FRONT_BUTTONS, std::move(controlsFront)));
   controlsChildren.push_back(SettingInfo::Submenu(StrId::STR_SIDE_BUTTONS, std::move(controlsSide)));
-  // CrumBLE 4.5.3: Bluetooth page-turner pairing was only reachable from the
-  // in-reader menu, so first-time users had to open a book before they could
-  // bond their remote. Surface the same wizard here so the scan + bond flow
-  // is discoverable from cold-boot Settings too. Pairing only -- page-turn
-  // events still gate on being in the reader.
-  controlsChildren.push_back(SettingInfo::Action(StrId::STR_BLUETOOTH_SETUP, SettingAction::PageTurnerSetup));
 
   rootSettings_.push_back(SettingInfo::Submenu(StrId::STR_CAT_CONTROLS, std::move(controlsChildren)));
 
@@ -278,6 +272,12 @@ void SettingsActivity::rebuildSettingsLists() {
   // === Sync & Network submenu =====================================
   std::vector<SettingInfo> syncChildren;
   syncChildren.push_back(SettingInfo::Action(StrId::STR_WIFI_NETWORKS, SettingAction::Network));
+  // CrumBLE 4.5.3: Bluetooth page-turner pairing was only reachable from the
+  // in-reader menu, so first-time users had to open a book before they could
+  // bond their remote. Surface the same wizard here so the scan + bond flow
+  // is discoverable from cold-boot Settings too. Pairing only -- page-turn
+  // events still gate on being in the reader.
+  syncChildren.push_back(SettingInfo::Action(StrId::STR_BLUETOOTH_SETUP, SettingAction::PageTurnerSetup));
   syncChildren.push_back(SettingInfo::Action(StrId::STR_KOREADER_SYNC, SettingAction::KOReaderSync));
   syncChildren.push_back(SettingInfo::Action(StrId::STR_OPDS_SERVERS, SettingAction::OPDSBrowser));
 
