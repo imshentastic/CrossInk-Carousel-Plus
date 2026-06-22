@@ -10,6 +10,7 @@
 #include <iterator>
 
 #include "AppVersion.h"
+#include "BluetoothSettingsActivity.h"
 #include "ButtonRemapActivity.h"
 #include "ClearCacheActivity.h"
 #include "CoverThumbStatus.h"
@@ -252,6 +253,12 @@ void SettingsActivity::rebuildSettingsLists() {
   controlsChildren.push_back(SettingInfo::Submenu(StrId::STR_POWER_BUTTON, std::move(controlsPower)));
   controlsChildren.push_back(SettingInfo::Submenu(StrId::STR_FRONT_BUTTONS, std::move(controlsFront)));
   controlsChildren.push_back(SettingInfo::Submenu(StrId::STR_SIDE_BUTTONS, std::move(controlsSide)));
+  // CrumBLE 4.5.3: Bluetooth page-turner pairing was only reachable from the
+  // in-reader menu, so first-time users had to open a book before they could
+  // bond their remote. Surface the same wizard here so the scan + bond flow
+  // is discoverable from cold-boot Settings too. Pairing only -- page-turn
+  // events still gate on being in the reader.
+  controlsChildren.push_back(SettingInfo::Action(StrId::STR_BLUETOOTH_SETUP, SettingAction::PageTurnerSetup));
 
   rootSettings_.push_back(SettingInfo::Submenu(StrId::STR_CAT_CONTROLS, std::move(controlsChildren)));
 
@@ -439,6 +446,17 @@ void SettingsActivity::toggleCurrentSetting() {
         break;
       case SettingAction::RemapFrontButtonsReader:
         startActivityForResult(std::make_unique<ButtonRemapActivity>(renderer, mappedInput, true), resultHandler);
+        break;
+      case SettingAction::PageTurnerSetup:
+        // CrumBLE 4.5.3: launched from Settings (no parent book), so the
+        // wizard should return us to Settings on successful bond instead of
+        // auto-popping its parent. exitOnSuccessfulConnect=false keeps it
+        // open after pair so the user can verify the device list / debug
+        // monitor; they back out manually like any other Settings sub-page.
+        startActivityForResult(
+            std::make_unique<BluetoothSettingsActivity>(renderer, mappedInput, [] { activityManager.popActivity(); },
+                                                        /*exitOnSuccessfulConnect=*/false),
+            resultHandler);
         break;
       case SettingAction::CustomiseStatusBar:
         startActivityForResult(std::make_unique<StatusBarSettingsActivity>(renderer, mappedInput), resultHandler);

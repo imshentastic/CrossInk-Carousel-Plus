@@ -19,6 +19,7 @@
 #include "network/CrossPointWebServerActivity.h"
 #include "reader/ReaderActivity.h"
 #include "settings/OpdsServerListActivity.h"
+#include "settings/BluetoothSettingsActivity.h"
 #include "settings/OtaUpdateActivity.h"
 #include "settings/SettingsActivity.h"
 #include "util/FullScreenMessageActivity.h"
@@ -192,6 +193,15 @@ void ActivityManager::goToFileTransfer(std::string returnBookPath) {
 
 void ActivityManager::goToOtaUpdate() {
   replaceActivity(std::make_unique<OtaUpdateActivity>(renderer, mappedInput));
+}
+
+void ActivityManager::goToBluetoothSettings() {
+  // CrumBLE 4.5.3: replaceActivity (not push) -- used by the silent-restart
+  // dispatch at boot, where we want BT settings to BE the root activity
+  // rather than stacked over Home. exitOnSuccessfulConnect=false so the
+  // user explicitly backs out when done (same shape as goToSettings).
+  replaceActivity(std::make_unique<BluetoothSettingsActivity>(
+      renderer, mappedInput, [this] { popActivity(); }, /*exitOnSuccessfulConnect=*/false));
 }
 
 void ActivityManager::goToSettings() { replaceActivity(std::make_unique<SettingsActivity>(renderer, mappedInput)); }

@@ -93,6 +93,10 @@ class ActivityManager {
   // CrumBLE 4.5: route straight to OtaUpdateActivity. Used by the post-boot
   // dispatch after a heap-defrag silent restart from OTA's pre-flight.
   void goToOtaUpdate();
+  // CrumBLE 4.5.3: replace-root entry into BluetoothSettingsActivity. Used
+  // by the silent-restart dispatch when the BT enable/scan pre-flight
+  // tripped and we rebooted to recover heap.
+  void goToBluetoothSettings();
   void goToSettings();
   void goToFileBrowser(std::string path = {});
   void goToRecentBooks();

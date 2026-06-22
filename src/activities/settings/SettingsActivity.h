@@ -37,6 +37,12 @@ enum class SettingAction {
   // cache dir so the new Cover Tone setting applies to existing covers.
   // Distinct from RetryFailedCovers (markers only); this one is destructive.
   RegenerateAllCovers,
+  // CrumBLE 4.5.3: launch the BluetoothSettingsActivity wizard from
+  // Settings -> Controls so users can scan + pair a page-turner remote
+  // without first having to open a book (which was the only entry point
+  // previously, via the in-reader menu). BT input still only delivers
+  // page-turn events inside the reader -- pairing just bonds the device.
+  PageTurnerSetup,
 };
 
 struct SettingInfo {

@@ -459,6 +459,16 @@ constexpr uint32_t SILENT_REBOOT_TARGET_OTA_UPDATE = 3;
 // to OtaUpdater so the install bypasses the check phase.
 constexpr uint32_t SILENT_REBOOT_TARGET_OTA_INSTALL = 4;
 
+// CrumBLE 4.5.3: BT enable / scan needs ~66 KB free heap + ~8 KB MaxAlloc.
+// In a typical reading session (book open, glyph caches warm) that's
+// rarely available. Previously the user got "Memory low. Restart device."
+// and had to power-cycle manually. This target lets BluetoothSettings
+// silent-restart itself when its pre-flight fails; post-restart heap is
+// ~150 KB free + ~100 KB MaxAlloc so the next enable/scan attempt
+// proceeds. g_postBtSilentReboot below guards against an infinite loop
+// if even a fresh boot is somehow under the floor.
+constexpr uint32_t SILENT_REBOOT_TARGET_BT_SETTINGS = 5;
+
 // How the device is coming back to life, resolved once at boot. Both resume
 // flows suppress the splash and leave the panel holding its pre-boot frame; a
 // plain boot shows the splash. See setup() for the resolution.
@@ -506,6 +516,22 @@ void silentRestartToOtaUpdate() {
   silentRebootTarget = SILENT_REBOOT_TARGET_OTA_UPDATE;
   silentRebootMagic = SILENT_REBOOT_MAGIC;
   LOG_INF("MAIN", "Silent restart (target=ota-update) — heap pre-flight tripped");
+  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+  delay(50);
+  ESP.restart();
+}
+
+// Set true at boot dispatch when snapshotTarget == SILENT_REBOOT_TARGET_BT_
+// SETTINGS so BluetoothSettingsActivity knows not to silent-restart again
+// on a recurring heap pre-flight failure (prevents infinite loop). Reset
+// to false on any other entry path.
+bool g_postBtSilentReboot = false;
+
+void silentRestartToBluetoothSettings() {
+  if (deepSleepInProgress) return;
+  silentRebootTarget = SILENT_REBOOT_TARGET_BT_SETTINGS;
+  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  LOG_INF("MAIN", "Silent restart (target=bt-settings) — heap pre-flight tripped");
   GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
   delay(50);
   ESP.restart();
@@ -1649,6 +1675,14 @@ void setup() {
             snapshotTarget == SILENT_REBOOT_TARGET_OTA_INSTALL ? "install" : "update", ESP.getFreeHeap(),
             ESP.getMaxAllocHeap());
     activityManager.goToOtaUpdate();
+  } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_BT_SETTINGS) {
+    // CrumBLE 4.5.3: heap-defrag restart from BluetoothSettingsActivity.
+    // Route straight back to BT settings on the freshly-recovered heap.
+    // g_postBtSilentReboot flips so the activity's pre-flight knows not
+    // to silent-restart again -- one attempt only, then real error.
+    LOG_INF("BOOT", "Lean-boot BT dispatch: heap=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    g_postBtSilentReboot = true;
+    activityManager.goToBluetoothSettings();
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_READER &&
              !APP_STATE.openEpubPath.empty()) {
     activityManager.goToReader(APP_STATE.openEpubPath);

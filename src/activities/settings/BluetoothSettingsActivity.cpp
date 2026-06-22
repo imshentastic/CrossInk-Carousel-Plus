@@ -9,6 +9,7 @@
 #include "CrossPointSettings.h"
 #include "DeviceProfiles.h"
 #include "MappedInputManager.h"
+#include "SilentRestart.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -30,9 +31,20 @@ bool checkScanHeapOrError(std::string& outError) {
   if (freeHeap >= kScanMinFreeHeap && maxAlloc >= kScanMinMaxAlloc) {
     return true;
   }
-  LOG_ERR("BT", "BT scan pre-flight refused: free=%u maxAlloc=%u (need %u/%u)",
+  // CrumBLE 4.5.3: silent-restart to recover heap instead of just telling
+  // the user to power-cycle. Post-restart we land back in BT settings on
+  // a clean ~150KB free heap. g_postBtSilentReboot guards against looping
+  // if even a fresh boot can't clear the floor (extremely unlikely but
+  // possible if BT is enabled and the very first scan tries it).
+  if (!g_postBtSilentReboot) {
+    LOG_INF("BT", "BT scan pre-flight low (free=%u maxAlloc=%u) -- silent-restart to recover heap",
+            freeHeap, maxAlloc);
+    silentRestartToBluetoothSettings();
+    // never returns
+  }
+  LOG_ERR("BT", "BT scan pre-flight refused after silent-restart: free=%u maxAlloc=%u (need %u/%u)",
           freeHeap, maxAlloc, kScanMinFreeHeap, kScanMinMaxAlloc);
-  outError = "Memory low. Restart device, then scan before opening a book.";
+  outError = "Memory low even after recovery restart. Please power-cycle the device.";
   return false;
 }
 }  // namespace
@@ -226,6 +238,20 @@ void BluetoothSettingsActivity::handleMainMenuInput() {
           SETTINGS.bluetoothEnabled = 1;
           SETTINGS.saveToFile();
         } else {
+          // CrumBLE 4.5.3: enable() refuses below 66 KB free heap (NimBLE
+          // init needs that much contiguous). Silent-restart to recover
+          // instead of just showing "Not enough memory" -- post-restart
+          // boot has ~150 KB free so the next click works. Skip on
+          // already-post-restart to avoid an infinite loop on a stuck
+          // heap (vanishingly unlikely).
+          if (!g_postBtSilentReboot && ESP.getFreeHeap() < 70u * 1024u) {
+            LOG_INF("BT", "Enable failed under low heap (free=%u) -- silent-restart to recover",
+                    ESP.getFreeHeap());
+            SETTINGS.bluetoothEnabled = 1;  // persist intent so onEnter auto-restores post-boot
+            SETTINGS.saveToFile();
+            silentRestartToBluetoothSettings();
+            // never returns
+          }
           lastError = btMgr->lastError.empty() ? "Failed to enable" : btMgr->lastError;
         }
       }

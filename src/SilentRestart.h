@@ -128,6 +128,15 @@ void clearSilentRebootContinuationFlag();
 // on a clean ~115KB heap so the SSL handshake fits.
 void silentRestartToOtaUpdate();
 
+// CrumBLE 4.5.3: silent-restart back to BluetoothSettingsActivity. Called
+// from the activity when enable or scan fails the heap pre-flight (~66 KB
+// free needed for NimBLE init, ~14 KB free + 8 KB MaxAlloc for scan), so
+// the user doesn't have to manually power-cycle. The post-boot dispatch
+// sets g_postBtSilentReboot=true; the activity checks that flag to avoid
+// looping silent-restarts if a fresh boot is somehow still under the floor.
+void silentRestartToBluetoothSettings();
+extern bool g_postBtSilentReboot;
+
 // CrumBLE 4.6: silent restart that resumes mid-OTA -- after the user has
 // confirmed install on the "New update available" screen. Skips the check
 // phase; URL + size + version are persisted to RTC and pulled back into
