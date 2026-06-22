@@ -3934,6 +3934,15 @@ void HomeActivity::render(RenderLock&&) {
     } else if (storeCoverBuffer()) {
       coverBufferStored = true;
     }
+  } else if (homeRenderPopupShown) {
+    // CrumBLE 4.5.3: non-Flow themes (Lyra Carousel, Minimal, etc.) also
+    // draw the Loading popup during shelf cover gen / series detection.
+    // Without a follow-up requestUpdate(), the e-ink keeps showing the
+    // popup forever after the slow op finishes -- a paint only happens
+    // on the next user input. Field report: fresh-flash + reboot lands
+    // on Home with "Loading" overlay stuck until a button press clears
+    // it. Schedule a clean repaint so the popup is wiped automatically.
+    requestUpdate();
   }
 
   presentHomeBuffer();
