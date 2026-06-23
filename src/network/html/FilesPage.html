@@ -1650,6 +1650,7 @@
     <button class="action-btn upload-action-btn" onclick="openUploadModal()">📤 Upload</button>
     <button class="action-btn folder-action-btn" onclick="openFolderModal()">📁 New Folder</button>
     <button class="action-btn optimize-action-btn" onclick="optimizeSelectedOnDevice()">Optimize Selected</button>
+    <button class="action-btn optimize-action-btn" onclick="optimizeSelectedOnDevice({ prebakeOnly: true })" title="Skip image-optimize + re-upload. Use when the EPUB on device is already optimized and only the chapter prebake needs to be (re-)run -- e.g. a previous Optimize Selected got the upload-back done but prebake stalled.">Prebake Selected</button>
     <button class="action-btn delete-action-btn" onclick="openDeleteSelectedModal()">🗑️ Delete Selected</button>
   </div>
 </div>
@@ -2720,11 +2721,18 @@
   // follows the same grey/red/green state machine. Failures on any
   // single file are non-fatal: the batch continues with the next file
   // and the failed entries surface in the retry banner.
-  async function optimizeSelectedOnDevice() {
+  async function optimizeSelectedOnDevice(opts = {}) {
+    // CrumBLE 4.5.4: prebakeOnly skips the image-optimize + re-upload steps
+    // and runs ONLY chapter prebake on each selected file. Use when the SD
+    // copy is already optimized (e.g. a prior Optimize Selected got upload
+    // done but prebake stalled on font fetch / heap pressure) and the user
+    // just wants the cache-build retry without doubling the wall time.
+    const prebakeOnly = !!opts.prebakeOnly;
     const sel = getSelectedItems();
     const epubs = sel.filter(s => !s.isFolder && /\.epub$/i.test(s.name));
     if (epubs.length === 0) {
-      alert('Select one or more EPUB files to optimize. Folders and non-EPUB files are ignored.');
+      alert((prebakeOnly ? 'Select one or more EPUB files to prebake.' : 'Select one or more EPUB files to optimize.') +
+            ' Folders and non-EPUB files are ignored.');
       return;
     }
     if (epubs.length < sel.length) {
@@ -2757,7 +2765,7 @@
     if (convertOptions) convertOptions.style.display = 'none';
     if (startConvBtn) startConvBtn.style.display = 'none';
     const titleEl = document.getElementById('uploadModalTitle');
-    if (titleEl) titleEl.textContent = 'Optimize selected';
+    if (titleEl) titleEl.textContent = prebakeOnly ? 'Prebake selected' : 'Optimize selected';
     // The shared upload-modal subtitle reads 'Select a file to upload to ...'
     // which is wrong for Optimize Selected (source is the device, not disk).
     // Hide while running; the openUploadModal() flow restores it for next time.
@@ -2850,14 +2858,19 @@
       progressText.textContent = `${phase}${batch} -- ${overall}%${tail}`;
     };
 
+    // Phase budgets. prebakeOnly skips convert+upload so prebake gets the
+    // full bar; otherwise we keep the original 5/25/80/100 split.
+    const prebakeStartPct = prebakeOnly ? 15 : 80;
     for (let i = 0; i < epubs.length; i++) {
       const item = epubs[i];
       const itemPath = item.path; // e.g. "/Books/Foo.epub"
       const parentPath = itemPath.substring(0, itemPath.lastIndexOf('/') + 1) || '/';
       const fileName = item.name;
+      let convertedFile;  // populated below; prebake uses this
 
       try {
-        // 1. Download the EPUB from device back to browser.
+        // 1. Download the EPUB from device back to browser. We need the
+        // bytes locally to feed prebakeChapters regardless of mode.
         log(`[${i + 1}/${epubs.length}] Downloading ${fileName}...`, '', 'INFO');
         setPhase(i, `Downloading ${fileName}`, 0);
         const dlResp = await fetch('/download?path=' + encodeURIComponent(itemPath));
@@ -2866,9 +2879,14 @@
         }
         const epubBlob = await dlResp.blob();
         const epubFile = new File([epubBlob], fileName, { type: 'application/epub+zip' });
-        progressFill.style.width = fileScale(i, 5) + '%';
-        setPhase(i, `Downloaded ${fileName}`, 5);
+        progressFill.style.width = fileScale(i, prebakeOnly ? 15 : 5) + '%';
+        setPhase(i, `Downloaded ${fileName}`, prebakeOnly ? 15 : 5);
 
+        if (prebakeOnly) {
+          // Skip convert + upload: SD copy is already what we want; just
+          // run chapter prebake on the freshly-downloaded bytes.
+          convertedFile = epubFile;
+        } else {
         // 2. Run the BT pass in the browser (image processing, .pxc bake).
         log(`[${i + 1}/${epubs.length}] Optimizing images...`, '', 'INFO');
         const convertedBlob = await convertEpubFile(epubFile, (pct) => {
@@ -2876,7 +2894,7 @@
           progressFill.style.width = fileScale(i, local) + '%'; // 5%->25% local
           setPhase(i, `Optimizing images in ${fileName}`, local);
         });
-        const convertedFile = new File([convertedBlob], fileName, { type: 'application/epub+zip' });
+        convertedFile = new File([convertedBlob], fileName, { type: 'application/epub+zip' });
 
         // 3. Upload the optimized EPUB back to its same SD path
         //    (overwrites the original).
@@ -2904,13 +2922,15 @@
           formData.append('file', convertedFile, fileName);
           xhr.send(formData);
         });
+        }  // end !prebakeOnly
 
         // 4. Chapter prebake: produces book.bin + sections-prebake/ +
         //    manifest and uploads them to /.crosspoint/epub_<hash>/.
         log(`[${i + 1}/${epubs.length}] Building chapter index...`, '', 'INFO');
-        setPhase(i, `Building chapter index for ${fileName}`, 80);
+        setPhase(i, `Building chapter index for ${fileName}`, prebakeStartPct);
+        const prebakeSpan = 100 - prebakeStartPct;
         await prebakeChapters(convertedFile, itemPath, (pct, status) => {
-          const local = 80 + pct * 0.20; // 80%->100%
+          const local = prebakeStartPct + pct * (prebakeSpan / 100);
           progressFill.style.width = fileScale(i, local) + '%';
           setPhase(i, `Building chapter index for ${fileName}`, local, status || '');
         });
@@ -4386,9 +4406,12 @@ function retryAllFailedUploads() {
       // from the last successfully-received byte, no progress lost.
       const MAX_ATTEMPTS = 16;
       let lastErr;
+      let lastSentBytes = 0;
+      const statusEl = document.getElementById('modal-status');
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
           await lanotaUploadWs(file, (sent, total) => {
+            lastSentBytes = sent;
             lanotaSetProgress(sent / total * 100,
               'Uploading: ' + (sent / 1024 / 1024).toFixed(2) + ' / ' + (total / 1024 / 1024).toFixed(2) + ' MB' +
               (attempt > 1 ? ' (attempt ' + attempt + ')' : ''));
@@ -4398,8 +4421,37 @@ function retryAllFailedUploads() {
         } catch (e) {
           lastErr = e;
           if (attempt >= MAX_ATTEMPTS) break;
-          document.getElementById('modal-status').textContent = 'Connection dropped (' + e.message + '). Auto-retrying in 2s... (attempt ' + (attempt + 1) + '/' + MAX_ATTEMPTS + ')';
-          await new Promise(r => setTimeout(r, 2000));
+          // CrumBLE 4.5.4: adaptive backoff. If the device asked for a
+          // restart-to-defrag-heap mid-upload, the WS server is offline
+          // for ~8s while it reboots and ~5s more for WiFi to come back.
+          // Detect that case + probe /api/status until the device confirms
+          // it's serving again before reconnecting. Server's RESUME picks
+          // up at lastSentBytes automatically.
+          const isRestart = /restart|fragment/i.test(e.message || '');
+          const resumeMb = (lastSentBytes / 1024 / 1024).toFixed(2);
+          const totalMb = (file.size / 1024 / 1024).toFixed(2);
+          if (isRestart) {
+            statusEl.textContent = `Device is restarting to recover heap (${resumeMb}/${totalMb} MB saved). Waiting for it to come back...`;
+            for (let probe = 1; probe <= 30; probe++) {
+              await new Promise(r => setTimeout(r, 2000));
+              try {
+                const ctrl = new AbortController();
+                const tid = setTimeout(() => ctrl.abort(), 1500);
+                const r = await fetch('/api/status', { cache: 'no-store', signal: ctrl.signal });
+                clearTimeout(tid);
+                if (r.ok) {
+                  statusEl.textContent = `Device back online. Resuming upload from ${resumeMb} MB...`;
+                  await new Promise(r => setTimeout(r, 500));
+                  break;
+                }
+              } catch (_) {
+                statusEl.textContent = `Waiting for device to finish restart... (${probe * 2}s)`;
+              }
+            }
+          } else {
+            statusEl.textContent = `Connection dropped (${e.message}). Resuming from ${resumeMb} MB in 3s... (attempt ${attempt + 1}/${MAX_ATTEMPTS})`;
+            await new Promise(r => setTimeout(r, 3000));
+          }
         }
       }
       if (lastErr) throw lastErr;
@@ -4423,7 +4475,7 @@ function retryAllFailedUploads() {
         }
       }
       if (installErr) throw installErr;
-      lanotaSetProgress(100, 'Installing... device will restart in about 1 minute. This page will reload when v' + latestVersion + ' is detected.');
+      lanotaSetProgress(100, 'Installing... device will restart in about 1 minute. The new firmware boots into Home, not File Transfer -- to verify v' + latestVersion + ' is running, re-enter File Transfer mode on your device after the screen returns to Home.');
       lanotaPollReboot(latestVersion);
     } catch (e) {
       document.getElementById('modal-status').textContent = 'Update failed after retries: ' + e.message;

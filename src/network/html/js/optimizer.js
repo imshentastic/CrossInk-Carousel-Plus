@@ -2290,6 +2290,13 @@ function loadCrumblePrebakeFactory() {
 // rejected instead of just an opaque "exit code N".
 const crumblePrebakeOutputBuf = [];
 
+// CrumBLE 4.5.4: live progress heartbeat. Set by prebakeChapters() before
+// Module.callMain() and cleared after. The print/printErr hooks invoke it
+// on every WASM stdout line so the UI bar moves during the long CLI run.
+// Defined at module scope (not inside the factory) so the same function
+// instance is hooked once at module-load and read per-call.
+let crumblePrebakeHeartbeat = null;
+
 // Get a ready Module instance. The factory is invoked once and the resulting
 // Module is reused across runs (EXIT_RUNTIME=0 keeps MEMFS + libc alive
 // between callMain invocations). This means we pay the ~850 KB WASM
@@ -2312,11 +2319,24 @@ async function loadCrumblePrebakeModule() {
         crumblePrebakeOutputBuf.push(msg);
         try { console.log('[prebake]', msg); } catch (e) {}
         try { log(`[prebake] ${msg}`, '', 'PRE'); } catch (e) {}
+        // CrumBLE 4.5.4: live heartbeat. callMain() blocks the JS main
+        // thread, so setInterval/setTimeout in JS can't tick during the
+        // CLI run. But Module.print fires sync on every stdout line --
+        // hook it to nudge the progress bar so 80->99% actually moves
+        // instead of sticking at the "started prebake" milestone forever.
+        // Caller sets crumblePrebakeHeartbeat to (lineText) => void before
+        // callMain and clears it after.
+        if (typeof crumblePrebakeHeartbeat === 'function') {
+          try { crumblePrebakeHeartbeat(msg); } catch (e) {}
+        }
       },
       printErr: (msg) => {
         crumblePrebakeOutputBuf.push(msg);
         try { console.error('[prebake-err]', msg); } catch (e) {}
         try { log(`[prebake-err] ${msg}`, 'warning', 'PRE-ERR'); } catch (e) {}
+        if (typeof crumblePrebakeHeartbeat === 'function') {
+          try { crumblePrebakeHeartbeat(msg); } catch (e) {}
+        }
       },
     });
   })();
@@ -2476,12 +2496,44 @@ async function prebakeChapters(epubBlob, deviceFilePath, progressCallback) {
     }
     if (pt > 0) {
       log(`Chapter prebake: fetching SD font ${fname} @ ${pt}pt`, '', 'PRE');
-      try {
-        const fontResp = await fetch(`/api/fonts/file?family=${encodeURIComponent(fname)}&size=${pt}`);
-        if (!fontResp.ok) {
-          throw new Error(`/api/fonts/file ${fontResp.status}`);
+      // Hard-deadline + retry. Without this, a hung HTTP response from the
+      // device (most often heap pressure stalling /api/fonts/file mid-stream)
+      // silently wedges the whole prebake at the "fetching SD font" log line
+      // with no progress and no error -- user can't tell it's stuck vs slow.
+      const FONT_FETCH_TIMEOUT_MS = 30000;  // CJK fonts can be 2-3 MB at 18pt
+      const FONT_FETCH_MAX_ATTEMPTS = 3;
+      let fontResp = null;
+      let fontBytes = null;
+      let lastFontErr = null;
+      for (let attempt = 1; attempt <= FONT_FETCH_MAX_ATTEMPTS; attempt++) {
+        const ctrl = new AbortController();
+        const deadline = setTimeout(() => ctrl.abort(), FONT_FETCH_TIMEOUT_MS);
+        try {
+          fontResp = await fetch(
+            `/api/fonts/file?family=${encodeURIComponent(fname)}&size=${pt}`,
+            { signal: ctrl.signal },
+          );
+          if (!fontResp.ok) throw new Error(`HTTP ${fontResp.status}`);
+          fontBytes = new Uint8Array(await fontResp.arrayBuffer());
+          clearTimeout(deadline);
+          lastFontErr = null;
+          break;
+        } catch (e) {
+          clearTimeout(deadline);
+          lastFontErr = e;
+          log(`SD font fetch attempt ${attempt}/${FONT_FETCH_MAX_ATTEMPTS} failed: ${e.name === 'AbortError' ? `timeout after ${FONT_FETCH_TIMEOUT_MS}ms` : (e.message || e)}`,
+              'warning', 'PRE');
+          if (attempt < FONT_FETCH_MAX_ATTEMPTS) {
+            const backoff = 1500 * attempt;
+            log(`Retrying in ${backoff}ms...`, '', 'PRE');
+            await new Promise(r => setTimeout(r, backoff));
+          }
         }
-        const fontBytes = new Uint8Array(await fontResp.arrayBuffer());
+      }
+      try {
+        if (!fontBytes) {
+          throw lastFontErr || new Error('SD font fetch exhausted retries');
+        }
         Module.FS.writeFile(sdFontPath, fontBytes);
         // CrumBLE 4.4: --emit-section-glyph-subsets gates BOTH the v39 EGS
         // emit AND the v40 glyph atlas emit on the CLI side. Without it the
@@ -2509,7 +2561,24 @@ async function prebakeChapters(epubBlob, deviceFilePath, progressCallback) {
   // Clear the print/printErr capture buffer right before we run so any
   // earlier session output doesn't pollute this run's diagnostics.
   crumblePrebakeOutputBuf.length = 0;
-  const rc = Module.callMain(cliArgs);
+  // CrumBLE 4.5.4: live heartbeat. WASM CLI runs synchronously (blocks
+  // the JS main thread), so the only way to update the UI during it is
+  // from inside the print hook. Each stdout line nudges the bar 0.4%
+  // within the 40..90 sub-range we own here, capped so we never reach
+  // 100 before the actual upload-cache step runs.
+  let heartbeatPct = 40;
+  crumblePrebakeHeartbeat = (line) => {
+    heartbeatPct = Math.min(89, heartbeatPct + 0.4);
+    // Truncate long lines so the status text doesn't overflow the modal.
+    const summary = typeof line === 'string' && line.length > 70 ? line.slice(0, 67) + '...' : (line || '');
+    reportProgress(heartbeatPct, summary || 'baking sections...');
+  };
+  let rc = -1;
+  try {
+    rc = Module.callMain(cliArgs);
+  } finally {
+    crumblePrebakeHeartbeat = null;
+  }
   if (rc !== 0) {
     // Surface whatever the CLI actually said on its way out. Without this
     // the thrown error is just "exit code N" with no clue what was wrong.

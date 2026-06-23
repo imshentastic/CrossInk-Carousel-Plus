@@ -249,9 +249,13 @@
         // progress on a mid-stream disconnect.
         const MAX_ATTEMPTS = 16;
         let lastErr;
+        // Tracks how far the server has acknowledged so the "Resuming from
+        // X MB" status text on retry reflects the actual saved progress.
+        let lastSentBytes = 0;
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
           try {
             await uploadFirmwareWs(file, (sent, total) => {
+              lastSentBytes = sent;
               setModalProgress(sent / total * 100,
                 'Uploading: ' + (sent / 1024 / 1024).toFixed(2) + ' / ' + (total / 1024 / 1024).toFixed(2) + ' MB' +
                 (attempt > 1 ? ' (attempt ' + attempt + ')' : ''));
@@ -261,8 +265,41 @@
           } catch (e) {
             lastErr = e;
             if (attempt >= MAX_ATTEMPTS) break;
-            setModalStatus('Connection dropped (' + e.message + '). Auto-retrying in 2s... (attempt ' + (attempt + 1) + '/' + MAX_ATTEMPTS + ')');
-            await new Promise(r => setTimeout(r, 2000));
+            // CrumBLE 4.5.4: adaptive backoff. If the device asked for a
+            // restart-to-defrag-heap mid-upload, the WS server is offline for
+            // ~8s while it reboots and ~5s more for WiFi to come back. The
+            // old fixed 2s retry just slammed a dead socket repeatedly. Now:
+            // detect the restart message + wait long enough, AND poll
+            // /api/status until the device confirms it's actually serving
+            // again before reconnecting. Server's RESUME protocol picks
+            // back up at lastSentBytes automatically.
+            const isRestart = /restart|fragment/i.test(e.message || '');
+            const resumeMb = (lastSentBytes / 1024 / 1024).toFixed(2);
+            const totalMb = (file.size / 1024 / 1024).toFixed(2);
+            if (isRestart) {
+              setModalStatus(`Device is restarting to recover heap (${resumeMb}/${totalMb} MB saved). Waiting for it to come back...`);
+              // Probe /api/status until the device responds. Adds visible
+              // progress text per check so the user knows we're alive.
+              for (let probe = 1; probe <= 30; probe++) {
+                await new Promise(r => setTimeout(r, 2000));
+                try {
+                  const ctrl = new AbortController();
+                  const tid = setTimeout(() => ctrl.abort(), 1500);
+                  const r = await fetch('/api/status', { cache: 'no-store', signal: ctrl.signal });
+                  clearTimeout(tid);
+                  if (r.ok) {
+                    setModalStatus(`Device back online. Resuming upload from ${resumeMb} MB...`);
+                    await new Promise(r => setTimeout(r, 500));
+                    break;
+                  }
+                } catch (_) {
+                  setModalStatus(`Waiting for device to finish restart... (${probe * 2}s)`);
+                }
+              }
+            } else {
+              setModalStatus(`Connection dropped (${e.message}). Resuming from ${resumeMb} MB in 3s... (attempt ${attempt + 1}/${MAX_ATTEMPTS})`);
+              await new Promise(r => setTimeout(r, 3000));
+            }
           }
         }
         if (lastErr) throw lastErr;
@@ -287,7 +324,7 @@
           }
         }
         if (installErr) throw installErr;
-        setModalProgress(100, 'Installing... device will restart in about 1 minute. This page will reload when v' + latestVersion + ' is detected.');
+        setModalProgress(100, 'Installing... device will restart in about 1 minute. The new firmware boots into Home, not File Transfer -- to verify v' + latestVersion + ' is running, re-enter File Transfer mode on your device after the screen returns to Home.');
         pollForReboot(latestVersion);
       } catch (e) {
         setModalStatus('Update failed after retries: ' + e.message);
