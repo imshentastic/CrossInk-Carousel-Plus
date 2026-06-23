@@ -326,17 +326,37 @@ void BluetoothSettingsActivity::handleMainMenuInput() {
       }
       requestUpdate();
     } else if (selectedIndex == kScanForDevicesIndex) {
-      // Start scan and switch to device list
-      if (btMgr->isEnabled()) {
-        if (checkScanHeapOrError(lastError)) {
-          btMgr->startScan(10000);
-          lastScanTime = millis();
-          viewMode = ViewMode::DEVICE_LIST;
-          selectedIndex = 0;
-          lastError = "";
+      // CrumBLE 4.5.4 follow-up: auto-enable BT if it's off when user hits
+      // Scan. Previously the activity bounced with 'Enable BT first',
+      // forcing the user to back up, toggle Enable, then re-pick Scan --
+      // and many users perceived this as 'scan turned BT off' since the
+      // BT label flipped back to Enable. One-tap scan keeps the affordance
+      // obvious. Persist SETTINGS so the post-NimBLE-init silent-restart
+      // path also lands with BT auto-restored.
+      if (!btMgr->isEnabled()) {
+        LOG_INF("BT", "Auto-enabling Bluetooth before scan (user hit Scan from BT-off state)");
+        EpubReaderActivity::prewarmReaderTextBuffer(renderer);
+        if (btMgr->enable()) {
+          SETTINGS.bluetoothEnabled = 1;
+          SETTINGS.saveToFile();
+        } else if (!g_postBtSilentReboot && ESP.getFreeHeap() < 70u * 1024u) {
+          LOG_INF("BT", "Auto-enable for scan failed under low heap -- silent-restart to recover");
+          SETTINGS.bluetoothEnabled = 1;
+          SETTINGS.saveToFile();
+          silentRestartToBluetoothSettings();
+          // never returns
+        } else {
+          lastError = btMgr->lastError.empty() ? "Failed to enable BT" : btMgr->lastError;
+          requestUpdate();
+          return;
         }
-      } else {
-        lastError = "Enable BT first";
+      }
+      if (btMgr->isEnabled() && checkScanHeapOrError(lastError)) {
+        btMgr->startScan(10000);
+        lastScanTime = millis();
+        viewMode = ViewMode::DEVICE_LIST;
+        selectedIndex = 0;
+        lastError = "";
       }
       requestUpdate();
     } else if (selectedIndex == kRemoteSetupWizardIndex) {
@@ -631,7 +651,14 @@ void BluetoothSettingsActivity::handleDeviceListInput() {
         SETTINGS.saveToFile();
         btMgr->setBondedDevice(device.address, device.name);
 
-        lastError = "Bluetooth enabled";
+        // CrumBLE 4.5.4 follow-up: explicit 'connected and saved' message
+        // instead of the misleading 'Bluetooth enabled' (BT was already
+        // enabled to scan -- the meaningful new state is that THIS remote
+        // is now bonded). Truncate device name so the bottom status line
+        // doesn't overflow on long remote names.
+        std::string shortName = device.name.empty() ? std::string("remote") : device.name;
+        if (shortName.size() > 24) shortName = shortName.substr(0, 21) + "...";
+        lastError = "Connected: " + shortName + " (saved)";
         LOG_INF("BT", "Successfully connected to %s", device.name.c_str());
         if (exitOnSuccessfulConnect) {
           MenuResult result;
