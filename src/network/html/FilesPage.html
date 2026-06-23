@@ -1076,21 +1076,68 @@
       background-color: #e0e0e0;
       border-radius: 10px;
       overflow: hidden;
+      position: relative;
     }
     #progress-fill {
       height: 100%;
       background-color: #27ae60;
       width: 0%;
       transition: width 0.3s;
+      position: relative;
+      overflow: hidden;
     }
     #progress-fill.no-transition {
       transition: none !important;
+    }
+    /* CrumBLE 4.5.4: alive-but-slow heartbeat. The numeric progress can sit
+       at the same value for 30-60s during chapter-cache upload (12/703 ->
+       13/703 etc.), making the modal look frozen. Inner shimmer slides
+       left-to-right across the filled portion every 1.6s so the user has
+       continuous motion confirming the device is still processing. Pure
+       CSS, no JS tick cost. */
+    #progress-fill::after {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; bottom: 0;
+      width: 80px;
+      background: linear-gradient(90deg, rgba(255,255,255,0) 0%,
+                                          rgba(255,255,255,0.6) 50%,
+                                          rgba(255,255,255,0) 100%);
+      animation: progress-shimmer 1.6s linear infinite;
+    }
+    /* Hide the shimmer when the bar is parked (no progress activity). The
+       .done class is applied by the upload modal when the run finishes. */
+    #progress-fill.done::after {
+      display: none;
+    }
+    @keyframes progress-shimmer {
+      0%   { transform: translateX(-100%); }
+      100% { transform: translateX(800px); }
     }
     #progress-text {
       text-align: center;
       margin-top: 5px;
       font-size: 0.9em;
       color: var(--label-color);
+    }
+    /* CrumBLE 4.5.4: animated ellipsis suffix. Add class 'pulsing' to
+       progress-text and the trailing dots cycle 1->2->3->1... so the
+       status line itself reads as still-alive even when the body text
+       (12/703 etc.) hasn't ticked over. JS toggles the class while a
+       run is in-flight and removes it on done/cancel. */
+    #progress-text.pulsing::after {
+      content: '\00A0\00A0\00A0';
+      display: inline-block;
+      width: 1.5em;
+      text-align: left;
+      animation: progress-ellipsis 1.2s steps(4, end) infinite;
+    }
+    @keyframes progress-ellipsis {
+      0%   { content: '\00A0\00A0\00A0'; }
+      25%  { content: '.\00A0\00A0'; }
+      50%  { content: '..\00A0'; }
+      75%  { content: '...'; }
+      100% { content: '\00A0\00A0\00A0'; }
     }
     .folder-form {
       margin-top: 10px;
@@ -2394,6 +2441,9 @@
     const progressText = document.getElementById('progress-text');
     progressFill.style.width = '0%';
     progressFill.style.backgroundColor = '#e74c3c';
+    // CrumBLE 4.5.4: terminal state -- stop the heartbeat (shimmer + ellipsis).
+    progressFill.classList.add('done');
+    progressText.classList.remove('pulsing');
     progressText.style.color = '#e74c3c';
     progressText.textContent = 'Upload cancelled by User!';
     // Re-enable the action button (uploadBtn is always visible at this point;
@@ -2834,6 +2884,10 @@
     const progressText = document.getElementById('progress-text');
     progressFill.style.width = '0%';
     progressFill.style.backgroundColor = '#27ae60';
+    // CrumBLE 4.5.4: start the alive heartbeat. Shimmer in the bar + ellipsis
+    // after the status text. Cleared in the terminal-state branches below.
+    progressFill.classList.remove('done');
+    progressText.classList.add('pulsing');
     // Hide the file picker chrome since this flow's source is the SD card.
     const fileInput = document.getElementById('fileInput');
     const uploadBtn = document.getElementById('uploadBtn');
@@ -3063,6 +3117,9 @@
       cancelBtn.classList.remove('in-progress');
       cancelBtn.classList.add('done');
     }
+    // CrumBLE 4.5.4: terminal state -- stop the heartbeat (shimmer + ellipsis).
+    progressFill.classList.add('done');
+    progressText.classList.remove('pulsing');
     if (failed.length === 0) {
       progressFill.style.backgroundColor = '#4caf50';
       progressText.textContent = 'Finished, close when ready.';
@@ -3765,6 +3822,9 @@ async function uploadFile() {
   async function uploadNextFile() {
     if (currentIndex >= files.length) {
       // All files processed - show summary
+      // CrumBLE 4.5.4: terminal state -- stop the heartbeat (shimmer + ellipsis).
+      progressFill.classList.add('done');
+      progressText.classList.remove('pulsing');
       if (failedFiles.length === 0) {
         progressFill.style.backgroundColor = '#4caf50';
         progressFill.style.width = '100%';
@@ -3844,6 +3904,11 @@ async function uploadFile() {
     progressFill.classList.add('no-transition');
     progressFill.style.width = '0%';
     progressFill.style.backgroundColor = '#27ae60';
+    // CrumBLE 4.5.4: start the alive heartbeat (shimmer + ellipsis) for
+    // this file. Cleared in the terminal-state branches above (success /
+    // error / cancelled).
+    progressFill.classList.remove('done');
+    progressText.classList.add('pulsing');
     // Re-enable transition after a brief delay
     setTimeout(() => progressFill.classList.remove('no-transition'), 50);
 
@@ -4203,7 +4268,7 @@ function showFailedUploadsBanner() {
            Retry-from-start now reopens the modal, where the in-modal Resume
            button handles continuation of the prior run from the saved
            offset via the WS RESUME protocol. -->
-      <button class="retry-btn" onclick="retrySingleUpload(${index})" title="Reopen the upload modal to resume from where the prior attempt left off">Retry from start</button>
+      <button class="retry-btn" onclick="retrySingleUpload(${index})" title="Reopen the upload modal -- the in-modal Resume button picks up from the saved byte offset">Retry</button>
     `;
     filesList.appendChild(item);
   });
