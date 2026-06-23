@@ -76,6 +76,10 @@ constexpr DeviceProfile KNOWN_DEVICES[] = {
 
     // Free3-M page turner (confirmed working keycodes from setup wizard)
     {"Free3-M", nullptr, 0x02, 0x01, false, 2, false},
+
+    // Free3-R (R + sound mode): code in byte[0], clean 0x00 releases.
+    // LEFT=0x01 (back), SELECT/RIGHT=0x02 (forward).
+    {"Free3-R", nullptr, 0x01, 0x02, false, 0, false},
 };
 
 constexpr int KNOWN_DEVICES_COUNT = sizeof(KNOWN_DEVICES) / sizeof(KNOWN_DEVICES[0]);

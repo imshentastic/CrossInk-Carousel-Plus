@@ -161,18 +161,20 @@ const DeviceProfile* findDeviceProfile(const char* macAddress, const char* devic
 
   // Then try to find by device name (flexible matching)
   if (deviceName && strlen(deviceName) > 0) {
+    // Exact name match wins over the fuzzy patterns below. Otherwise a
+    // mode-specific name like "Free3-R" gets hijacked by the broad "Free3"
+    // pattern and mapped to the wrong (Free3-M) report layout.
     for (int i = 0; i < KNOWN_DEVICES_COUNT; i++) {
-      const char* profileName = KNOWN_DEVICES[i].name;
-      
-      // Try exact match first
-      if (strcmp(deviceName, profileName) == 0) {
-        LOG_INF("DEV", "Matched device profile by exact name: %s", profileName);
+      if (strcmp(deviceName, KNOWN_DEVICES[i].name) == 0) {
+        LOG_INF("DEV", "Matched device profile by exact name: %s", KNOWN_DEVICES[i].name);
         return &KNOWN_DEVICES[i];
       }
-      
+    }
+
+    for (int i = 0; i < KNOWN_DEVICES_COUNT; i++) {
       // Try case-insensitive substring match for common patterns
       // This allows "Game Brick", "GameBrick", "IINE Game Brick", etc.
-      if (strstr(deviceName, "Game") || strstr(deviceName, "game") || 
+      if (strstr(deviceName, "Game") || strstr(deviceName, "game") ||
           strstr(deviceName, "GAME")) {
         if (strstr(deviceName, "Brick") || strstr(deviceName, "brick") || 
             strstr(deviceName, "BRICK")) {
