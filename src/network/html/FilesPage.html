@@ -2422,6 +2422,11 @@
     if (convertOptionsReset) convertOptionsReset.style.display = '';
     const titleResetEl = document.getElementById('uploadModalTitle');
     if (titleResetEl) titleResetEl.textContent = '📤 Upload file';
+    // optimizeSelectedOnDevice() also hides the file-info subtitle since
+    // 'Select a file to upload to ...' is wrong for that flow. Restore it
+    // for the next fresh upload.
+    const subtitleReset = document.querySelector('#uploadModal .file-info');
+    if (subtitleReset) subtitleReset.style.display = '';
     const uploadBtn = document.getElementById('uploadBtn');
     uploadBtn.disabled = true;
     uploadBtn.style.display = 'block';
@@ -2753,6 +2758,11 @@
     if (startConvBtn) startConvBtn.style.display = 'none';
     const titleEl = document.getElementById('uploadModalTitle');
     if (titleEl) titleEl.textContent = 'Optimize selected';
+    // The shared upload-modal subtitle reads 'Select a file to upload to ...'
+    // which is wrong for Optimize Selected (source is the device, not disk).
+    // Hide while running; the openUploadModal() flow restores it for next time.
+    const subtitleEl = document.querySelector('#uploadModal .file-info');
+    if (subtitleEl) subtitleEl.style.display = 'none';
     // Three-state Cancel/Close: red while running.
     isUploadInProgress = true;
     uploadGeneration++;
@@ -2829,16 +2839,27 @@
     const fileOriginPct = (idx) => idx * fileSliceSize;
     const fileScale = (idx, localPct) => fileOriginPct(idx) + (localPct * fileSliceSize / 100);
 
+    // Per-phase progress text helper: always shows file, batch index, current
+    // phase, and a live percent so the user can see *something* changing
+    // during long phases like the image-optimize / chapter-prebake passes
+    // that previously had no visible heartbeat.
+    const setPhase = (i, phase, localPct, suffix) => {
+      const overall = Math.round(fileScale(i, localPct));
+      const batch = epubs.length > 1 ? ` (${i + 1}/${epubs.length})` : '';
+      const tail = suffix ? ` -- ${suffix}` : '';
+      progressText.textContent = `${phase}${batch} -- ${overall}%${tail}`;
+    };
+
     for (let i = 0; i < epubs.length; i++) {
       const item = epubs[i];
       const itemPath = item.path; // e.g. "/Books/Foo.epub"
       const parentPath = itemPath.substring(0, itemPath.lastIndexOf('/') + 1) || '/';
       const fileName = item.name;
-      progressText.textContent = `Optimizing ${fileName} (${i + 1}/${epubs.length})...`;
 
       try {
         // 1. Download the EPUB from device back to browser.
         log(`[${i + 1}/${epubs.length}] Downloading ${fileName}...`, '', 'INFO');
+        setPhase(i, `Downloading ${fileName}`, 0);
         const dlResp = await fetch('/download?path=' + encodeURIComponent(itemPath));
         if (!dlResp.ok) {
           throw new Error(`download failed: HTTP ${dlResp.status}`);
@@ -2846,23 +2867,30 @@
         const epubBlob = await dlResp.blob();
         const epubFile = new File([epubBlob], fileName, { type: 'application/epub+zip' });
         progressFill.style.width = fileScale(i, 5) + '%';
+        setPhase(i, `Downloaded ${fileName}`, 5);
 
         // 2. Run the BT pass in the browser (image processing, .pxc bake).
         log(`[${i + 1}/${epubs.length}] Optimizing images...`, '', 'INFO');
         const convertedBlob = await convertEpubFile(epubFile, (pct) => {
-          progressFill.style.width = fileScale(i, 5 + pct * 0.20) + '%'; // 5%->25% local
+          const local = 5 + pct * 0.20;
+          progressFill.style.width = fileScale(i, local) + '%'; // 5%->25% local
+          setPhase(i, `Optimizing images in ${fileName}`, local);
         });
         const convertedFile = new File([convertedBlob], fileName, { type: 'application/epub+zip' });
 
         // 3. Upload the optimized EPUB back to its same SD path
         //    (overwrites the original).
         log(`[${i + 1}/${epubs.length}] Uploading optimized EPUB...`, '', 'INFO');
+        setPhase(i, `Uploading ${fileName}`, 25);
         await new Promise((resolve, reject) => {
           const xhr = new XMLHttpRequest();
           xhr.upload.addEventListener('progress', (e) => {
             if (e.lengthComputable) {
               const uploadPct = (e.loaded / e.total) * 100;
-              progressFill.style.width = fileScale(i, 25 + uploadPct * 0.55) + '%'; // 25%->80%
+              const local = 25 + uploadPct * 0.55;
+              progressFill.style.width = fileScale(i, local) + '%'; // 25%->80%
+              setPhase(i, `Uploading ${fileName}`, local,
+                `${(e.loaded / 1024 / 1024).toFixed(1)}/${(e.total / 1024 / 1024).toFixed(1)} MB`);
             }
           });
           xhr.addEventListener('load', () => {
@@ -2880,13 +2908,11 @@
         // 4. Chapter prebake: produces book.bin + sections-prebake/ +
         //    manifest and uploads them to /.crosspoint/epub_<hash>/.
         log(`[${i + 1}/${epubs.length}] Building chapter index...`, '', 'INFO');
+        setPhase(i, `Building chapter index for ${fileName}`, 80);
         await prebakeChapters(convertedFile, itemPath, (pct, status) => {
           const local = 80 + pct * 0.20; // 80%->100%
           progressFill.style.width = fileScale(i, local) + '%';
-          if (status) {
-            progressText.textContent =
-              `Optimizing ${fileName} (${i + 1}/${epubs.length})... ${status}`;
-          }
+          setPhase(i, `Building chapter index for ${fileName}`, local, status || '');
         });
 
         okCount++;
