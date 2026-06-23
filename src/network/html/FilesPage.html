@@ -4197,8 +4197,13 @@ function showFailedUploadsBanner() {
         <div class="failed-file-name">📄 ${escapeHtml(failedFile.name)}</div>
         <div class="failed-file-error">Error: ${escapeHtml(failedFile.error)}</div>
       </div>
-      <button class="retry-btn" onclick="resumeSingleUpload(${index})">Resume</button>
-      <button class="retry-btn" onclick="retrySingleUpload(${index})" title="Reopen the upload modal to change options">Retry from start</button>
+      <!-- CrumBLE 4.5.4 follow-up: removed the per-file Resume button from
+           this banner -- user feedback: 'Resume button should be inside the
+           modal, don't put resume on the main screen behind the modal'.
+           Retry-from-start now reopens the modal, where the in-modal Resume
+           button handles continuation of the prior run from the saved
+           offset via the WS RESUME protocol. -->
+      <button class="retry-btn" onclick="retrySingleUpload(${index})" title="Reopen the upload modal to resume from where the prior attempt left off">Retry from start</button>
     `;
     filesList.appendChild(item);
   });
