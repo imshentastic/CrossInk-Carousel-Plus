@@ -884,10 +884,61 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
   // Option 0 (default) keeps the user's current settings; Back/Cancel
   // maps to that same outcome because "do nothing destructive" is the
   // less surprising fallback when someone backs out of the prompt.
-  const std::string promptBody =
-      "This book was prepared with different reader settings. Keep your current "
-      "settings (chapters will rebuild against the live cache), or restore the "
-      "prepared layout for instant chapter loads?";
+  //
+  // CrumBLE 4.5.4: also list WHICH fields differ in the prompt body. Users
+  // hit this prompt without knowing what they did wrong; the generic
+  // "different reader settings" text made it impossible to align the
+  // device's settings to the prebake without trial-and-error toggling.
+  // Now the prompt names each drifted field (Font Size: 14pt -> 18pt,
+  // Hyphenation: off -> on, etc.) so the user can decide informed.
+  auto onoff = [](bool b) -> const char* { return b ? "on" : "off"; };
+  std::string diffLines;
+  auto append = [&diffLines](const std::string& line) {
+    if (!diffLines.empty()) diffLines += "\n";
+    diffLines += "  - ";
+    diffLines += line;
+  };
+  if (pm.fontId != curFontId) {
+    append("Font: device fontId=" + std::to_string(curFontId) + ", prebake fontId=" + std::to_string(pm.fontId));
+  }
+  if (pm.viewportWidth != curViewportW || pm.viewportHeight != curViewportH) {
+    append("Viewport: " + std::to_string(curViewportW) + "x" + std::to_string(curViewportH) +
+           " (device) vs " + std::to_string(pm.viewportWidth) + "x" + std::to_string(pm.viewportHeight) + " (prebake)");
+  }
+  if (pm.lineCompression != curLineComp) {
+    char buf[80];
+    snprintf(buf, sizeof(buf), "Line spacing: %.2f -> %.2f", static_cast<double>(curLineComp),
+             static_cast<double>(pm.lineCompression));
+    append(buf);
+  }
+  if (pm.extraParagraphSpacing != SETTINGS.extraParagraphSpacing) {
+    append(std::string("Paragraph spacing: ") + onoff(SETTINGS.extraParagraphSpacing) + " -> " + onoff(pm.extraParagraphSpacing));
+  }
+  if (pm.forceParagraphIndents != SETTINGS.forceParagraphIndents) {
+    append(std::string("Force indents: ") + onoff(SETTINGS.forceParagraphIndents) + " -> " + onoff(pm.forceParagraphIndents));
+  }
+  if (pm.paragraphAlignment != SETTINGS.paragraphAlignment) {
+    append("Alignment: " + std::to_string(SETTINGS.paragraphAlignment) + " -> " + std::to_string(pm.paragraphAlignment));
+  }
+  if (pm.hyphenationEnabled != SETTINGS.hyphenationEnabled) {
+    append(std::string("Hyphenation: ") + onoff(SETTINGS.hyphenationEnabled) + " -> " + onoff(pm.hyphenationEnabled));
+  }
+  if (pm.embeddedStyle != SETTINGS.embeddedStyle) {
+    append(std::string("Embedded CSS: ") + onoff(SETTINGS.embeddedStyle) + " -> " + onoff(pm.embeddedStyle));
+  }
+  if (pm.imageRendering != SETTINGS.imageRendering) {
+    append("Images: " + std::to_string(SETTINGS.imageRendering) + " -> " + std::to_string(pm.imageRendering));
+  }
+  if (pm.bionicReadingEnabled != SETTINGS.bionicReadingEnabled) {
+    append(std::string("Bionic reading: ") + onoff(SETTINGS.bionicReadingEnabled) + " -> " + onoff(pm.bionicReadingEnabled));
+  }
+  if (pm.guideReadingEnabled != SETTINGS.guideReadingEnabled) {
+    append(std::string("Guide reading: ") + onoff(SETTINGS.guideReadingEnabled) + " -> " + onoff(pm.guideReadingEnabled));
+  }
+  std::string promptBody =
+      "This book's chapter cache was prepared with different reader settings:\n\n" +
+      diffLines +
+      "\n\nKeep your current settings (rebuild chapters on demand), or restore the prepared layout (apply the book's prepared settings to your device)?";
   prebakePromptShowing_ = true;
   startActivityForResult(
       std::make_unique<ChoicePromptActivity>(
