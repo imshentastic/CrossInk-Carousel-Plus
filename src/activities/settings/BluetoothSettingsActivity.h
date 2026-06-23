@@ -28,6 +28,8 @@ class BluetoothSettingsActivity : public Activity {
   BluetoothHIDManager* btMgr = nullptr;
   std::string lastError = "";
   unsigned long lastScanTime = 0;
+  // Throttles the e-ink re-render for the animated "Searching..." dots.
+  unsigned long lastScanAnimMs = 0;
   LearnStep learnStep = LearnStep::WAIT_PREV;
   uint8_t pendingLearnKey = 0;
   uint8_t pendingLearnIndex = 0xFF;

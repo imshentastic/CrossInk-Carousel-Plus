@@ -1,4 +1,5 @@
 #include "BluetoothHIDManager.h"
+#include <algorithm>
 #include <Logging.h>
 #include <NimBLEDevice.h>
 #include <HalGPIO.h>
@@ -161,7 +162,10 @@ class ScanCallbacks : public NimBLEScanCallbacks {
   
   void onScanEnd(const NimBLEScanResults& results, int reason) override {
     (void)results;
-    (void)reason;
+    // Async scan finished: clear _scanning so the UI shows results.
+    if (g_instance) {
+      g_instance->onScanComplete(reason);
+    }
   }
 };
 
@@ -371,26 +375,18 @@ void BluetoothHIDManager::startScan(uint32_t durationMs) {
   pScan->setInterval(100);
   pScan->setWindow(99);
   
-  // In NimBLE 2.x, duration=0 means scan continuously until stop() is called
-  // Parameter 1: 0 = continuous scan
-  // Parameter 2: isContinue (false = clear old results)
-  bool started = pScan->start(0, false);
-  
+  // Async: NimBLE auto-stops after durationMs (ms) and fires onScanEnd. Was a
+  // blocking delay() that froze the UI for the whole scan. (false = clear results)
+  bool started = pScan->start(durationMs, false);
+
   if (!started) {
     LOG_ERR("BT", "Failed to start scan!");
     _scanning = false;
     lastError = "Scan failed";
     return;
   }
-  
-  // Wait for the specified duration
-  delay(durationMs);
-  
-  // Stop the scan
-  pScan->stop();
-  
-  _scanning = false;
-  LOG_INF("BT", "Scan complete, found %d devices", _discoveredDevices.size());
+
+  LOG_INF("BT", "Scan started (async, %lu ms)", durationMs);
 }
 
 void BluetoothHIDManager::stopScan() {
@@ -466,8 +462,23 @@ void BluetoothHIDManager::onScanResult(NimBLEAdvertisedDevice* advertisedDevice)
 
   _discoveredDevices.push_back(device);
 
+  // Named devices first, then stronger RSSI; stable to avoid jitter as results stream in.
+  std::stable_sort(_discoveredDevices.begin(), _discoveredDevices.end(),
+                   [](const BluetoothDevice& a, const BluetoothDevice& b) {
+                     const bool aNamed = a.name != "Unknown";
+                     const bool bNamed = b.name != "Unknown";
+                     if (aNamed != bNamed) return aNamed;  // named first
+                     return a.rssi > b.rssi;               // stronger signal first
+                   });
+
   LOG_DBG("BT", "Found device: %s (%s) RSSI:%d HID:%d",
           device.name.c_str(), device.address.c_str(), rssi, isHID);
+}
+
+void BluetoothHIDManager::onScanComplete(int reason) {
+  _scanning = false;
+  LOG_INF("BT", "Scan ended (reason=%d), found %d devices", reason,
+          static_cast<int>(_discoveredDevices.size()));
 }
 
 bool BluetoothHIDManager::connectToDevice(const std::string& address) {

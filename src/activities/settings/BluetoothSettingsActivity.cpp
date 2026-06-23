@@ -165,6 +165,16 @@ void BluetoothSettingsActivity::loop() {
     }
   }
 
+  // Re-render on a throttle to animate the "Searching..." dots during a scan.
+  // ~700 ms: faster would strobe the e-ink panel.
+  if (btMgr && viewMode == ViewMode::DEVICE_LIST && btMgr->isScanning()) {
+    constexpr unsigned long kScanAnimIntervalMs = 700;
+    if (millis() - lastScanAnimMs > kScanAnimIntervalMs) {
+      lastScanAnimMs = millis();
+      requestUpdate();
+    }
+  }
+
   // Check if scan completed
   if (btMgr && viewMode == ViewMode::DEVICE_LIST && !btMgr->isScanning() && lastScanTime > 0) {
     if (millis() - lastScanTime > 500) { // Small delay to see final results
@@ -558,6 +568,17 @@ void BluetoothSettingsActivity::handleLearnInput() {
 void BluetoothSettingsActivity::handleDeviceListInput() {
   if (!btMgr) return;
 
+  // Don't index the device list mid-scan (mutated on the BLE task); only cancel.
+  if (btMgr->isScanning()) {
+    if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
+      btMgr->stopScan();
+      viewMode = ViewMode::MAIN_MENU;
+      selectedIndex = 0;
+      requestUpdate();
+    }
+    return;
+  }
+
   const auto& devices = btMgr->getDiscoveredDevices();
   const auto& connectedDevices = btMgr->getConnectedDevices();
   
@@ -822,7 +843,10 @@ void BluetoothSettingsActivity::renderDeviceList() {
   // Subheader with scan status
   std::string subheaderText;
   if (btMgr->isScanning()) {
-    subheaderText = "Searching for devices...";
+    // Animated trailing dots; trailing spaces keep the width fixed so it doesn't reflow.
+    const int dotCount = static_cast<int>((millis() / 700) % 4);
+    subheaderText = "Searching for devices" + std::string(dotCount, '.') +
+                    std::string(3 - dotCount, ' ');
   } else {
     if (devices.empty()) {
       subheaderText = "No devices found";
@@ -836,54 +860,60 @@ void BluetoothSettingsActivity::renderDeviceList() {
   GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight},
                     subheaderText.c_str());
 
-  // Build device list labels. `GUI.drawList()` already paginates based on
-  // `selectedIndex`, so keep the full device list here and let the user scroll
-  // through every discovered device instead of truncating after the first page.
-  std::vector<std::string> deviceLabels;
-  std::vector<std::string> deviceValues;
-  char buf[128];
+  // During a scan the list is mutated on the BLE task; don't iterate it here
+  // (race). Show a hint; build the interactive list once the scan finishes.
+  if (btMgr->isScanning()) {
+    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, "Looking for nearby remotes...");
+  } else {
+    // Build device list labels. `GUI.drawList()` already paginates based on
+    // `selectedIndex`, so keep the full device list here and let the user scroll
+    // through every discovered device instead of truncating after the first page.
+    std::vector<std::string> deviceLabels;
+    std::vector<std::string> deviceValues;
+    char buf[128];
 
-  if (!devices.empty()) {
-    for (const auto& device : devices) {
-      const bool connected = btMgr->isConnected(device.address.c_str());
+    if (!devices.empty()) {
+      for (const auto& device : devices) {
+        const bool connected = btMgr->isConnected(device.address.c_str());
 
-      // Device name with indicators
-      const char* connSymbol = connected ? "[*] " : "";
-      const char* hidSymbol = device.isHID ? "[HID] " : "";
-      snprintf(buf, sizeof(buf), "%s%s%s", connSymbol, hidSymbol, device.name.c_str());
-      deviceLabels.push_back(buf);
+        // Device name with indicators
+        const char* connSymbol = connected ? "[*] " : "";
+        const char* hidSymbol = device.isHID ? "[HID] " : "";
+        snprintf(buf, sizeof(buf), "%s%s%s", connSymbol, hidSymbol, device.name.c_str());
+        deviceLabels.push_back(buf);
 
-      // RSSI/signal strength
-      const std::string signalBars = getSignalStrengthIndicator(device.rssi);
-      snprintf(buf, sizeof(buf), "%s (%d dBm)", signalBars.c_str(), device.rssi);
-      deviceValues.push_back(buf);
+        // RSSI/signal strength
+        const std::string signalBars = getSignalStrengthIndicator(device.rssi);
+        snprintf(buf, sizeof(buf), "%s (%d dBm)", signalBars.c_str(), device.rssi);
+        deviceValues.push_back(buf);
+      }
     }
-  }
 
-  // Add action buttons after the full device list.
-  deviceLabels.push_back("< Rescan >");
-  deviceValues.push_back("");
-  
-  if (!connectedDevices.empty()) {
-    deviceLabels.push_back("< Disconnect All >");
+    // Add action buttons after the full device list.
+    deviceLabels.push_back("< Rescan >");
     deviceValues.push_back("");
+
+    if (!connectedDevices.empty()) {
+      deviceLabels.push_back("< Disconnect All >");
+      deviceValues.push_back("");
+    }
+
+    // Render the list using GUI.drawList for consistency
+    GUI.drawList(
+        renderer,
+        Rect{0, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing, pageWidth,
+             pageHeight - (metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.buttonHintsHeight +
+                           metrics.verticalSpacing * 2)},
+        deviceLabels.size(), selectedIndex,
+        [&deviceLabels](int index) { return deviceLabels[index]; }, nullptr, nullptr,
+        [&deviceValues](int i) { return i < (int)deviceValues.size() ? deviceValues[i] : std::string(""); },
+        true);
   }
-  
-  // Render the list using GUI.drawList for consistency
-  GUI.drawList(
-      renderer,
-      Rect{0, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing, pageWidth,
-           pageHeight - (metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.buttonHintsHeight +
-                         metrics.verticalSpacing * 2)},
-      deviceLabels.size(), selectedIndex,
-      [&deviceLabels](int index) { return deviceLabels[index]; }, nullptr, nullptr,
-      [&deviceValues](int i) { return i < (int)deviceValues.size() ? deviceValues[i] : std::string(""); },
-      true);
 
   // Help text
   GUI.drawHelpText(renderer,
                    Rect{0, pageHeight - metrics.buttonHintsHeight - metrics.contentSidePadding - 15, pageWidth, 20},
-                   "Up/Down: Scroll | Right: Rescan");
+                   btMgr->isScanning() ? "Left/Back: Cancel scan" : "Up/Down: Scroll | Right: Rescan");
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_CONNECT), tr(STR_DIR_LEFT), tr(STR_RETRY));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
