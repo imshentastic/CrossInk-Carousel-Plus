@@ -16,6 +16,15 @@ void silentRestartToFileTransfer();// goes straight back to File Transfer activi
 void setSilentRebootFtModeHint(uint32_t mode);
 uint32_t consumeSilentRebootFtModeHint();
 
+// CrumBLE 4.5.4: panic-recovery flag for FT WS uploads. Called by the WS
+// upload handler on START accept (true) and on DONE / abort / disconnect /
+// FT exit (false). If a panic-reboot happens while true, setup() detects
+// it on the next boot and silent-restart-to-FT so the browser's WS retry
+// + RESUME protocol can naturally continue the interrupted upload. The
+// false-call also resets the consecutive-fail counter, so a clean run
+// restores full auto-resume budget for the next session.
+void setFtUploadInProgress(bool active);
+
 // CrumBLE 4.4 task #48: quick-restart on natural pauses. The pre-boot
 // action runs once the activity stack lands back on the reader, giving
 // the operation a fresh post-defrag heap to work with.
@@ -136,6 +145,15 @@ void silentRestartToOtaUpdate();
 // looping silent-restarts if a fresh boot is somehow still under the floor.
 void silentRestartToBluetoothSettings();
 extern bool g_postBtSilentReboot;
+
+// CrumBLE 4.5.4: same pattern as BT, for KOReader auth + OPDS browser.
+// Both flip true on a post-recovery boot so the activity's pre-flight
+// knows not to re-arm the silent-restart loop (one attempt then real
+// error). False on any other entry path.
+void silentRestartToKoreaderAuth();
+extern bool g_postKoreaderSilentReboot;
+void silentRestartToOpdsBrowser();
+extern bool g_postOpdsSilentReboot;
 
 // CrumBLE 4.6: silent restart that resumes mid-OTA -- after the user has
 // confirmed install on the "New update available" screen. Skips the check

@@ -468,6 +468,56 @@ constexpr uint32_t SILENT_REBOOT_TARGET_OTA_INSTALL = 4;
 // proceeds. g_postBtSilentReboot below guards against an infinite loop
 // if even a fresh boot is somehow under the floor.
 constexpr uint32_t SILENT_REBOOT_TARGET_BT_SETTINGS = 5;
+// CrumBLE 4.5.4: KOReader auth needs WiFi (+58 KB) + HTTPS handshake
+// (~40-50 KB contiguous for mbedtls cert chain) -- same heap profile as
+// BT enable. Field reports of "Memory low. Restart device." in mid-
+// reading sessions traced to ~30-50 KB MaxAlloc after a book had been
+// open. This target self-restarts the activity onto a ~150 KB free heap
+// so the auth POST completes. g_postKoreaderSilentReboot guards against
+// looping if a fresh boot is also under floor (e.g. wifi-enabled-at-
+// boot eats too much).
+constexpr uint32_t SILENT_REBOOT_TARGET_KOREADER_AUTH = 6;
+// CrumBLE 4.5.4: OPDS browser hits the same wifi+https heap profile,
+// plus the OPDS feed parse which can be 100+ KB of XML through the
+// parser's chunk buffer. Pre-flight + silent-restart-to-self with the
+// same shape as KOReader. Post-restart dispatch goes back through
+// goToBrowser() which picks single-server-direct OR server-picker as
+// appropriate, so we don't have to persist server selection across the
+// restart.
+constexpr uint32_t SILENT_REBOOT_TARGET_OPDS_BROWSER = 7;
+
+// CrumBLE 4.5.4: auto-recover from a panic mid-WS-upload by silent-restarting
+// straight back to FT instead of cold-booting into Home. Without this, a
+// device that crashes while serving a long upload (heap pressure, panic, etc.)
+// comes back into Home with no web server -- the user has no way to know
+// they need to manually re-enter FT to continue, and the browser's auto-
+// retry loop just spins on a closed port. With this:
+//
+//   1. WS upload START accept sets ftUploadInProgressFlag = MAGIC.
+//   2. WS upload DONE / abort / FT exit clears it back to 0.
+//   3. On boot, if flag == MAGIC and we're NOT in any other silent-restart
+//      path, increment ftUploadResumeFailCount + silentRestartToFileTransfer.
+//      Browser's WS retry naturally reconnects + the server's RESUME protocol
+//      picks up at the saved byte offset, so no progress is lost.
+//   4. Counter guards against infinite-panic loops: after MAX consecutive
+//      auto-resume attempts (FT mode itself crashes), we clear the flag and
+//      fall through to normal Home boot so user can at least navigate.
+//
+// Counter resets to 0 on every clean upload completion / FT exit, so a one-
+// off panic doesn't permanently burn the retry budget.
+RTC_NOINIT_ATTR uint32_t ftUploadInProgressFlag;
+RTC_NOINIT_ATTR uint32_t ftUploadResumeFailCount;
+constexpr uint32_t FT_UPLOAD_FLAG_MAGIC = 0xF7AB1234;
+constexpr uint32_t FT_UPLOAD_MAX_RESUME_TRIES = 2;
+
+void setFtUploadInProgress(bool active) {
+  if (active) {
+    ftUploadInProgressFlag = FT_UPLOAD_FLAG_MAGIC;
+  } else {
+    ftUploadInProgressFlag = 0;
+    ftUploadResumeFailCount = 0;  // clean exit -- restore full retry budget
+  }
+}
 
 // How the device is coming back to life, resolved once at boot. Both resume
 // flows suppress the splash and leave the panel holding its pre-boot frame; a
@@ -532,6 +582,31 @@ void silentRestartToBluetoothSettings() {
   silentRebootTarget = SILENT_REBOOT_TARGET_BT_SETTINGS;
   silentRebootMagic = SILENT_REBOOT_MAGIC;
   LOG_INF("MAIN", "Silent restart (target=bt-settings) — heap pre-flight tripped");
+  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+  delay(50);
+  ESP.restart();
+}
+
+// CrumBLE 4.5.4: mirror the BT pre-flight pattern for the two other auth-
+// heavy entry points users hit mid-session.
+bool g_postKoreaderSilentReboot = false;
+bool g_postOpdsSilentReboot = false;
+
+void silentRestartToKoreaderAuth() {
+  if (deepSleepInProgress) return;
+  silentRebootTarget = SILENT_REBOOT_TARGET_KOREADER_AUTH;
+  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  LOG_INF("MAIN", "Silent restart (target=koreader-auth) — heap pre-flight tripped");
+  GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+  delay(50);
+  ESP.restart();
+}
+
+void silentRestartToOpdsBrowser() {
+  if (deepSleepInProgress) return;
+  silentRebootTarget = SILENT_REBOOT_TARGET_OPDS_BROWSER;
+  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  LOG_INF("MAIN", "Silent restart (target=opds-browser) — heap pre-flight tripped");
   GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
   delay(50);
   ESP.restart();
@@ -1271,8 +1346,10 @@ void setup() {
   const bool isSilentReboot = (silentRebootMagic == SILENT_REBOOT_MAGIC);
   // CrumBLE 4.5.4 fix: bound was OTA_INSTALL (4) which snapped BT_SETTINGS (5)
   // to 0 -- silent-restart-from-BT landed on home instead of BT Settings.
+  // Bumped again to OPDS_BROWSER (7) for the same reason: any new target we
+  // add below the bound silently routes to home if we forget to widen it.
   const uint32_t snapshotTarget =
-      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_BT_SETTINGS) ? silentRebootTarget : 0;
+      (isSilentReboot && silentRebootTarget <= SILENT_REBOOT_TARGET_OPDS_BROWSER) ? silentRebootTarget : 0;
   // Snapshot the FT mode hint into a normal variable before clearing
   // RTC state, so the FT activity's onEnter can read it via
   // consumeSilentRebootFtModeHint(). Only honour it on a confirmed
@@ -1330,6 +1407,34 @@ void setup() {
   silentRebootOtaUrl[0] = '\0';
   silentRebootOtaVersion[0] = '\0';
   silentRebootOtaSize = 0;
+
+  // CrumBLE 4.5.4: auto-resume an interrupted FT WS upload. If the prior
+  // boot's WS upload set the flag and we just panic-rebooted (cold/non-
+  // silent boot), silent-restart back into FT so the browser's WS retry
+  // naturally reconnects + the server's RESUME protocol picks up at the
+  // saved byte offset. Counter caps consecutive auto-resumes so FT-mode-
+  // itself crashes can't loop forever -- after MAX tries, fall through
+  // to normal Home boot. Skip when this IS already a silent reboot to a
+  // different target (OTA install / BT settings etc.) -- those take
+  // precedence so the user isn't yanked away from their explicit choice.
+  if (!isSilentReboot && ftUploadInProgressFlag == FT_UPLOAD_FLAG_MAGIC) {
+    if (ftUploadResumeFailCount < FT_UPLOAD_MAX_RESUME_TRIES) {
+      ftUploadResumeFailCount++;
+      LOG_INF("BOOT", "FT upload was in-progress before reboot -- silent-restarting to FT (try %u/%u)",
+              static_cast<unsigned>(ftUploadResumeFailCount),
+              static_cast<unsigned>(FT_UPLOAD_MAX_RESUME_TRIES));
+      // Don't clear the flag here -- if THIS resume attempt also panics,
+      // the next boot increments the counter again and eventually gives
+      // up. Successful upload completion clears the flag via
+      // setFtUploadInProgress(false) which also resets the counter.
+      silentRestartToFileTransfer();  // never returns
+    } else {
+      LOG_ERR("BOOT", "FT upload flag set for %u consecutive boots -- giving up, booting Home normally",
+              static_cast<unsigned>(ftUploadResumeFailCount));
+      ftUploadInProgressFlag = 0;
+      ftUploadResumeFailCount = 0;
+    }
+  }
 
   // CrumBLE 4.5: lean-boot path for silent-restart-to-OTA. The mbedtls SSL
   // handshake to api.github.com needs ~40-50 KB contiguous on top of WiFi's
@@ -1685,6 +1790,20 @@ void setup() {
     LOG_INF("BOOT", "Lean-boot BT dispatch: heap=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     g_postBtSilentReboot = true;
     activityManager.goToBluetoothSettings();
+  } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_KOREADER_AUTH) {
+    // CrumBLE 4.5.4: same pattern as BT, scoped to the KOReader auth flow.
+    LOG_INF("BOOT", "Lean-boot KOReader auth dispatch: heap=%u maxAlloc=%u",
+            ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    g_postKoreaderSilentReboot = true;
+    activityManager.goToKoreaderAuth();
+  } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_OPDS_BROWSER) {
+    // CrumBLE 4.5.4: same pattern as BT, scoped to OPDS feed-fetch entry.
+    // goToBrowser() handles the single-server-direct vs picker fork so
+    // we don't have to persist which server was being accessed.
+    LOG_INF("BOOT", "Lean-boot OPDS dispatch: heap=%u maxAlloc=%u",
+            ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    g_postOpdsSilentReboot = true;
+    activityManager.goToBrowser();
   } else if (resume == BootResume::Silent && snapshotTarget == SILENT_REBOOT_TARGET_READER &&
              !APP_STATE.openEpubPath.empty()) {
     activityManager.goToReader(APP_STATE.openEpubPath);

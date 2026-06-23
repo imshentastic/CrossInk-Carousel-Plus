@@ -2742,43 +2742,58 @@
   // follows the same grey/red/green state machine. Failures on any
   // single file are non-fatal: the batch continues with the next file
   // and the failed entries surface in the retry banner.
-  // CrumBLE 4.5.4: Resume state. When an Optimize Selected run fails
-  // mid-batch, we stash the remaining items + the right per-file phase
-  // ('prebakeOnly' if upload-back already succeeded for that item) so the
-  // user can click the in-modal Resume button to pick up exactly where
-  // we left off without re-picking from the DOM (selection may have been
-  // cleared) or re-running phases that already landed on SD. Cleared on
-  // successful completion or when a fresh run starts.
-  let optimizeResumeContext = null;
-  function setOptimizeResumeState(ctx) {
-    optimizeResumeContext = ctx;
+  // CrumBLE 4.5.4: generic Resume action. Any code path that bottoms out
+  // with recoverable state can call setPendingResumeAction({label, run})
+  // and the in-modal Resume button surfaces, labeled appropriately. Resume
+  // click consumes the pending action and invokes run(). Used by both
+  // Optimize Selected (resume from prebake or full pipeline) AND regular
+  // WS upload (resume after probe-exhaustion meaning the device probably
+  // rebooted out of FT mode and the user needs to re-enter FT manually).
+  let pendingResumeAction = null;
+  function setPendingResumeAction(action) {
+    pendingResumeAction = action;
     const btn = document.getElementById('resumeBtn');
     if (!btn) return;
-    if (ctx && Array.isArray(ctx.pendingFiles) && ctx.pendingFiles.length > 0) {
-      const n = ctx.pendingFiles.length;
-      const what = ctx.prebakeOnly ? 'prebake' : 'optimize';
-      btn.textContent = `Resume — ${what} ${n} file${n === 1 ? '' : 's'}`;
+    if (action && typeof action.run === 'function') {
+      btn.textContent = action.label || 'Resume';
       btn.style.display = '';
     } else {
       btn.style.display = 'none';
     }
   }
-  function clearOptimizeResumeState() {
-    optimizeResumeContext = null;
+  function clearPendingResumeAction() {
+    pendingResumeAction = null;
     const btn = document.getElementById('resumeBtn');
     if (btn) btn.style.display = 'none';
   }
   async function runResume() {
-    if (!optimizeResumeContext) return;
-    const ctx = optimizeResumeContext;
-    optimizeResumeContext = null;  // consume; re-set on next failure
+    if (!pendingResumeAction) return;
+    const action = pendingResumeAction;
+    pendingResumeAction = null;  // consume; re-set on next failure
     const btn = document.getElementById('resumeBtn');
     if (btn) btn.style.display = 'none';
-    await optimizeSelectedOnDevice({
-      prebakeOnly: !!ctx.prebakeOnly,
-      resumeSelection: ctx.pendingFiles,
+    await action.run();
+  }
+  // Back-compat shims so the existing Optimize Selected catch path keeps
+  // working without surgery. setOptimizeResumeState builds the run()
+  // callback that re-enters optimizeSelectedOnDevice with the right
+  // prebakeOnly + resumeSelection.
+  function setOptimizeResumeState(ctx) {
+    if (!ctx || !Array.isArray(ctx.pendingFiles) || ctx.pendingFiles.length === 0) {
+      clearPendingResumeAction();
+      return;
+    }
+    const n = ctx.pendingFiles.length;
+    const what = ctx.prebakeOnly ? 'prebake' : 'optimize';
+    setPendingResumeAction({
+      label: `Resume — ${what} ${n} file${n === 1 ? '' : 's'}`,
+      run: () => optimizeSelectedOnDevice({
+        prebakeOnly: !!ctx.prebakeOnly,
+        resumeSelection: ctx.pendingFiles,
+      }),
     });
   }
+  function clearOptimizeResumeState() { clearPendingResumeAction(); }
 
   async function optimizeSelectedOnDevice(opts = {}) {
     // CrumBLE 4.5.4: prebakeOnly skips the image-optimize + re-upload steps
@@ -3405,12 +3420,20 @@ async function uploadFileWebSocket(file, onProgress, onComplete, onError) {
   const MAX_RETRIES = 10;
   let attempt = 0;
   let lastError = null;
+  // CrumBLE 4.5.4: capture progress bytes so the probe-exhaustion path can
+  // tell the user how many MB they've already pushed -- and so the in-modal
+  // Resume action knows where to resume from in its label.
+  let lastSentBytes = 0;
+  const trackProgress = (sent, total) => {
+    if (typeof sent === 'number') lastSentBytes = sent;
+    if (onProgress) onProgress(sent, total);
+  };
 
   while (attempt <= MAX_RETRIES) {
     try {
       // CrumBLE 4.4: surface devicePath (returned by DONE:<path> upgrade) so
       // the caller can skip the post-upload /api/files lookup.
-      const devicePath = await uploadFileWebSocketOnce(file, onProgress, onComplete, onError);
+      const devicePath = await uploadFileWebSocketOnce(file, trackProgress, onComplete, onError);
       return devicePath;
     } catch (err) {
       lastError = err;
@@ -3467,8 +3490,26 @@ async function uploadFileWebSocket(file, onProgress, onComplete, onError) {
           }
         }
         if (!probedBack) {
-          // Probe budget exhausted -- device never came back within 60s.
-          // Fall through to a generic exponential backoff as last resort.
+          // CrumBLE 4.5.4: probe budget exhausted -- /api/status never
+          // responded for 60s. Most likely scenario: device hard-crashed
+          // (panic) and rebooted into Home (not FT), so the web server
+          // isn't running. We can't keep blindly retrying WS connects;
+          // the user has to manually re-enter FT mode for the server to
+          // come back. Set up a Resume action with a clear actionable
+          // message + abort the auto-retry loop with a sentinel error
+          // that the catch handler doesn't treat as a normal failure.
+          const resumeFromMb = (lastSentBytes / 1024 / 1024).toFixed(2);
+          const totalMb = (file.size / 1024 / 1024).toFixed(2);
+          if (onError) {
+            try {
+              onError(`Device may have rebooted out of File Transfer mode (no response for 60s). To continue from ${resumeFromMb}/${totalMb} MB: re-enter File Transfer on your device (Settings -> Sync & Network -> File Transfer), then click Resume below.`);
+            } catch (e) { /* ignore */ }
+          }
+          setPendingResumeAction({
+            label: `Resume upload (from ${resumeFromMb} MB)`,
+            run: () => uploadFileWebSocket(file, onProgress, onComplete, onError),
+          });
+          throw new Error('Upload paused -- re-enter File Transfer mode and click Resume below.');
         }
       } else {
         const delayMs = Math.min(2000 * Math.pow(2, attempt - 1), 32000);

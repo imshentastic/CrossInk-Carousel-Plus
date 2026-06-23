@@ -26,6 +26,25 @@ constexpr size_t OPDS_BROWSER_ENTRY_CAPACITY = MAX_OPDS_FEED_ENTRIES + 2;
 void OpdsBookBrowserActivity::onEnter() {
   Activity::onEnter();
 
+  // CrumBLE 4.5.4: heap pre-flight before WiFi + OPDS-feed parse. WiFi
+  // begin = ~58 KB, HTTPS handshake = ~40-50 KB contiguous, plus the
+  // streaming OPDS XML parser eats ~10-15 KB through its chunk buffer
+  // on large catalogs. Mid-reading sessions sit ~50 KB free; without
+  // the silent-restart the user used to hit ERROR with no recovery
+  // path. Pattern mirrors KOReader auth + BT scan: bail to a clean
+  // ~150 KB heap, then continue. g_postOpdsSilentReboot guards loop.
+  constexpr uint32_t kOpdsMinFreeHeap = 66u * 1024u;
+  constexpr uint32_t kOpdsMinMaxAlloc = 48u * 1024u;
+  const uint32_t freeHeapPre = ESP.getFreeHeap();
+  const uint32_t maxAllocPre = ESP.getMaxAllocHeap();
+  if ((freeHeapPre < kOpdsMinFreeHeap || maxAllocPre < kOpdsMinMaxAlloc) && !g_postOpdsSilentReboot) {
+    LOG_INF("OPDS",
+            "OPDS browser pre-flight low (free=%u maxAlloc=%u, need %u/%u) -- silent-restart to recover heap",
+            freeHeapPre, maxAllocPre, kOpdsMinFreeHeap, kOpdsMinMaxAlloc);
+    silentRestartToOpdsBrowser();
+    return;  // never returns; appease the linter
+  }
+
   state = BrowserState::CHECK_WIFI;
   entryCount = 0;
   navigationHistory.clear();
