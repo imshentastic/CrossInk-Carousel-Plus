@@ -260,6 +260,13 @@ void CrossPointWebServerActivity::onExit() {
 
   LOG_DBG("WEBACT", "Free heap at onExit start: %d bytes", ESP.getFreeHeap());
 
+  // CrumBLE 4.5.4: user explicitly exited FT -- clear the panic-recovery
+  // flag so a later unrelated panic doesn't auto-restart back into FT
+  // they no longer want to be in. Reset is idempotent if no upload was
+  // active. Counter resets too, restoring full auto-resume budget for
+  // the next FT session.
+  setFtUploadInProgress(false);
+
   // CrumBLE: books may have just been uploaded over the file-transfer
   // web UI (USB or hotspot). Mark the LibraryIndex stale so the next
   // visit to Recently Added / All Books re-walks SD and discovers them.

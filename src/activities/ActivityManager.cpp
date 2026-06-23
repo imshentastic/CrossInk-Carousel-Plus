@@ -19,6 +19,7 @@
 #include "network/CrossPointWebServerActivity.h"
 #include "reader/ReaderActivity.h"
 #include "settings/OpdsServerListActivity.h"
+#include "settings/KOReaderAuthActivity.h"
 #include "settings/BluetoothSettingsActivity.h"
 #include "settings/OtaUpdateActivity.h"
 #include "settings/SettingsActivity.h"
@@ -202,6 +203,12 @@ void ActivityManager::goToBluetoothSettings() {
   // user explicitly backs out when done (same shape as goToSettings).
   replaceActivity(std::make_unique<BluetoothSettingsActivity>(
       renderer, mappedInput, [this] { popActivity(); }, /*exitOnSuccessfulConnect=*/false));
+}
+
+void ActivityManager::goToKoreaderAuth() {
+  // CrumBLE 4.5.4: replaceActivity post-silent-restart so the auth
+  // wizard is the root activity, matching the BT pattern.
+  replaceActivity(std::make_unique<KOReaderAuthActivity>(renderer, mappedInput));
 }
 
 void ActivityManager::goToSettings() { replaceActivity(std::make_unique<SettingsActivity>(renderer, mappedInput)); }

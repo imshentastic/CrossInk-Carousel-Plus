@@ -551,6 +551,15 @@ class CrossPointSettings {
   // pass stays on, matching v3.7.3 behaviour). Only affects the cycle
   // path -- cover sleep, custom sleep, and end-of-book sleep keep the
   // grayscale pass either way.
+  //
+  // CrumBLE 4.5.4: kept default at 0. Considered flipping to 1 since X4
+  // cycling can feel sluggish vs X3, but field testing showed that the
+  // sluggish-feeling X4 sessions had grayscale sleep images (where the
+  // 4-level rendering is the entire reason to use the image), and X3
+  // sessions with snappy cycling typically used B/W sleep images
+  // already. Users with grayscale-heavy collections would regress on a
+  // default-on flip; they can opt in via the Settings toggle if they
+  // prefer the speed-over-fidelity trade.
   uint8_t sleepCycleSkipGrayscale = 0;
 
   // CrumBLE prebake — master switch for the off-device chapter-index optimizer.

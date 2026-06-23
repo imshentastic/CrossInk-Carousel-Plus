@@ -1,4 +1,5 @@
 #include "CrossPointWebServer.h"
+#include "SilentRestart.h"
 
 #include <ArduinoJson.h>
 #ifdef SIMULATOR
@@ -410,6 +411,9 @@ void CrossPointWebServer::abortWsUpload(const char* tag) {
   wsUploadInProgress = false;
   wsUploadClientNum = 255;
   wsLastProgressSent = 0;
+  // CrumBLE 4.5.4: explicit abort -- clear the panic-recovery flag so we
+  // don't auto-restart-to-FT on a subsequent unrelated panic.
+  setFtUploadInProgress(false);
 }
 
 void CrossPointWebServer::stop() {
@@ -2371,6 +2375,11 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
 
           wsUploadClientNum = num;
           wsUploadInProgress = true;
+          // CrumBLE 4.5.4: arm panic-recovery flag. If the device hard-
+          // crashes during the rest of this upload, setup() detects this
+          // on the next boot and silent-restart-to-FT so the browser's
+          // WS retry + RESUME picks up at the saved byte offset.
+          setFtUploadInProgress(true);
           if (resumeFrom > 0) {
             char resumeMsg[48];
             snprintf(resumeMsg, sizeof(resumeMsg), "RESUME:%lu", static_cast<unsigned long>(resumeFrom));
@@ -2486,6 +2495,10 @@ void CrossPointWebServer::onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* 
         wsUploadFile.close();
         wsUploadInProgress = false;
         wsUploadClientNum = 255;
+        // CrumBLE 4.5.4: clean DONE -- clear the panic-recovery flag and
+        // reset its consecutive-fail counter so the next upload starts
+        // with full auto-resume budget.
+        setFtUploadInProgress(false);
 
         wsLastCompleteName = wsUploadFileName;
         wsLastCompleteSize = wsUploadSize;

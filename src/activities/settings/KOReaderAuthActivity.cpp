@@ -52,6 +52,26 @@ void KOReaderAuthActivity::performAuthentication() {
 void KOReaderAuthActivity::onEnter() {
   Activity::onEnter();
 
+  // CrumBLE 4.5.4: heap pre-flight. WiFi.begin alone needs ~58 KB free +
+  // ~30 KB MaxAlloc, and the mbedtls HTTPS handshake for the KOReader
+  // sync server's auth POST needs another ~40-50 KB contiguous on top.
+  // Mid-reading session, free heap is often ~50 KB / MaxAlloc ~25 KB --
+  // the user used to see "Memory low. Restart device." and have to
+  // power-cycle. Now: silent-restart to come back on a clean ~150 KB
+  // free heap, then the auth completes. g_postKoreaderSilentReboot
+  // guards against an infinite loop if even a fresh boot is somehow
+  // under the floor.
+  constexpr uint32_t kAuthMinFreeHeap = 66u * 1024u;
+  constexpr uint32_t kAuthMinMaxAlloc = 48u * 1024u;
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+  if ((freeHeap < kAuthMinFreeHeap || maxAlloc < kAuthMinMaxAlloc) && !g_postKoreaderSilentReboot) {
+    LOG_INF("KOR", "KOReader auth pre-flight low (free=%u maxAlloc=%u, need %u/%u) -- silent-restart to recover heap",
+            freeHeap, maxAlloc, kAuthMinFreeHeap, kAuthMinMaxAlloc);
+    silentRestartToKoreaderAuth();
+    return;  // never returns, but appease the linter
+  }
+
   // Check if already connected
   if (WiFi.status() == WL_CONNECTED) {
     onWifiSelectionComplete(true);

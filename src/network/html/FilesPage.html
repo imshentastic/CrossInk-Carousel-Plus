@@ -1076,21 +1076,68 @@
       background-color: #e0e0e0;
       border-radius: 10px;
       overflow: hidden;
+      position: relative;
     }
     #progress-fill {
       height: 100%;
       background-color: #27ae60;
       width: 0%;
       transition: width 0.3s;
+      position: relative;
+      overflow: hidden;
     }
     #progress-fill.no-transition {
       transition: none !important;
+    }
+    /* CrumBLE 4.5.4: alive-but-slow heartbeat. The numeric progress can sit
+       at the same value for 30-60s during chapter-cache upload (12/703 ->
+       13/703 etc.), making the modal look frozen. Inner shimmer slides
+       left-to-right across the filled portion every 1.6s so the user has
+       continuous motion confirming the device is still processing. Pure
+       CSS, no JS tick cost. */
+    #progress-fill::after {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; bottom: 0;
+      width: 80px;
+      background: linear-gradient(90deg, rgba(255,255,255,0) 0%,
+                                          rgba(255,255,255,0.6) 50%,
+                                          rgba(255,255,255,0) 100%);
+      animation: progress-shimmer 1.6s linear infinite;
+    }
+    /* Hide the shimmer when the bar is parked (no progress activity). The
+       .done class is applied by the upload modal when the run finishes. */
+    #progress-fill.done::after {
+      display: none;
+    }
+    @keyframes progress-shimmer {
+      0%   { transform: translateX(-100%); }
+      100% { transform: translateX(800px); }
     }
     #progress-text {
       text-align: center;
       margin-top: 5px;
       font-size: 0.9em;
       color: var(--label-color);
+    }
+    /* CrumBLE 4.5.4: animated ellipsis suffix. Add class 'pulsing' to
+       progress-text and the trailing dots cycle 1->2->3->1... so the
+       status line itself reads as still-alive even when the body text
+       (12/703 etc.) hasn't ticked over. JS toggles the class while a
+       run is in-flight and removes it on done/cancel. */
+    #progress-text.pulsing::after {
+      content: '\00A0\00A0\00A0';
+      display: inline-block;
+      width: 1.5em;
+      text-align: left;
+      animation: progress-ellipsis 1.2s steps(4, end) infinite;
+    }
+    @keyframes progress-ellipsis {
+      0%   { content: '\00A0\00A0\00A0'; }
+      25%  { content: '.\00A0\00A0'; }
+      50%  { content: '..\00A0'; }
+      75%  { content: '...'; }
+      100% { content: '\00A0\00A0\00A0'; }
     }
     .folder-form {
       margin-top: 10px;
@@ -1872,6 +1919,13 @@
       <!-- Optimize & Upload button - shown when picker is visible, replaces Upload -->
       <button id="startConversionBtn" class="upload-btn optimize" style="display:none;" onclick="startConversionWithImageStates()">Optimize & Upload</button>
       <button id="uploadBtn" class="upload-btn" onclick="uploadFile()" disabled>Upload</button>
+      <!-- CrumBLE 4.5.4: Resume button. Surfaces ONLY when a prior run left
+           recoverable state (e.g. Optimize Selected got upload-back done but
+           prebake stalled). Replaces the standalone 'Prebake Selected' button
+           that lived next to 'Optimize Selected' and was unclear. Hidden by
+           default; shown by setResumeState() when there's actual work to
+           resume; hidden again on successful completion or fresh-run start. -->
+      <button id="resumeBtn" class="upload-btn optimize" style="display:none;" onclick="runResume()">Resume</button>
       <button class="delete-btn-cancel" onclick="handleCancelUploadModal()">Cancel</button>
       <div id="progress-container">
         <div id="progress-bar"><div id="progress-fill"></div></div>
@@ -2150,7 +2204,21 @@
     let lastErrMsg = null;
     for (let attempt = 0; attempt <= MAX_RECONNECT_ATTEMPTS; attempt++) {
       try {
-        const response = await fetch('/api/files?path=' + encodeURIComponent(currentPath) + '&_=' + Date.now());
+        // CrumBLE 4.5.4: hard 8s deadline. If the device silent-restarts to
+        // recover heap mid-request, the TCP connection just hangs (no 503,
+        // no error) and the previous code would sit on a single fetch
+        // forever -- the retry loop never fires because catch only runs
+        // when fetch actually errors. AbortController forces a timeout
+        // path so we cycle through the retries during the restart window.
+        const ctrl = new AbortController();
+        const tid = setTimeout(() => ctrl.abort(), 8000);
+        let response;
+        try {
+          response = await fetch('/api/files?path=' + encodeURIComponent(currentPath) + '&_=' + Date.now(),
+                                 { signal: ctrl.signal });
+        } finally {
+          clearTimeout(tid);
+        }
         if (response.status === 503) {
           // Device is in low-heap recovery; back off and retry.
           throw new Error('Device busy (503) — likely silent-restarting');
@@ -2162,6 +2230,7 @@
         lastErrMsg = null;
         break;  // success
       } catch (e) {
+        if (e.name === 'AbortError') e.message = 'Request timed out (8s) — device likely silent-restarting';
         lastErrMsg = e.message || String(e);
         console.warn('[FilesPage] load attempt ' + (attempt + 1) + '/' + (MAX_RECONNECT_ATTEMPTS + 1) + ' failed:', lastErrMsg);
         if (attempt < MAX_RECONNECT_ATTEMPTS) {
@@ -2372,6 +2441,9 @@
     const progressText = document.getElementById('progress-text');
     progressFill.style.width = '0%';
     progressFill.style.backgroundColor = '#e74c3c';
+    // CrumBLE 4.5.4: terminal state -- stop the heartbeat (shimmer + ellipsis).
+    progressFill.classList.add('done');
+    progressText.classList.remove('pulsing');
     progressText.style.color = '#e74c3c';
     progressText.textContent = 'Upload cancelled by User!';
     // Re-enable the action button (uploadBtn is always visible at this point;
@@ -2422,6 +2494,11 @@
     if (convertOptionsReset) convertOptionsReset.style.display = '';
     const titleResetEl = document.getElementById('uploadModalTitle');
     if (titleResetEl) titleResetEl.textContent = '📤 Upload file';
+    // optimizeSelectedOnDevice() also hides the file-info subtitle since
+    // 'Select a file to upload to ...' is wrong for that flow. Restore it
+    // for the next fresh upload.
+    const subtitleReset = document.querySelector('#uploadModal .file-info');
+    if (subtitleReset) subtitleReset.style.display = '';
     const uploadBtn = document.getElementById('uploadBtn');
     uploadBtn.disabled = true;
     uploadBtn.style.display = 'block';
@@ -2715,11 +2792,76 @@
   // follows the same grey/red/green state machine. Failures on any
   // single file are non-fatal: the batch continues with the next file
   // and the failed entries surface in the retry banner.
-  async function optimizeSelectedOnDevice() {
-    const sel = getSelectedItems();
+  // CrumBLE 4.5.4: generic Resume action. Any code path that bottoms out
+  // with recoverable state can call setPendingResumeAction({label, run})
+  // and the in-modal Resume button surfaces, labeled appropriately. Resume
+  // click consumes the pending action and invokes run(). Used by both
+  // Optimize Selected (resume from prebake or full pipeline) AND regular
+  // WS upload (resume after probe-exhaustion meaning the device probably
+  // rebooted out of FT mode and the user needs to re-enter FT manually).
+  let pendingResumeAction = null;
+  function setPendingResumeAction(action) {
+    pendingResumeAction = action;
+    const btn = document.getElementById('resumeBtn');
+    if (!btn) return;
+    if (action && typeof action.run === 'function') {
+      btn.textContent = action.label || 'Resume';
+      btn.style.display = '';
+    } else {
+      btn.style.display = 'none';
+    }
+  }
+  function clearPendingResumeAction() {
+    pendingResumeAction = null;
+    const btn = document.getElementById('resumeBtn');
+    if (btn) btn.style.display = 'none';
+  }
+  async function runResume() {
+    if (!pendingResumeAction) return;
+    const action = pendingResumeAction;
+    pendingResumeAction = null;  // consume; re-set on next failure
+    const btn = document.getElementById('resumeBtn');
+    if (btn) btn.style.display = 'none';
+    await action.run();
+  }
+  // Back-compat shims so the existing Optimize Selected catch path keeps
+  // working without surgery. setOptimizeResumeState builds the run()
+  // callback that re-enters optimizeSelectedOnDevice with the right
+  // prebakeOnly + resumeSelection.
+  function setOptimizeResumeState(ctx) {
+    if (!ctx || !Array.isArray(ctx.pendingFiles) || ctx.pendingFiles.length === 0) {
+      clearPendingResumeAction();
+      return;
+    }
+    const n = ctx.pendingFiles.length;
+    const what = ctx.prebakeOnly ? 'prebake' : 'optimize';
+    setPendingResumeAction({
+      label: `Resume — ${what} ${n} file${n === 1 ? '' : 's'}`,
+      run: () => optimizeSelectedOnDevice({
+        prebakeOnly: !!ctx.prebakeOnly,
+        resumeSelection: ctx.pendingFiles,
+      }),
+    });
+  }
+  function clearOptimizeResumeState() { clearPendingResumeAction(); }
+
+  async function optimizeSelectedOnDevice(opts = {}) {
+    // CrumBLE 4.5.4: prebakeOnly skips the image-optimize + re-upload steps
+    // and runs ONLY chapter prebake on each selected file. Used either
+    // directly (no callers today -- standalone 'Prebake Selected' button
+    // was removed for clarity) or via the in-modal Resume button when the
+    // last failure left the SD copy already optimized.
+    //
+    // resumeSelection overrides getSelectedItems() so the Resume button
+    // can replay against the remaining items even when the user has
+    // cleared the DOM selection or navigated away.
+    const prebakeOnly = !!opts.prebakeOnly;
+    clearOptimizeResumeState();  // fresh run -- discard any prior stuck state
+    const sel = opts.resumeSelection || getSelectedItems();
     const epubs = sel.filter(s => !s.isFolder && /\.epub$/i.test(s.name));
     if (epubs.length === 0) {
-      alert('Select one or more EPUB files to optimize. Folders and non-EPUB files are ignored.');
+      alert((prebakeOnly ? 'Select one or more EPUB files to prebake.' : 'Select one or more EPUB files to optimize.') +
+            ' Folders and non-EPUB files are ignored.');
       return;
     }
     if (epubs.length < sel.length) {
@@ -2742,6 +2884,10 @@
     const progressText = document.getElementById('progress-text');
     progressFill.style.width = '0%';
     progressFill.style.backgroundColor = '#27ae60';
+    // CrumBLE 4.5.4: start the alive heartbeat. Shimmer in the bar + ellipsis
+    // after the status text. Cleared in the terminal-state branches below.
+    progressFill.classList.remove('done');
+    progressText.classList.add('pulsing');
     // Hide the file picker chrome since this flow's source is the SD card.
     const fileInput = document.getElementById('fileInput');
     const uploadBtn = document.getElementById('uploadBtn');
@@ -2752,7 +2898,12 @@
     if (convertOptions) convertOptions.style.display = 'none';
     if (startConvBtn) startConvBtn.style.display = 'none';
     const titleEl = document.getElementById('uploadModalTitle');
-    if (titleEl) titleEl.textContent = 'Optimize selected';
+    if (titleEl) titleEl.textContent = prebakeOnly ? 'Prebake selected' : 'Optimize selected';
+    // The shared upload-modal subtitle reads 'Select a file to upload to ...'
+    // which is wrong for Optimize Selected (source is the device, not disk).
+    // Hide while running; the openUploadModal() flow restores it for next time.
+    const subtitleEl = document.querySelector('#uploadModal .file-info');
+    if (subtitleEl) subtitleEl.style.display = 'none';
     // Three-state Cancel/Close: red while running.
     isUploadInProgress = true;
     uploadGeneration++;
@@ -2829,40 +2980,74 @@
     const fileOriginPct = (idx) => idx * fileSliceSize;
     const fileScale = (idx, localPct) => fileOriginPct(idx) + (localPct * fileSliceSize / 100);
 
+    // Per-phase progress text helper: always shows file, batch index, current
+    // phase, and a live percent so the user can see *something* changing
+    // during long phases like the image-optimize / chapter-prebake passes
+    // that previously had no visible heartbeat.
+    const setPhase = (i, phase, localPct, suffix) => {
+      const overall = Math.round(fileScale(i, localPct));
+      const batch = epubs.length > 1 ? ` (${i + 1}/${epubs.length})` : '';
+      const tail = suffix ? ` -- ${suffix}` : '';
+      progressText.textContent = `${phase}${batch} -- ${overall}%${tail}`;
+    };
+
+    // Phase budgets. prebakeOnly skips convert+upload so prebake gets the
+    // full bar; otherwise we keep the original 5/25/80/100 split.
+    const prebakeStartPct = prebakeOnly ? 15 : 80;
     for (let i = 0; i < epubs.length; i++) {
       const item = epubs[i];
       const itemPath = item.path; // e.g. "/Books/Foo.epub"
       const parentPath = itemPath.substring(0, itemPath.lastIndexOf('/') + 1) || '/';
       const fileName = item.name;
-      progressText.textContent = `Optimizing ${fileName} (${i + 1}/${epubs.length})...`;
+      let convertedFile;  // populated below; prebake uses this
+      // CrumBLE 4.5.4: Resume state tracking. True once this item's SD copy
+      // is known to be the optimized version -- either we just uploaded it
+      // (post POST /upload success) or the caller declared prebakeOnly
+      // (SD copy already optimized from a prior run). On catch this drives
+      // whether the Resume button replays prebake-only or the full pipeline.
+      let itemUploadedThisRun = prebakeOnly;
 
       try {
-        // 1. Download the EPUB from device back to browser.
+        // 1. Download the EPUB from device back to browser. We need the
+        // bytes locally to feed prebakeChapters regardless of mode.
         log(`[${i + 1}/${epubs.length}] Downloading ${fileName}...`, '', 'INFO');
+        setPhase(i, `Downloading ${fileName}`, 0);
         const dlResp = await fetch('/download?path=' + encodeURIComponent(itemPath));
         if (!dlResp.ok) {
           throw new Error(`download failed: HTTP ${dlResp.status}`);
         }
         const epubBlob = await dlResp.blob();
         const epubFile = new File([epubBlob], fileName, { type: 'application/epub+zip' });
-        progressFill.style.width = fileScale(i, 5) + '%';
+        progressFill.style.width = fileScale(i, prebakeOnly ? 15 : 5) + '%';
+        setPhase(i, `Downloaded ${fileName}`, prebakeOnly ? 15 : 5);
 
+        if (prebakeOnly) {
+          // Skip convert + upload: SD copy is already what we want; just
+          // run chapter prebake on the freshly-downloaded bytes.
+          convertedFile = epubFile;
+        } else {
         // 2. Run the BT pass in the browser (image processing, .pxc bake).
         log(`[${i + 1}/${epubs.length}] Optimizing images...`, '', 'INFO');
         const convertedBlob = await convertEpubFile(epubFile, (pct) => {
-          progressFill.style.width = fileScale(i, 5 + pct * 0.20) + '%'; // 5%->25% local
+          const local = 5 + pct * 0.20;
+          progressFill.style.width = fileScale(i, local) + '%'; // 5%->25% local
+          setPhase(i, `Optimizing images in ${fileName}`, local);
         });
-        const convertedFile = new File([convertedBlob], fileName, { type: 'application/epub+zip' });
+        convertedFile = new File([convertedBlob], fileName, { type: 'application/epub+zip' });
 
         // 3. Upload the optimized EPUB back to its same SD path
         //    (overwrites the original).
         log(`[${i + 1}/${epubs.length}] Uploading optimized EPUB...`, '', 'INFO');
+        setPhase(i, `Uploading ${fileName}`, 25);
         await new Promise((resolve, reject) => {
           const xhr = new XMLHttpRequest();
           xhr.upload.addEventListener('progress', (e) => {
             if (e.lengthComputable) {
               const uploadPct = (e.loaded / e.total) * 100;
-              progressFill.style.width = fileScale(i, 25 + uploadPct * 0.55) + '%'; // 25%->80%
+              const local = 25 + uploadPct * 0.55;
+              progressFill.style.width = fileScale(i, local) + '%'; // 25%->80%
+              setPhase(i, `Uploading ${fileName}`, local,
+                `${(e.loaded / 1024 / 1024).toFixed(1)}/${(e.total / 1024 / 1024).toFixed(1)} MB`);
             }
           });
           xhr.addEventListener('load', () => {
@@ -2876,17 +3061,20 @@
           formData.append('file', convertedFile, fileName);
           xhr.send(formData);
         });
+        // Upload-back landed: SD copy is now the optimized version. From
+        // here, any failure is recoverable via prebake-only Resume.
+        itemUploadedThisRun = true;
+        }  // end !prebakeOnly
 
         // 4. Chapter prebake: produces book.bin + sections-prebake/ +
         //    manifest and uploads them to /.crosspoint/epub_<hash>/.
         log(`[${i + 1}/${epubs.length}] Building chapter index...`, '', 'INFO');
+        setPhase(i, `Building chapter index for ${fileName}`, prebakeStartPct);
+        const prebakeSpan = 100 - prebakeStartPct;
         await prebakeChapters(convertedFile, itemPath, (pct, status) => {
-          const local = 80 + pct * 0.20; // 80%->100%
+          const local = prebakeStartPct + pct * (prebakeSpan / 100);
           progressFill.style.width = fileScale(i, local) + '%';
-          if (status) {
-            progressText.textContent =
-              `Optimizing ${fileName} (${i + 1}/${epubs.length})... ${status}`;
-          }
+          setPhase(i, `Building chapter index for ${fileName}`, local, status || '');
         });
 
         okCount++;
@@ -2894,8 +3082,30 @@
       } catch (err) {
         console.error(`Optimization failed for ${fileName}:`, err);
         log(`[${i + 1}/${epubs.length}] ${fileName}: FAILED -- ${err.message || err}`, 'warning', 'OPT-FAIL');
-        failed.push({ name: fileName, path: itemPath, error: err.message || String(err) });
+        // CrumBLE 4.5.4: stash the per-item Resume hint alongside the
+        // failure record. We need the original item object (not just
+        // {name,path}) so a later Resume click can re-enter the pipeline
+        // with the same selection-style shape getSelectedItems returns.
+        failed.push({
+          name: fileName, path: itemPath, error: err.message || String(err),
+          _item: item, _uploadedThisRun: itemUploadedThisRun,
+        });
       }
+    }
+
+    // CrumBLE 4.5.4: build Resume state from accumulated failures, not
+    // per-iteration. Setting inside the catch overwrote earlier failures
+    // with each subsequent catch -- losing items from the Resume list.
+    // Now: collect every failed item across the whole batch and pick the
+    // safest replay mode (full pipeline if any failed BEFORE upload-back
+    // landed; prebake-only if every failure happened after the SD copy
+    // was already updated).
+    if (failed.length > 0) {
+      const allUploaded = failed.every(f => f._uploadedThisRun);
+      setOptimizeResumeState({
+        pendingFiles: failed.map(f => f._item),
+        prebakeOnly: allUploaded,
+      });
     }
 
     // Terminal state -- mirror the upload modal's three-state Close.
@@ -2907,6 +3117,9 @@
       cancelBtn.classList.remove('in-progress');
       cancelBtn.classList.add('done');
     }
+    // CrumBLE 4.5.4: terminal state -- stop the heartbeat (shimmer + ellipsis).
+    progressFill.classList.add('done');
+    progressText.classList.remove('pulsing');
     if (failed.length === 0) {
       progressFill.style.backgroundColor = '#4caf50';
       progressText.textContent = 'Finished, close when ready.';
@@ -3264,12 +3477,20 @@ async function uploadFileWebSocket(file, onProgress, onComplete, onError) {
   const MAX_RETRIES = 10;
   let attempt = 0;
   let lastError = null;
+  // CrumBLE 4.5.4: capture progress bytes so the probe-exhaustion path can
+  // tell the user how many MB they've already pushed -- and so the in-modal
+  // Resume action knows where to resume from in its label.
+  let lastSentBytes = 0;
+  const trackProgress = (sent, total) => {
+    if (typeof sent === 'number') lastSentBytes = sent;
+    if (onProgress) onProgress(sent, total);
+  };
 
   while (attempt <= MAX_RETRIES) {
     try {
       // CrumBLE 4.4: surface devicePath (returned by DONE:<path> upgrade) so
       // the caller can skip the post-upload /api/files lookup.
-      const devicePath = await uploadFileWebSocketOnce(file, onProgress, onComplete, onError);
+      const devicePath = await uploadFileWebSocketOnce(file, trackProgress, onComplete, onError);
       return devicePath;
     } catch (err) {
       lastError = err;
@@ -3280,18 +3501,82 @@ async function uploadFileWebSocket(file, onProgress, onComplete, onError) {
         throw err;  // out of retries
       }
       attempt++;
-      const delayMs = Math.min(2000 * Math.pow(2, attempt - 1), 32000);
+      // CrumBLE 4.5.4: device-restart-aware backoff. The device's START
+      // handler does a heap pre-flight and silentRestarts to recover when
+      // fragmented -- the user sees the upload sit at the same percent for
+      // 15-30s while the device reboots + reconnects WiFi + comes back up
+      // serving. The old code just exponential-backed-off with no
+      // indication that this is what's happening. Now: detect the explicit
+      // "Heap too fragmented" message OR a generic socket-close after
+      // we'd been making progress, and probe /api/status until the device
+      // confirms it's back BEFORE retrying the WS reconnect.
+      const isRestart = /restart|fragment/i.test(err.message || '') ||
+                        /WebSocket closed/i.test(err.message || '');
       console.warn('[WS] Upload failed (attempt ' + attempt + '/' + MAX_RETRIES +
-                   '), auto-resuming in ' + (delayMs / 1000) + 's:', err.message);
-      // Surface retry status via the onError callback so the UI can show
-      // "Retrying..." instead of "Failed". The actual onError fires only
-      // when retries are exhausted.
-      if (onError) {
-        try { onError('Upload paused (attempt ' + attempt + '/' + MAX_RETRIES +
-                       ') — auto-resuming in ' + (delayMs / 1000) + 's...'); }
-        catch (e) { /* ignore */ }
+                   '): ' + err.message);
+      if (isRestart) {
+        if (onError) {
+          try { onError('Device is restarting to recover heap. Waiting for it to come back...'); }
+          catch (e) { /* ignore */ }
+        }
+        // Probe /api/status every 2s with a 1.5s deadline, up to 60s. The
+        // first ok response means the device is serving again -- short
+        // breather to let WS bring-up settle, then resume.
+        let probedBack = false;
+        for (let probe = 1; probe <= 30; probe++) {
+          await new Promise(r => setTimeout(r, 2000));
+          try {
+            const ctrl = new AbortController();
+            const tid = setTimeout(() => ctrl.abort(), 1500);
+            const r = await fetch('/api/status', { cache: 'no-store', signal: ctrl.signal });
+            clearTimeout(tid);
+            if (r.ok) {
+              probedBack = true;
+              if (onError) {
+                try { onError('Device back online. Resuming upload...'); }
+                catch (e) { /* ignore */ }
+              }
+              await new Promise(r => setTimeout(r, 500));
+              break;
+            }
+          } catch (_) {
+            if (onError) {
+              try { onError('Waiting for device to finish restart... (' + (probe * 2) + 's, attempt ' + attempt + '/' + MAX_RETRIES + ')'); }
+              catch (e) { /* ignore */ }
+            }
+          }
+        }
+        if (!probedBack) {
+          // CrumBLE 4.5.4: probe budget exhausted -- /api/status never
+          // responded for 60s. Most likely scenario: device hard-crashed
+          // (panic) and rebooted into Home (not FT), so the web server
+          // isn't running. We can't keep blindly retrying WS connects;
+          // the user has to manually re-enter FT mode for the server to
+          // come back. Set up a Resume action with a clear actionable
+          // message + abort the auto-retry loop with a sentinel error
+          // that the catch handler doesn't treat as a normal failure.
+          const resumeFromMb = (lastSentBytes / 1024 / 1024).toFixed(2);
+          const totalMb = (file.size / 1024 / 1024).toFixed(2);
+          if (onError) {
+            try {
+              onError(`Device may have rebooted out of File Transfer mode (no response for 60s). To continue from ${resumeFromMb}/${totalMb} MB: re-enter File Transfer on your device (Settings -> Sync & Network -> File Transfer), then click Resume below.`);
+            } catch (e) { /* ignore */ }
+          }
+          setPendingResumeAction({
+            label: `Resume upload (from ${resumeFromMb} MB)`,
+            run: () => uploadFileWebSocket(file, onProgress, onComplete, onError),
+          });
+          throw new Error('Upload paused -- re-enter File Transfer mode and click Resume below.');
+        }
+      } else {
+        const delayMs = Math.min(2000 * Math.pow(2, attempt - 1), 32000);
+        if (onError) {
+          try { onError('Upload paused (attempt ' + attempt + '/' + MAX_RETRIES +
+                         ') — auto-resuming in ' + (delayMs / 1000) + 's...'); }
+          catch (e) { /* ignore */ }
+        }
+        await new Promise(r => setTimeout(r, delayMs));
       }
-      await new Promise(r => setTimeout(r, delayMs));
     }
   }
 
@@ -3537,6 +3822,9 @@ async function uploadFile() {
   async function uploadNextFile() {
     if (currentIndex >= files.length) {
       // All files processed - show summary
+      // CrumBLE 4.5.4: terminal state -- stop the heartbeat (shimmer + ellipsis).
+      progressFill.classList.add('done');
+      progressText.classList.remove('pulsing');
       if (failedFiles.length === 0) {
         progressFill.style.backgroundColor = '#4caf50';
         progressFill.style.width = '100%';
@@ -3616,6 +3904,11 @@ async function uploadFile() {
     progressFill.classList.add('no-transition');
     progressFill.style.width = '0%';
     progressFill.style.backgroundColor = '#27ae60';
+    // CrumBLE 4.5.4: start the alive heartbeat (shimmer + ellipsis) for
+    // this file. Cleared in the terminal-state branches above (success /
+    // error / cancelled).
+    progressFill.classList.remove('done');
+    progressText.classList.add('pulsing');
     // Re-enable transition after a brief delay
     setTimeout(() => progressFill.classList.remove('no-transition'), 50);
 
@@ -3969,8 +4262,13 @@ function showFailedUploadsBanner() {
         <div class="failed-file-name">📄 ${escapeHtml(failedFile.name)}</div>
         <div class="failed-file-error">Error: ${escapeHtml(failedFile.error)}</div>
       </div>
-      <button class="retry-btn" onclick="resumeSingleUpload(${index})">Resume</button>
-      <button class="retry-btn" onclick="retrySingleUpload(${index})" title="Reopen the upload modal to change options">Retry from start</button>
+      <!-- CrumBLE 4.5.4 follow-up: removed the per-file Resume button from
+           this banner -- user feedback: 'Resume button should be inside the
+           modal, don't put resume on the main screen behind the modal'.
+           Retry-from-start now reopens the modal, where the in-modal Resume
+           button handles continuation of the prior run from the saved
+           offset via the WS RESUME protocol. -->
+      <button class="retry-btn" onclick="retrySingleUpload(${index})" title="Reopen the upload modal -- the in-modal Resume button picks up from the saved byte offset">Retry</button>
     `;
     filesList.appendChild(item);
   });
@@ -4360,9 +4658,12 @@ function retryAllFailedUploads() {
       // from the last successfully-received byte, no progress lost.
       const MAX_ATTEMPTS = 16;
       let lastErr;
+      let lastSentBytes = 0;
+      const statusEl = document.getElementById('modal-status');
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
           await lanotaUploadWs(file, (sent, total) => {
+            lastSentBytes = sent;
             lanotaSetProgress(sent / total * 100,
               'Uploading: ' + (sent / 1024 / 1024).toFixed(2) + ' / ' + (total / 1024 / 1024).toFixed(2) + ' MB' +
               (attempt > 1 ? ' (attempt ' + attempt + ')' : ''));
@@ -4372,8 +4673,37 @@ function retryAllFailedUploads() {
         } catch (e) {
           lastErr = e;
           if (attempt >= MAX_ATTEMPTS) break;
-          document.getElementById('modal-status').textContent = 'Connection dropped (' + e.message + '). Auto-retrying in 2s... (attempt ' + (attempt + 1) + '/' + MAX_ATTEMPTS + ')';
-          await new Promise(r => setTimeout(r, 2000));
+          // CrumBLE 4.5.4: adaptive backoff. If the device asked for a
+          // restart-to-defrag-heap mid-upload, the WS server is offline
+          // for ~8s while it reboots and ~5s more for WiFi to come back.
+          // Detect that case + probe /api/status until the device confirms
+          // it's serving again before reconnecting. Server's RESUME picks
+          // up at lastSentBytes automatically.
+          const isRestart = /restart|fragment/i.test(e.message || '');
+          const resumeMb = (lastSentBytes / 1024 / 1024).toFixed(2);
+          const totalMb = (file.size / 1024 / 1024).toFixed(2);
+          if (isRestart) {
+            statusEl.textContent = `Device is restarting to recover heap (${resumeMb}/${totalMb} MB saved). Waiting for it to come back...`;
+            for (let probe = 1; probe <= 30; probe++) {
+              await new Promise(r => setTimeout(r, 2000));
+              try {
+                const ctrl = new AbortController();
+                const tid = setTimeout(() => ctrl.abort(), 1500);
+                const r = await fetch('/api/status', { cache: 'no-store', signal: ctrl.signal });
+                clearTimeout(tid);
+                if (r.ok) {
+                  statusEl.textContent = `Device back online. Resuming upload from ${resumeMb} MB...`;
+                  await new Promise(r => setTimeout(r, 500));
+                  break;
+                }
+              } catch (_) {
+                statusEl.textContent = `Waiting for device to finish restart... (${probe * 2}s)`;
+              }
+            }
+          } else {
+            statusEl.textContent = `Connection dropped (${e.message}). Resuming from ${resumeMb} MB in 3s... (attempt ${attempt + 1}/${MAX_ATTEMPTS})`;
+            await new Promise(r => setTimeout(r, 3000));
+          }
         }
       }
       if (lastErr) throw lastErr;
@@ -4397,7 +4727,7 @@ function retryAllFailedUploads() {
         }
       }
       if (installErr) throw installErr;
-      lanotaSetProgress(100, 'Installing... device will restart in about 1 minute. This page will reload when v' + latestVersion + ' is detected.');
+      lanotaSetProgress(100, 'Installing... device will restart in about 1 minute. The new firmware boots into Home, not File Transfer -- to verify v' + latestVersion + ' is running, re-enter File Transfer mode on your device after the screen returns to Home.');
       lanotaPollReboot(latestVersion);
     } catch (e) {
       document.getElementById('modal-status').textContent = 'Update failed after retries: ' + e.message;

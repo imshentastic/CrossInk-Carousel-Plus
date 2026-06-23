@@ -97,6 +97,10 @@ class ActivityManager {
   // by the silent-restart dispatch when the BT enable/scan pre-flight
   // tripped and we rebooted to recover heap.
   void goToBluetoothSettings();
+  // CrumBLE 4.5.4: same shape as goToBluetoothSettings, but for the
+  // KOReader auth wizard. Used by the silent-restart-to-koreader-auth
+  // dispatch when the activity's WiFi+HTTPS pre-flight tripped.
+  void goToKoreaderAuth();
   void goToSettings();
   void goToFileBrowser(std::string path = {});
   void goToRecentBooks();

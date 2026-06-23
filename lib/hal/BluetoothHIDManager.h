@@ -140,6 +140,8 @@ public:
 
   // BLE callbacks (public for NimBLE callbacks)
   void onScanResult(NimBLEAdvertisedDevice* advertisedDevice);
+  // Called from onScanEnd when an async scan finishes; clears _scanning.
+  void onScanComplete(int reason);
   static void onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify);
 
   // CrumBLE: called from the NimBLE disconnect callback with the HCI reason.

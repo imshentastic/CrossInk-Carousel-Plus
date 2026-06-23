@@ -967,6 +967,18 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
       }
     }
   }
+  // CrumBLE 4.5.4: same fix as loadShelfCovers -- if we drew the Loading
+  // popup over the framebuffer during this pass, flag it so the end-of-
+  // render handler invalidates caches + schedules a clean repaint that
+  // erases the popup. Without this, the CAROUSEL cover-load path would
+  // leave 'Loading' stuck on screen until the next user input forced a
+  // re-render (the 4.5.3 fix only covered the loadShelfCovers path).
+  // Reproduces reliably on a fresh-flash + first-boot Home where every
+  // carousel slot needs cover gen.
+  if (showingLoading) {
+    homeRenderPopupShown = true;
+    requestUpdate();
+  }
 }
 
 void HomeActivity::enrichActiveCollectionForSeries() {
