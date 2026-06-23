@@ -899,7 +899,17 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
     diffLines += line;
   };
   if (pm.fontId != curFontId) {
-    append("Font: device fontId=" + std::to_string(curFontId) + ", prebake fontId=" + std::to_string(pm.fontId));
+    // CrumBLE 4.5.4 follow-up: show the human-readable font name (e.g.
+    // "Bitter 14pt" / "LXGWWenKai 18pt") instead of the raw uint32 hash
+    // -- the prebake manifest already carries fontFamily / fontSize /
+    // sdFontFamilyName for exactly this display path, and the BT-path
+    // prompt has used fontLabel() since 4.5.4 for the same reason.
+    append("Font: " +
+           fontLabel(readerSettingsCache_, SETTINGS.fontFamily, SETTINGS.fontSize, SETTINGS.sdFontSizeRange,
+                     SETTINGS.sdFontFamilyName) +
+           " -> " +
+           fontLabel(readerSettingsCache_, pm.fontFamily, pm.fontSize, pm.sdFontSizeRange,
+                     std::string(pm.sdFontFamilyName)));
   }
   if (pm.viewportWidth != curViewportW || pm.viewportHeight != curViewportH) {
     append("Viewport: " + std::to_string(curViewportW) + "x" + std::to_string(curViewportH) +
@@ -970,6 +980,14 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
           finish();
           return;
         }
+        // CrumBLE 4.5.4 follow-up: suppress the BT-path PxcManifest prompt
+        // for this session -- the user just answered the open-book
+        // PrebakeManifest prompt, and the BT prompt would show nearly the
+        // same mismatch in slightly different wording. The 'Restore'
+        // branch below applies fontFamily/fontSize/sdFontFamilyName, so
+        // any residual fontId difference the BT prompt would still surface
+        // comes from a missing SD font (BT prompt can't fix that either).
+        btManifestPromptAnsweredThisSession_ = true;
         const bool keepCurrent = chosen != 1;
         if (keepCurrent) {
           // User declined -- keep their current settings. Don't delete the
