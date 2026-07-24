@@ -647,6 +647,15 @@ void EpubReaderActivity::onEnter() {
     return;
   }
 
+  // v18.9.9.209: arm terminate-recovery to the READER. Field crash: a
+  // bad_alloc terminate during book open (deferred settings save racing
+  // the section build) dumped the user to Home (recoveryTarget=0). The
+  // book path is already RTC-stashed while reading, so target=1 reopens
+  // the book on the recovery boot. One-shot by construction — the
+  // terminate handler zeroes the magic, so a repeat crash in the same
+  // book falls back to Home instead of looping. Cleared in onExit.
+  armSilentRestartTarget(/*SILENT_REBOOT_TARGET_READER=*/1);
+
   // CrumBLE: free the in-RAM library index for the duration of the reading
   // session. Recently Added / All Books keep it loaded -- tens of KB of scattered
   // string allocations for a large library -- and holding it through reading
@@ -1939,6 +1948,11 @@ void EpubReaderActivity::onExit() {
               exitMaxAlloc, kExitSaveMinMaxAlloc);
     }
   }
+
+  // v18.9.9.209: paired with the onEnter arming — a terminate after this
+  // point should route wherever the NEXT activity arms, not back into
+  // the book we just left.
+  clearArmedSilentRestartTarget();
 
   // v18.9.9.202: persist the current chapter title so Home's Dashboard
   // theme can show it under the book title without loading the EPUB.

@@ -410,7 +410,14 @@ bool writeSettingsToDiskNow_(const CrossPointSettings& s, bool bypassHeapGate = 
   // allowed to attempt the write even below the floor (silent-restart
   // is about to lose the in-memory state anyway).
   if (!bypassHeapGate) {
-    constexpr uint32_t kSerializeHardFloorMaxAlloc = 20u * 1024u;
+    // v18.9.9.209: floor raised 20 KB -> 28 KB. Field crash on X3: the
+    // 20 KB check passed, then the concurrent section build + glyph-atlas
+    // work dropped maxAlloc to 18.4 KB during the ArduinoJson doc churn ->
+    // bad_alloc -> terminate at cps:serialize, bouncing the user to Home
+    // seconds after accepting a prepared layout. 28 KB leaves ~8 KB of
+    // drift headroom; below it the save stays deferred and retries when
+    // the reader settles.
+    constexpr uint32_t kSerializeHardFloorMaxAlloc = 28u * 1024u;
     const uint32_t maxAllocNow = ESP.getMaxAllocHeap();
     if (maxAllocNow < kSerializeHardFloorMaxAlloc) {
       LOG_ERR("CPS",

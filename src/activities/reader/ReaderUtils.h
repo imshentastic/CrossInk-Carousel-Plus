@@ -118,7 +118,16 @@ inline void clearStatusBarBand(const GfxRenderer& renderer, int orientedMarginBo
   if (clearY < 0) {
     clearY = 0;
   }
-  renderer.fillRect(0, clearY, renderer.getScreenWidth(), renderer.getScreenHeight() - clearY, false);
+  // v18.9.9.209: clear only the RIGHT-HAND zone, not the full width. The
+  // per-page-turn dynamic text (page counter, percent, time-left) is right
+  // aligned; the left side holds the static title, and the progress bar
+  // spans the width but doesn't ghost the way small glyphs do. Whiting the
+  // whole strip on every turn read as a distracting full-width flash.
+  // Right 40% covers "1234/5678  99%  2h 30 min" with margin to spare.
+  const int screenW = renderer.getScreenWidth();
+  const int zoneW = screenW * 2 / 5;
+  const int zoneX = screenW - zoneW;
+  renderer.fillRect(zoneX, clearY, zoneW, renderer.getScreenHeight() - clearY, false);
 }
 
 inline void displayWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntilFullRefresh) {
