@@ -10,6 +10,9 @@
 #include <algorithm>
 
 #include "../util/ConfirmationActivity.h"
+#include "../../CrossPointState.h"
+#include "../../SilentRestart.h"
+#include "../../util/SettingsViewCache.h"
 #include "CrossPointSettings.h"
 #include "EpubReaderActivity.h"  // prewarmReaderTextBuffer
 #include "MappedInputManager.h"
@@ -21,9 +24,73 @@
 
 namespace {
 
+// v18.9.9.59: path-aware compat sidecar accessors for the drawer's compat
+// toggle row. Mirror ROA's helpers, but keyed on APP_STATE.readerActivePath
+// so the toggle acts on whichever render path this book is currently on
+// (compat_prepared.flag vs compat_custom.flag).
+constexpr const char* kDrawerCompatFlagPrepared = "/compat_prepared.flag";
+constexpr const char* kDrawerCompatFlagCustom = "/compat_custom.flag";
+
+const char* drawerActiveCompatFlagBasename() {
+  return APP_STATE.readerActivePath == 0 ? kDrawerCompatFlagPrepared : kDrawerCompatFlagCustom;
+}
+
+std::string drawerActiveBookCachePath() {
+  if (APP_STATE.openEpubPath.empty()) return {};
+  return Epub::cachePathForFilePath(APP_STATE.openEpubPath, "/.crosspoint");
+}
+
+bool drawerReadCompatSidecar() {
+  const auto cachePath = drawerActiveBookCachePath();
+  if (cachePath.empty()) return false;
+  return Storage.exists((cachePath + drawerActiveCompatFlagBasename()).c_str());
+}
+
+void drawerWriteCompatSidecar() {
+  const auto cachePath = drawerActiveBookCachePath();
+  if (cachePath.empty()) return;
+  const std::string path = cachePath + drawerActiveCompatFlagBasename();
+  if (Storage.exists(path.c_str())) return;
+  HalFile f;
+  if (Storage.openFileForWrite("DRW", path.c_str(), f)) {
+    f.close();
+    LOG_INF("DRW", "Compat sidecar written: %s", path.c_str());
+  } else {
+    LOG_ERR("DRW", "Failed to write compat sidecar: %s", path.c_str());
+  }
+}
+
+void drawerClearCompatSidecar() {
+  const auto cachePath = drawerActiveBookCachePath();
+  if (cachePath.empty()) return;
+  const std::string path = cachePath + drawerActiveCompatFlagBasename();
+  if (Storage.exists(path.c_str())) {
+    Storage.remove(path.c_str());
+    LOG_INF("DRW", "Compat sidecar cleared: %s", path.c_str());
+  }
+}
+
 bool isLandscape(const GfxRenderer& r) {
   const auto o = r.getOrientation();
   return o == GfxRenderer::Orientation::LandscapeClockwise || o == GfxRenderer::Orientation::LandscapeCounterClockwise;
+}
+
+// v18.9.9.25: mirror SettingsActivity's isCompatLockedSetting so the drawer
+// row-render decorates the same four/five settings compat forces (embedded
+// style, images, tables, bionic reading, guide reading) with the "(Compat)"
+// suffix. Kept identical to the SettingsActivity helper -- if either grows
+// a setting, add to both.
+bool isDrawerCompatLockedSetting(const SettingInfo& info) {
+  switch (info.nameId) {
+    case StrId::STR_IMAGES:
+    case StrId::STR_TABLES:
+    case StrId::STR_EMBEDDED_STYLE:
+    case StrId::STR_BIONIC_READING:
+    case StrId::STR_GUIDE_READING:
+      return true;
+    default:
+      return false;
+  }
 }
 
 // Read the value text for a single SettingInfo-bound row.
@@ -145,14 +212,17 @@ void applyDeltaToSetting(const SettingInfo& info, int delta) {
 
 BookSettingsDrawerActivity::BookSettingsDrawerActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                                        const std::vector<SettingInfo>* externalReaderSettings,
-                                                       const std::optional<PxcManifest>* pxcManifest)
+                                                       const std::optional<PxcManifest>* pxcManifest,
+                                                       int initialExpandedGroupId)
     : Activity("BookSettingsDrawer", renderer, mappedInput),
       externalReaderSettings_(externalReaderSettings && !externalReaderSettings->empty() ? externalReaderSettings
                                                                                          : nullptr),
-      pxcManifest_(pxcManifest) {}
+      pxcManifest_(pxcManifest),
+      pendingInitialExpandedGroupId_(initialExpandedGroupId) {}
 
 void BookSettingsDrawerActivity::onEnter() {
   Activity::onEnter();
+  SET_CHECKPOINT("drawer:onEnter");
 
   // Remember whether BLE was on so onExit() can request its return after the
   // reader's re-layout drains. Settings toggles silently drop BLE (no prompt
@@ -168,6 +238,21 @@ void BookSettingsDrawerActivity::onEnter() {
   readerBufferStored = renderer.storeBwBuffer();
   if (!readerBufferStored) {
     LOG_INF("BSD", "Failed to snapshot reader page; drawer will fall back to existing BW backup or in-place framebuffer");
+  }
+
+  // v18.9.9.25: OpenBookSettingsDrawer boot-continuation path -- the caller
+  // asked us to open with a specific group pre-expanded. Build the settings
+  // source now (we're on a fresh ~90 KB heap, so ensureSettingsSrcBuilt
+  // should succeed) and set expandedGroupId_ before the first buildItems
+  // pass so the expanded rows appear immediately.
+  if (pendingInitialExpandedGroupId_ >= 0) {
+    if (ensureSettingsSrcBuilt()) {
+      expandedGroupId_ = pendingInitialExpandedGroupId_;
+      LOG_INF("BSD", "Auto-expanded group %d after silent-restart continuation", expandedGroupId_);
+    } else {
+      LOG_INF("BSD", "OpenBookSettingsDrawer continuation: heap still tight; skipping auto-expand");
+    }
+    pendingInitialExpandedGroupId_ = -1;
   }
 
   buildItems();
@@ -196,12 +281,72 @@ void BookSettingsDrawerActivity::onExit() {
   // change to re-layout for); approximate via settingsChanged.
   auto& bt = BluetoothHIDManager::getInstance();
   if (bleWasEnabledOnEntry_ && !bt.isEnabled() && settingsChanged) {
+    SET_CHECKPOINT("drawer:bt-re-enable-onexit");
     // CrumBLE Phase 1 fast-open: pre-grow the glyph buffer before the
     // deferred enable drains. The drawer dropped BLE on entry to apply
     // a layout change; the post-layout re-enable needs the buffer at
     // high-water mark before NimBLE eats heap.
     EpubReaderActivity::prewarmReaderTextBuffer(renderer);
     bt.requestEnableLater();
+    SET_CHECKPOINT("drawer:bt-request-queued");
+  }
+}
+
+// CrumBLE 4.5.6 (revision 2): mapping from a reader-category SettingInfo's
+// nameId to its DrawerGroup. Settings not listed here are excluded from the
+// drawer (deferred to Reader Options Main Settings). The 13-row simplified
+// inventory was chosen with the INX drawer as a reference: high-frequency
+// mid-read tweaks stay in the drawer (font, layout, reading aids, images);
+// set-once defaults (EMBEDDED_STYLE, TEXT_AA, TEXT_DARKNESS, GUIDE_READING)
+// drop out. Hidden meta-toggle (glyphAtlasEnabled, surfaced as STR_NONE_OPT)
+// stays excluded as before.
+//
+// Returns -1 if the nameId is not in the drawer inventory at all.
+static int drawerGroupForReaderSetting(StrId nameId) {
+  switch (nameId) {
+    // Font (2)
+    case StrId::STR_FONT_FAMILY:
+    case StrId::STR_FONT_SIZE:
+      return BookSettingsDrawerActivity::kGroupFont;
+    // Layout (6) -- order here is also the in-group render order
+    case StrId::STR_LINE_SPACING:
+    case StrId::STR_EXTRA_SPACING:
+    case StrId::STR_FORCE_PARAGRAPH_INDENTS:
+    case StrId::STR_PARA_ALIGNMENT:
+    case StrId::STR_SCREEN_MARGIN:
+    case StrId::STR_ORIENTATION:
+      return BookSettingsDrawerActivity::kGroupLayout;
+    // Reading aids (3)
+    case StrId::STR_HYPHENATION:
+    case StrId::STR_BIONIC_READING:
+    case StrId::STR_READER_DARK_MODE:
+      return BookSettingsDrawerActivity::kGroupReadingAids;
+    // Images (1)
+    case StrId::STR_IMAGES:
+      return BookSettingsDrawerActivity::kGroupImages;
+    // Everything else -- intentionally deferred to Main Settings or hidden:
+    //   STR_EMBEDDED_STYLE, STR_TEXT_AA, STR_TEXT_DARKNESS, STR_GUIDE_READING,
+    //   STR_NONE_OPT (the hidden glyphAtlasEnabled toggle).
+    default:
+      return -1;
+  }
+}
+
+// Visible label for each DrawerGroup separator row. Hardcoded English to
+// match the rest of the drawer's non-localized strings (BT rows, info row);
+// localization can come later in a single sweep.
+static const char* labelForGroup(int groupId) {
+  switch (groupId) {
+    case BookSettingsDrawerActivity::kGroupFont:
+      return "Font";
+    case BookSettingsDrawerActivity::kGroupLayout:
+      return "Layout";
+    case BookSettingsDrawerActivity::kGroupReadingAids:
+      return "Reading aids";
+    case BookSettingsDrawerActivity::kGroupImages:
+      return "Images";
+    default:
+      return "";
   }
 }
 
@@ -229,6 +374,10 @@ void BookSettingsDrawerActivity::buildItems() {
   //     "Quick Connect" button while a remote is already connected.
   buildBluetoothItems();
 
+  // 1b) v18.9.9.59: Compat Mode toggle row. See buildCompatModeItem for the
+  // full rationale.
+  buildCompatModeItem();
+
   // 2) Pull every Reader-category non-Action setting, in declaration order.
   //
   // PREFERRED PATH: when EpubReaderActivity built a settings cache at book
@@ -245,47 +394,233 @@ void BookSettingsDrawerActivity::buildItems() {
   // skip the build when heap is too tight and the drawer degrades to BT
   // actions only. This path is now rare -- only triggers when the parent
   // (EpubReaderActivity) couldn't build its own cache either.
-  if (externalReaderSettings_) {
-    const auto& src = *externalReaderSettings_;
-    for (size_t i = 0; i < src.size(); ++i) {
-      const auto& info = src[i];
-      if (info.category != StrId::STR_CAT_READER) continue;
-      if (info.type == SettingType::ACTION || info.type == SettingType::SECTION_HEADER) continue;
-      Item item;
-      item.nameId = info.nameId;
-      item.settingIndex = static_cast<int>(i);
-      items.push_back(std::move(item));
+  // CrumBLE 4.5.6 rev 3 (INX lazy pattern): drawer opens with BT actions + 4
+  // group separators only. The ~6-10 KB settings source (getSettingsList
+  // enumStringValues: font families, sizes, etc.) is built lazily on the
+  // FIRST group expand -- users whose intent is BT Quick Connect never pay
+  // the cost. Field test: post-BT free was 504 B with cache built, 3836 B
+  // without -- delta unblocks BT + SD-font reading. rebuildDrawerItems()
+  // handles both initial layout and post-expand rebuild; activateSelected
+  // invokes ensureSettingsSrcBuilt() before flipping expandedGroupId_.
+  rebuildDrawerItems();
+}
+
+// CrumBLE 4.5.6 rev 3: on-demand settings-source build. Runs when the user
+// first expands a group. Idempotent: no-op after the first successful build.
+// Returns true if the settings source is now available; false under low-heap.
+bool BookSettingsDrawerActivity::ensureSettingsSrcBuilt() {
+  if (externalReaderSettings_ != nullptr && !externalReaderSettings_->empty()) {
+    return true;  // parent-supplied cache still supported (rare)
+  }
+  if (!settingsList_.empty()) {
+    return true;  // built locally on a prior expand
+  }
+  // v18.9.9.63: v62 populates viewRows_ (not settingsList_) under viewMode_.
+  // Without this check, a second group-expand tap on a different group would
+  // re-enter the heap gate + clear-and-repopulate viewRows_ path, which under
+  // BT-tight heap either refuses or churns. The user saw this as "can't
+  // switch groups without closing/reopening the drawer" -- expandedGroupId_
+  // never advanced because ensureSettingsSrcBuilt returned false the second
+  // time around.
+  if (viewMode_ && !viewRows_.empty()) {
+    return true;
+  }
+  const auto heap = MemoryBudget::snapshot();
+  if (!MemoryBudget::hasHeap(heap, 28u * 1024u, 14u * 1024u)) {
+    // v18.9.9.55 (task #40): fall back to the SD-cached settings-view
+    // snapshot. If the cache loads, users can inspect their current
+    // values under BT without disconnect; edits still redirect to a
+    // silent-restart-with-OpenBookSettingsDrawer.
+    if (tryPopulateFromViewCache()) {
+      viewMode_ = true;
+      LOG_INF("BSD",
+              "ensureSettingsSrcBuilt: heap too tight (free=%u maxAlloc=%u); loaded %u rows from SD view cache "
+              "(view-only mode, edits will silent-restart)",
+              heap.freeHeap, heap.maxAllocHeap, static_cast<unsigned>(settingsList_.size()));
+      return true;
     }
-  } else {
-    const auto heap = MemoryBudget::snapshot();
-    if (MemoryBudget::hasHeap(heap, 28u * 1024u, 14u * 1024u)) {
-      // CrumBLE: pass the SD font registry so FONT_FAMILY's enumStringValues
-      // includes installed SD families AND FONT_SIZE uses the SD font's
-      // size list when one is active. Without the registry, both rows
-      // render blank when the user has an SD font selected: FONT_FAMILY
-      // because its valueGetter looks for the active name in an empty
-      // sdFamilyNames capture, and FONT_SIZE because the built-in size
-      // enum has fewer entries than the SD font's index.
-      sdFontSystem.refreshIfDirty();
-      settingsList_ = getSettingsList(&sdFontSystem.registry());
-      for (size_t i = 0; i < settingsList_.size(); ++i) {
-        const auto& info = settingsList_[i];
-        if (info.category != StrId::STR_CAT_READER) continue;
-        if (info.type == SettingType::ACTION || info.type == SettingType::SECTION_HEADER) continue;
+    LOG_INF("BSD",
+            "ensureSettingsSrcBuilt: heap too tight (free=%u maxAlloc=%u); no view cache available, can't expand "
+            "groups",
+            heap.freeHeap, heap.maxAllocHeap);
+    return false;
+  }
+  sdFontSystem.refreshIfDirty();
+  settingsList_ = getSettingsList(&sdFontSystem.registry());
+  LOG_INF("BSD", "ensureSettingsSrcBuilt: built lazily (heap free=%u maxAlloc=%u; %u entries)",
+          heap.freeHeap, heap.maxAllocHeap, static_cast<unsigned>(settingsList_.size()));
+  return true;
+}
+
+bool BookSettingsDrawerActivity::tryPopulateFromViewCache() {
+  // v18.9.9.61: pre-flight heap gate. loadSettingsViewCache pulls the whole
+  // cache file into a std::vector<SettingsViewRow>. Under -fno-exceptions
+  // any single vector-grow failure calls std::terminate (bad_alloc can't
+  // be caught). Refuse cleanly under super-tight heap.
+  //
+  // v18.9.9.62: drawer now stores viewRows_ directly (no SettingInfo
+  // conversion), which cuts alloc pressure roughly in half vs pre-62 --
+  // but the pre-flight stays because the initial load itself allocates a
+  // ~5-8 KB vector even before we touch it.
+  constexpr uint32_t kViewCacheMinMaxAlloc = 8u * 1024u;
+  const auto heap = MemoryBudget::snapshot();
+  if (heap.maxAllocHeap < kViewCacheMinMaxAlloc) {
+    LOG_INF("BSD",
+            "tryPopulateFromViewCache: maxAlloc=%u below floor=%u; refusing to load view cache "
+            "(bad_alloc would hard-restart)",
+            heap.maxAllocHeap, kViewCacheMinMaxAlloc);
+    return false;
+  }
+  viewRows_.clear();
+  if (!loadSettingsViewCache(viewRows_) || viewRows_.empty()) {
+    viewRows_.clear();  // in case load partially populated then failed
+    return false;
+  }
+  LOG_INF("BSD",
+          "tryPopulateFromViewCache: loaded %u rows into viewRows_ (heap free=%u maxAlloc=%u)",
+          static_cast<unsigned>(viewRows_.size()), heap.freeHeap, heap.maxAllocHeap);
+  return true;
+}
+
+std::string BookSettingsDrawerActivity::viewRowValueText(const SettingsViewRow& row) const {
+  // Mirrors ReaderOptionsActivity::viewRowValueText. Kept local to avoid a
+  // cross-activity dependency for a 20-line helper.
+  if (row.type == SettingType::TOGGLE) {
+    return row.currentValue ? std::string(I18N.get(StrId::STR_STATE_ON))
+                            : std::string(I18N.get(StrId::STR_STATE_OFF));
+  }
+  if (row.type == SettingType::ENUM) {
+    for (size_t i = 0; i < row.enumRawValues.size(); ++i) {
+      if (row.enumRawValues[i] == row.currentValue) {
+        if (i < row.enumStringLabels.size() && !row.enumStringLabels[i].empty()) {
+          return row.enumStringLabels[i];
+        }
+        if (i < row.enumStrIds.size() && row.enumStrIds[i] != StrId::STR_NONE_OPT) {
+          return std::string(I18N.get(row.enumStrIds[i]));
+        }
+      }
+    }
+    return std::to_string(row.currentValue);
+  }
+  if (row.type == SettingType::VALUE) {
+    return std::to_string(row.currentValue);
+  }
+  if (row.type == SettingType::STRING) {
+    return row.stringValue;
+  }
+  return {};
+}
+
+// Constructor + post-expand item rebuild. Always adds BT actions + all group
+// separators. If a settings source exists AND a group is expanded, appends
+// that group's member items right after its separator.
+void BookSettingsDrawerActivity::rebuildDrawerItems() {
+  items.clear();
+  buildBluetoothItems();
+  // v18.9.9.59: keep the compat toggle in the same slot on rebuild so
+  // group expand/collapse doesn't hide it. Layout intentionally mirrors
+  // buildItems' sequencing (BT actions -> compat toggle -> group tree).
+  buildCompatModeItem();
+
+  // v18.9.9.26: under Compat mode AND while BT is up, the drawer omits every
+  // reader settings group -- only the BT quick-connect / no-images /
+  // disconnect items above stay. This is the tight-heap regime where the
+  // group-expand path routinely refuses (~8 KB maxAlloc). When BT is off the
+  // heap has ~30-40 KB maxAlloc back, so the settings groups render and
+  // expand fine -- keep them visible so the user can still access reader
+  // options through the drawer without going to the in-book Reader Options
+  // screen. Compat mode itself (simpleRenderingActive_) only sticks when a
+  // book was opened with the sidecar + BT; if BT drops mid-session, compat
+  // stays on for this open but the heap is back so we relax the gate.
+  if (APP_STATE.readerCompatModeActive && BluetoothHIDManager::getInstance().isEnabled()) {
+    return;
+  }
+
+  const std::vector<SettingInfo>* settingsSrc = externalReaderSettings_;
+  if ((settingsSrc == nullptr || settingsSrc->empty()) && !settingsList_.empty()) {
+    settingsSrc = &settingsList_;
+  }
+  // v18.9.9.62: view-mode iterates viewRows_ (no SettingInfo copies) so the
+  // Font group renders without the alloc storm that used to crash the drawer
+  // under BT-tight heap. Item.settingIndex under viewMode_ points into
+  // viewRows_ instead of currentSettings().
+  const bool useViewRows = viewMode_ && !viewRows_.empty();
+
+  for (int group = 0; group < kGroupCount; ++group) {
+    Item sep;
+    sep.isGroupSeparator = true;
+    sep.groupId = group;
+    sep.customName = labelForGroup(group);
+    items.push_back(std::move(sep));
+
+    if (group != expandedGroupId_) continue;
+    if (!useViewRows && settingsSrc == nullptr) continue;
+
+    if (useViewRows) {
+      for (size_t i = 0; i < viewRows_.size(); ++i) {
+        const auto& row = viewRows_[i];
+        if (row.categoryId != StrId::STR_CAT_READER) continue;
+        if (row.type == SettingType::ACTION || row.type == SettingType::SECTION_HEADER) continue;
+        if (drawerGroupForReaderSetting(row.nameId) != group) continue;
         Item item;
-        item.nameId = info.nameId;
+        item.nameId = row.nameId;
         item.settingIndex = static_cast<int>(i);
+        item.groupId = group;
         items.push_back(std::move(item));
       }
     } else {
-      LOG_INF("BSD", "Low heap (free=%u maxAlloc=%u); showing Bluetooth actions only", heap.freeHeap,
-              heap.maxAllocHeap);
+      for (size_t i = 0; i < settingsSrc->size(); ++i) {
+        const auto& info = (*settingsSrc)[i];
+        if (info.category != StrId::STR_CAT_READER) continue;
+        if (info.type == SettingType::ACTION || info.type == SettingType::SECTION_HEADER) continue;
+        if (drawerGroupForReaderSetting(info.nameId) != group) continue;
+        Item item;
+        item.nameId = info.nameId;
+        item.settingIndex = static_cast<int>(i);
+        item.groupId = group;
+        items.push_back(std::move(item));
+      }
     }
   }
+}
 
-  // BT rows now live at the TOP of the drawer (built in step 1 above via
-  // buildBluetoothItems()). The trailing reader-settings appender used to
-  // run here; nothing else to do.
+
+void BookSettingsDrawerActivity::buildCompatModeItem() {
+  // Path-aware: writes/clears compat_prepared.flag or compat_custom.flag
+  // depending on APP_STATE.readerActivePath. Setter mirrors ROA's compat
+  // setter -- flips APP_STATE.readerCompatModeActive for immediate UI
+  // decorations, signals compatModeChanged for the reader-menu return
+  // handler, and tracks the manual-off intent for the auto-re-enable toast.
+  const bool compatOn = drawerReadCompatSidecar();
+  Item compat;
+  compat.nameId = StrId::STR_COMPAT_MODE;  // theming id; label is set below
+  compat.isAction = true;
+  // v18.9.9.60: snprintf into a stack buffer + one final std::string
+  // construction, instead of `string(a) + ": " + string(b)` which allocated
+  // three intermediates. The drawer rebuilds on every group expand under
+  // BT with maxAlloc as low as 44 B; every unnecessary alloc is a crash
+  // vector.
+  char labelBuf[48];
+  snprintf(labelBuf, sizeof(labelBuf), "%s: %s", I18N.get(StrId::STR_COMPAT_MODE),
+           compatOn ? I18N.get(StrId::STR_STATE_ON) : I18N.get(StrId::STR_STATE_OFF));
+  compat.customName = labelBuf;
+  compat.activate = [this, compatOn]() {
+    if (compatOn) {
+      drawerClearCompatSidecar();
+      APP_STATE.readerCompatModeActive = false;
+      APP_STATE.compatUserDisabledThisSession = true;
+    } else {
+      drawerWriteCompatSidecar();
+      APP_STATE.readerCompatModeActive = true;
+      APP_STATE.compatUserDisabledThisSession = false;
+    }
+    APP_STATE.compatModeChanged = true;
+    MenuResult result;
+    result.settingsChanged = true;
+    setResult(ActivityResult{result});
+    finish();
+  };
+  items.push_back(std::move(compat));
 }
 
 void BookSettingsDrawerActivity::buildBluetoothItems() {
@@ -339,9 +674,8 @@ void BookSettingsDrawerActivity::buildBluetoothItems() {
       MenuResult result;
       result.settingsChanged = settingsChanged;
       if (!hasBonded) {
-        // No bonded remote -- bounce to the pairing UI as before. Don't
-        // bother flagging connect-after-relayout; the user has to pair
-        // first and the BT UI handles its own connect flow.
+        // No bonded remote -- bounce to the pairing UI. The user has to pair
+        // first; the BT UI handles its own connect flow.
         result.requestBluetoothFlow = true;
       } else {
         result.bleConnectRequested = true;
@@ -395,6 +729,17 @@ void BookSettingsDrawerActivity::layoutDrawer() {
   itemsVisible = std::max(1, listRegion / itemHeight);
 }
 
+// CrumBLE 4.5.6 (revision 2): visibility predicate for the INX-style
+// collapsible drawer. Always-visible: BT actions (groupId<0), separators,
+// info row. Setting-bound rows: visible only when their group is the
+// currently-expanded one. clampSelection / render / navigation all walk
+// items[] honoring this rule, so collapsed groups quietly disappear.
+static bool isItemVisible(const BookSettingsDrawerActivity::Item& item, int expandedGroupId) {
+  if (item.isAction || item.isInfo || item.isGroupSeparator) return true;
+  if (item.groupId < 0) return true;  // top-level setting (none today, but be safe)
+  return item.groupId == expandedGroupId;
+}
+
 void BookSettingsDrawerActivity::clampSelection() {
   if (items.empty()) {
     selectedIndex = 0;
@@ -403,21 +748,73 @@ void BookSettingsDrawerActivity::clampSelection() {
   const int n = static_cast<int>(items.size());
   if (selectedIndex < 0) selectedIndex = n - 1;
   if (selectedIndex >= n) selectedIndex = 0;
+  // CrumBLE 4.5.6 (rev 2): if the cursor landed on a collapsed item (e.g.
+  // user toggled a group closed, or buildItems just rebuilt), walk to the
+  // next visible item. Wrap around at the ends. A drawer with at least
+  // one BT row always has a visible item, so this terminates.
+  if (!isItemVisible(items[selectedIndex], expandedGroupId_)) {
+    int probe = selectedIndex;
+    for (int steps = 0; steps < n; ++steps) {
+      probe = (probe + 1) % n;
+      if (isItemVisible(items[probe], expandedGroupId_)) {
+        selectedIndex = probe;
+        return;
+      }
+    }
+  }
 }
+
+// CrumBLE 4.5.6 (rev 2): visible-item helpers for scroll/render math. With
+// group collapse, scrollOffset must count *visible* items above the top of
+// the rendered window, not raw item indices, or scroll math breaks when
+// hidden items lie between scrollOffset and selectedIndex.
+namespace {
+int visibleCount(const std::vector<BookSettingsDrawerActivity::Item>& items, int expandedGroupId) {
+  int n = 0;
+  for (const auto& it : items) {
+    if (isItemVisible(it, expandedGroupId)) n++;
+  }
+  return n;
+}
+// Returns the visible-index (0-based count of visible items strictly before
+// rawIdx). Returns -1 if rawIdx is itself invisible (callers should not
+// pass invisible items; clampSelection ensures selectedIndex is visible).
+int visibleIndexOf(const std::vector<BookSettingsDrawerActivity::Item>& items, int expandedGroupId, int rawIdx) {
+  if (rawIdx < 0 || rawIdx >= static_cast<int>(items.size())) return -1;
+  if (!isItemVisible(items[rawIdx], expandedGroupId)) return -1;
+  int vi = 0;
+  for (int i = 0; i < rawIdx; ++i) {
+    if (isItemVisible(items[i], expandedGroupId)) vi++;
+  }
+  return vi;
+}
+}  // namespace
 
 void BookSettingsDrawerActivity::adjustScrollToSelection() {
   if (items.empty()) return;
-  if (selectedIndex < scrollOffset) {
-    scrollOffset = selectedIndex;
-  } else if (selectedIndex >= scrollOffset + itemsVisible) {
-    scrollOffset = selectedIndex - itemsVisible + 1;
+  // Translate raw selectedIndex into the visible coordinate space. If the
+  // selection isn't visible (shouldn't happen after clampSelection but be
+  // safe), leave scrollOffset alone.
+  const int selVi = visibleIndexOf(items, expandedGroupId_, selectedIndex);
+  if (selVi < 0) return;
+  if (selVi < scrollOffset) {
+    scrollOffset = selVi;
+  } else if (selVi >= scrollOffset + itemsVisible) {
+    scrollOffset = selVi - itemsVisible + 1;
   }
-  scrollOffset = std::max(0, std::min(scrollOffset, std::max(0, static_cast<int>(items.size()) - itemsVisible)));
+  // CrumBLE 4.5.6 (rev 2): clamp uses visible-count, not items.size(), so
+  // we don't reserve scroll positions for hidden rows that wouldn't render.
+  const int visN = visibleCount(items, expandedGroupId_);
+  scrollOffset = std::max(0, std::min(scrollOffset, std::max(0, visN - itemsVisible)));
 }
 
 void BookSettingsDrawerActivity::changeSelected(int delta) {
   if (items.empty()) return;
   auto& item = items[selectedIndex];
+  if (item.isInfo) return;  // CrumBLE 4.5.6: info rows don't respond to value changes
+  // CrumBLE 4.5.6 (rev 2): group-separator rows are toggle-only on Confirm;
+  // Left/Right value adjust is a no-op (no "value" to cycle through).
+  if (item.isGroupSeparator) return;
   if (item.isAction) {
     if (delta > 0 && item.activate) item.activate();
     return;
@@ -428,6 +825,65 @@ void BookSettingsDrawerActivity::changeSelected(int delta) {
 void BookSettingsDrawerActivity::activateSelected() {
   if (items.empty()) return;
   auto& item = items[selectedIndex];
+  if (item.isInfo) return;  // CrumBLE 4.5.6: info rows don't respond to Confirm
+  // CrumBLE 4.5.6 (rev 2): Confirm on a group separator toggles its
+  // expansion. INX-style "one expanded at a time": expanding a new group
+  // collapses the prior one. Confirm on the already-expanded group
+  // collapses it (no group expanded). After toggling we re-clamp the
+  // cursor so it doesn't end up sitting on an item that just disappeared.
+  if (item.isGroupSeparator) {
+    // v18.9.9.72c: remember the tapped group's ID BEFORE anything else. `item`
+    // is a reference into items[selectedIndex]; rebuildDrawerItems() below
+    // dangles it. We also can't rely on selectedIndex to still mean the same
+    // thing post-rebuild: expanding Reading Aids while Layout was already
+    // expanded shrinks Layout's rows out and pushes Reading Aids up by 6-8
+    // slots, so the raw selectedIndex now points at some item further down
+    // (or gets walked forward to BT Quick Disconnect by clampSelection when
+    // it lands on a hidden row). Save the identity, then restore it.
+    const int tappedGroupId = item.groupId;
+
+    // v18.9.5.5: reconcile with the visual state before toggling. When the
+    // lazy source hasn't been built yet, the indicator (see rebuildDrawerItems'
+    // render) shows "+" for every group -- including the one expandedGroupId_
+    // still points at from the header default (kGroupFont). Without this
+    // reset, the user's first click on Font sees "expandedGroupId_ ==
+    // item.groupId" and collapses to -1 (visually a no-op), forcing a second
+    // click to actually expand. The visual truth is "nothing is expanded,"
+    // so make the internal state agree before we branch.
+    const bool hasSource =
+        externalReaderSettings_ != nullptr || !settingsList_.empty() || (viewMode_ && !viewRows_.empty());
+    if (!hasSource) {
+      expandedGroupId_ = -1;
+    }
+    if (expandedGroupId_ == tappedGroupId) {
+      expandedGroupId_ = -1;
+    } else {
+      // CrumBLE 4.5.6 rev 3: lazy settings-source build. First expand
+      // triggers the ~6-10 KB getSettingsList() work. If heap is too tight,
+      // refuse the expand (keeps drawer usable in BT-actions-only mode).
+      // v18.9.9.26: under compat mode the group separators aren't even
+      // rendered (see rebuildDrawerItems), so we can only reach here
+      // outside compat -- refuses are rare on a normal-render session.
+      if (!ensureSettingsSrcBuilt()) return;
+      expandedGroupId_ = tappedGroupId;
+    }
+    rebuildDrawerItems();
+
+    // Restore focus to the separator we just tapped. Walk items[] for the
+    // group ID we saved; if it's gone for any reason (e.g. compat-mode
+    // rebuild dropped every group separator), fall back to clampSelection.
+    bool restored = false;
+    for (size_t i = 0; i < items.size(); ++i) {
+      if (items[i].isGroupSeparator && items[i].groupId == tappedGroupId) {
+        selectedIndex = static_cast<int>(i);
+        restored = true;
+        break;
+      }
+    }
+    if (!restored) clampSelection();
+    adjustScrollToSelection();
+    return;
+  }
   if (item.isAction) {
     if (item.activate) item.activate();
     return;
@@ -554,6 +1010,20 @@ uint8_t previewDeltaValue(const SettingInfo& info, int delta) {
 void BookSettingsDrawerActivity::attemptSettingChange(int itemIndex, int delta) {
   if (itemIndex < 0 || itemIndex >= static_cast<int>(items.size())) return;
   const auto& item = items[itemIndex];
+  // v18.9.9.62: check view-mode BEFORE the currentSettings() bounds check.
+  // Under viewMode_ we intentionally have currentSettings().empty()==true
+  // (settingsList_ isn't populated -- viewRows_ owns the data). Pre-62 the
+  // bounds check would return early and silently swallow the user's tap.
+  if (viewMode_) {
+    const uint8_t g = expandedGroupId_ >= 0 ? static_cast<uint8_t>(expandedGroupId_) : 0;
+    LOG_INF("BSD",
+            "View-mode edit tap (row=%d delta=%d group=%u); silent-restart with OpenBookSettingsDrawer "
+            "to open editable drawer on fresh heap",
+            itemIndex, delta, static_cast<unsigned>(g));
+    silentRestartToReaderOpeningDrawerAt(g);
+    // never returns
+    return;
+  }
   if (item.settingIndex < 0 || item.settingIndex >= static_cast<int>(currentSettings().size())) return;
   const SettingInfo& info = currentSettings()[item.settingIndex];
 
@@ -612,18 +1082,25 @@ void BookSettingsDrawerActivity::loop() {
   }
 
   // List navigation: portrait uses Up/Down, landscape uses Right/Left.
+  // CrumBLE 4.5.6 (rev 2): skip past invisible (collapsed-group) items so
+  // one keypress always moves to the next visible row. Without this the
+  // user would hit Up/Down repeatedly to traverse the cursor across hidden
+  // settings, which would feel broken.
   const bool prevList = mi.wasReleased(landscape ? B::Right : B::Up);
   const bool nextList = mi.wasReleased(landscape ? B::Left : B::Down);
-  if (prevList) {
-    selectedIndex--;
-    clampSelection();
-    adjustScrollToSelection();
-    requestUpdate();
-    return;
-  }
-  if (nextList) {
-    selectedIndex++;
-    clampSelection();
+  if (prevList || nextList) {
+    const int n = static_cast<int>(items.size());
+    if (n > 0) {
+      const int dir = prevList ? -1 : 1;
+      int probe = selectedIndex;
+      for (int steps = 0; steps < n; ++steps) {
+        probe = (probe + dir + n) % n;
+        if (isItemVisible(items[probe], expandedGroupId_)) {
+          selectedIndex = probe;
+          break;
+        }
+      }
+    }
     adjustScrollToSelection();
     requestUpdate();
     return;
@@ -747,47 +1224,99 @@ void BookSettingsDrawerActivity::renderDrawer() {
   // against the rect edge.
   const int rowTextY = 6;
 
-  for (int i = 0; i < itemsVisible; ++i) {
-    const int idx = scrollOffset + i;
-    if (idx >= static_cast<int>(items.size())) break;
+  // CrumBLE 4.5.6 (rev 2): visible-aware row walk. Skip items whose group
+  // is collapsed; render at most itemsVisible visible rows starting at the
+  // scrollOffset-th visible row. Separator rows render with a +/-
+  // expansion indicator on the right and a bold label on the left -- no
+  // value column and no action arrow.
+  int rowsDrawn = 0;
+  int visiblesSeen = 0;
+  for (int idx = 0; idx < static_cast<int>(items.size()) && rowsDrawn < itemsVisible; ++idx) {
     const Item& item = items[idx];
-    const int rowY = listStartY + i * itemHeight;
+    if (!isItemVisible(item, expandedGroupId_)) continue;
+    if (visiblesSeen < scrollOffset) {
+      visiblesSeen++;
+      continue;
+    }
+    visiblesSeen++;
+    const int rowY = listStartY + rowsDrawn * itemHeight;
     const bool selected = (idx == selectedIndex);
     if (selected) {
-      // Selection highlight uses inverse video relative to the panel: in
-      // light mode the panel is white so highlight is black; in dark mode
-      // the panel is black so highlight is white. panelStrokeInk doubles
-      // as "draw with ink" which matches the panel's contrast direction.
+      // Selection highlight uses inverse video relative to the panel.
       renderer.fillRect(drawerX + 1, rowY, drawerW - 2, itemHeight, panelStrokeInk);
     }
     const char* name = !item.customName.empty() ? item.customName.c_str() : I18N.get(item.nameId);
     const auto& src = currentSettings();
-    const std::string value =
-        (item.settingIndex >= 0 && item.settingIndex < static_cast<int>(src.size()))
-            ? valueTextForSetting(src[item.settingIndex])
-            : std::string{};
-    // Row text color: when NOT selected, draw with the panel's primary text
-    // color (black in light, white in dark). When selected, the highlight rect
-    // has inverted; draw text in the opposite color so it stays legible.
-    const bool textBlack = selected ? darkMode : panelTextBlack;
-    renderer.drawText(UI_12_FONT_ID, drawerX + leftPad, rowY + rowTextY, name, textBlack);
-    if (!value.empty()) {
-      const int valueWidth = renderer.getTextWidth(UI_12_FONT_ID, value.c_str());
-      renderer.drawText(UI_12_FONT_ID, drawerX + drawerW - rightPad - valueWidth, rowY + rowTextY, value.c_str(),
-                         textBlack);
-    } else if (item.isAction) {
-      const char* arrow = "→";
-      const int aw = renderer.getTextWidth(UI_12_FONT_ID, arrow);
-      renderer.drawText(UI_12_FONT_ID, drawerX + drawerW - rightPad - aw, rowY + rowTextY, arrow, textBlack);
+    // v18.9.9.62: dual-source name/value lookup. Under viewMode_ the
+    // Item.settingIndex points into viewRows_ (raw cache rows, no
+    // SettingInfo shells). Otherwise it points into currentSettings().
+    // The compat suffix decorator still runs for both -- viewMode's
+    // fake SettingInfo shell used to carry the info; now we drive it
+    // off the row's nameId directly.
+    const bool useViewRow = viewMode_ && item.settingIndex >= 0 &&
+                            item.settingIndex < static_cast<int>(viewRows_.size());
+    // Info + separator rows have no SettingInfo; skip value resolution.
+    std::string value;
+    if (!item.isInfo && !item.isGroupSeparator) {
+      if (useViewRow) {
+        value = viewRowValueText(viewRows_[item.settingIndex]);
+      } else if (item.settingIndex >= 0 && item.settingIndex < static_cast<int>(src.size())) {
+        value = valueTextForSetting(src[item.settingIndex]);
+      }
     }
+    // v18.9.9.25: append the compat marker on the drawer's setting rows too
+    // -- same behaviour as SettingsActivity so the user sees the same
+    // "(Compat)" hint whether they came in through the drawer or the global
+    // Settings screen. v18.9.9.62: also route through viewRows_ for the
+    // isDrawerCompatLockedSetting check when in view-mode.
+    if (!value.empty() && APP_STATE.readerCompatModeActive && !item.isInfo && !item.isGroupSeparator) {
+      if (useViewRow) {
+        SettingInfo shim;  // stack-only shim, no vector allocations
+        shim.nameId = viewRows_[item.settingIndex].nameId;
+        if (isDrawerCompatLockedSetting(shim)) value += tr(STR_SETTING_COMPAT_SUFFIX);
+      } else if (item.settingIndex >= 0 && item.settingIndex < static_cast<int>(src.size()) &&
+                 isDrawerCompatLockedSetting(src[item.settingIndex])) {
+        value += tr(STR_SETTING_COMPAT_SUFFIX);
+      }
+    }
+    const bool textBlack = selected ? darkMode : panelTextBlack;
+    if (item.isGroupSeparator) {
+      // Bold label on the left; "+" if collapsed, "-" if expanded, on the right.
+      renderer.drawText(UI_12_FONT_ID, drawerX + leftPad, rowY + rowTextY, name, textBlack, EpdFontFamily::BOLD);
+      // v18.9.5.3: only show "-" when the group's items would actually appear
+      // below. The default expandedGroupId_ = kGroupFont opens the Font group
+      // conceptually, but the INX-style lazy settings source may not be
+      // built yet (see ensureSettingsSrcBuilt). Without this guard the Font
+      // row reads as expanded ("-") but shows no items underneath because
+      // rebuildItems skipped them for lack of a source -- a visible lie.
+      const bool hasSource = externalReaderSettings_ != nullptr || !settingsList_.empty() ||
+                             (viewMode_ && !viewRows_.empty());
+      const bool visuallyExpanded = hasSource && (expandedGroupId_ == item.groupId);
+      const char* indicator = visuallyExpanded ? "-" : "+";
+      const int iw = renderer.getTextWidth(UI_12_FONT_ID, indicator, EpdFontFamily::BOLD);
+      renderer.drawText(UI_12_FONT_ID, drawerX + drawerW - rightPad - iw, rowY + rowTextY, indicator, textBlack,
+                        EpdFontFamily::BOLD);
+    } else {
+      renderer.drawText(UI_12_FONT_ID, drawerX + leftPad, rowY + rowTextY, name, textBlack);
+      if (!value.empty()) {
+        const int valueWidth = renderer.getTextWidth(UI_12_FONT_ID, value.c_str());
+        renderer.drawText(UI_12_FONT_ID, drawerX + drawerW - rightPad - valueWidth, rowY + rowTextY, value.c_str(),
+                           textBlack);
+      } else if (item.isAction) {
+        const char* arrow = "→";
+        const int aw = renderer.getTextWidth(UI_12_FONT_ID, arrow);
+        renderer.drawText(UI_12_FONT_ID, drawerX + drawerW - rightPad - aw, rowY + rowTextY, arrow, textBlack);
+      }
+    }
+    rowsDrawn++;
   }
 
-  // Scroll indicator: small block on the right edge if list overflows.
-  if (static_cast<int>(items.size()) > itemsVisible) {
+  // Scroll indicator: based on visible-count, not raw items.size().
+  const int visN = visibleCount(items, expandedGroupId_);
+  if (visN > itemsVisible) {
     const int trackH = itemsVisible * itemHeight;
-    const int barH = std::max(8, (trackH * itemsVisible) / static_cast<int>(items.size()));
-    const int barY = listStartY + (trackH - barH) * scrollOffset /
-                                       std::max(1, static_cast<int>(items.size()) - itemsVisible);
+    const int barH = std::max(8, (trackH * itemsVisible) / visN);
+    const int barY = listStartY + (trackH - barH) * scrollOffset / std::max(1, visN - itemsVisible);
     renderer.fillRect(drawerX + drawerW - 4, barY, 2, barH, panelStrokeInk);
   }
 
@@ -805,10 +1334,20 @@ void BookSettingsDrawerActivity::renderDrawer() {
 }
 
 void BookSettingsDrawerActivity::presentFastRefresh() {
+  // Reverted from displayBufferRegion -- the windowed path's std::vector
+  // allocation for the per-region BW+RED scratch (~19 KB combined under
+  // dual-buffer mode) threw bad_alloc under tight heap, which the global
+  // std::terminate handler caught and silent-restarted to FT, surprising
+  // the user mid-drawer. The static frameBuffer path used by displayBuffer
+  // avoids the runtime allocation entirely. Once partial-mode is actually
+  // delivering a speedup AND the windowed-buffer alloc is bounded /
+  // pre-checked, this can come back.
   renderer.displayBuffer(HalDisplay::FAST_REFRESH);
 }
 
 void BookSettingsDrawerActivity::render(RenderLock&&) {
+  SET_CHECKPOINT("drawer:render");
   renderDrawer();
+  SET_CHECKPOINT("drawer:present");
   presentFastRefresh();
 }

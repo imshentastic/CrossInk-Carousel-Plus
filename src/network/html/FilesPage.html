@@ -34,7 +34,12 @@
     body {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
       Oxygen, Ubuntu, sans-serif;
-      max-width: 800px;
+      /* CrumBLE 4.5.4: was max-width: 800px, which left huge whitespace
+         on wider monitors and forced the file table to wrap long names.
+         Now: scale to the viewport. min(1400px, ...) caps very-wide
+         screens so the table doesn't sprawl unreadably; calc() leaves
+         room for the page padding. */
+      max-width: min(1400px, calc(100vw - 40px));
       margin: 0 auto;
       padding: 20px;
       background-color: var(--bg);
@@ -302,6 +307,24 @@
       cursor: pointer;
       position: relative;
     }
+    /* CrumBLE 4.5.4: (i) icon next to the badge. Clicking it opens the
+       prebake-manifest popover. Tiny button (not a span) so it's keyboard-
+       focusable and screen-reader announces it. */
+    .prebake-info-btn {
+      display: inline-block;
+      vertical-align: middle;
+      margin-left: 4px;
+      padding: 0 4px;
+      background: transparent;
+      border: none;
+      color: #5a8db8;
+      font-size: 0.95em;
+      cursor: pointer;
+      line-height: 1;
+      font-family: inherit;
+    }
+    .prebake-info-btn:hover { color: #2c3e50; }
+    .prebake-info-btn:focus-visible { outline: 2px solid #5a8db8; outline-offset: 2px; }
     /* CrumBLE 4.4: custom hover tooltip with near-zero delay. Native HTML
        `title` is browser-mandated to wait ~500-700ms before showing. The
        data-tooltip attribute carries the multi-line summary; CSS reveals
@@ -402,6 +425,16 @@
     .upload-btn:disabled {
       background-color: #95a5a6;
       cursor: not-allowed;
+    }
+    /* Upload in progress: grey out Choose Files + Output destination so the
+       user can't tweak inputs mid-flight (they were interactive but had no
+       effect, which was misleading). Applies via a data attribute on the
+       modal that setUploadInProgress() toggles alongside isUploadInProgress. */
+    .modal-overlay[data-upload-in-progress="true"] .upload-form input[type="file"],
+    .modal-overlay[data-upload-in-progress="true"] #outputDestinationSection {
+      opacity: 0.55;
+      pointer-events: none;
+      user-select: none;
     }
     /* Convert options */
     .convert-options {
@@ -1221,6 +1254,27 @@
     .failed-uploads-banner.show {
       display: block;
     }
+    /* v18.9.9.190: weak-WiFi warning banner. Uses the same yellow palette
+       as the failed-uploads banner for consistency. Threshold is -65 dBm,
+       matching the field-observed floor where TCP retransmits under weak
+       links cause FT-side heap fragmentation and upload truncation. */
+    .wifi-warning-banner {
+      background-color: #fff3cd;
+      border: 1px solid #ffc107;
+      border-radius: 4px;
+      padding: 12px 15px;
+      margin-bottom: 15px;
+      display: none;
+      color: #856404;
+      font-size: 0.95em;
+      line-height: 1.4;
+    }
+    .wifi-warning-banner.show {
+      display: block;
+    }
+    .wifi-warning-banner strong {
+      color: #533f03;
+    }
     .failed-uploads-header {
       display: flex;
       justify-content: space-between;
@@ -1698,7 +1752,28 @@
     <button class="action-btn folder-action-btn" onclick="openFolderModal()">📁 New Folder</button>
     <button class="action-btn optimize-action-btn" onclick="optimizeSelectedOnDevice()">Optimize Selected</button>
     <button class="action-btn delete-action-btn" onclick="openDeleteSelectedModal()">🗑️ Delete Selected</button>
+    <!-- v18.9.9.310: Show Hidden Files toggle. Mirrors Settings > Library >
+         Files > Show Hidden Files on the device. Flipping here calls
+         /api/show-hidden then re-fetches the file list so dot-prefixed
+         entries appear / disappear immediately. -->
+    <label class="action-btn show-hidden-toggle" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;">
+      <input type="checkbox" id="showHiddenToggle" onchange="toggleShowHidden(this.checked)" style="margin:0;">
+      <span>Show hidden</span>
+    </label>
+    <!-- v18.9.9.330: device heap indicator. Polls /api/status every 5s so
+         users can see when heap is degraded before it causes crashes.
+         Color codes: green >30KB, amber 15-30KB, red <15KB (matches the
+         FT low-heap watchdog thresholds). -->
+    <span id="heapIndicator" title="Device free heap"
+          style="display:inline-flex;align-items:center;padding:6px 10px;font-size:0.85em;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#f4f5f6;color:#666;border-radius:4px;user-select:none;">
+      Heap: --
+    </span>
   </div>
+</div>
+
+<!-- v18.9.9.190: Weak-WiFi warning banner (shows when RSSI <= -65 dBm) -->
+<div class="wifi-warning-banner" id="wifiWarningBanner">
+  <span id="wifiWarningLabel"></span>
 </div>
 
 <!-- Failed Uploads Banner -->
@@ -1718,9 +1793,27 @@
   </div>
 
   <div id="file-table">
-    <div class="loader-container">
-      <span class="loader"></span>
+    <!-- CrumBLE 4.5.4: spinner state replaces a bare loading indicator so the
+         user has visual progress when /api/files takes 20-60s on a heap-
+         tight device. 4.5.6: dropped the "Warming FT" headline (read as
+         jargon on every folder navigation; field report: "I see this on
+         every directory I visit"). Now generic "Loading..." with the
+         disclaimer below carrying the why-it's-slow context. -->
+    <div class="no-files" style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:20px;">
+      <div class="reconnect-spinner" aria-hidden="true"></div>
+      <div style="font-weight:500;">Loading<span class="reconnect-dots" aria-hidden="true"><span class="dot dot-1">.</span><span class="dot dot-2">.</span><span class="dot dot-3">.</span></span></div>
+      <div style="font-size:0.85em;color:#888;">Preparing the file list (can take 20-60s on a busy device)</div>
     </div>
+    <style>
+      @keyframes reconnect-spin { 0% { transform: rotate(0deg) } 100% { transform: rotate(360deg) } }
+      @keyframes reconnect-blink { 0%,80%,100% { opacity:0.2 } 40% { opacity:1 } }
+      .reconnect-spinner { width:32px; height:32px; border:3px solid #e0e0e0; border-top-color:#666; border-radius:50%; animation: reconnect-spin 1s linear infinite; }
+      .reconnect-dots { display:inline-block; }
+      .reconnect-dots .dot { animation: reconnect-blink 1.4s infinite both; display:inline-block; }
+      .reconnect-dots .dot-1 { animation-delay: 0s; }
+      .reconnect-dots .dot-2 { animation-delay: 0.2s; }
+      .reconnect-dots .dot-3 { animation-delay: 0.4s; }
+    </style>
   </div>
 </div>
 
@@ -1911,6 +2004,35 @@
         <div class="image-grid" id="imageGrid"></div>
       </div>
       </div><!-- end picker-columns -->
+      <!-- CrumBLE 4.5.4: output destination chooser. Sits outside the
+           Optimize EPUB toggle because it's an orthogonal concern -- the
+           user might want to download even an unoptimized upload (for
+           Calibre backup) or skip the optimize step entirely. Two
+           options: send to device (default; the entire prior behavior)
+           OR build a zip of the final outputs and download via the
+           browser so the user can SD-card drag-and-drop or stash in
+           Calibre. The zip mirrors the SD card root layout so dropping
+           extracted files onto SD is a 1:1 copy. -->
+      <div class="output-destination" id="outputDestinationSection" style="margin: 12px 0; padding: 12px; background: rgba(127,127,127,0.06); border-radius: 8px; font-size: 0.92em;">
+        <div style="font-weight: 500; margin-bottom: 8px;">Output destination</div>
+        <label style="display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor: pointer;">
+          <input type="radio" name="outputDest" value="device" id="outputDestDevice" checked onchange="updateOutputDestUI()">
+          <span><strong>Upload to device</strong> — over WiFi (default)</span>
+        </label>
+        <label style="display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor: pointer;">
+          <input type="radio" name="outputDest" value="download" id="outputDestDownload" onchange="updateOutputDestUI()">
+          <span><strong>Save to local folder</strong> — manual SD-card copy / Calibre backup</span>
+        </label>
+        <div id="outputDestDownloadDetail" style="display: none; margin-top: 10px; padding: 10px 12px; background: rgba(255, 180, 30, 0.08); border-left: 3px solid rgba(255, 180, 30, 0.6); border-radius: 4px; font-size: 0.88em; line-height: 1.45;">
+          <div style="font-weight: 600; color: #b8860b; margin-bottom: 4px;">⚠ For Advanced Users Only</div>
+          <div style="margin-bottom: 8px;">Use this option if you prefer a local copy of the output and will move it to your SD card manually. The output folder will include written instructions on where each file needs to land on the SD card.</div>
+          <button type="button" id="chooseOutputFolderBtn" onclick="chooseOutputFolder()" style="padding: 6px 12px; font-size: 0.95em; border-radius: 4px; cursor: pointer;">Choose folder…</button>
+          <span id="chosenFolderLabel" style="margin-left: 8px; color: var(--label-color, #666); font-style: italic;">No folder selected</span>
+          <div id="outputDestFallbackNote" style="display: none; margin-top: 8px; font-size: 0.85em; color: #888;">
+            Your browser doesn't support direct folder writes; the output will download as a single .zip you can extract yourself.
+          </div>
+        </div>
+      </div>
       <!-- Sync compatibility warning - outside picker-columns -->
       <div class="convert-warning" id="convertWarning" style="display:none;" role="alert" aria-live="polite">
         ⚠️ Converting will modify files and can break hash‑based sync. ⚠️<br>
@@ -1986,6 +2108,20 @@
 </div>
 
 <!-- Move Modal -->
+<!-- CrumBLE 4.5.4: prebake-manifest detail popover. Triggered by the (i)
+     icon next to a CP.FONT badge. Lazy-fetches /api/files/prebake-manifest
+     on click instead of including the per-row tooltip in every /api/files
+     response (which dominated FT page-load latency on heap-tight devices). -->
+<div class="modal-overlay" id="prebakeManifestModal">
+  <div class="modal" style="max-width:520px;">
+    <button class="modal-close" onclick="closePrebakeManifestModal()">&times;</button>
+    <h3>Prepared Layout</h3>
+    <p class="file-info" id="prebakeManifestFileName" style="margin:0 0 12px 0;"></p>
+    <pre id="prebakeManifestBody" style="white-space:pre-wrap;background:#f5f5f5;padding:12px;border-radius:6px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:0.85em;line-height:1.5;max-height:50vh;overflow:auto;color:#000;">Loading...</pre>
+    <button class="delete-btn-cancel" onclick="closePrebakeManifestModal()" style="margin-top:12px;">Close</button>
+  </div>
+</div>
+
 <div class="modal-overlay" id="moveModal">
   <div class="modal">
     <button class="modal-close" onclick="closeMoveModal()">&times;</button>
@@ -2001,22 +2137,143 @@
   </div>
 </div>
 
+
 <script>
   // Load jszip on demand. Only the EPUB optimizer needs it, so we avoid serving
-  // ~28 KB from the device's tiny file-transfer heap on every page load (which
+  // ~90 KB from the device's tiny file-transfer heap on every page load (which
   // was OOM'ing the device on flaky links). Resolves once JSZip is available.
+  //
+  // v18.9.9.380: CDN-first, device fallback. When user's router has internet,
+  // browser fetches from unpkg.com (~500 KB/s, no device wire traffic). Falls
+  // back to /js/jszip.min.js in AP/hotspot mode or when CDN blocked. Version
+  // pinned to 3.10.1 (matches the PROGMEM copy).
   let _jszipLoading = null;
   function ensureJSZip() {
     if (typeof JSZip !== 'undefined') return Promise.resolve();
     if (_jszipLoading) return _jszipLoading;
-    _jszipLoading = new Promise((resolve, reject) => {
+    const tryLoad = (src) => new Promise((resolve, reject) => {
       const s = document.createElement('script');
-      s.src = '/js/jszip.min.js';
+      s.src = src;
       s.onload = () => resolve();
-      s.onerror = () => { _jszipLoading = null; reject(new Error('Failed to load jszip')); };
+      s.onerror = () => reject(new Error('Failed to load ' + src));
       document.head.appendChild(s);
     });
+    _jszipLoading = tryLoad('https://unpkg.com/jszip@3.10.1/dist/jszip.min.js')
+      .catch(err => {
+        console.warn('[FilesPage] jszip CDN load failed, falling back to device:', err.message);
+        return tryLoad('/js/jszip.min.js');
+      })
+      .catch(err => { _jszipLoading = null; throw err; });
     return _jszipLoading;
+  }
+
+  // v18.9.9.386: minimal IDB font-cache helpers duplicated from optimizer.js.
+  // Same DB + store + schema, so warmSdFontCache() and the optimizer's
+  // fontCacheGet/Put talk to the same store. Kept intentionally small so
+  // FilesPage.html can prefetch fonts WITHOUT loading the full optimizer.js
+  // bundle (which is 64 KB gzipped and lazy-loaded per v380).
+  const FONT_CACHE_DB_NAME_FP = 'crumble-font-cache-v1';
+  const FONT_CACHE_STORE_FP = 'fontBytes';
+  function openFontCacheDbFp() {
+    if (typeof indexedDB === 'undefined') return Promise.reject(new Error('no idb'));
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(FONT_CACHE_DB_NAME_FP, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(FONT_CACHE_STORE_FP)) {
+          const store = db.createObjectStore(FONT_CACHE_STORE_FP, { keyPath: 'fingerprint' });
+          store.createIndex('lastUsed', 'lastUsed');
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  async function fontCacheHasFp(fingerprint) {
+    try {
+      const db = await openFontCacheDbFp();
+      try {
+        return await new Promise((resolve, reject) => {
+          const tx = db.transaction(FONT_CACHE_STORE_FP, 'readonly');
+          const store = tx.objectStore(FONT_CACHE_STORE_FP);
+          const req = store.getKey ? store.getKey(fingerprint) : store.get(fingerprint);
+          req.onsuccess = () => resolve(!!req.result);
+          req.onerror = () => reject(req.error);
+        });
+      } finally { db.close(); }
+    } catch (e) { return false; }
+  }
+  async function fontCachePutFp(fingerprint, family, pt, mtime, bytes) {
+    try {
+      const db = await openFontCacheDbFp();
+      try {
+        const buf = bytes.buffer.byteLength === bytes.byteLength
+          ? bytes.buffer
+          : bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction(FONT_CACHE_STORE_FP, 'readwrite');
+          const store = tx.objectStore(FONT_CACHE_STORE_FP);
+          store.put({ fingerprint, family, pt, mtime, bytes: buf, size: buf.byteLength, lastUsed: Date.now() });
+          tx.oncomplete = resolve;
+          tx.onerror = () => reject(tx.error);
+        });
+      } finally { db.close(); }
+    } catch (e) { /* silent */ }
+  }
+
+  // v18.9.9.386: opportunistic SD-font warm-up. Fires after api-files completes
+  // on FilesPage load. If the device has an SD font selected, probe its
+  // fingerprint (family|pt|mtime|fileSize) and check IDB. On cache hit: done,
+  // no wire traffic beyond the 100-byte probe. On miss: fetch the font bytes
+  // (multi-MB stream) and store in IDB so the next upload's WASM prebake
+  // finds it locally without a mid-tight-heap re-fetch. Silent on failure --
+  // if we can't warm the cache, the upload path will still try again.
+  async function warmSdFontCache() {
+    // Learn which font the device has selected + its size.
+    let renderInfo;
+    try {
+      const r = await fetch('/api/reader-render-info', { cache: 'no-store' });
+      if (!r.ok) return;
+      renderInfo = await r.json();
+    } catch (e) { return; }
+    const family = renderInfo && renderInfo.sdFontFamilyName;
+    const pt = renderInfo && renderInfo.sdFontSize;
+    if (!family || typeof pt !== 'number' || pt <= 0) return;  // no SD font configured
+
+    // Get fingerprint from device.
+    let ver;
+    try {
+      const r = await fetch(
+        `/api/fonts/version?family=${encodeURIComponent(family)}&size=${pt}`,
+        { cache: 'no-store' });
+      if (!r.ok) return;
+      ver = await r.json();
+    } catch (e) { return; }
+    if (typeof ver.mtime !== 'number' || typeof ver.fileSize !== 'number') return;
+    const fingerprint = `${family}|${pt}|${ver.mtime}|${ver.fileSize}`;
+
+    // Fast path: cache hit -> nothing to do.
+    if (await fontCacheHasFp(fingerprint)) {
+      console.log(`[FilesPage] SD font cache HIT for ${family} @ ${pt}pt (${ver.fileSize} B) -- prefetch skipped`);
+      return;
+    }
+    console.log(`[FilesPage] SD font cache MISS for ${family} @ ${pt}pt -- background prefetch starting`);
+
+    // Cache miss -> fetch bytes and store. This is the multi-MB transfer.
+    try {
+      const resp = await fetch(
+        `/api/fonts/file?family=${encodeURIComponent(family)}&size=${pt}`,
+        { cache: 'no-store' });
+      if (!resp.ok) {
+        console.log(`[FilesPage] SD font prefetch: HTTP ${resp.status}`);
+        return;
+      }
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      await fontCachePutFp(fingerprint, family, pt, ver.mtime, bytes);
+      console.log(`[FilesPage] SD font prefetched to IDB: ${family} @ ${pt}pt (${bytes.length} B)`);
+    } catch (e) {
+      console.log(`[FilesPage] SD font prefetch failed: ${e.message || e}`);
+    }
   }
 
   // Load the EPUB optimizer module on demand. All the heavy conversion code
@@ -2131,39 +2388,95 @@
   }
 
   async function hydrate() {
-    // Fetch CrossInk version
-    fetchVersion();
-
-    // Close modals when clicking overlay - call proper cleanup functions
+    // Close modals when clicking overlay - call proper cleanup functions.
+    // CrumBLE 4.5.5+: gate on a same-target mousedown+click pair so a text-
+    // selection drag that started INSIDE the dialog and released onto the
+    // overlay doesn't get treated as "user clicked outside to cancel". The
+    // optimizer modal had the same anti-pattern; field report there was the
+    // user highlighting text to copy and accidentally dismissing the modal
+    // (which propagated downstream as a "Finished with errors" optimize
+    // result). Same fix applies to every modal on this page.
     document.querySelectorAll('.modal-overlay').forEach(function(overlay) {
+      let mouseDownOnOverlay = false;
+      overlay.addEventListener('mousedown', function(e) { mouseDownOnOverlay = (e.target === overlay); });
       overlay.addEventListener('click', function(e) {
-        if (e.target === overlay) {
-          // Call the appropriate close function for each modal to ensure cleanup
-          if (overlay.id === 'uploadModal') return closeUploadModal();
-          if (overlay.id === 'folderModal') return closeFolderModal();
-          if (overlay.id === 'deleteModal') return closeDeleteModal();
-          if (overlay.id === 'renameModal') return closeRenameModal();
-          if (overlay.id === 'moveModal') return closeMoveModal();
-          overlay.classList.remove('open');
-        }
+        const wasOverlayClick = (e.target === overlay) && mouseDownOnOverlay;
+        mouseDownOnOverlay = false;
+        if (!wasOverlayClick) return;
+        // Call the appropriate close function for each modal to ensure cleanup
+        if (overlay.id === 'uploadModal') return closeUploadModal();
+        if (overlay.id === 'folderModal') return closeFolderModal();
+        if (overlay.id === 'deleteModal') return closeDeleteModal();
+        if (overlay.id === 'renameModal') return closeRenameModal();
+        if (overlay.id === 'moveModal') return closeMoveModal();
+        overlay.classList.remove('open');
       });
     });
 
+    // CrumBLE 4.5.5: settle before kicking off API calls. The 30 KB inline HTML
+    // for this page still has its trailing chunks sitting in AsyncWebServer's
+    // TCP send queue when the script reaches this point -- the browser has
+    // received them but the device hasn't seen the ACKs yet, so the
+    // AsyncResponse object is still pinned in heap. On a fresh FT mode boot
+    // we're at ~24 KB free / ~21 KB maxAlloc, and the html serve dips free
+    // to ~14.6 KB / maxAlloc ~11 KB. The dip recovers as TCP ACKs come back,
+    // but on a weak link (RSSI -70 dBm) the 5744-byte TCP_SND_BUF needs
+    // 4-6 RTTs to drain -- call it 1-1.5 s. A first 400 ms settle (4.5.5
+    // initial attempt) wasn't enough; the /api/files guard fired with
+    // heap still 1-2 KB below the threshold and triggered a silentRestart.
+    //
+    // 1200 ms is a "WiFi-aware" settle that covers slow links. fetchVersion
+    // is serialised AFTER loadFiles -- it's small but it competes for the
+    // same heap window during the api-files JSON build; better to let
+    // loadFiles complete unraced, then fetch the version chip in the
+    // background while the user is reading the file list.
+    await new Promise(resolve => setTimeout(resolve, 1200));
     await loadFiles();
+    fetchVersion();
+    // CrumBLE 4.5.4: keep Upload disabled (via the `disabled` HTML attr on
+    // line ~1921) until loadFiles completes. Field report: clicking Upload
+    // before the file list loaded opened the modal but left the Optimize
+    // toggle in a half-initialised state that wouldn't respond -- only a
+    // page refresh recovered. Now the button is inert until the page
+    // knows what files exist.
+    const __uploadBtn = document.getElementById('uploadBtn');
+    if (__uploadBtn) __uploadBtn.disabled = false;
 
-    // CrumBLE 4.4: opportunistic optimizer.js preload. The "Optimize Selected"
-    // and "Optimize & Upload" flows both await ensureOptimizer() BEFORE they
-    // can show their confirmation prompt (showOptimizerPreflightModal lives
-    // inside optimizer.js, so the prompt cannot precede the load). On a cold
-    // page the script fetch takes 5-7 s on a tight-heap device, and the user
-    // experiences that as the Optimize click being unresponsive. Kick the
-    // fetch off here so the cache is warm by the time the user clicks. Fire-
-    // and-forget: failure just means the eventual click pays the same cost
-    // it would have without this optimisation. setTimeout pushes it after
-    // the initial render's painting so the file list shows up first.
-    setTimeout(() => {
-      ensureOptimizer().catch(err => console.warn('Optimizer preload (background) failed:', err));
-    }, 0);
+    // v18.9.9.380: eager optimizer.js preload removed. Field log showed the
+    // 64 KB PROGMEM serve firing right after api-files completed, competing
+    // for the same LWIP TCP send buffers and often disconnecting mid-body
+    // (client abandoned at ~34-37 KB/64 KB, wasted device serve). The user
+    // isn't necessarily going to optimize anyway -- browse/delete/download
+    // flows never touch it. Load on demand: ensureOptimizer() is already
+    // called from every optimize entry point (Optimize Selected, Optimize
+    // & Upload, showOptimizerPreflightModal). The visible cost shifts to
+    // the click: user waits 3-8 s for optimizer.js to fetch before the
+    // confirmation modal shows. Acceptable trade to avoid derailing the
+    // browse-only common case that never needs the optimizer.
+
+    // v18.9.9.386: opportunistic SD font prefetch. If the device has an SD
+    // font configured (sdFontFamilyName non-empty in /api/reader-render-info),
+    // start a background fetch of that font into the same IDB cache the
+    // optimizer uses. When the user later uploads a CJK book, WASM finds
+    // font in IDB, cover-fp bakes .cpfont marker, chapter jumps stay fast.
+    // Without this, first upload per browser tab misses the cache, tries
+    // to fetch mid-tight-heap after book upload, often fails -> book gets
+    // no .cpfont -> streaming atlas mode at runtime.
+    // Fire-and-forget: any failure is silent, upload path still works.
+    setTimeout(() => { warmSdFontCache().catch(() => {}); }, 500);
+
+    // CrumBLE 4.5.4: cache slot for the optimize preflight renderInfo.
+    // Populated by toggleConvertOptions() when the user CHECKS the
+    // "Optimize EPUB" box -- intent signal that they're about to need
+    // it. Read by the showOptimizerPreflightModal callers in this file.
+    // We intentionally do NOT prefetch at DOMContentLoaded: that would
+    // pile on top of the optimizer.js + WASM + jszip + /api/files
+    // requests that are already pounding the heap-tight web server,
+    // making the initial load slower for everyone (not just optimize
+    // users). Triggering on the checkbox click is "right when the user
+    // is committing time"; the checkbox itself is the cheapest signal.
+    window.__cachedRenderInfo = null;
+    window.__cachedRenderInfoAt = 0;
   }
 
   // CrumBLE 4.4: file-listing refresh. Pulled out of hydrate() so the
@@ -2241,15 +2554,35 @@
           // explicit "Reconnecting N/MAX" labeling once we know the first
           // retry also didn't land (attempt >= 1).
           if (attempt === 0) {
+            // CrumBLE 4.5.6: generic "Loading..." headline everywhere -- the
+            // prior split ("Warming FT" on cold first load, "Refreshing"
+            // post-action) was jargon-noisy on every folder navigation.
+            // Sub-text still differentiates so the user gets the right
+            // context (first-load slowness vs. routine refresh) without
+            // FT-specific phrasing in the main label.
+            const headlineText = 'Loading';
+            const subText = window.__ftFirstLoadDone
+                ? 'Updating file list...'
+                : 'Preparing the file list (can take 20-60s on a busy device)';
             fileTable.innerHTML =
               '<div class="no-files" style="display:flex;flex-direction:column;align-items:center;gap:12px;padding:20px;">' +
               '<div class="reconnect-spinner" aria-hidden="true"></div>' +
-              '<div>Loading files...</div>' +
+              '<div style="font-weight:500;">' + headlineText +
+              '<span class="reconnect-dots" aria-hidden="true">' +
+              '<span class="dot dot-1">.</span><span class="dot dot-2">.</span><span class="dot dot-3">.</span>' +
+              '</span></div>' +
+              '<div style="font-size:0.85em;color:#888;">' + subText + '</div>' +
               '</div>' +
               '<style>' +
               '@keyframes reconnect-spin { 0% { transform: rotate(0deg) } 100% { transform: rotate(360deg) } }' +
+              '@keyframes reconnect-blink { 0%,80%,100% { opacity:0.2 } 40% { opacity:1 } }' +
               '.reconnect-spinner { width:32px; height:32px; border:3px solid #e0e0e0; border-top-color:#666; ' +
               'border-radius:50%; animation: reconnect-spin 1s linear infinite; }' +
+              '.reconnect-dots { display:inline-block; }' +
+              '.reconnect-dots .dot { animation: reconnect-blink 1.4s infinite both; display:inline-block; }' +
+              '.reconnect-dots .dot-1 { animation-delay: 0s; }' +
+              '.reconnect-dots .dot-2 { animation-delay: 0.2s; }' +
+              '.reconnect-dots .dot-3 { animation-delay: 0.4s; }' +
               '</style>';
           } else {
             // attempt >= 1 -- show count of failed retries so far. Display
@@ -2358,21 +2691,14 @@
               badgeText += '+CP.FONT';
               badgeTitle = 'Images + chapters + custom-font glyph atlas';
             }
-            // CrumBLE 4.4: append the device-side prepared-layout settings
-            // (font/size/orientation/etc.) so the FT badge tooltip mirrors
-            // the on-device long-press viewer. Server returns the
-            // pre-formatted multi-line string in file.prebakeTooltip;
-            // empty when manifest is missing or heap was too tight to
-            // parse. Two newlines separate the badge meaning from the
-            // layout summary.
-            if (file.prebakeTooltip) {
-              badgeTitle += '\n\n' + file.prebakeTooltip;
-            }
-            // CrumBLE 4.4: render via data-tooltip (CSS hover bubble, near-
-            // instant) instead of native title (~500ms browser delay).
-            // Keep title= as fallback for screen readers / older browsers
-            // that don't render ::after on inline elements.
+            // CrumBLE 4.5.4: prebakeTooltip is no longer in the per-row
+            // response (was the dominant /api/files latency on heap-tight
+            // devices). Render the badge as a hover-tooltip for just the
+            // meaning ("Images + chapters + ..."); add an (i) icon to
+            // fetch the manifest detail on demand via
+            // /api/files/prebake-manifest?path=...
             fileTableContent += ` <span class="prebaked-badge" data-tooltip="${escapeHtml(badgeTitle)}" title="${escapeHtml(badgeTitle)}">${escapeHtml(badgeText)}</span>`;
+            fileTableContent += ` <button class="prebake-info-btn" type="button" data-path="${encodeURIComponent(filePath)}" data-name="${escapeHtml(file.name)}" title="Show prepared-layout settings" aria-label="Show prepared-layout settings for ${escapeHtml(file.name)}">ⓘ</button>`;
           }
           fileTableContent += '</td>';
           fileTableContent += file.isEpub ? '<td><span class="epub-badge">EPUB</span></td>' : `<td>${escapeHtml(file.name.split('.').pop().toUpperCase())}</td>`;
@@ -2389,10 +2715,153 @@
       fileTableContent += '</table>';
       fileTable.innerHTML = fileTableContent;
     }
+    // CrumBLE 4.5.4: mark first-load complete so subsequent loadFiles() calls
+    // (after delete/refresh/etc.) show "Refreshing..." instead of "Warming
+    // FT..." on the first-attempt spinner. Set unconditionally at end --
+    // even the no-files / device-unreachable branches above count as a
+    // completed load attempt for the user-perception of "I'm in FT".
+    window.__ftFirstLoadDone = true;
   }
 
   // Modal functions
+  // CrumBLE 4.5.4: output-destination picker state + helpers.
+  // Default mode is 'device' (radio is `checked` in markup). The
+  // 'download' mode is gated behind the Advanced-Users-Only block;
+  // chosenOutputDirHandle is null until the user clicks Choose folder.
+  let chosenOutputDirHandle = null;
+  function getOutputDestMode() {
+    const dl = document.getElementById('outputDestDownload');
+    return dl && dl.checked ? 'download' : 'device';
+  }
+  function updateOutputDestUI() {
+    const isDownload = getOutputDestMode() === 'download';
+    const detail = document.getElementById('outputDestDownloadDetail');
+    if (detail) detail.style.display = isDownload ? 'block' : 'none';
+    const fallbackNote = document.getElementById('outputDestFallbackNote');
+    if (fallbackNote) {
+      fallbackNote.style.display = (typeof window.showDirectoryPicker === 'function') ? 'none' : 'block';
+    }
+    if (!isDownload) {
+      chosenOutputDirHandle = null;
+      const lbl = document.getElementById('chosenFolderLabel');
+      if (lbl) { lbl.textContent = 'No folder selected'; lbl.style.fontStyle = 'italic'; lbl.style.color = ''; }
+    }
+  }
+  async function chooseOutputFolder() {
+    if (typeof window.showDirectoryPicker !== 'function') {
+      alert('This browser doesn\'t support folder picking. The output will download as a single .zip instead.');
+      return;
+    }
+    try {
+      chosenOutputDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      const lbl = document.getElementById('chosenFolderLabel');
+      if (lbl) {
+        lbl.textContent = chosenOutputDirHandle.name + ' ✓';
+        lbl.style.fontStyle = 'normal';
+        lbl.style.color = '#2a8f4f';
+      }
+    } catch (e) {
+      if (e && e.name !== 'AbortError') {
+        alert('Folder selection failed: ' + (e.message || e));
+      }
+    }
+  }
+  function buildInstructionsText(epubFileName, hashId) {
+    return [
+      'CrumBLE / CrossInk Prebake -- Manual Install Instructions',
+      '=========================================================',
+      '',
+      'This folder contains two artifacts you need to copy to your device\'s',
+      'SD card. Both are required for the device to recognize the optimization.',
+      '',
+      '1. ' + epubFileName,
+      '   COPY TO: /<your-chosen-folder>/' + epubFileName,
+      '   This is the optimized version of your book. You can place it at the',
+      '   SD card root, or inside any sub-folder you prefer -- whatever path',
+      '   you choose IS what the device will show in the Library.',
+      '',
+      '2. .crosspoint/' + hashId + '/  (a hidden folder)',
+      '   COPY TO: /.crosspoint/' + hashId + '/   (preserve this EXACT path',
+      '           at the SD card root -- the leading dot matters)',
+      '   Inside you\'ll find book.bin, manifest.json, sections-prebake/,',
+      '   and prebake-*.marker files. The hash id (' + hashId + ') is derived',
+      '   from the SD path you chose for the EPUB above. If you move the',
+      '   EPUB to a different path on the SD card the device will not match',
+      '   it to this cache -- in that case re-run Optimize from File Transfer',
+      '   mode against the new path.',
+      '',
+      'TROUBLESHOOTING',
+      '---------------',
+      '* If your OS hides files starting with a dot, enable "Show hidden',
+      '  files" before browsing. macOS Finder: Cmd+Shift+. Windows Explorer:',
+      '  View > Show > Hidden items.',
+      '* If only one of the two artifacts lands on the SD card the device',
+      '  will show the book without the IMG/CHAP/CP.FONT badges, and chapter',
+      '  turns + custom-font rendering will fall back to live decoding.',
+      '* Eject the SD card cleanly before removing it.',
+      '',
+      'Generated by CrumBLE / CrossInk File Transfer mode.',
+      '',
+    ].join('\n');
+  }
+  async function writePrebakeToLocalFolder(dirHandle, optimizedFile, hashId, cacheFiles, instructionsText) {
+    // Top-level: INSTRUCTIONS.txt + optimized EPUB.
+    {
+      const fh = await dirHandle.getFileHandle('INSTRUCTIONS.txt', { create: true });
+      const w = await fh.createWritable(); await w.write(instructionsText); await w.close();
+    }
+    {
+      const fh = await dirHandle.getFileHandle(optimizedFile.name, { create: true });
+      const w = await fh.createWritable(); await w.write(optimizedFile); await w.close();
+    }
+    // .crosspoint/<hashId>/<relPath> for each cache file.
+    const cp = await dirHandle.getDirectoryHandle('.crosspoint', { create: true });
+    const ch = await cp.getDirectoryHandle(hashId, { create: true });
+    for (const f of cacheFiles) {
+      const parts = f.relPath.split('/');
+      let target = ch;
+      for (let i = 0; i < parts.length - 1; i++) {
+        target = await target.getDirectoryHandle(parts[i], { create: true });
+      }
+      const fh = await target.getFileHandle(parts[parts.length - 1], { create: true });
+      const w = await fh.createWritable(); await w.write(f.bytes); await w.close();
+    }
+  }
+  async function writePrebakeToZip(optimizedFile, hashId, cacheFiles, instructionsText) {
+    await ensureJSZip();
+    const zip = new JSZip();
+    zip.file('INSTRUCTIONS.txt', instructionsText);
+    zip.file(optimizedFile.name, optimizedFile);
+    const baseDir = '.crosspoint/' + hashId + '/';
+    for (const f of cacheFiles) {
+      zip.file(baseDir + f.relPath, f.bytes);
+    }
+    const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = optimizedFile.name.replace(/\.epub$/i, '') + '_crumble-prebake.zip';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => { try { URL.revokeObjectURL(url); } catch (e) {} }, 2000);
+  }
+
   function openUploadModal() {
+    // Reset output-destination state to default (device upload).
+    const ddev = document.getElementById('outputDestDevice');
+    if (ddev) ddev.checked = true;
+    chosenOutputDirHandle = null;
+    updateOutputDestUI();
+    // CrumBLE 4.5.4: a fresh modal open is a fresh upload from the user's
+    // perspective. Clear any stale Resume button left over from a previous
+    // run's failure -- otherwise the user sees Resume on a modal that has
+    // nothing to do with the prior failure. retrySingleUpload sets the
+    // resume state AFTER calling this, so the Retry path isn't affected;
+    // a brand-new Upload click correctly starts with no Resume affordance.
+    if (typeof clearPendingResumeAction === 'function') {
+      clearPendingResumeAction();
+    }
     // Reset converter variables to defaults
     ENABLE_GRAYSCALE = true;
     JPEG_QUALITY = 85;
@@ -2426,16 +2895,62 @@
       closeUploadModal();
       return;
     }
+    // v18.9.9.330: confirm if we're past ~50% -- protects against accidental
+    // clicks losing minutes of upload time. The current progress percentage
+    // is written into the progress-fill element's inline width during the
+    // send loop, so read that as a cheap proxy for "how far in are we."
+    const progressFill = document.getElementById('progress-fill');
+    if (progressFill) {
+      const widthPct = parseFloat(String(progressFill.style.width || '0'));
+      if (widthPct >= 50 && widthPct < 100) {
+        const remainSec = window.__lastUploadEtaSec || 0;
+        const timeHint = remainSec > 0 && remainSec < 3600
+          ? ` (~${remainSec}s remaining)`
+          : '';
+        if (!confirm(`Upload is ${Math.round(widthPct)}% complete${timeHint}. Cancel anyway?`)) {
+          return;  // user backed out; upload keeps running
+        }
+      }
+    }
+    // v18.9.9.301: immediate visual feedback. The WASM optimizer runs
+    // synchronously and blocks the JS thread, so restoreAfterCancel()
+    // (which recolors the progress bar + button + status text) can only
+    // fire on the next yield point -- usually a few seconds after the
+    // click. Without immediate feedback the button looks unresponsive
+    // and users double-click / assume it's broken. Flip the label to
+    // "Cancelling..." now and grey it out so the click is obviously
+    // received.
+    const cancelBtnNow = document.querySelector('#uploadModal .delete-btn-cancel');
+    if (cancelBtnNow) {
+      cancelBtnNow.textContent = 'Cancelling...';
+      cancelBtnNow.disabled = true;
+      cancelBtnNow.style.opacity = '0.6';
+      cancelBtnNow.style.cursor = 'wait';
+    }
+    const progressText = document.getElementById('progress-text');
+    if (progressText) {
+      progressText.textContent = 'Cancelling...';
+    }
     // Process running: stop it, keep modal open for retry
     operationCancelled = true;
     if (currentUploadWs) { currentUploadWs.close(); currentUploadWs = null; }
     if (currentUploadXhr) { currentUploadXhr.abort(); currentUploadXhr = null; }
+    // CrumBLE 4.5.4: also abort the Optimize pipeline. operationCancelled
+    // flips the global flag the cache-file upload loop checks, AND we abort
+    // any in-flight fetch via window.optimizeAbortController so the loop
+    // doesn't have to wait for the current 12s-timeout to expire before
+    // seeing the cancel. The WASM Module.callMain is synchronous + blocks
+    // the JS thread, so cancellation can only land on the next yield point
+    // after it returns -- usually within a few seconds of the click.
+    if (window.optimizeAbortController) {
+      try { window.optimizeAbortController.abort(); } catch (_) {}
+    }
     // isUploadInProgress and UI are restored by restoreAfterCancel() from the async handlers
   }
 
   function restoreAfterCancel() {
     operationCancelled = false;
-    isUploadInProgress = false;
+    setUploadInProgress(false);
     document.getElementById('uploadModalClose').classList.remove('disabled');
     const progressFill = document.getElementById('progress-fill');
     const progressText = document.getElementById('progress-text');
@@ -2699,8 +3214,194 @@
   }
 
 
+  // v18.9.9.310: fetch initial Show Hidden state so the checkbox reflects
+  // whatever the device setting currently is. Fires POST on user change,
+  // then reloads the file list so dot-prefixed entries appear/disappear.
+  async function initShowHiddenToggle() {
+    const cb = document.getElementById('showHiddenToggle');
+    if (!cb) return;
+    try {
+      const r = await fetch('/api/show-hidden', { cache: 'no-store' });
+      if (r.ok) {
+        const j = await r.json();
+        cb.checked = !!j.value;
+      }
+    } catch (_) { /* leave default unchecked */ }
+  }
+  async function toggleShowHidden(value) {
+    try {
+      const r = await fetch('/api/show-hidden', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: !!value })
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      // Re-fetch the current directory so hidden entries appear/disappear.
+      if (typeof loadFiles === 'function') loadFiles();
+    } catch (e) {
+      // Roll the checkbox back on failure so it reflects actual server state.
+      const cb = document.getElementById('showHiddenToggle');
+      if (cb) cb.checked = !cb.checked;
+      console.warn('show-hidden toggle failed:', e);
+    }
+  }
+
+  // v18.9.9.393: manual device reset. POSTs /api/restart-ft which arms a
+  // debounced silent-restart-to-FT on the device (same mechanism the DONE
+  // handler uses post-large-upload). We then wait ~7 s for the device to
+  // reboot + WiFi to reconnect and reload the FT page -- the browser
+  // rebuilds its state against the fresh device instead of trying to keep
+  // any of the old sockets alive. Called from the "Reset device" button in
+  // the top toolbar, and auto-triggered by the WS retry loop when a WS
+  // accept has failed N times with zero productive progress (see
+  // uploadFileWebSocket).
+  async function resetDeviceAndReload(opts) {
+    const auto = opts && opts.auto;
+    const btn = document.getElementById('resetDeviceBtn');
+    // Guard against double-taps -- the endpoint is idempotent server-side
+    // (repeat POSTs just rearm the same pending-restart timer) but we still
+    // want the button to visibly enter a locked state.
+    if (btn && btn.dataset.pending === '1') return;
+    if (btn) {
+      btn.dataset.pending = '1';
+      btn.disabled = true;
+      btn.textContent = 'Restarting...';
+    }
+    if (!auto) {
+      const ok = confirm(
+          'Silent-restart the device to recover the File Transfer session?\n\n' +
+          'Any in-progress upload will be paused and auto-resume once the ' +
+          'device reboots (~5-10 s). Books already on the device are not ' +
+          'affected.');
+      if (!ok) {
+        if (btn) {
+          btn.dataset.pending = '';
+          btn.disabled = false;
+          btn.textContent = 'Reset device';
+        }
+        return;
+      }
+    }
+    try {
+      await fetch('/api/restart-ft', { method: 'POST', cache: 'no-store' });
+    } catch (e) {
+      // Expected -- the device may cut TCP mid-response as the restart fires.
+      console.log('[reset] POST returned/errored (expected mid-restart):', e && e.message);
+    }
+    // v18.9.9.404: DON'T reload when an upload is in progress. Reload nukes
+    // the File object reference held by the input element, so the WS retry
+    // loop's next attempt has no source to read from -- symptom was "upload
+    // stuck at 3%, silent-restart happens, file list reappears, nothing
+    // visible tells the user anything is still trying." Instead, poll
+    // /api/status until the device is reachable (webserver up) and then let
+    // the caller's normal retry logic fire the resume. When it's NOT an
+    // in-flight upload (user hit some future manual reset button), reload
+    // is safe and gives a clean slate.
+    const uploadInFlight = (typeof isUploadInProgress !== 'undefined' && isUploadInProgress) ||
+                           (typeof currentUploadWs !== 'undefined' && currentUploadWs);
+    if (!uploadInFlight) {
+      setTimeout(() => { location.reload(); }, 7000);
+      return;
+    }
+    // Poll for the device to come back. Cap at 25 s (well past the typical
+    // 5-7 s reboot + WiFi reconnect); if it's not up by then, something
+    // bigger is wrong and we fall through to the retry loop's next attempt
+    // anyway.
+    const pollStart = Date.now();
+    const POLL_TIMEOUT_MS = 25000;
+    const POLL_INTERVAL_MS = 1000;
+    while (Date.now() - pollStart < POLL_TIMEOUT_MS) {
+      await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+      try {
+        const r = await fetch('/api/status', { cache: 'no-store' });
+        if (r.ok) {
+          console.log('[reset] device reachable at ' + (Date.now() - pollStart) + 'ms; letting retry loop resume');
+          if (btn) {
+            btn.dataset.pending = '';
+            btn.disabled = false;
+            btn.textContent = 'Reset device';
+          }
+          return;
+        }
+      } catch (e) {
+        // still down, keep polling
+      }
+    }
+    console.warn('[reset] device did not become reachable within ' + POLL_TIMEOUT_MS + 'ms');
+    if (btn) {
+      btn.dataset.pending = '';
+      btn.disabled = false;
+      btn.textContent = 'Reset device';
+    }
+  }
+  // Expose for the WS retry loop to call.
+  window.resetDeviceAndReload = resetDeviceAndReload;
+
+  // v18.9.9.330: heap poller. Refreshes the header's Heap: XX KB pill every
+  // 5s so users can spot heap degradation before it triggers a crash. Sourced
+  // from the existing /api/status endpoint (already returns freeHeap; no new
+  // handler needed on the device). Color codes track the FT watchdog floors:
+  // green >30KB, amber 15-30KB, red <15KB. Poll is skipped while an upload
+  // is in progress -- fetch()'s TCP ack contention adds noise to upload
+  // throughput and heap is already displayed inline via the upload progress
+  // ETA. On any transient fetch error the pill just stays stale.
+  // v18.9.9.434: during an upload, show "Heap: — (uploading)" in neutral
+  // colors instead of leaving the last pre-upload value looking live.
+  // Confused users who reported "heap says 21 KB but the log says 68 KB
+  // free" -- the pill was frozen by design, but the design didn't say so.
+  let heapPollInterval = null;
+  async function refreshHeapIndicator() {
+    const el = document.getElementById('heapIndicator');
+    if (!el) return;
+    if (typeof isUploadInProgress !== 'undefined' && isUploadInProgress) {
+      el.textContent = 'Heap: — (uploading)';
+      el.style.background = '#f4f5f6';
+      el.style.color = '#666';
+      return;
+    }
+    try {
+      const r = await fetch('/api/status', { cache: 'no-store' });
+      if (!r.ok) return;
+      const j = await r.json();
+      const kb = Math.round((j.freeHeap || 0) / 1024);
+      el.textContent = `Heap: ${kb} KB`;
+      // Color coding matches the FT low-heap silent-restart floor and the
+      // saveToFile deferral floor. Green: comfortable. Amber: cautious (some
+      // operations may defer). Red: expect crashes on heavy operations.
+      let bg = '#e6f4ea', fg = '#137333';       // green
+      if (kb < 15) { bg = '#fce8e6'; fg = '#c5221f'; }       // red
+      else if (kb < 30) { bg = '#fef7e0'; fg = '#b06000'; }  // amber
+      el.style.background = bg;
+      el.style.color = fg;
+    } catch (e) {
+      // leave stale; not worth surfacing
+    }
+  }
+  function startHeapPoller() {
+    if (heapPollInterval) return;
+    refreshHeapIndicator();
+    heapPollInterval = setInterval(refreshHeapIndicator, 5000);
+  }
+
+  // v18.9.9.331: sync device wall-clock on FT load. HomePage already fires
+  // this on its own load, but users who bookmark /files or navigate straight
+  // there never triggered the sync -- every file they upload got the boot-
+  // default mtime (visible: all .crosspoint files stamped "Dec 31 2025 11pm").
+  // Shifted-for-timezone epochMs so FAT stores wall-local. Fire-and-forget.
+  function syncDeviceTime() {
+    const localEpochMs = Date.now() - new Date().getTimezoneOffset() * 60000;
+    return fetch('/api/sync-time', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ epochMs: localEpochMs })
+    }).catch(err => console.warn('time sync failed (non-fatal):', err));
+  }
+
   // Initialize quality settings handlers
   document.addEventListener('DOMContentLoaded', function() {
+    initShowHiddenToggle();
+    startHeapPoller();
+    syncDeviceTime();
     const qualitySlider = document.getElementById('qualitySlider');
     const qualityInput = document.getElementById('qualityInput');
 
@@ -2857,6 +3558,14 @@
     // cleared the DOM selection or navigated away.
     const prebakeOnly = !!opts.prebakeOnly;
     clearOptimizeResumeState();  // fresh run -- discard any prior stuck state
+    // CrumBLE 4.5.4: clear the sticky cancel flag at run-entry. Otherwise a
+    // prior cancelled run leaves operationCancelled=true, and the very first
+    // call to convertEpubFile inside the new run throws 'Cancelled by user'
+    // before any HTTP traffic fires -- modal shows 'Cancelled by user' a
+    // tenth of a second after the Resume click and nothing has happened on
+    // the device. restoreAfterCancel() resets the flag only on its own
+    // cancel-cleanup path, which a manual Close click doesn't traverse.
+    operationCancelled = false;
     const sel = opts.resumeSelection || getSelectedItems();
     const epubs = sel.filter(s => !s.isFolder && /\.epub$/i.test(s.name));
     if (epubs.length === 0) {
@@ -2905,8 +3614,16 @@
     const subtitleEl = document.querySelector('#uploadModal .file-info');
     if (subtitleEl) subtitleEl.style.display = 'none';
     // Three-state Cancel/Close: red while running.
-    isUploadInProgress = true;
+    setUploadInProgress(true);
     uploadGeneration++;
+    // CrumBLE 4.5.4: fresh AbortController per run so the Cancel button
+    // can fail-fast every in-flight upload/fetch inside the optimize
+    // pipeline immediately, instead of waiting for the per-fetch 12s
+    // timeout. uploadOneToDevice listens to this global signal.
+    if (window.optimizeAbortController) {
+      try { window.optimizeAbortController.abort(); } catch (_) {}
+    }
+    window.optimizeAbortController = new AbortController();
     document.getElementById('uploadModalClose').classList.add('disabled');
     const cancelBtn = document.querySelector('#uploadModal .delete-btn-cancel');
     if (cancelBtn) {
@@ -2926,7 +3643,7 @@
       console.error('Optimizer module load failed:', loadErr);
       alert('Could not load the optimizer module: ' + (loadErr.message || loadErr));
       // Reset modal state so the user can dismiss it.
-      isUploadInProgress = false;
+      setUploadInProgress(false);
       document.getElementById('uploadModalClose').classList.remove('disabled');
       if (cancelBtn) {
         cancelBtn.classList.remove('in-progress');
@@ -2942,21 +3659,56 @@
     showLog();
     log(`Optimizing ${epubs.length} EPUB${epubs.length === 1 ? '' : 's'} on device...`, '', 'INFO');
 
-    // Preflight ONCE for the whole batch -- the device's SETTINGS lock
-    // for the bake matches what gets baked into the manifest. Same
-    // call shape FilesPage.html uses for fresh uploads.
+    // Preflight ONCE for the whole batch -- the modal's dryRun response
+    // is the renderInfo every per-file bake step will use, so the user
+    // picks the bake target once and we thread it through all the
+    // convertEpubFile / prebakeChapters calls below.
+    let bakeRenderInfo = null;
     try {
-      const riResp = await fetch('/api/reader-render-info');
-      if (riResp.ok) {
-        const ri = await riResp.json();
-        if (ri && ri.viewportWidth > 0 && ri.viewportHeight > 0) {
-          const batchLabel = epubs.length > 1 ? `${epubs[0].name} + ${epubs.length - 1} more` : epubs[0].name;
-          await showOptimizerPreflightModal(ri, batchLabel);
+      // CrumBLE 4.5.6: surface render-info failures visibly. Previously this
+      // block silently skipped the preflight modal when /api/reader-render-info
+      // returned !ok OR (viewportWidth=0 || viewportHeight=0), and the upload
+      // proceeded with prebakeChapters falling back to a second internal
+      // render-info fetch. Field report: user expected to be asked about
+      // prepared-layout settings on every upload, but the modal didn't appear
+      // after a delete+immediate-reupload sequence. The render-info fetch
+      // probably returned invalid data while the device was still rebuilding
+      // its file index post-delete. New behavior: retry the fetch up to 3
+      // times with a short delay, and if it still fails, ABORT the upload
+      // with an alert instead of silently proceeding. "Always ask" is the
+      // contract the user expects.
+      let ri = null;
+      let lastErr = null;
+      for (let attempt = 0; attempt < 3; ++attempt) {
+        try {
+          const riResp = await fetch('/api/reader-render-info');
+          if (riResp.ok) {
+            const candidate = await riResp.json();
+            if (candidate && candidate.viewportWidth > 0 && candidate.viewportHeight > 0) {
+              ri = candidate;
+              break;
+            }
+            lastErr = `render-info had viewport=${candidate?.viewportWidth || 0}x${candidate?.viewportHeight || 0}`;
+          } else {
+            lastErr = `render-info HTTP ${riResp.status}`;
+          }
+        } catch (e) {
+          lastErr = e.message || String(e);
         }
+        if (attempt < 2) await new Promise(r => setTimeout(r, 400));
       }
+      if (!ri) {
+        log(`Preflight skipped: ${lastErr}`, 'error', 'WARN');
+        alert(`Couldn't get render settings from the device (${lastErr}).\n\n` +
+              `This usually means the device is busy. Wait a few seconds and retry.\n\n` +
+              `Upload aborted so we don't bake with stale layout values.`);
+        throw new Error(`render-info unavailable: ${lastErr}`);
+      }
+      const batchLabel = epubs.length > 1 ? `${epubs[0].name} + ${epubs.length - 1} more` : epubs[0].name;
+      bakeRenderInfo = await showPreflightAndFontImport(ri, batchLabel);
     } catch (preErr) {
       log(`Cancelled before start: ${preErr.message || preErr}`, 'warning', 'INFO');
-      isUploadInProgress = false;
+      setUploadInProgress(false);
       document.getElementById('uploadModalClose').classList.remove('disabled');
       if (cancelBtn) {
         cancelBtn.classList.remove('in-progress');
@@ -3017,6 +3769,22 @@
           throw new Error(`download failed: HTTP ${dlResp.status}`);
         }
         const epubBlob = await dlResp.blob();
+        // CrumBLE 4.5.4: validate the EPUB magic before handing to jszip.
+        // A prior Optimize Selected run that failed mid-upload-back can
+        // leave the SD copy truncated/garbled; the resulting jszip parse
+        // dies with an opaque 'Corrupted zip or bug: unexpected signature
+        // (\xC2\x3D\xE9\x26, expected \x50\x4B\x03\x04)' and the user has
+        // no idea the SD file itself is the problem. EPUBs are ZIP under
+        // the hood -- first 4 bytes MUST be 50 4B 03 04. Reject early
+        // with an actionable message instead.
+        if (epubBlob.size < 32) {
+          throw new Error(`device returned only ${epubBlob.size} bytes -- the SD copy is likely truncated from a prior failed upload. Please re-upload this book from the Upload button.`);
+        }
+        const head = new Uint8Array(await epubBlob.slice(0, 4).arrayBuffer());
+        if (head[0] !== 0x50 || head[1] !== 0x4B || head[2] !== 0x03 || head[3] !== 0x04) {
+          const hex = Array.from(head).map(b => '\\x' + b.toString(16).padStart(2, '0').toUpperCase()).join('');
+          throw new Error(`device SD copy is not a valid EPUB (first 4 bytes are ${hex}, expected \\x50\\x4B\\x03\\x04). Likely truncated from a prior failed upload. Please re-upload from the Upload button.`);
+        }
         const epubFile = new File([epubBlob], fileName, { type: 'application/epub+zip' });
         progressFill.style.width = fileScale(i, prebakeOnly ? 15 : 5) + '%';
         setPhase(i, `Downloaded ${fileName}`, prebakeOnly ? 15 : 5);
@@ -3032,11 +3800,15 @@
           const local = 5 + pct * 0.20;
           progressFill.style.width = fileScale(i, local) + '%'; // 5%->25% local
           setPhase(i, `Optimizing images in ${fileName}`, local);
-        });
+        }, { overrideRenderInfo: bakeRenderInfo });
         convertedFile = new File([convertedBlob], fileName, { type: 'application/epub+zip' });
 
         // 3. Upload the optimized EPUB back to its same SD path
-        //    (overwrites the original).
+        //    (overwrites the original) -- ONLY in device-output mode.
+        //    Download mode skips this step entirely and writes the
+        //    optimized EPUB to the user-picked folder after prebake.
+        const outputDestMode = (typeof getOutputDestMode === 'function') ? getOutputDestMode() : 'device';
+        if (outputDestMode === 'device') {
         log(`[${i + 1}/${epubs.length}] Uploading optimized EPUB...`, '', 'INFO');
         setPhase(i, `Uploading ${fileName}`, 25);
         await new Promise((resolve, reject) => {
@@ -3064,18 +3836,51 @@
         // Upload-back landed: SD copy is now the optimized version. From
         // here, any failure is recoverable via prebake-only Resume.
         itemUploadedThisRun = true;
+        } else {
+        // Download mode: jump the local-progress sub-bar straight to the
+        // prebake start so the user sees % moving even though we skipped
+        // the device-side upload phase.
+        setPhase(i, `Skipped device upload for ${fileName} (local-folder mode)`, 25);
+        }
         }  // end !prebakeOnly
 
-        // 4. Chapter prebake: produces book.bin + sections-prebake/ +
-        //    manifest and uploads them to /.crosspoint/epub_<hash>/.
+        // 4. Chapter prebake. In device mode the cache files upload
+        //    directly to /.crosspoint/epub_<hash>/; in download mode the
+        //    cache files come back to us and we write them to the
+        //    user-picked folder (or zip-fallback if no folder API).
         log(`[${i + 1}/${epubs.length}] Building chapter index...`, '', 'INFO');
         setPhase(i, `Building chapter index for ${fileName}`, prebakeStartPct);
         const prebakeSpan = 100 - prebakeStartPct;
-        await prebakeChapters(convertedFile, itemPath, (pct, status) => {
+        const prebakeRes = await prebakeChapters(convertedFile, itemPath, (pct, status) => {
           const local = prebakeStartPct + pct * (prebakeSpan / 100);
           progressFill.style.width = fileScale(i, local) + '%';
           setPhase(i, `Building chapter index for ${fileName}`, local, status || '');
-        });
+        }, { collectOnly: outputDestMode === 'download', overrideRenderInfo: bakeRenderInfo });
+
+        if (outputDestMode === 'download' && prebakeRes && prebakeRes.collectOnly) {
+          // Write the optimized EPUB + cache tree + INSTRUCTIONS.txt.
+          setPhase(i, `Saving ${fileName} to local folder`, 96);
+          const instructions = buildInstructionsText(fileName, prebakeRes.hashId);
+          try {
+            if (chosenOutputDirHandle) {
+              await writePrebakeToLocalFolder(chosenOutputDirHandle, convertedFile,
+                  prebakeRes.hashId, prebakeRes.files, instructions);
+              log(`[${i + 1}/${epubs.length}] Wrote ${fileName} + .crosspoint/${prebakeRes.hashId}/ to "${chosenOutputDirHandle.name}"`,
+                  '', 'INFO');
+            } else {
+              // No directory handle (browser doesn't support the API, or
+              // user didn't click Choose folder). Fall back to a zip
+              // download -- still gives them the same artifacts, just
+              // packaged so they have to extract themselves.
+              await writePrebakeToZip(convertedFile, prebakeRes.hashId, prebakeRes.files, instructions);
+              log(`[${i + 1}/${epubs.length}] Downloaded zip for ${fileName} (no folder selected; extract manually per INSTRUCTIONS.txt)`,
+                  '', 'INFO');
+            }
+          } catch (e) {
+            throw new Error(`local save failed: ${e.message || e}`);
+          }
+          setPhase(i, `Saved ${fileName} locally`, 100);
+        }
 
         okCount++;
         log(`[${i + 1}/${epubs.length}] ${fileName}: OK`, '', 'INFO');
@@ -3110,7 +3915,7 @@
 
     // Terminal state -- mirror the upload modal's three-state Close.
     progressFill.style.width = '100%';
-    isUploadInProgress = false;
+    setUploadInProgress(false);
     document.getElementById('uploadModalClose').classList.remove('disabled');
     if (cancelBtn) {
       cancelBtn.textContent = 'Close';
@@ -3130,9 +3935,29 @@
         okCount > 0
           ? `Finished with errors. ${okCount}/${epubs.length} optimized.`
           : 'Finished with errors. See log for details.';
+      // CrumBLE 4.5.4: resume-prebake hint. When the first run finishes
+      // with partial failures (typical heap-pressure / WiFi-blip case),
+      // the user has no obvious recovery path -- the modal just sits in
+      // the red state. Tell them what to do: re-run Optimize Selected on
+      // the same book(s); the prebake will list-then-diff what's already
+      // on the device and only re-upload the missing files.
+      // 4.5.5: removed "right-click" -- this page doesn't have a context
+      // menu. Surface the actually-clickable affordances: the Resume Upload
+      // button at the top of the file list, or selecting + re-running
+      // Optimize Selected on the same book.
+      log('To resume: click "Resume Upload" at the top of the file list, or select the same book ' +
+          'and choose "Optimize Selected" again. The system will compare the device cache against ' +
+          'the prebake output and only upload the missing files, not start over.',
+          '', 'INFO');
       modalNeedsBannerOnClose = true;
+      // 4.5.5: keep f.path on the failed entry. Optimize Selected failures
+      // have no original File (the source was an on-device EPUB pulled via
+      // /download, not a picker upload), so retrySingleUpload's old
+      // dt.items.add(failedFile.file) threw "parameter 1 is not of type
+      // 'File'". With path preserved we can route those retries through
+      // optimizeSelectedOnDevice({ resumeSelection: [...]}) instead.
       failedUploadsGlobal = failedUploadsGlobal.concat(
-        failed.map(f => ({ name: f.name, error: f.error, file: null })),
+        failed.map(f => ({ name: f.name, path: f.path, error: f.error, file: null })),
       );
     }
   }
@@ -3184,41 +4009,78 @@
       return p;
     });
 
-    // CrumBLE 4.4: chunk multi-delete into smaller batches. The ESP32 WebServer's
-    // x-www-form-urlencoded body parser silently drops large payloads -- a
-    // selection of ~100+ cache files in /.crosspoint/epub_*/ produced a ~7KB
-    // body and the server rejected it with "Missing `path` or `paths` argument"
-    // because the `paths` form arg never materialized. 20 paths per request
-    // keeps each body well under any practical limit, and the loop preserves
-    // the all-or-nothing-on-error semantics by stopping at the first failure.
-    const CHUNK_SIZE = 20;
-    const failures = [];
-    for (let i = 0; i < paths.length; i += CHUNK_SIZE) {
-      const chunk = paths.slice(i, i + CHUNK_SIZE);
-      const body = 'paths=' + encodeURIComponent(JSON.stringify(chunk));
-      try {
-        const res = await fetch('/delete', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: body
-        });
-        if (!res.ok) {
-          const text = await res.text();
-          failures.push(`Chunk ${Math.floor(i / CHUNK_SIZE) + 1}: ${text}`);
-          break;  // stop on first failure -- subsequent requests would likely fail the same way
-        }
-      } catch (e) {
-        failures.push(`Chunk ${Math.floor(i / CHUNK_SIZE) + 1}: network error`);
-        break;
+    // CrumBLE 4.5.5: optimistic UI. Strip the rows + close the confirm
+    // modal IMMEDIATELY, then fire the delete in the background. The
+    // device-side cleanup walks /.crosspoint/epub_<hash>/ removing every
+    // section file, .pxc, thumbnail etc. -- on a fully-baked CJK book
+    // that's 500+ files at ~20 ms / SD remove = 10+ s of "frozen modal"
+    // before any visual feedback. The actual delete on disk hasn't
+    // gotten faster, but the user sees the row vanish in <100 ms and
+    // can keep working. On the rare failure case we re-fetch the
+    // listing and toast.
+    const deletedNames = new Set(paths);
+    const rows = document.querySelectorAll('.file-table tr');
+    const removedRows = [];  // keep references in case we need to restore on failure
+    rows.forEach(tr => {
+      const checkbox = tr.querySelector('.select-item');
+      if (!checkbox) return;
+      const rowPath = decodeURIComponent(checkbox.getAttribute('data-path') || '');
+      const rowPathSlash = rowPath.startsWith('/') ? rowPath : '/' + rowPath;
+      if (deletedNames.has(rowPathSlash) || deletedNames.has(rowPath)) {
+        // Stash the row + its parent so we can put it back if delete fails.
+        removedRows.push({ row: tr, nextSibling: tr.nextSibling, parent: tr.parentNode });
+        tr.remove();
       }
+    });
+    closeDeleteModal();
+    // If we couldn't optimistically match any rows (data-path edge case)
+    // fall back to legacy synchronous path with reload so the user isn't
+    // stranded with a stale table.
+    if (removedRows.length === 0) {
+      try {
+        const body = 'paths=' + encodeURIComponent(JSON.stringify(paths));
+        await fetch('/delete', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+      } catch (e) { /* swallow -- reload will surface real state */ }
+      window.location.reload();
+      return;
     }
 
-    if (failures.length === 0) {
-      window.location.reload();
-    } else {
-      alert('Failed to delete:\n' + failures.join('\n'));
-      closeDeleteModal();
-    }
+    // Fire the delete in background. CrumBLE 4.4 chunking still applies:
+    // the ESP32 WebServer's x-www-form-urlencoded body parser silently
+    // drops large payloads (~100+ paths hit ~7KB and the `paths` arg
+    // never materialized), so 20 per request. Stop on first failure
+    // because subsequent requests would likely fail the same way.
+    (async () => {
+      const CHUNK_SIZE = 20;
+      const failures = [];
+      for (let i = 0; i < paths.length; i += CHUNK_SIZE) {
+        const chunk = paths.slice(i, i + CHUNK_SIZE);
+        const body = 'paths=' + encodeURIComponent(JSON.stringify(chunk));
+        try {
+          const res = await fetch('/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: body
+          });
+          if (!res.ok) {
+            const text = await res.text();
+            failures.push(`Chunk ${Math.floor(i / CHUNK_SIZE) + 1}: ${text}`);
+            break;
+          }
+        } catch (e) {
+          failures.push(`Chunk ${Math.floor(i / CHUNK_SIZE) + 1}: network error`);
+          break;
+        }
+      }
+      if (failures.length > 0) {
+        // Re-fetch the listing so the user sees actual on-device state
+        // (the failed items are back, anything we did delete is gone).
+        // A toast would be nicer than alert() but the modal's already
+        // closed so blocking modal is fine.
+        alert('Some items could not be deleted (the file list will refresh to show actual state):\n' + failures.join('\n'));
+        window.location.reload();
+      }
+    })();
   }
 
   // Helper to clear image picker state
@@ -3316,12 +4178,144 @@
 let failedUploadsGlobal = [];
 let wsConnection = null;
 let isUploadInProgress = false; // Prevent modal close during upload/conversion
+
+// CrumBLE 4.5.6 rev 4: single entry point for the "upload/bake is running" flag.
+// Was `isUploadInProgress = true/false` sprinkled across ~8 sites; now also
+// toggles a data attribute on the modal (drives CSS that greys out Choose
+// Files + Output destination) and hard-disables the underlying inputs so
+// tab-nav can't reach them mid-flight either.
+function setUploadInProgress(inProgress) {
+  isUploadInProgress = inProgress;
+  const modal = document.getElementById('uploadModal');
+  if (modal) modal.dataset.uploadInProgress = inProgress ? 'true' : 'false';
+  const fileInput = document.getElementById('fileInput');
+  if (fileInput) fileInput.disabled = inProgress;
+  const outputDestDevice = document.getElementById('outputDestDevice');
+  const outputDestDownload = document.getElementById('outputDestDownload');
+  const chooseFolderBtn = document.getElementById('chooseOutputFolderBtn');
+  if (outputDestDevice) outputDestDevice.disabled = inProgress;
+  if (outputDestDownload) outputDestDownload.disabled = inProgress;
+  if (chooseFolderBtn) chooseFolderBtn.disabled = inProgress;
+
+  // v18.9.9.303: stall watchdog. If progress-text stays unchanged for 30s
+  // while an upload is "in progress", surface an actionable message.
+  // Common trigger: firmware asset fetch (optimizer.js / crumble-prebake.wasm)
+  // stalls mid-body when WiFi is weak -- the browser's <script src> and
+  // fetch() have no built-in timeout, so nothing tells the user their
+  // upload is dead. Prior UX: the "Converting..." status stays forever
+  // until user gives up. Now they see a bold banner + guidance.
+  if (inProgress) {
+    startUploadStallWatchdog();
+  } else {
+    stopUploadStallWatchdog();
+  }
+}
+
+let _stallWatchdogInterval = null;
+let _stallLastBytesSent = -1;
+let _stallLastChangeMs = 0;
+let _stallBannerShown = false;
+// v18.9.9.390: raised 30 s -> 45 s. Under heap pressure the device stalls
+// mid-upload for 20-40 s stretches while it flushes SD writes, then resumes
+// at full speed. 30 s was firing during those recoverable pauses -- users
+// saw "click Cancel to retry" while the upload was actually still moving
+// (progress bar ticked from 74% -> 89% moments later). 45 s ensures we only
+// alert when the socket is truly wedged.
+const STALL_THRESHOLD_MS = 45000;
+
+function startUploadStallWatchdog() {
+  stopUploadStallWatchdog();
+  // v18.9.9.390: watch the byte counter (strictly monotonic per chunk sent)
+  // instead of #progress-text's rendered string. Rounded percent + smoothed
+  // KB/s + integer ETA can all land on the same value for 30+ s while bytes
+  // ARE moving, which produced false "upload stalled" banners.
+  _stallLastBytesSent = typeof window.__lastUploadBytesSent === 'number'
+      ? window.__lastUploadBytesSent : 0;
+  _stallLastChangeMs = Date.now();
+  _stallBannerShown = false;
+  _stallWatchdogInterval = setInterval(() => {
+    if (!isUploadInProgress) return;
+    const now = typeof window.__lastUploadBytesSent === 'number'
+        ? window.__lastUploadBytesSent : _stallLastBytesSent;
+    if (now !== _stallLastBytesSent) {
+      _stallLastBytesSent = now;
+      _stallLastChangeMs = Date.now();
+      if (_stallBannerShown) {
+        hideStallBanner();
+        _stallBannerShown = false;
+      }
+      return;
+    }
+    if (!_stallBannerShown && (Date.now() - _stallLastChangeMs) >= STALL_THRESHOLD_MS) {
+      showStallBanner();
+      _stallBannerShown = true;
+    }
+  }, 3000);
+}
+
+function stopUploadStallWatchdog() {
+  if (_stallWatchdogInterval) {
+    clearInterval(_stallWatchdogInterval);
+    _stallWatchdogInterval = null;
+  }
+  hideStallBanner();
+  _stallBannerShown = false;
+}
+
+function showStallBanner() {
+  const existing = document.getElementById('upload-stall-banner');
+  if (existing) return;
+  const modalContent = document.querySelector('#uploadModal .modal-content') ||
+                       document.getElementById('uploadModal');
+  if (!modalContent) return;
+  const banner = document.createElement('div');
+  banner.id = 'upload-stall-banner';
+  banner.style.cssText =
+      'margin:12px 0;padding:12px 14px;background:#8b3a1e;color:#fff;' +
+      'border-radius:6px;font-weight:600;line-height:1.4;';
+  banner.innerHTML =
+      'Upload is slow to progress. Auto-retry is running in the background.<br>' +
+      '<span style="font-weight:400">Move the device closer to your router if this persists. Cancel only if you want to stop.</span>';
+  // Insert near the top of the modal so it's visible without scrolling.
+  const firstChild = modalContent.firstElementChild;
+  if (firstChild && firstChild.nextSibling) {
+    modalContent.insertBefore(banner, firstChild.nextSibling);
+  } else {
+    modalContent.appendChild(banner);
+  }
+}
+
+function hideStallBanner() {
+  const banner = document.getElementById('upload-stall-banner');
+  if (banner) banner.remove();
+}
+
+// CrumBLE 4.5.6: guard against accidental tab navigation / refresh / close
+// while an upload or bake is mid-flight. Field report: user refreshed the
+// FT page mid-upload, the device's WS upload handler was left holding heap
+// for the partial transfer + the browser's blob reader, and the next render
+// task tripped a watchdog. The native beforeunload prompt is the right
+// surface here -- it stops the navigation BEFORE the upload state is lost,
+// gives the user one click to "stay" if it was an accident, and one click
+// to "leave" if they really meant it (in which case the upload aborts the
+// same way Cancel does). The returned string is browser-displayed only in
+// older browsers; modern Chrome / Safari show a fixed "Changes you made
+// may not be saved" message regardless. Returning ANY non-empty value is
+// what triggers the prompt; returning undefined / no return = no prompt.
+window.addEventListener('beforeunload', (e) => {
+  if (!isUploadInProgress) return;
+  // Trigger the browser's "really leave?" confirm. Chrome ignores the
+  // string; older browsers display it. Both behaviors are fine.
+  e.preventDefault();
+  e.returnValue = 'An upload is in progress. Leaving will abort it and may leave the device in an inconsistent state.';
+  return e.returnValue;
+});
 let operationCancelled = false; // Set by Cancel to stop conversion loops and upload async handlers
 let uploadGeneration = 0;       // Incremented each uploadFile() call; guards stale restoreAfterCancel()
 let currentUploadWs = null;     // Active WebSocket reference for external abort
 let currentUploadXhr = null;    // Active XHR reference for external abort
 const WS_PORT = 81;
-const WS_CHUNK_SIZE = 4096; // 4KB chunks - smaller for ESP32 stability
+const WS_CHUNK_SIZE = 4096; // 8KB chunks - matches WEBSOCKETS_MAX_DATA_SIZE in platformio.ini
 
 // ============================================================================
 // EPUB Image Conversion Functions (from Baseline JPEG Converter)
@@ -3359,6 +4353,14 @@ let OVERLAP_PERCENT = 5; // Minimum overlap percentage for splits (5%, 10%, 15%)
 let imageStates = {};        // Map: imagePath -> state (0=Normal, 1=H-Split, 2=V-Split, 3=Rotate)
 let epubImagesCache = [];    // Cache of extracted images for preview
 let pendingConversionFile = null;  // File awaiting conversion after image selection
+// CrumBLE 4.5.4: per-file snapshot of imageStates at the moment the user
+// hits 'Optimize & Upload'. retrySingleUpload reads from this map so a
+// retry of a failed run skips the per-image picker (the user has already
+// committed those choices once; making them redo every image dropdown on
+// a 30+-image book was the noise this map removes). Keyed by file.name +
+// '|' + file.size as a cheap tamper guard. Populated by
+// startConversionWithImageStates in optimizer.js.
+const cachedImageStatesByFile = new Map();
 
 // ============================================================================
 // Enhanced Logging System
@@ -3384,11 +4386,47 @@ async function fetchVersion() {
         DETECTED_DEVICE = data.device;
         applyDeviceTarget();
       }
+      if (typeof data.rssi === 'number') updateWifiWarning(data.rssi);
     }
   } catch (e) {
     console.error('Failed to fetch version:', e);
   }
 }
+
+// v18.9.9.190: weak-WiFi warning. Shows a banner when RSSI drops below
+// -65 dBm (the field-observed threshold where TCP retransmit-driven
+// fragmentation makes uploads flaky and .wasm serves get truncated).
+// Below -75 dBm the wording escalates to "Very weak". AP mode returns
+// rssi=0 and hides the banner (no useful signal in AP mode -- the phone
+// is the AP so RSSI at the device is meaningless).
+function updateWifiWarning(rssi) {
+  const banner = document.getElementById('wifiWarningBanner');
+  const label  = document.getElementById('wifiWarningLabel');
+  if (!banner || !label) return;
+  if (!rssi || rssi === 0 || rssi >= -64) {
+    banner.classList.remove('show');
+    return;
+  }
+  const severity = rssi <= -75 ? 'Very weak' : 'Weak';
+  label.innerHTML =
+    `<strong>${severity} WiFi signal (${rssi} dBm).</strong> ` +
+    `Uploads may be slow, fail, or truncate. Move closer to your router for reliable transfers.`;
+  banner.classList.add('show');
+}
+
+// Poll /api/status every 15 s so the banner reflects the current signal
+// as the user (or their environment) moves. Skips while the tab is hidden
+// so a backgrounded FT page doesn't add background load.
+async function pollWifiSignal() {
+  if (typeof document !== 'undefined' && document.hidden) return;
+  try {
+    const r = await fetch('/api/status', { cache: 'no-store' });
+    if (!r.ok) return;
+    const d = await r.json();
+    if (typeof d.rssi === 'number') updateWifiWarning(d.rssi);
+  } catch { /* transient network errors are fine -- next tick will retry */ }
+}
+setInterval(pollWifiSignal, 15000);
 
 // Resolve DEVICE_TARGET ('auto' | 'X4' | 'X3') to a concrete profile and update UI.
 function applyDeviceTarget() {
@@ -3460,7 +4498,18 @@ function isFatalUploadError(errMsg) {
          lower.includes('disk full') ||
          lower.includes('invalid start') ||
          lower.includes('overflow') ||
-         lower.includes('failed to create file');
+         lower.includes('failed to create file') ||
+         // v18.9.9.382: treat user cancel as fatal so the outer retry loop
+         // stops instead of reconnecting immediately with the same file. Was
+         // causing the "Cancelling..." button to hang while [WS] Client 0
+         // connected/disconnected messages kept firing every few seconds.
+         lower.includes('cancelled by user') ||
+         // v18.9.9.392: device fires FATAL:SD_WRITE_FAILING after N consecutive
+         // openFileForWrite failures; the SD card / cache path is bad and no
+         // amount of retrying will save this upload. Bubble up cleanly so the
+         // outer prebake-push loop aborts the whole batch (704 dead-end
+         // retries is what this replaces).
+         lower.includes('sd_write_failing');
 }
 
 // Upload file via WebSocket (faster, binary protocol). Auto-resumes via the
@@ -3477,16 +4526,46 @@ async function uploadFileWebSocket(file, onProgress, onComplete, onError) {
   const MAX_RETRIES = 10;
   let attempt = 0;
   let lastError = null;
+  // v18.9.9.395: track consecutive non-productive failures separately from
+  // the MAX_RETRIES budget. The isRestart-with-probe-confirmed-up branch
+  // (post-silent-restart lwIP-settling exemption) doesn't increment
+  // `attempt`, so my v393 auto-reset trigger that keyed on `attempt + 1
+  // === 3` never fired when the WS accept was permanently wedged. Field
+  // symptom: browser sat at attempt 0/10 for 10+ minutes doing 30 s stall
+  // cycles because every failure was exempted from budget-counting. New
+  // rule: a consecutive-fails counter that ANY non-productive attempt
+  // increments (regardless of the isRestart exemption), used purely for
+  // the auto-reset trigger; MAX_RETRIES accounting is unchanged.
+  let nonProductiveInARow = 0;
+  const AUTO_RESET_STREAK = 3;
   // CrumBLE 4.5.4: capture progress bytes so the probe-exhaustion path can
   // tell the user how many MB they've already pushed -- and so the in-modal
   // Resume action knows where to resume from in its label.
   let lastSentBytes = 0;
+  // CrumBLE 4.5.4 follow-up: track bytes at the START of each attempt so the
+  // catch handler can tell whether the attempt actually made progress. A
+  // long upload over a flaky / heap-tight device can disconnect 20+ times
+  // while still moving forward (each reconnect resumes from offset); the
+  // old fixed MAX_RETRIES=10 budget gave up at attempt 10 even when bytes
+  // were still climbing. New rule: if this attempt advanced lastSentBytes
+  // by >= 64 KB, the connection IS productive -- reset the attempt counter
+  // so the retry budget refills.
+  let bytesAtAttemptStart = 0;
+  const PROGRESS_THRESHOLD_FOR_RESET = 64 * 1024;
   const trackProgress = (sent, total) => {
     if (typeof sent === 'number') lastSentBytes = sent;
     if (onProgress) onProgress(sent, total);
   };
 
   while (attempt <= MAX_RETRIES) {
+    // v18.9.9.382: honour cancel between retries. Previously the outer
+    // retry loop didn't check operationCancelled -- if the user cancelled
+    // during the exponential-backoff sleep at line ~4457, the next
+    // iteration would reconnect + resume anyway.
+    if (operationCancelled) {
+      throw new Error('Upload cancelled by user');
+    }
+    bytesAtAttemptStart = lastSentBytes;
     try {
       // CrumBLE 4.4: surface devicePath (returned by DONE:<path> upgrade) so
       // the caller can skip the post-upload /api/files lookup.
@@ -3497,10 +4576,28 @@ async function uploadFileWebSocket(file, onProgress, onComplete, onError) {
       if (isFatalUploadError(err.message)) {
         throw err;  // not retryable
       }
-      if (attempt >= MAX_RETRIES) {
-        throw err;  // out of retries
+      // Productive-attempt detection: did we make material progress this
+      // round? If yes, the connection IS working, just unstable -- don't
+      // count it against the retry budget. Bumping attempt only when we
+      // truly stalled keeps long uploads alive across many reconnects.
+      //
+      // CrumBLE 4.5.5: defer the increment decision until AFTER the isRestart
+      // probe runs (see below). If isRestart matches AND /api/status confirms
+      // the device is up, the failure was transient on the network side
+      // (lwIP pbuf pool / TCP TIME_WAIT contention while heap settles) -- we
+      // do NOT count it against the budget. Pre-this fix, a long upload
+      // could get through 5 MB in productive cycles, then exhaust the retry
+      // budget on 10 transient handshake fails while the device was visibly
+      // healthy. Real fix here is investigating device-side lwIP exhaustion,
+      // but treating these as free retries on the browser side keeps long
+      // uploads alive in the meantime.
+      const advanced = lastSentBytes - bytesAtAttemptStart;
+      const wasProductive = advanced >= PROGRESS_THRESHOLD_FOR_RESET;
+      if (wasProductive) {
+        console.log('[WS] attempt ' + attempt + ' advanced ' + advanced + ' B -- not counting against retry budget');
       }
-      attempt++;
+      // Increment deferred -- happens below, only if NOT productive and NOT a
+      // probe-confirmed-up restart.
       // CrumBLE 4.5.4: device-restart-aware backoff. The device's START
       // handler does a heap pre-flight and silentRestarts to recover when
       // fragmented -- the user sees the upload sit at the same percent for
@@ -3510,21 +4607,41 @@ async function uploadFileWebSocket(file, onProgress, onComplete, onError) {
       // "Heap too fragmented" message OR a generic socket-close after
       // we'd been making progress, and probe /api/status until the device
       // confirms it's back BEFORE retrying the WS reconnect.
-      const isRestart = /restart|fragment/i.test(err.message || '') ||
-                        /WebSocket closed/i.test(err.message || '');
+      // CrumBLE 4.5.4: ALSO treat 'WebSocket connection failed' (raw
+       // handshake failure when the device is heap-tight or restarting)
+       // the same as 'WebSocket closed'. Both mean 'device WS unavailable
+       // right now' -- probe /api/status to detect when it's back instead
+       // of exponential-backing-off 16s -> 32s -> 32s, which produced the
+       // long dead time the user reported between disconnect and resume.
+       const isRestart = /restart|fragment/i.test(err.message || '') ||
+                         /WebSocket closed/i.test(err.message || '') ||
+                         /WebSocket connection failed/i.test(err.message || '');
       console.warn('[WS] Upload failed (attempt ' + attempt + '/' + MAX_RETRIES +
-                   '): ' + err.message);
+                   ', advanced ' + advanced + ' B, isRestart=' + isRestart + '): ' + err.message);
       if (isRestart) {
         if (onError) {
           try { onError('Device is restarting to recover heap. Waiting for it to come back...'); }
           catch (e) { /* ignore */ }
         }
-        // Probe /api/status every 2s with a 1.5s deadline, up to 60s. The
-        // first ok response means the device is serving again -- short
-        // breather to let WS bring-up settle, then resume.
+        // CrumBLE 4.5.4: probe /api/status with shorter cadence + try
+        // immediately on first attempt (was: 2s wait before first probe
+        // = mandatory 2s dead time even when device hadn't actually
+        // dropped). Now: 1s interval, first attempt fires after 200ms
+        // (~enough for the disconnect to settle device-side). 60 probes
+        // x 1s ~= same 60s ceiling.
+        // CrumBLE 4.5.6: surface the "re-enter FT" hint EARLIER. The 60-
+        // second probe budget is for the auto-recovery case (device silent-
+        // restarts and comes back to FT on its own); after ~10 seconds of
+        // failed probes the more likely cause is that the device rebooted
+        // out of FT mode entirely (panic, user-pressed Power, WiFi drop)
+        // and isn't going to auto-recover. Telling the user at the 10s mark
+        // that they CAN intervene by re-entering FT cuts the dead-air wait
+        // when manual action is actually needed. If the device DOES come
+        // back on its own, the success branch overrides the message.
+        const kHintAfterProbeSeconds = 10;
         let probedBack = false;
-        for (let probe = 1; probe <= 30; probe++) {
-          await new Promise(r => setTimeout(r, 2000));
+        for (let probe = 1; probe <= 60; probe++) {
+          await new Promise(r => setTimeout(r, probe === 1 ? 200 : 1000));
           try {
             const ctrl = new AbortController();
             const tid = setTimeout(() => ctrl.abort(), 1500);
@@ -3541,7 +4658,17 @@ async function uploadFileWebSocket(file, onProgress, onComplete, onError) {
             }
           } catch (_) {
             if (onError) {
-              try { onError('Waiting for device to finish restart... (' + (probe * 2) + 's, attempt ' + attempt + '/' + MAX_RETRIES + ')'); }
+              try {
+                if (probe < kHintAfterProbeSeconds) {
+                  onError('Waiting for device to finish restart... (' + probe + 's, attempt ' + attempt + '/' + MAX_RETRIES + ')');
+                } else {
+                  // v18.9.9.418: drop the "(attempt N/M)" tail per user
+                  // feedback -- it read as an error state ("we're failing")
+                  // rather than a resumable pause. Softened phrasing to
+                  // frame the action as normal, not a retry budget.
+                  onError('Device disconnected. If it left File Transfer mode, just reconnect to File Transfer and this upload will auto-resume.');
+                }
+              }
               catch (e) { /* ignore */ }
             }
           }
@@ -3568,7 +4695,26 @@ async function uploadFileWebSocket(file, onProgress, onComplete, onError) {
           });
           throw new Error('Upload paused -- re-enter File Transfer mode and click Resume below.');
         }
-      } else {
+        // CrumBLE 4.5.5: probe confirmed device is healthy. The failure was
+        // transient on the network side (lwIP pbuf / TIME_WAIT contention
+        // while heap settled after the previous upload). Don't count this
+        // against the retry budget -- the device IS working, just briefly
+        // refused the WS handshake. Pre-this fix, a long upload could
+        // exhaust MAX_RETRIES on 10 such transient handshake fails after
+        // making 5+ MB of productive progress.
+        console.log('[WS] isRestart with probe-confirmed-up -- not counting against retry budget');
+        // v18.9.9.395: BUT still track this against the auto-reset streak.
+        // Field log showed 20+ consecutive failures of exactly this shape
+        // (each 30 s stall), all budget-exempted, so attempt stayed at 0
+        // and the auto-reset trigger from v393 never fired.
+        nonProductiveInARow++;
+      } else if (!wasProductive) {
+        // Non-restart, non-productive failure. Now we charge the budget.
+        nonProductiveInARow++;
+        if (attempt >= MAX_RETRIES) {
+          throw err;
+        }
+        attempt++;
         const delayMs = Math.min(2000 * Math.pow(2, attempt - 1), 32000);
         if (onError) {
           try { onError('Upload paused (attempt ' + attempt + '/' + MAX_RETRIES +
@@ -3576,6 +4722,49 @@ async function uploadFileWebSocket(file, onProgress, onComplete, onError) {
           catch (e) { /* ignore */ }
         }
         await new Promise(r => setTimeout(r, delayMs));
+      } else {
+        // wasProductive (advanced >= 64 KB) on a non-restart failure: fall
+        // through with no charge + no backoff. The connection IS working;
+        // just reconnect immediately. Also reset the auto-reset streak so
+        // a mid-upload productive attempt after a rough patch doesn't
+        // trigger an unnecessary device restart.
+        nonProductiveInARow = 0;
+      }
+
+      // v18.9.9.395: unified auto-reset trigger. Any streak of 3 consecutive
+      // non-productive failures (of any classification -- budget-exempted OR
+      // budget-charged) means the socket path is genuinely wedged. Reset the
+      // device.
+      // v18.9.9.404: reset-and-resume WITHOUT reload. Prior version called
+      // window.resetDeviceAndReload which reloaded the page after 7 s -- but
+      // reload nuked the File reference in the input element, so the next
+      // upload attempt had no source. Symptom: silent-restart succeeded,
+      // page reloaded showing the file list, and the user had no visible
+      // indication that the upload was still supposed to be running.
+      // v18.9.9.404's resetDeviceAndReload no longer reloads when an upload
+      // is in flight -- it polls /api/status until the device is back and
+      // returns, letting THIS retry loop naturally continue with the same
+      // file object.
+      if (nonProductiveInARow >= AUTO_RESET_STREAK &&
+          typeof window.resetDeviceAndReload === 'function') {
+        console.warn('[WS] ' + nonProductiveInARow +
+                     ' non-productive failures in a row -- auto-triggering device reset');
+        if (onError) {
+          try { onError('Upload stuck. Restarting the device (~7 s) then resuming...'); }
+          catch (e) { /* ignore */ }
+        }
+        // await -- returns when device is reachable again (or times out at 25 s).
+        await window.resetDeviceAndReload({ auto: true });
+        // Reset the streak so we don't immediately re-trigger; if the resume
+        // attempts also fail we'll rebuild the streak from 0.
+        nonProductiveInARow = 0;
+        if (onError) {
+          try { onError('Device is back. Resuming upload from last confirmed byte...'); }
+          catch (e) { /* ignore */ }
+        }
+        // Fall through to the top of the outer while() loop, which will run
+        // another uploadFileWebSocketOnce() attempt. Server responds with
+        // RESUME:N against the fsync'd partial file on SD.
       }
     }
   }
@@ -3593,8 +4782,36 @@ function uploadFileWebSocketOnce(file, onProgress, onComplete, onError) {
 
     ws.binaryType = 'arraybuffer';
 
+    // CrumBLE 4.5.5: stall watchdog. The device-side path that triggered
+    // this fix: WS handshake succeeds, browser sends START, device
+    // accepts the connection but fails to allocate the parse buffer for
+    // the incoming TEXT frame on a fragmented heap -- the frame is
+    // silently dropped, no ERROR, no close. Browser sits in the send
+    // loop or the "waiting for DONE" window indefinitely (saw 7+ min in
+    // the field). The watchdog fires every 5 s; if nothing has happened
+    // (no message received, no chunk advance) for STALL_TIMEOUT_MS, we
+    // close() the socket -- onclose then runs the outer-loop retry path
+    // which establishes a fresh connection (and the device's reserve-
+    // pad-free at next START is the actual structural fix). Cleared on
+    // resolve/reject so it doesn't leak across uploads.
+    const STALL_TIMEOUT_MS = 30000;
+    let lastActivityAt = Date.now();
+    const bumpActivity = () => { lastActivityAt = Date.now(); };
+    const stallWatchdog = setInterval(() => {
+      if (uploadComplete) {
+        clearInterval(stallWatchdog);
+        return;
+      }
+      if (Date.now() - lastActivityAt > STALL_TIMEOUT_MS) {
+        console.warn('[WS] Stall watchdog: no activity for', STALL_TIMEOUT_MS, 'ms; closing socket to force retry');
+        try { ws.close(); } catch (e) { /* socket already gone */ }
+        clearInterval(stallWatchdog);
+      }
+    }, 5000);
+
     ws.onopen = function() {
       console.log('[WS] Connected, starting upload:', file.name);
+      bumpActivity();
       // Send start message: START:<filename>:<size>:<path>
       ws.send(`START:${file.name}:${file.size}:${currentPath}`);
     };
@@ -3602,6 +4819,7 @@ function uploadFileWebSocketOnce(file, onProgress, onComplete, onError) {
     ws.onmessage = async function(event) {
       const msg = event.data;
       console.log('[WS] Message:', msg);
+      bumpActivity();  // any server message resets the stall timer
 
       // CrumBLE 4.4: resume support. Server sends "RESUME:<bytes>" when a
       // partial upload exists at the destination path. We start sending
@@ -3625,8 +4843,28 @@ function uploadFileWebSocketOnce(file, onProgress, onComplete, onError) {
           // Send file in chunks
           const totalSize = file.size;
           let offset = resumeOffset;
+          // v18.9.9.330: throughput + ETA tracking. Sample bytes/time over a
+          // rolling ~4s window so the display doesn't spike on individual
+          // slow chunks and doesn't drift when the network briefly hangs.
+          // ETA is exposed on window.__lastUploadEtaSec for the cancel
+          // confirmation dialog to reference.
+          const throughputSamples = [];  // [{ atMs, bytesSent }]
+          const throughputWindowMs = 4000;
+          const throughputStartMs = Date.now();
+          const throughputStartBytes = resumeOffset;
+          window.__lastUploadEtaSec = 0;
+          window.__lastUploadKbps = 0;
 
           while (offset < totalSize && ws.readyState === WebSocket.OPEN) {
+            // v18.9.9.319: honor Cancel synchronously. Previously the loop
+            // only checked ws.readyState; ws.close() is async so several
+            // chunks slipped through the pipe after the user pressed Cancel
+            // (visible: "Cancelling..." on screen while [WS] BIN frame logs
+            // keep ticking on the device). operationCancelled is set inline
+            // by the Cancel handler so this check bails immediately.
+            if (operationCancelled) {
+              throw new Error('Upload cancelled by user');
+            }
             const chunkSize = Math.min(WS_CHUNK_SIZE, totalSize - offset);
             const chunk = file.slice(offset, offset + chunkSize);
             const buffer = await chunk.arrayBuffer();
@@ -3639,6 +4877,9 @@ function uploadFileWebSocketOnce(file, onProgress, onComplete, onError) {
             // ~1 KB mid-stream. Cost: ~5-10 seconds added on a typical book,
             // which is well worth the reliability win.
             while (ws.bufferedAmount > WS_CHUNK_SIZE / 2 && ws.readyState === WebSocket.OPEN) {
+              if (operationCancelled) {
+                throw new Error('Upload cancelled by user');
+              }
               await new Promise(r => setTimeout(r, 5));
             }
 
@@ -3648,11 +4889,47 @@ function uploadFileWebSocketOnce(file, onProgress, onComplete, onError) {
 
             ws.send(buffer);
             offset += chunkSize;
+            bumpActivity();  // chunk sent successfully -- bytes are moving
+            window.__lastUploadBytesSent = offset;
+
+            // v18.9.9.330: update rolling throughput window + compute ETA.
+            // Sample every chunk; drop samples older than the window.
+            const nowMs = Date.now();
+            throughputSamples.push({ atMs: nowMs, bytesSent: offset });
+            while (throughputSamples.length > 1 &&
+                   throughputSamples[0].atMs < nowMs - throughputWindowMs) {
+              throughputSamples.shift();
+            }
+            let kbps = 0;
+            let etaSec = 0;
+            if (throughputSamples.length >= 2) {
+              const oldest = throughputSamples[0];
+              const dtSec = (nowMs - oldest.atMs) / 1000;
+              const dBytes = offset - oldest.bytesSent;
+              if (dtSec > 0.05) {
+                kbps = (dBytes / 1024) / dtSec;
+                const remainBytes = totalSize - offset;
+                if (kbps > 0) etaSec = Math.round(remainBytes / (kbps * 1024));
+              }
+            }
+            window.__lastUploadKbps = kbps;
+            window.__lastUploadEtaSec = etaSec;
 
             // Update local progress with real transfer progress
             // Server will confirm 100% with DONE message
             if (onProgress) {
               onProgress(offset, totalSize);
+            }
+            // v18.9.9.330: append throughput + ETA to progress text so
+            // users see the upload is alive and can estimate time left.
+            // Formatted as e.g. "62% (185 KB/s -- ~42s)". Only touches
+            // the text if not currently showing a cancel/error state.
+            const progressText = document.getElementById('progress-text');
+            if (progressText && !operationCancelled) {
+              const pct = Math.round((offset / totalSize) * 100);
+              const speedStr = kbps > 0 ? ` (${Math.round(kbps)} KB/s` : '';
+              const etaStr = etaSec > 0 && etaSec < 3600 ? ` -- ~${etaSec}s)` : (speedStr ? ')' : '');
+              progressText.textContent = `Uploading ${pct}%${speedStr}${etaStr}`;
             }
           }
 
@@ -3661,6 +4938,7 @@ function uploadFileWebSocketOnce(file, onProgress, onComplete, onError) {
         } catch (err) {
           console.error('[WS] Error sending chunks:', err);
           sendingChunks = false;
+          clearInterval(stallWatchdog);
           ws.close();
           reject(err);
         }
@@ -3678,11 +4956,22 @@ function uploadFileWebSocketOnce(file, onProgress, onComplete, onError) {
         if (onProgress) onProgress(file.size, file.size);
         uploadComplete = true;
         currentUploadWs = null;
+        clearInterval(stallWatchdog);
         ws.close();
         if (onComplete) onComplete(devicePath);
         resolve(devicePath);
       } else if (msg.startsWith('ERROR:')) {
         const error = msg.substring(6);
+        clearInterval(stallWatchdog);
+        ws.close();
+        if (onError) onError(error);
+        reject(new Error(error));
+      } else if (msg.startsWith('FATAL:')) {
+        // v18.9.9.392: SD_WRITE_FAILING and future hard-abort signals.
+        // Reject with a message that isFatalUploadError() recognises so
+        // the outer retry loop stops immediately.
+        const error = msg.substring(6);
+        clearInterval(stallWatchdog);
         ws.close();
         if (onError) onError(error);
         reject(new Error(error));
@@ -3692,6 +4981,7 @@ function uploadFileWebSocketOnce(file, onProgress, onComplete, onError) {
     ws.onerror = function(event) {
       console.error('[WS] Error:', event);
       currentUploadWs = null;
+      clearInterval(stallWatchdog);
       if (!uploadStarted) {
         reject(new Error('WebSocket connection failed'));
       } else if (!sendingChunks) {
@@ -3704,6 +4994,7 @@ function uploadFileWebSocketOnce(file, onProgress, onComplete, onError) {
 
     ws.onclose = function(event) {
       console.log('[WS] Connection closed, code:', event.code, 'reason:', event.reason);
+      clearInterval(stallWatchdog);
       // Reject for any close before upload was confirmed complete (covers both
       // mid-chunk-send closes and the "all chunks sent, waiting for DONE" window)
       if (!uploadComplete) {
@@ -3767,6 +5058,14 @@ async function uploadFile() {
     return;
   }
 
+  // CrumBLE 4.5.4: clicking Upload starts a fresh run that has nothing to
+  // do with any earlier failure. Drop any lingering Resume affordance so
+  // the modal isn't carrying state from an abandoned previous run. If THIS
+  // run fails, the failure handler will set a fresh resume action then.
+  if (typeof clearPendingResumeAction === 'function') {
+    clearPendingResumeAction();
+  }
+
   // The optimizer code is lazy-loaded. Make sure it's present before any
   // conversion/logging runs. If it can't be fetched (flaky link), fall back to
   // uploading the originals rather than failing the whole batch.
@@ -3775,14 +5074,25 @@ async function uploadFile() {
     try {
       await ensureOptimizer();
     } catch (e) {
-      console.error('Optimizer load failed, uploading originals:', e);
-      showNotification('Optimizer unavailable — uploading original files', 'warning');
-      convertEnabled = false;
+      // v18.9.9.319: no more silent fallback. Previously we flipped
+      // convertEnabled=false and uploaded originals, which betrayed the
+      // user's explicit checkbox choice ("optimize for device"). Now we
+      // surface the error and let the user decide -- retry (often works
+      // the second time; the failure is usually a transient low-heap
+      // silent-restart) or uncheck the optimize box and try again.
+      console.error('Optimizer load failed:', e);
+      showNotification(
+        'Optimizer failed to load (usually transient — retry the upload). ' +
+        'Uncheck "Optimize for device" if you want to upload the original file.',
+        'error');
+      setUploadInProgress(false);
+      document.getElementById('uploadModalClose').classList.remove('disabled');
+      return;
     }
   }
 
   // Prevent modal close during upload
-  isUploadInProgress = true;
+  setUploadInProgress(true);
   uploadGeneration++;
   const myGeneration = uploadGeneration;
   document.getElementById('uploadModalClose').classList.add('disabled');
@@ -3808,6 +5118,10 @@ async function uploadFile() {
   // SETTINGS apply for the whole batch -- showing the modal again per
   // file would make the batch flow feel like a per-file confirmation.
   let batchPreflightDone = false;
+  // CrumBLE 4.5.5: dryRun renderInfo from the preflight modal, stashed
+  // here so per-file convertEpubFile + prebakeChapters calls all use
+  // the same bake target without re-fetching device SETTINGS.
+  let batchOverrideRenderInfo = null;
 
   // Check if we should use batch logging mode
   const epubFilesToConvert = files.filter(f => f.name.toLowerCase().endsWith('.epub') && convertEnabled);
@@ -3838,7 +5152,7 @@ async function uploadFile() {
         // the close button (it was disabled during the in-progress
         // state) and clear the in-progress flag so a refresh on close
         // shows the freshly-uploaded files when they DO close.
-        isUploadInProgress = false;
+        setUploadInProgress(false);
         document.getElementById('uploadModalClose').classList.remove('disabled');
         const cancelBtn = document.querySelector('#uploadModal .delete-btn-cancel');
         if (cancelBtn) {
@@ -3857,6 +5171,18 @@ async function uploadFile() {
         progressText.textContent = ok > 0
           ? `Finished with errors. ${ok}/${files.length} uploaded.`
           : 'Finished with errors. See log for details.';
+
+        // CrumBLE 4.5.4: resume-prebake hint. Same guidance as the
+        // optimize-selected path -- user doesn't need to delete the
+        // partial cache or start from scratch; just re-run Optimize
+        // Selected on the same book and the prebake will diff what's
+        // already on the device and only upload the gaps.
+        // 4.5.5: removed "right-click" -- no context menu on this page. Point
+        // the user at the actual UI affordances (Resume Upload + selection).
+        log('To resume: click "Resume Upload" at the top of the file list, or select the same ' +
+            'book and choose "Optimize Selected" again. The system will compare the device cache ' +
+            'against the prebake output and only upload the missing files.',
+            '', 'INFO');
 
         // Add upload errors to batch log
         if (useBatchLog) {
@@ -3879,7 +5205,7 @@ async function uploadFile() {
         // flag here -- reloading would wipe failedUploadsGlobal, which
         // is plain JS state. Instead set the banner flag so close-click
         // dismisses the modal and surfaces the retry UI in-page.
-        isUploadInProgress = false;
+        setUploadInProgress(false);
         document.getElementById('uploadModalClose').classList.remove('disabled');
         const cancelBtnFail = document.querySelector('#uploadModal .delete-btn-cancel');
         if (cancelBtnFail) {
@@ -3976,11 +5302,23 @@ async function uploadFile() {
         saveToFileBatchLog(file.name, false, convOriginalSize, convNewSize);
       }
 
-      failedFiles.push({ name: file.name, error: error, file: originalFile });
+      // CrumBLE 4.5.4 follow-up: store `file` (the possibly-converted blob),
+      // NOT originalFile. With Optimize EPUB on, the device has partial
+      // OPTIMIZED bytes preserved for resume; sending originalFile on Retry
+      // would mix the original tail into the optimized head and the SD copy
+      // ends up as garbage. `file` is the converted blob after line 4482's
+      // reassignment, falls back to the picked file when convert was off.
+      failedFiles.push({ name: file.name, error: error, file: file });
 
-      // If network error, mark all remaining files as failed and show retry banner
+      // If network error, mark all remaining files as failed and show retry banner.
+      // CrumBLE 4.5.4: also recognize the WS-mid-stream cases ('WebSocket closed
+      // during upload' from the chunked uploader, 'WS closed mid-upload' from
+      // the cache-stream path) -- they hit the same recoverable state as the
+      // legacy 'disconnected' / 'timeout' keywords but weren't matching, so no
+      // retry UI surfaced and the user thought the run was just dead.
       if (error.includes('connection failed') || error.includes('Network error') ||
-          error.includes('timeout') || error.includes('disconnected')) {
+          error.includes('timeout') || error.includes('disconnected') ||
+          error.includes('WebSocket closed') || error.includes('WS closed')) {
         console.log(`[Network] Network error detected: ${error}`);
 
         // Add all remaining files to failed list
@@ -3995,7 +5333,7 @@ async function uploadFile() {
 
         // Show retry banner immediately with all failed files
         failedUploadsGlobal = failedUploadsGlobal.concat(failedFiles);
-        isUploadInProgress = false;
+        setUploadInProgress(false);
         document.getElementById('uploadModalClose').classList.remove('disabled');
         closeUploadModal();
         showFailedUploadsBanner();
@@ -4032,21 +5370,61 @@ async function uploadFile() {
       // so cancel/error on a later file doesn't re-trigger the modal.
       if (willOptimize && !batchPreflightDone) {
         try {
-          const riResp = await fetch('/api/reader-render-info');
-          if (riResp.ok) {
-            const ri = await riResp.json();
-            if (ri && ri.viewportWidth > 0 && ri.viewportHeight > 0) {
-              // Modal returns the (possibly edited) renderInfo. We don't
-              // need the value here -- convertEpubFile / prebakeChapters
-              // both re-fetch render-info themselves after the device-
-              // side SETTINGS have been updated. The modal call's only
-              // purpose at this layer is "wait until user confirms".
-              const batchLabel = files.length > 1
-                ? `${file.name} + ${files.length - 1} more`
-                : file.name;
-              await showOptimizerPreflightModal(ri, batchLabel);
+          // CrumBLE 4.5.4: use prefetched renderInfo from page load if it's
+          // <30 s old. Saves the 1-5 s fetch latency on heap-tight devices.
+          // Fall back to a fresh fetch if the cache is stale or empty.
+          //
+          // CrumBLE 4.5.6: same retry + abort logic as the outer multi-file
+          // entry point at L3268. Silently skipping the preflight when
+          // render-info is missing/invalid was the bug behind "it didn't ask
+          // me about prepared layout on re-upload after delete." If after
+          // retries we still can't get valid render-info, alert + abort
+          // instead of proceeding with a bake that may carry stale layout.
+          let ri = null;
+          let lastErr = null;
+          const cacheAgeMs = Date.now() - (window.__cachedRenderInfoAt || 0);
+          if (window.__cachedRenderInfo && cacheAgeMs < 30000 &&
+              window.__cachedRenderInfo.viewportWidth > 0 &&
+              window.__cachedRenderInfo.viewportHeight > 0) {
+            ri = window.__cachedRenderInfo;
+          } else {
+            for (let attempt = 0; attempt < 3; ++attempt) {
+              try {
+                const riResp = await fetch('/api/reader-render-info');
+                if (riResp.ok) {
+                  const candidate = await riResp.json();
+                  if (candidate && candidate.viewportWidth > 0 && candidate.viewportHeight > 0) {
+                    ri = candidate;
+                    break;
+                  }
+                  lastErr = `render-info had viewport=${candidate?.viewportWidth || 0}x${candidate?.viewportHeight || 0}`;
+                } else {
+                  lastErr = `render-info HTTP ${riResp.status}`;
+                }
+              } catch (e) {
+                lastErr = e.message || String(e);
+              }
+              if (attempt < 2) await new Promise(r => setTimeout(r, 400));
             }
           }
+          if (!ri) {
+            log(`Preflight skipped: ${lastErr}`, 'error', 'WARN');
+            alert(`Couldn't get render settings from the device (${lastErr}).\n\n` +
+                  `This usually means the device is busy. Wait a few seconds and retry.\n\n` +
+                  `Upload aborted so we don't bake with stale layout values.`);
+            throw new Error(`render-info unavailable: ${lastErr}`);
+          }
+          // CrumBLE 4.5.5: modal now resolves with the bake-time
+          // renderInfo override (dryRun response). Stash on the
+          // uploadFile-scope batchOverrideRenderInfo so every file in
+          // this batch's convertEpubFile + prebakeChapters call picks
+          // it up. Was: modal POSTed updates to SETTINGS and the
+          // downstream re-fetches saw the new SETTINGS; now SETTINGS
+          // doesn't change, so we have to thread the override.
+          const batchLabel = files.length > 1
+            ? `${file.name} + ${files.length - 1} more`
+            : file.name;
+          batchOverrideRenderInfo = await showPreflightAndFontImport(ri, batchLabel);
           batchPreflightDone = true;
         } catch (preErr) {
           // User cancelled (or modal threw) -- propagate up as a
@@ -4076,7 +5454,7 @@ async function uploadFile() {
             // Scale convert into [0, convertEnd]. convertEnd is 25% when
             // prebake will follow, 50% when only convert + upload run.
             progressFill.style.width = Math.round(percent * convertEnd / 100) + '%';
-          });
+          }, { overrideRenderInfo: batchOverrideRenderInfo });
 
           // Create new File from converted blob
           file = new File([convertedBlob], file.name, { type: 'application/epub+zip' });
@@ -4091,7 +5469,6 @@ async function uploadFile() {
           console.error('Conversion error:', convError);
           // Log the error
           logError(`Conversion failed: ${convError.message}`);
-          log('Uploading original file instead...', 'warning', 'INFO');
           conversionFailed = true;
 
           // In single file mode, export error log
@@ -4101,11 +5478,18 @@ async function uploadFile() {
             }, 100);
           }
 
-          // If conversion fails, try uploading original file
-          progressText.textContent = `Conversion failed, uploading original ${file.name}...`;
-          progressFill.style.backgroundColor = '#e67e22'; // Orange for fallback
-          // Reset progress bar to 0% for original file upload
-          progressFill.style.width = '0%';
+          // v18.9.9.381: do NOT silently fall back to uploading the original.
+          // The user explicitly checked "Optimize EPUB" -- shipping the raw
+          // file bypasses that intent, and the resulting book won't have
+          // cover-thumbs / .pxc / chapter prebake caches the reader relies on
+          // for fast open + BT text rendering. Surface the error and abort so
+          // the user can retry or cancel deliberately.
+          log('Aborting upload -- retry from the modal, or uncheck Optimize to send as-is.',
+              'error', 'INFO');
+          progressText.textContent = `Conversion failed: ${file.name}`;
+          progressText.style.color = '#c0392b';
+          progressFill.style.backgroundColor = '#c0392b';
+          throw convError;  // propagate to outer catch (per-file loop handler)
         }
       }
 
@@ -4206,7 +5590,7 @@ async function uploadFile() {
             const suffix = status ? ` — ${status}` : '';
             progressText.textContent =
               `Optimizing chapter indexing for ${file.name}... ${barPct}%${suffix}`;
-          });
+          }, { overrideRenderInfo: batchOverrideRenderInfo });
           progressFill.style.width = '100%';
         } catch (preErr) {
           console.error('Chapter prebake error:', preErr);
@@ -4262,13 +5646,16 @@ function showFailedUploadsBanner() {
         <div class="failed-file-name">📄 ${escapeHtml(failedFile.name)}</div>
         <div class="failed-file-error">Error: ${escapeHtml(failedFile.error)}</div>
       </div>
-      <!-- CrumBLE 4.5.4 follow-up: removed the per-file Resume button from
-           this banner -- user feedback: 'Resume button should be inside the
-           modal, don't put resume on the main screen behind the modal'.
-           Retry-from-start now reopens the modal, where the in-modal Resume
-           button handles continuation of the prior run from the saved
-           offset via the WS RESUME protocol. -->
-      <button class="retry-btn" onclick="retrySingleUpload(${index})" title="Reopen the upload modal -- the in-modal Resume button picks up from the saved byte offset">Retry</button>
+      <!-- CrumBLE 4.5.4: Resume + Retry side by side. Resume is the primary
+           action -- one click, WS RESUME protocol picks up at the device's
+           preserved byte offset. The original Retry path reopens the modal
+           and reruns the full pipeline from scratch (download from device,
+           re-optimize, re-upload) which is the right call only when the
+           user wants a clean slate, not "continue this upload". Previous
+           UI only exposed Retry, which surfaced as "why does it start
+           over every time" -- the field bug this fixes. -->
+      <button class="retry-btn" onclick="resumeSingleUpload(${index})" style="background:#27ae60;color:#fff;" title="Continue this upload from where it left off (uses the device's saved byte offset)">Resume Upload</button>
+      <button class="retry-btn" onclick="retrySingleUpload(${index})" style="margin-left:6px;" title="Start over: reopen the modal and re-run the full optimize+upload pipeline">Retry from Start</button>
     `;
     filesList.appendChild(item);
   });
@@ -4290,7 +5677,37 @@ function retrySingleUpload(index) {
   const failedFile = failedUploadsGlobal[index];
   if (!failedFile) return;
 
-  // Create a DataTransfer to set the file input
+  // 4.5.5: branch by failure source. Optimize Selected failures have
+  // file===null because the source was an on-device EPUB pulled via
+  // /download (no picker File involved). Forcing them through the
+  // DataTransfer path below threw "parameter 1 is not of type 'File'"
+  // (`dt.items.add(null)`). Route these through optimizeSelectedOnDevice
+  // with a synthetic single-item selection; the optimizer will re-fetch
+  // the source from the device, re-optimize, re-upload.
+  if (!failedFile.file && failedFile.path) {
+    failedUploadsGlobal.splice(index, 1);
+    if (failedUploadsGlobal.length === 0) dismissFailedUploads();
+    if (typeof optimizeSelectedOnDevice === 'function') {
+      optimizeSelectedOnDevice({
+        resumeSelection: [{ path: failedFile.path, name: failedFile.name }],
+      }).catch(err => {
+        console.warn('[FilesPage] optimize-retry failed:', err);
+      });
+    } else {
+      alert('Optimize retry unavailable -- reload the page and try again.');
+    }
+    return;
+  }
+
+  // Defensive: neither file nor path -> we can't retry anything.
+  if (!failedFile.file) {
+    console.warn('[FilesPage] retrySingleUpload: failed entry has neither file nor path; discarding');
+    failedUploadsGlobal.splice(index, 1);
+    if (failedUploadsGlobal.length === 0) dismissFailedUploads();
+    return;
+  }
+
+  // Original picker-upload retry path (file IS a real File object).
   const dt = new DataTransfer();
   dt.items.add(failedFile.file);
 
@@ -4305,7 +5722,31 @@ function retrySingleUpload(index) {
     dismissFailedUploads();
   }
 
-  // Open modal and trigger upload
+  // CrumBLE 4.5.4: if we cached the user's picker choices from the
+  // original Optimize & Upload run for this file, skip the picker UI on
+  // retry and go straight to optimize+upload. The user's prepared layout
+  // is already locked in; making them re-pick 30+ image dropdowns just
+  // because the connection dropped mid-stream is exactly the friction
+  // this is meant to remove.
+  const cacheKey = (failedFile.file.name || '') + '|' + (failedFile.file.size || 0);
+  if (typeof cachedImageStatesByFile !== 'undefined' && cachedImageStatesByFile.has(cacheKey)) {
+    try {
+      imageStates = JSON.parse(JSON.stringify(cachedImageStatesByFile.get(cacheKey)));
+      pendingConversionFile = failedFile.file;
+      // Ensure Optimize EPUB is on so the upload flow runs the optimizer
+      // (it was on in the original run by definition -- we only cache the
+      // picker state when the user clicked 'Optimize & Upload').
+      const cb = document.getElementById('convertBeforeUpload');
+      if (cb) { cb.checked = true; if (typeof toggleConvertOptions === 'function') toggleConvertOptions(); }
+      openUploadModal();
+      if (typeof startConversionWithImageStates === 'function') {
+        startConversionWithImageStates();
+        return;
+      }
+    } catch (_) { /* fall through to picker-UI path */ }
+  }
+
+  // No cached state -- fresh picker walkthrough (first-time or cache miss).
   openUploadModal();
   validateFile();
 }
@@ -4320,7 +5761,32 @@ function retrySingleUpload(index) {
 // internally per attempt.
 async function resumeSingleUpload(index) {
   const failedFile = failedUploadsGlobal[index];
-  if (!failedFile || !failedFile.file) return;
+  if (!failedFile) return;
+
+  // 4.5.5: optimize-flow failure (no source File in browser memory --
+  // source was an on-device EPUB pulled via /download). True "resume from
+  // byte offset" isn't meaningful here because the optimized blob isn't
+  // in memory; rerun the full optimize pipeline instead. The device-side
+  // RESUME protocol still kicks in during the re-upload phase if any
+  // partial bytes from the prior attempt survived on SD. Same routing as
+  // retrySingleUpload so both buttons do the right thing for both failure
+  // sources -- previously this returned silently and the user reported
+  // "clicking Resume Upload does nothing".
+  if (!failedFile.file && failedFile.path) {
+    failedUploadsGlobal.splice(index, 1);
+    showFailedUploadsBanner();
+    if (failedUploadsGlobal.length === 0) dismissFailedUploads();
+    if (typeof optimizeSelectedOnDevice === 'function') {
+      optimizeSelectedOnDevice({
+        resumeSelection: [{ path: failedFile.path, name: failedFile.name }],
+      }).catch(err => {
+        console.warn('[FilesPage] resume-via-optimize failed:', err);
+      });
+    }
+    return;
+  }
+
+  if (!failedFile.file) return;
 
   // Remove from list while we attempt. If it fails again it gets re-added.
   failedUploadsGlobal.splice(index, 1);
@@ -4412,7 +5878,15 @@ function retryAllFailedUploads() {
 
     xhr.onload = function() {
       if (xhr.status === 200) {
-        window.location.reload();
+        // v18.9.9.416: was window.location.reload() -- forced a full page
+        // reload including HTML + optimizer.js + prebake.js + prebake.wasm
+        // just to show one new folder row. Now: clear the input, then re-
+        // fetch /api/files only. Same visible result, ~5x less work.
+        const nameInput = document.getElementById('folderName');
+        if (nameInput) nameInput.value = '';
+        const btn = document.getElementById('createFolderBtn');
+        if (btn) btn.disabled = true;
+        if (typeof loadFiles === 'function') loadFiles();
       } else {
         alert('Failed to create folder: ' + xhr.responseText);
       }
@@ -4555,6 +6029,53 @@ function retryAllFailedUploads() {
   function closeMoveModal() {
     document.getElementById('moveModal').classList.remove('open');
   }
+
+  // CrumBLE 4.5.4: prebake-manifest popover. Opens an empty modal,
+  // immediately shows 'Loading...', then fetches the manifest text from
+  // /api/files/prebake-manifest?path=... and swaps it in. The fetch is
+  // ~50-200ms on a heap-tight device but only fires on user click, so
+  // /api/files page load stays fast.
+  async function openPrebakeManifestModal(path, name) {
+    document.getElementById('prebakeManifestFileName').textContent = name || '';
+    const body = document.getElementById('prebakeManifestBody');
+    body.textContent = 'Loading...';
+    document.getElementById('prebakeManifestModal').classList.add('open');
+    try {
+      const ctrl = new AbortController();
+      const tid = setTimeout(() => ctrl.abort(), 10000);
+      const resp = await fetch('/api/files/prebake-manifest?path=' + path + '&_=' + Date.now(),
+                               { signal: ctrl.signal });
+      clearTimeout(tid);
+      if (resp.status === 404) {
+        body.textContent = 'No prebake manifest found for this book.';
+        return;
+      }
+      if (!resp.ok) {
+        body.textContent = 'Failed to load manifest (' + resp.status + ' ' + resp.statusText + ').';
+        return;
+      }
+      body.textContent = await resp.text();
+    } catch (e) {
+      body.textContent = 'Failed to load manifest: ' + (e.message || e);
+    }
+  }
+
+  function closePrebakeManifestModal() {
+    document.getElementById('prebakeManifestModal').classList.remove('open');
+  }
+
+  // Event delegation: each row's (i) button is dynamically generated; wire
+  // a single delegated click handler on the file table container so we
+  // don't need per-row inline onclick (which would clutter the row HTML
+  // with escaping).
+  document.addEventListener('click', function(e) {
+    const btn = e.target.closest('.prebake-info-btn');
+    if (!btn) return;
+    e.preventDefault();
+    const path = btn.getAttribute('data-path') || '';
+    const name = btn.getAttribute('data-name') || '';
+    openPrebakeManifestModal(path, name);
+  });
 
   function confirmMove() {
     const path = document.getElementById('moveItemPath').value;

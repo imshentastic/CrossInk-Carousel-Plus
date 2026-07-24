@@ -1,5 +1,6 @@
 #include "EpdFontFamily.h"
 
+#include <Logging.h>
 #include <Utf8.h>
 
 #include <algorithm>
@@ -327,10 +328,161 @@ EpdFontFamily::GlyphData EpdFontFamily::getGlyphData(const uint32_t cp, const St
     }
   }
 
+  // CrumBLE 4.5.4 UI font fallback. If a global fallback family is
+  // registered (typically the user's loaded SD-card family), try it
+  // before resorting to REPLACEMENT_GLYPH. Skip when we ARE the
+  // fallback family (avoid infinite recursion) and when the codepoint
+  // is the replacement itself (would loop on REPLACEMENT_GLYPH miss).
   if (cp != REPLACEMENT_GLYPH) {
+    const EpdFontFamily* fb = uiFallbackFamily();
+    if (fb != nullptr && fb != this) {
+      // Two-step lookup: cheap in-memory findGlyphData first, then if
+      // null fall through to the EpdFont-level miss handler so on-SD
+      // CJK glyphs (NOT prewarmed) get lazy-loaded. Calling the
+      // family-level getGlyphData on the fallback would re-enter the
+      // typography-substitution + recursive-fallback path and could
+      // ping-pong back into THIS family via REPLACEMENT_GLYPH lookup.
+      auto tryFallbackStyle = [fb, cp](Style fbStyle) -> GlyphData {
+        if (const GlyphData fbData = fb->findGlyphData(cp, fbStyle); fbData.glyph) {
+          return fbData;
+        }
+        const EpdFont* fbFont = fb->getFont(fbStyle);
+        if (fbFont == nullptr) return {nullptr, nullptr};
+        if (const EpdGlyph* g = fbFont->getGlyph(cp)) {
+          return {fbFont->data, g};
+        }
+        return {nullptr, nullptr};
+      };
+      if (const GlyphData fbData = tryFallbackStyle(style); fbData.glyph) {
+        return fbData;
+      }
+      // Some SD fonts only have REGULAR. Retry with REGULAR if we asked
+      // for a styled variant.
+      if (style != REGULAR) {
+        if (const GlyphData fbReg = tryFallbackStyle(REGULAR); fbReg.glyph) {
+          return fbReg;
+        }
+      }
+    }
+    // CrumBLE 4.5.4 task #5C+: built-in fallback. If the primary AND UI
+    // fallback both miss, try the built-in family (typically Bitter UI_10
+    // for its broad Latin coverage). Catches the case where the user picks
+    // an SD CJK font that ships CJK-only -- ASCII / digits / punctuation
+    // in book text fall through to Bitter and render correctly instead of
+    // showing '?'.
+    const EpdFontFamily* bi = builtInFallbackFamily();
+    if (bi != nullptr && bi != this) {
+      if (const GlyphData biData = bi->findGlyphData(cp, style); biData.glyph) {
+        // CrumBLE 4.5.4 diag: confirm the built-in fallback is actually
+        // being consulted at render time. Field report: SD CJK font as
+        // primary + English book = '?' even though Bitter has the
+        // codepoint. If this line never fires we know the fallback chain
+        // isn't being entered; if it fires we know it IS hit but the
+        // glyph isn't reaching the renderer. One-shot per style so the
+        // log doesn't drown in per-glyph traffic.
+        static bool dumpedBi[4] = {false, false, false, false};
+        const uint8_t styleIdx = static_cast<uint8_t>(style) & 0x03;
+        if (!dumpedBi[styleIdx]) {
+          dumpedBi[styleIdx] = true;
+          LOG_INF("BIFB", "Built-in fallback HIT style=%u cp=U+%04lX this=%p bi=%p",
+                  styleIdx, static_cast<unsigned long>(cp),
+                  static_cast<const void*>(this), static_cast<const void*>(bi));
+        }
+        return biData;
+      }
+      if (style != REGULAR) {
+        if (const GlyphData biReg = bi->findGlyphData(cp, REGULAR); biReg.glyph) {
+          static bool dumpedBiR = false;
+          if (!dumpedBiR) {
+            dumpedBiR = true;
+            LOG_INF("BIFB", "Built-in fallback REGULAR HIT (style asked=%u) cp=U+%04lX",
+                    static_cast<uint8_t>(style) & 0x03, static_cast<unsigned long>(cp));
+          }
+          return biReg;
+        }
+      }
+    } else {
+      // CrumBLE 4.5.4 diag: one-shot log when the built-in fallback
+      // path is REACHED but skipped. Catches (a) bi is null (not
+      // registered at boot), (b) bi == this (the renderer's primary
+      // is somehow the same instance as the registered built-in).
+      static bool dumpedBiSkip = false;
+      if (!dumpedBiSkip) {
+        dumpedBiSkip = true;
+        LOG_INF("BIFB", "Built-in fallback SKIPPED cp=U+%04lX this=%p bi=%p (bi==this:%d bi==null:%d)",
+                static_cast<unsigned long>(cp),
+                static_cast<const void*>(this), static_cast<const void*>(bi),
+                (bi == this) ? 1 : 0, (bi == nullptr) ? 1 : 0);
+      }
+    }
+  }
+
+  if (cp != REPLACEMENT_GLYPH) {
+    // CrumBLE 4.5.4 diag: one-shot log when we're about to bottom out
+    // on REPLACEMENT_GLYPH. Confirms the fallback chain (UI + built-in)
+    // both missed for this cp.
+    static bool dumpedDead = false;
+    if (!dumpedDead) {
+      dumpedDead = true;
+      LOG_INF("BIFB", "Fallback chain BOTTOM-OUT cp=U+%04lX style=%u this=%p ui=%p bi=%p -- returning REPLACEMENT",
+              static_cast<unsigned long>(cp), static_cast<uint8_t>(style) & 0x03,
+              static_cast<const void*>(this),
+              static_cast<const void*>(uiFallbackFamily()),
+              static_cast<const void*>(builtInFallbackFamily()));
+    }
     return getGlyphData(REPLACEMENT_GLYPH, style);
   }
   return {nullptr, nullptr};
+}
+
+namespace {
+// File-scope so the static-init order is well-defined relative to any
+// translation unit that calls setUiFallbackFamily / uiFallbackFamily.
+const EpdFontFamily* gUiFallback = nullptr;
+EpdFontFamily::LazyFallbackLoader gLazyLoader = nullptr;
+}  // namespace
+
+void EpdFontFamily::setUiFallbackFamily(const EpdFontFamily* family) {
+  gUiFallback = family;
+  // CrumBLE 4.5.4 diag: field reports of CJK book titles still rendering
+  // as '?' even with an SD font selected. Log every set/clear so we can
+  // confirm from serial whether loadFamily actually wired the fallback.
+  LOG_INF("UIFB", "UI font fallback %s", family ? "REGISTERED" : "CLEARED");
+}
+
+void EpdFontFamily::setLazyFallbackLoader(LazyFallbackLoader loader) {
+  gLazyLoader = loader;
+  LOG_INF("UIFB", "UI fallback lazy loader %s", loader ? "ARMED" : "DISARMED");
+}
+
+namespace {
+const EpdFontFamily* gBuiltInFallback = nullptr;
+}
+
+void EpdFontFamily::setBuiltInFallbackFamily(const EpdFontFamily* family) {
+  gBuiltInFallback = family;
+  LOG_INF("UIFB", "Built-in fallback %s", family ? "REGISTERED" : "CLEARED");
+}
+
+const EpdFontFamily* EpdFontFamily::builtInFallbackFamily() { return gBuiltInFallback; }
+
+const EpdFontFamily* EpdFontFamily::uiFallbackFamily() {
+  // CrumBLE 4.5.4 task #5C: first-miss lazy load. If a loader has been
+  // armed (SdCardFontSystem::registerLazyFallback was called at boot
+  // with a non-empty SETTINGS.uiFontFallbackFamily) AND we don't have
+  // a resident fallback yet, invoke the loader. It runs synchronously,
+  // loads the SD font, calls setUiFallbackFamily(...) which populates
+  // gUiFallback. Then null gLazyLoader so the next miss is a fast
+  // pointer-read with no allocation cost. If the loader fails (font
+  // not on SD, OOM, etc.) gUiFallback stays null and gLazyLoader still
+  // gets cleared -- no point retrying every miss.
+  if (gUiFallback == nullptr && gLazyLoader != nullptr) {
+    LazyFallbackLoader once = gLazyLoader;
+    gLazyLoader = nullptr;  // one-shot; clear before invocation in case loader recurses
+    LOG_INF("UIFB", "UI fallback lazy load triggered by first glyph miss");
+    once();
+  }
+  return gUiFallback;
 }
 
 const EpdGlyph* EpdFontFamily::getGlyph(const uint32_t cp, const Style style) const {
@@ -378,6 +530,36 @@ uint32_t EpdFontFamily::getFallbackCodepoint(const uint32_t cp, const Style styl
   // fallback cascade run. The bold/italic visual style is lost but text
   // stays readable -- preferable to "??? Two" for chapter headers.
   if (style != REGULAR && getGlyphData(cp, REGULAR).glyph) return cp;
+  // CrumBLE 4.5.4: before declaring this codepoint replaceable, consult
+  // the UI fallback family. drawText short-circuits to the synthetic '?'
+  // when this function returns REPLACEMENT_GLYPH, so without this check
+  // CJK book titles / collection names rendered as '?' even though the
+  // fallback hook in getGlyphData would have lazy-loaded the glyph.
+  // Probe via the EpdFont-level getGlyph (invokes the SD miss handler)
+  // -- NOT via family-level getGlyphData, which would recurse through
+  // typography substitutions back into the same REPLACEMENT_GLYPH path.
+  if (cp != REPLACEMENT_GLYPH) {
+    const EpdFontFamily* fb = uiFallbackFamily();
+    if (fb != nullptr && fb != this) {
+      if (const EpdFont* fbFont = fb->getFont(style); fbFont && fbFont->getGlyph(cp)) return cp;
+      if (style != REGULAR) {
+        if (const EpdFont* fbReg = fb->getFont(REGULAR); fbReg && fbReg->getGlyph(cp)) return cp;
+      }
+    }
+    // CrumBLE 4.5.4 task #5C+: built-in fallback probe (Bitter for Latin).
+    // Mirrors the UI-fallback path above so getFallbackCodepoint stays in
+    // lockstep with getGlyphData -- without this, drawText's width-probe
+    // would return REPLACEMENT_GLYPH for ASCII codepoints that getGlyph
+    // Data CAN resolve via Bitter, and the actual draw would render '?'
+    // anyway because the synthetic-replacement short-circuit fires first.
+    const EpdFontFamily* bi = builtInFallbackFamily();
+    if (bi != nullptr && bi != this) {
+      if (const EpdFont* biFont = bi->getFont(style); biFont && biFont->findGlyph(cp)) return cp;
+      if (style != REGULAR) {
+        if (const EpdFont* biReg = bi->getFont(REGULAR); biReg && biReg->findGlyph(cp)) return cp;
+      }
+    }
+  }
   return REPLACEMENT_GLYPH;
 }
 

@@ -28,12 +28,30 @@ class SleepActivity final : public Activity {
   // the last book page the user saw.
   static void snapshotFramebufferForCycle();
 
+  // v18.9.9.258: bake .slp caches for every source image in /.sleep/ (or
+  // /sleep/). For each *.png / *.bmp with no existing .slp companion,
+  // decodes the source once and snapshots the 1bpp framebuffer bytes to
+  // SD. Runtime sleep entry then does a straight fread into the
+  // framebuffer -- no PNG/BMP decoder, no transient buffers. Returns
+  // {baked, skipped} counts. Called from Settings > Display > "Bake
+  // sleep images". Idempotent: images with a valid existing .slp are
+  // skipped so running twice is cheap.
+  struct BakeResult {
+    int baked = 0;
+    int skipped = 0;
+    int failed = 0;
+    int total = 0;
+  };
+  using BakeProgressFn = void (*)(int done, int total);
+  static BakeResult bakeAllSleepImages(GfxRenderer& renderer, BakeProgressFn onProgress = nullptr);
+
  private:
   void renderDefaultSleepScreen() const;
   void renderCustomSleepScreen() const;
   void renderCoverSleepScreen() const;
   void renderReadingStatsSleepScreen() const;
   void renderMinimalSleepScreen() const;
+  void renderMinimalStatsSleepScreen() const;
   void renderBitmapSleepScreen(const Bitmap& bitmap) const;
   void renderLastScreenSleepScreen() const;
   void renderBlankSleepScreen() const;
@@ -42,7 +60,13 @@ class SleepActivity final : public Activity {
   // same background-rebuild + grayscale-pass flow used by overlay mode. Used
   // by Custom mode when a PNG is picked so the reader page shows through
   // transparent regions of the image.
-  void composePngOverReaderPage(const std::string& pngPath) const;
+  // v18.9.9.260: returns true iff decodeSleepPngToBuffer succeeded and
+  // the composited PNG was displayed. False means decode failed and we
+  // fell back to SLEEP_FB_CACHE_PATH (or the default sleep screen).
+  // Used by renderCustomSleepScreen to decide whether the sleep-image
+  // cursor should advance -- pre-v260 the cursor advanced regardless,
+  // so a run of failed decodes silently skipped through the cycle.
+  bool composePngOverReaderPage(const std::string& pngPath) const;
   bool canSnapshotOverlayBackground = false;
   bool overlayPageBufferStored = false;
   bool overlayPageBufferTrusted = false;

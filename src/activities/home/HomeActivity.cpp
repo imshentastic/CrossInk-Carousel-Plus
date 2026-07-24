@@ -22,6 +22,15 @@
 
 #include "../reader/BookReadingStats.h"
 #include "../reader/BookStatsActivity.h"
+#include "activities/settings/ClockSyncActivity.h"
+#include "HalClock.h"
+#include "SilentRestart.h"
+#include "WifiCredentialStore.h"
+#include "FontDecompressor.h"
+
+extern FontDecompressor fontDecompressor;
+#include "activities/settings/ReadingHeatmapActivity.h"
+#include "ReadingStats.h"
 #include "activities/home/BookshelfPickerActivity.h"
 #include "activities/reader/GlobalReadingStats.h"
 #include "activities/util/ChoicePromptActivity.h"
@@ -52,8 +61,10 @@
 #include "CollectionsStore.h"
 #include "components/themes/lyra/LyraCarouselTheme.h"
 #include "components/themes/lyra/LyraFlowTheme.h"
+#include "SilentRestart.h"
 #include "components/themes/minimal/MinimalTheme.h"
 #include "fontIds.h"
+#include "util/SleepCache.h"  // v18.9.9.267: sleep-bake first-boot prompt
 
 namespace {
 constexpr uint32_t CAROUSEL_CACHE_MAGIC = 0x43434152;  // "CCAR"
@@ -296,6 +307,8 @@ HomeMenuAction homeActionForInitialMenuItem(HomeMenuItem item) {
       return HomeMenuAction::FileTransfer;
     case HomeMenuItem::SETTINGS_MENU:
       return HomeMenuAction::Settings;
+    case HomeMenuItem::READING_STATS:
+      return HomeMenuAction::ReadingStats;
     case HomeMenuItem::NONE:
     default:
       return HomeMenuAction::ContinueReading;
@@ -312,7 +325,9 @@ int findMenuActionIndex(const std::vector<HomeMenuEntry>& items, HomeMenuAction 
 }
 
 bool isMinimalTheme() {
-  return static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) == CrossPointSettings::UI_THEME::MINIMAL;
+  const auto t = static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme);
+  return t == CrossPointSettings::UI_THEME::MINIMAL ||
+         t == CrossPointSettings::UI_THEME::DASHBOARD;
 }
 
 bool isAnyFrontButtonPressed(const MappedInputManager& mappedInput) {
@@ -447,6 +462,10 @@ void drawHomeToast(const GfxRenderer& renderer, const char* msg) {
   renderer.displayBuffer();
 }
 }  // namespace
+
+bool HomeActivity::sArrivedWithGoingHomePopup = false;
+
+void HomeActivity::noteGoingHomePopupShown() { sArrivedWithGoingHomePopup = true; }
 
 // ---------------------------------------------------------------------------
 // Static carousel frame cache — survives HomeActivity re-creation so that
@@ -670,7 +689,7 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
         if (centerMissing || sideMissing) {
           if (FsHelpers::hasEpubExtension(book.path)) {
             Epub epub(book.path, "/.crosspoint");
-            if (!showingLoading) {
+            if (!showingLoading && !suppressLoadPopups_) {
               showingLoading = true;
               popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
             }
@@ -716,7 +735,7 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
           } else if (FsHelpers::hasXtcExtension(book.path)) {
             Xtc xtc(book.path, "/.crosspoint");
             if (xtc.load()) {
-              if (!showingLoading) {
+              if (!showingLoading && !suppressLoadPopups_) {
                 showingLoading = true;
                 popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
               }
@@ -760,7 +779,7 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
         if (coverPath.empty() || !Storage.exists(coverPath.c_str())) {
           if (FsHelpers::hasEpubExtension(book.path)) {
             Epub epub(book.path, "/.crosspoint");
-            if (!showingLoading) {
+            if (!showingLoading && !suppressLoadPopups_) {
               showingLoading = true;
               popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
             }
@@ -816,7 +835,7 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
           } else if (FsHelpers::hasXtcExtension(book.path)) {
             Xtc xtc(book.path, "/.crosspoint");
             if (xtc.load()) {
-              if (!showingLoading) {
+              if (!showingLoading && !suppressLoadPopups_) {
                 showingLoading = true;
                 popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
               }
@@ -898,20 +917,8 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
   // so the perspective fast-path picks up the new covers instead of
   // staying on the slow drawPerspectiveBitmap fallback. Bounded to one
   // tile-bake pass per loadRecentCovers invocation.
-  if (!isCarouselTheme &&
-      static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) == CrossPointSettings::UI_THEME::LYRA_FLOW) {
-    bool anyFlowUpdated = false;
-    for (size_t i = 0; i < bookUpdated.size(); ++i) {
-      if (bookUpdated[i]) {
-        anyFlowUpdated = true;
-        break;
-      }
-    }
-    if (anyFlowUpdated) {
-      static_cast<const LyraFlowTheme&>(GUI).prerenderCarouselSideTiles(renderer, recentBooks);
-      requestUpdate();
-    }
-  }
+  // v18.9.9.206: side-tile prerender removed. The Flow drawStackedCover
+  // path now streams every side cover from SD/cache on demand.
 
   // CrumBLE #125: Reading Stats covers. The carousel/flow loop above only
   // generates covers for the top homeRecentBooksCount books (Home's
@@ -945,7 +952,7 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
         LOG_DBG("HOME", "Stats cover gen deferred: low heap (free=%u)", ESP.getFreeHeap());
         break;
       }
-      if (!showingLoading) {
+      if (!showingLoading && !suppressLoadPopups_) {
         showingLoading = true;
         popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
       }
@@ -1004,11 +1011,31 @@ void HomeActivity::enrichActiveCollectionForSeries() {
       CollectionsStore::getInstance().resolveBookPaths(active->id);
   if (paths.empty()) return;
 
+  // v18.9.9.223: cap the OPF-peek pass to the visible shelf window
+  // (mirrors loadShelfCovers). Before, this iterated ALL paths in the
+  // active collection every render -- 500-book "All Books" cost 500
+  // OPF opens on the first render after enabling Series Detection.
+  // Now we touch only the up-to-12 books currently visible (max Flow
+  // shelf layout: 2 rows * 6 cells). As user scrolls, additional
+  // cells get enriched on their first render. Off-screen books never
+  // pay unless/until they scroll into view.
+  //
+  // The seriesEnrichmentNeededForActive flag stays REACTIVE now: we
+  // don't clear it after one visible-window pass, so subsequent
+  // renders keep checking visible cells (usually a no-op via
+  // hasBeenChecked below). We only clear when the whole collection is
+  // done, or when we bail early on low heap.
+  constexpr int kMaxVisibleShelfCells = 12;  // Flow max: 2 rows * 6 cells
+  const int windowStart = std::max(0, shelfScrollOffset);
+  const int windowEnd = std::min(static_cast<int>(paths.size()),
+                                   windowStart + kMaxVisibleShelfCells);
+
   // First pass: how many EPUBs need parsing? Avoids drawing a popup
   // when everything's already cached.
   std::vector<std::string> toCheck;
-  toCheck.reserve(paths.size());
-  for (const auto& p : paths) {
+  toCheck.reserve(kMaxVisibleShelfCells);
+  for (int i = windowStart; i < windowEnd; ++i) {
+    const auto& p = paths[i];
     if (!FsHelpers::hasEpubExtension(p)) continue;
     if (SeriesIndex::getInstance().hasBeenChecked(p)) continue;
     toCheck.push_back(p);
@@ -1031,12 +1058,19 @@ void HomeActivity::enrichActiveCollectionForSeries() {
     return;
   }
 
-  const Rect popupRect = GUI.drawPopup(renderer, "Detecting series...");
-  // Popup drawn over the framebuffer; flag the frame so the end-of-render
-  // snapshot is skipped and the follow-up render erases it (see
-  // homeRenderPopupShown). Otherwise the "Detecting series..." popup can get
-  // stuck over the carousel the same way the shelf Loading popup did.
-  homeRenderPopupShown = true;
+  // v18.9.9.208: skip the popup during the pre-first-paint window when we
+  // arrived under the reader's "Going home..." popup (see
+  // suppressLoadPopups_). The scan still runs — just silently.
+  Rect popupRect{};
+  const bool seriesPopupShown = !suppressLoadPopups_;
+  if (seriesPopupShown) {
+    popupRect = GUI.drawPopup(renderer, "Detecting series...");
+    // Popup drawn over the framebuffer; flag the frame so the end-of-render
+    // snapshot is skipped and the follow-up render erases it (see
+    // homeRenderPopupShown). Otherwise the "Detecting series..." popup can
+    // get stuck over the carousel the same way the shelf Loading popup did.
+    homeRenderPopupShown = true;
+  }
   const int total = static_cast<int>(toCheck.size());
   int processed = 0;
   for (const auto& p : toCheck) {
@@ -1063,9 +1097,16 @@ void HomeActivity::enrichActiveCollectionForSeries() {
       SeriesIndex::getInstance().record(p, epub.getSeriesName(), epub.getSeriesIndex());
     }
     processed++;
-    GUI.fillPopupProgress(renderer, popupRect, 5 + (processed * 90) / total);
+    if (seriesPopupShown) {
+      GUI.fillPopupProgress(renderer, popupRect, 5 + (processed * 90) / total);
+    }
   }
-  seriesEnrichmentNeededForActive = false;
+  // v18.9.9.223: leave seriesEnrichmentNeededForActive set. Subsequent
+  // renders will re-enter this fn and process any newly-visible unchecked
+  // cells (usually a no-op after the initial visible window fill).
+  //   NOTE: this WOULD run every render forever, but the toCheck.empty()
+  //   short-circuit above makes the re-entry cost O(visibleCount) hash
+  //   lookups (~12 map lookups) -- negligible compared to a shelf paint.
   // ShelfEntries derived from the new SeriesIndex state — bust the
   // path cache so the next resolveShelfEntries sees fresh data.
   invalidateShelfPathsCache();
@@ -1079,6 +1120,16 @@ void HomeActivity::loadShelfCovers(int cellWidth, int cellHeight, int scrollOffs
     shelfCoversLoaded = true;
     return;
   }
+  // v18.9.9.316: fast-path early return. shelfCoversLoaded was already set
+  // to true after the previous successful pass, and every state-mutating
+  // event (collection change, scroll shift, thumb-marker wipe, etc.) that
+  // could invalidate the "all visible thumbs present on SD" invariant
+  // sets shelfCoversLoaded = false in the same block. So on repeat
+  // renders with no such event, we can skip the ~12 Storage.exists() SD
+  // stats this function otherwise does per render -- 500-600 ms shaved
+  // from the shelf phase of every carousel/menu-row L/R press. The bit
+  // was previously set-but-never-read; this is the missing gate.
+  if (shelfCoversLoaded) return;
   // Pull the live book list via the per-frame cache so we don't re-sort
   // the LibraryIndex on every render (was the dominant cause of laggy
   // home-screen navigation with "All Books" active).
@@ -1101,6 +1152,90 @@ void HomeActivity::loadShelfCovers(int cellWidth, int cellHeight, int scrollOffs
   if (start >= end) {
     shelfCoversLoaded = true;
     return;
+  }
+
+  // 4.5.5+: heap-recovery guard. Cover gen needs ~40 KB contiguous (DEFLATE
+  // window + scratch + image decode). After a long session with WiFi/BT
+  // residue, maxAlloc can sit below that even when free heap looks fine
+  // (fragmentation). Without recovery, the visible-window thumbs that need
+  // genning sync-fail one-by-one, each getting stamped into failedShelfCovers
+  // -- the book stays as a placeholder until the user reboots manually.
+  //
+  // Instead: if any thumb in the visible window is missing AND maxAlloc is
+  // below the gen floor AND this boot hasn't already burned the one-shot
+  // recovery, mark the flag and silentRestart() back to Home. Lands with
+  // ~85 KB free, covers gen cleanly, real images appear on next render.
+  //
+  // Bounded by hasAttemptedCoverHeapRestart() to AT MOST ONE restart per
+  // boot. If the flag is already set when we get here, we fall through to
+  // the normal sync gen path -- placeholder is the worst case, never an
+  // infinite reboot loop. RTC NOINIT flag survives reboot but resets on
+  // power cycle, so cold boot always has a fresh budget.
+  {
+    constexpr uint32_t kCoverHeapRestartFloor = 30u * 1024u;
+    // v18.9.2: skip when we just came from a silent-restart. The BT-disable
+    // exit path in BluetoothSettingsActivity silent-restarts to Home; that
+    // reboot's whole purpose was to defrag. If maxAlloc is still under the
+    // floor immediately after, a second guard-restart layered on top just
+    // burns another 2-3 s of user-visible delay for no gain. Cold boot and
+    // steady-state Home entries still get the guard.
+    // v18.9.9.287: same bypass as the predictive gate at ~line 2325. Skip
+    // the restart when we have plenty of total free heap (>=50 KB); cover
+    // decode does not need one 30 KB contiguous chunk, it does per-tile
+    // decoding at ~4-8 KB each.
+    constexpr uint32_t kCoverHeapFreeBypassBytes = 50u * 1024u;
+    if (ESP.getMaxAllocHeap() < kCoverHeapRestartFloor &&
+        ESP.getFreeHeap() < kCoverHeapFreeBypassBytes &&
+        !hasAttemptedCoverHeapRestart() &&
+        !isContinuingFromSilentReboot()) {
+      // Quick scan: any visible book in this window actually missing a
+      // thumb? Don't burn a 5-second restart if everything's already cached.
+      bool anyMissing = false;
+      for (int i = start; i < end && !anyMissing; ++i) {
+        const auto& bp = allPaths[i];
+        if (!Storage.exists(bp.c_str())) continue;
+        if (std::find(failedShelfCovers.begin(), failedShelfCovers.end(), bp) !=
+            failedShelfCovers.end()) {
+          // Already failed this session -- a restart could fix it.
+          anyMissing = true;
+          break;
+        }
+        std::string tpl;
+        if (FsHelpers::hasEpubExtension(bp)) tpl = Epub(bp, "/.crosspoint").getThumbBmpPath();
+        else if (FsHelpers::hasXtcExtension(bp)) tpl = Xtc(bp, "/.crosspoint").getThumbBmpPath();
+        else continue;
+        const std::string resolved = UITheme::getCoverThumbPath(tpl, cellWidth, cellHeight);
+        if (resolved.empty() || !Storage.exists(resolved.c_str())) {
+          anyMissing = true;
+        }
+      }
+      if (anyMissing) {
+        LOG_INF("HOME",
+                "Cover heap-guard: maxAlloc=%u < %u and missing thumbs in "
+                "window -- silentRestart() to recover (one-shot this boot)",
+                ESP.getMaxAllocHeap(), kCoverHeapRestartFloor);
+        markCoverHeapRestartAttempted();
+        // CrumBLE 4.5.5+: the user almost always reaches this code path by
+        // pressing L/R on the shelf header to switch into a collection whose
+        // thumbs aren't yet generated. Without this flag, the post-restart
+        // onEnter wipes selectorIndex to 0 (= carousel focus) and the cursor
+        // appears to randomly jump up to the carousel. The flag tells the
+        // post-restart onEnter to put focus back on the shelf header where
+        // the user left it.
+        if (shelfHeaderFocused) {
+          markPendingHomeFocusOnShelfHeader();
+        }
+        // v18.9.9.342: flushDeferredPersistenceBeforeRestart() inside
+        // snapshotFrameBufferForSilentRestart() will attempt the deferred
+        // collections + settings write before ESP.restart() so the
+        // user's Show/Hide toggle survives the recovery reboot instead
+        // of being wiped by the in-memory reset.
+        silentRestart();
+        // silentRestart calls ESP.restart(); we never return. But just
+        // in case (e.g. deepSleepInProgress short-circuit), fall through
+        // to normal sync gen rather than hanging here.
+      }
+    }
   }
 
   bool showingLoading = false;
@@ -1177,13 +1312,23 @@ void HomeActivity::loadShelfCovers(int cellWidth, int cellHeight, int scrollOffs
       freeCarouselFrames();
     }
 
-    // Need to generate. Show a loading popup if this is the first book in
-    // this pass that's missing — matches the loadRecentCovers UX.
-    if (!showingLoading) {
-      showingLoading = true;
-      popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
-    }
-    GUI.fillPopupProgress(renderer, popupRect, 10 + processed * progressIncrement);
+    // CrumBLE 4.5.5+: skip the Loading popup for shelf thumb-gen. The popup
+    // draws a frame + text into the framebuffer AND calls displayBuffer()
+    // internally -- which means every nav that needs to gen even one thumb
+    // pays an extra ~417 ms FAST_REFRESH for the popup, on top of the
+    // ~417 ms FAST_REFRESH that presentHomeBuffer fires after gen completes.
+    // RPROF profiling on a CJK-book session showed ~800-1500 ms prep on
+    // affected navs, ~half of which was this popup refresh. The gen itself
+    // takes 500-1500 ms; without the popup the user sees the previous shelf
+    // during that window, then the new content -- one refresh, not two.
+    //
+    // showingLoading and the fillPopupProgress call are kept conditional on
+    // the same flag so they're trivially re-enabled if the silent path
+    // turns out to feel frozen on bulk first-boot gen (30+ books missing).
+    // For the steady-state case (1-2 failures per session) silent is the
+    // right call.
+    (void)progressIncrement;
+    showingLoading = true;
 
     bool genSucceeded = false;
     if (FsHelpers::hasEpubExtension(bookPath)) {
@@ -1216,11 +1361,43 @@ void HomeActivity::loadShelfCovers(int cellWidth, int cellHeight, int scrollOffs
     const bool thumbNowExists = !resolved.empty() && Storage.exists(resolved.c_str());
     if (!thumbNowExists) {
       failedShelfCovers.push_back(bookPath);
-      // Persist across boots so the next session's home doesn't repeat
-      // the same Loading-popup flash for this book.
-      CoverThumbStatus::markFailed(bookPath, cellWidth, cellHeight);
-      LOG_ERR("HOME", "shelf: thumb generation failed for %s; rendering blank (won't retry)",
-              bookPath.c_str());
+      // v18.9.9.134: don't persist a "failed" marker when the current heap
+      // is too tight to have decoded ANY cover (post-upload state has
+      // maxAlloc~11 KB, EOCD scan buffer alone wants ~5 KB). Field repro:
+      // uploaded a book via FT, home rendered at maxAlloc=11252, EOCD
+      // failed with "Couldn't allocate memory for buffer", cover marked
+      // permanently failed. Next Home load at healthy heap would decode
+      // fine but the marker suppresses retry -> book stays blank forever.
+      // Skip the persistent mark when heap is degraded; the transient
+      // in-memory failedShelfCovers still prevents same-render retry, but
+      // a fresh boot or heap recovery gets another chance.
+      // v18.9.9.354: raised 20K -> 55K to match the JPEG decoder's real
+      // heap requirement.
+      // v18.9.9.368: use FREE heap (not maxAlloc) as the gate and drop the
+      // threshold to 45 KB. Field bug: two corrupt EPUBs (Confessions*.epub
+      // with truncated/corrupt cover.jpeg -> ZIP inflate reader init failed)
+      // sat below the maxAlloc>=55K bar forever because Home's steady-state
+      // maxAlloc floats around 30-45 KB. Every Home paint retried them and
+      // fragmented the heap further, eventually starving FT to maxAlloc=2292
+      // during HTML serve (browser saw "reconnecting"). Using FREE heap
+      // catches the "post-upload starved" case (free<30K) while allowing
+      // permanent-mark when we clearly had room to try (free>=45K). The
+      // in-memory failedShelfCovers still prevents same-render retry either
+      // way; the persistent marker stops the CROSS-render retry loop.
+      const uint32_t freeNow = ESP.getFreeHeap();
+      const uint32_t maxAllocNow = ESP.getMaxAllocHeap();
+      if (freeNow >= 45u * 1024u) {
+        CoverThumbStatus::markFailed(bookPath, cellWidth, cellHeight);
+        LOG_ERR("HOME",
+                "shelf: thumb generation failed for %s at healthy heap "
+                "(free=%u maxAlloc=%u); marking permanent (probably corrupt/unreadable cover)",
+                bookPath.c_str(), freeNow, maxAllocNow);
+      } else {
+        LOG_ERR("HOME",
+                "shelf: thumb generation failed for %s (free=%u<45K, maxAlloc=%u); "
+                "NOT marking persistent -- will retry when heap is fresher",
+                bookPath.c_str(), freeNow, maxAllocNow);
+      }
     } else if (genSucceeded) {
       // Wipe the persistent marker on the rare cross-build "fixed cover"
       // case (decoder improved or user replaced the book file).
@@ -1241,9 +1418,11 @@ void HomeActivity::loadShelfCovers(int cellWidth, int cellHeight, int scrollOffs
   // ends. Keeping the requestUpdate here is still correct for the success
   // case (covers that DID generate need one repaint to appear).
   if (showingLoading) {
-    // The Loading popup was drawn over the framebuffer; flag the frame so the
-    // end-of-render snapshot is skipped and the follow-up render erases it.
-    homeRenderPopupShown = true;
+    // CrumBLE 4.5.5+: popup is no longer drawn (see above), so the framebuffer
+    // stays clean and we DON'T need to invalidate the snapshot. We still
+    // requestUpdate() so the newly-generated thumbs land on screen on the
+    // next render pass. (Variable name kept for minimal diff; semantically
+    // this flag now just means "we did real gen work this pass".)
     requestUpdate();
   }
 }
@@ -1263,6 +1442,21 @@ const std::vector<ShelfEntry>& HomeActivity::cachedShelfEntries() {
   // in one pass) and derive the path list as one firstPath per entry.
   auto& store = CollectionsStore::getInstance();
   shelfEntriesCache = store.resolveShelfEntries(activeId);
+  // v18.9.9.230: empty user collections get a synthetic placeholder
+  // ShelfEntry so the shelf strip renders "Add books to this collection"
+  // as a real, focusable book-shaped cell (Left/Right/Confirm work the
+  // same as any other cell). Virtuals stay empty -- their empty state
+  // is a static non-focusable overlay in the render path below. Only
+  // inject when the resolve returned no entries AND heap pressure
+  // didn't spuriously blank the list (see kMaxHeapPressureRetries).
+  if (shelfEntriesCache.empty() && !store.lastResolveHitHeapPressure()) {
+    const Collection* active = store.getActiveCollection();
+    if (active != nullptr && !active->isVirtual) {
+      ShelfEntry cta;
+      cta.firstPath = kEmptyCollectionCtaPath;  // sentinel: openShelfEntry routes on this
+      shelfEntriesCache.push_back(std::move(cta));
+    }
+  }
   shelfPathsCache.clear();
   shelfPathsCache.reserve(shelfEntriesCache.size());
   for (const auto& e : shelfEntriesCache) shelfPathsCache.push_back(e.firstPath);
@@ -1343,6 +1537,16 @@ void HomeActivity::showHomeBookActionMenu(const std::string& bookPath) {
   BookActions::BookActionMenuOptions opts;
   opts.addToCollection = true;
   opts.showMetadata = true;
+  // v18.9.9.356: expose "Retry failed covers" from the carousel + shelf
+  // book long-press so users don't have to navigate to Settings to
+  // clear a stuck placeholder.
+  opts.retryFailedCovers = true;
+  // v18.9.9.179: Refresh cover option pulled from the menu. Silent-restart
+  // approach couldn't regen large-JPEG covers at post-boot low-heap state
+  // (24 KB shelf snapshot + carousel probe drops maxAlloc to ~11 KB before
+  // regen runs; JPEG decoder needs ~53 KB contiguous). Underlying helper
+  // stays in place for the future browser-thumb-pregen path.
+  // opts.refreshCover = true;
   // Only emit Remove from Recent Books if the book is actually in the
   // recents list -- otherwise the option is meaningless (e.g. a
   // Favorites-only book that was never opened).
@@ -1367,6 +1571,31 @@ void HomeActivity::showHomeBookActionMenu(const std::string& bookPath) {
                                                   BookActions::optimizedHeaderLabel(bookPath), header.author),
       [this, bookPath](const ActivityResult& result) {
         longPressConfirmHandled = false;
+        // v18.9.9.135: force a full refresh on return from the long-press
+        // menu. HALF_REFRESH_DEEP scrubs the panel, but only pushes the
+        // CURRENT framebuffer contents. If the framebuffer still holds
+        // the menu pixels (because Carousel's cached-draw short-circuited
+        // its render at 4ms instead of ~200ms), the panel shows the menu
+        // overlay after the refresh completes.
+        // v18.9.9.136: also invalidate the carousel cache so the next
+        // render() FULLY repaints the carousel into the framebuffer.
+        // Without this invalidate, Carousel's dirty-check said "same
+        // selection, same books, skip draw" and HALF_REFRESH_DEEP flushed
+        // the untouched (menu-contaminated) buffer.
+        pendingFullRefresh = true;
+        gCarouselCache.invalidate();
+        // v18.9.9.140: v136's gCarouselCache.invalidate() wasn't enough. The
+        // real culprit is coverBufferStored + lastRenderedCoverSelectorValid.
+        // Flow theme's storeCoverBuffer snapshots ONLY the shelf strip; on
+        // restore, the carousel/header regions retain whatever was in the
+        // framebuffer -- which is the menu pixels. Then drawRecentBookCover
+        // takes the canSkipCovers fast path (nothing changed, buffer
+        // restored) and does NOT overwrite those menu pixels. The result is
+        // a Home screen with a menu overlay stuck over the carousel.
+        // Invalidating both flags forces the render to clearScreen() and
+        // fully repaint the covers.
+        coverBufferStored = false;
+        lastRenderedCoverSelectorValid = false;
         if (result.isCancelled) {
           return;
         }
@@ -1402,6 +1631,8 @@ void HomeActivity::showHomeBookActionMenu(const std::string& bookPath) {
                   SeriesIndex::getInstance().forgetPath(bookPath);
                   if (!Storage.remove(bookPath.c_str())) {
                     LOG_ERR("HOME", "Failed to delete file: %s", bookPath.c_str());
+                    BookActions::drawToast(renderer, tr(STR_BOOK_DELETE_FAILED));
+                    delay(1500);
                   }
                   // Recents shrank — reload from the store so the
                   // carousel/shelf indices stay valid.
@@ -1411,15 +1642,7 @@ void HomeActivity::showHomeBookActionMenu(const std::string& bookPath) {
                   // bookStatsCached[i] would reference stats from the OLD
                   // book that used to occupy slot i.
                   loadAllBookStats();
-                  // CrumBLE #125: same reason -- tile cache is keyed by
-                  // book path so the existing entries are still valid,
-                  // but the deleted/removed book's entry is now stale
-                  // (its file may be gone). Rebuild to match the new
-                  // recentBooks vector.
-                  if (static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) ==
-                      CrossPointSettings::UI_THEME::LYRA_FLOW) {
-                    static_cast<const LyraFlowTheme&>(GUI).prerenderCarouselSideTiles(renderer, recentBooks);
-                  }
+                  // v18.9.9.206: side-tile cache removed; nothing to rebake.
                   if (selectorIndex >= recentBooks.size() + 1) {
                     selectorIndex = recentBooks.empty() ? 0 : static_cast<int>(recentBooks.size()) - 1;
                   }
@@ -1447,6 +1670,15 @@ void HomeActivity::showHomeBookActionMenu(const std::string& bookPath) {
               delay(800);
             }
             shelfCoversLoaded = false;  // thumbs in cache may have been wiped.
+            requestUpdate();
+            return;
+          }
+          case FileBrowserAction::ToggleSimpleRendering: {
+            // v18.9.6.2: flip the sidecar; toast the new state.
+            const bool nowOn = BookActions::toggleSimpleRenderingSidecar(bookPath);
+            drawHomeToast(renderer, nowOn ? tr(STR_ENABLE_SIMPLE_RENDERING)
+                                          : tr(STR_DISABLE_SIMPLE_RENDERING));
+            delay(800);
             requestUpdate();
             return;
           }
@@ -1500,13 +1732,7 @@ void HomeActivity::showHomeBookActionMenu(const std::string& bookPath) {
               // the post-remove vector doesn't read stale stats out of slots
               // that used to hold the removed book / its neighbors.
               loadAllBookStats();
-              // CrumBLE #125: rebake the Flow side-tile cache. Removed
-              // book's entry would still render if cached, but a fresh
-              // build keeps the table tidy.
-              if (static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) ==
-                  CrossPointSettings::UI_THEME::LYRA_FLOW) {
-                static_cast<const LyraFlowTheme&>(GUI).prerenderCarouselSideTiles(renderer, recentBooks);
-              }
+              // v18.9.9.206: side-tile cache removed; nothing to rebake.
               if (selectorIndex >= recentBooks.size() + 1) {
                 selectorIndex = recentBooks.empty() ? 0 : static_cast<int>(recentBooks.size()) - 1;
               }
@@ -1532,6 +1758,40 @@ void HomeActivity::showHomeBookActionMenu(const std::string& bookPath) {
                 std::make_unique<BookMetadataViewerActivity>(renderer, mappedInput, bookPath),
                 [this](const ActivityResult&) { requestUpdate(); });
             return;
+          }
+          case FileBrowserAction::RefreshCover: {
+            const std::string cacheDir = Epub::cachePathForFilePath(bookPath, "/.crosspoint");
+            const int removed = CoverThumbStatus::regenerateThumbsForBook(cacheDir);
+            LOG_INF("HOME", "Refresh cover: cleared %d cached entr(y/ies) for %s; silent-restart to home for fresh heap",
+                    removed, bookPath.c_str());
+            // v18.9.9.177: silent-restart-to-home so the thumb regen runs on
+            // a fresh ~60 KB heap. See project_crumble_browser_thumb_pregen
+            // memory for the deeper fix that avoids device-side JPEG decode.
+            silentRestart();
+            // never returns
+          }
+          case FileBrowserAction::RetryFailedCovers: {
+            // v18.9.9.356: sweep persistent thumb-failed markers.
+            // v18.9.9.365: also silent-restart to Home so shelf re-render
+            // gets fresh ~85 KB heap. Field bug: most cover failures aren't
+            // marked persistent because Home's steady-state maxAlloc floats
+            // around 40-55 KB (below the 55K JPEG floor), so shelf loop
+            // NOT-marks them. Without a heap reset, retry re-renders at the
+            // same tight heap and fails identically. Silent-restart is the
+            // only lever that gets to fresh heap without a visible full
+            // reset -- same pattern as RefreshCover.
+            const int removed = CoverThumbStatus::sweepAllMarkers();
+            char msg[96];
+            if (removed > 0) {
+              std::snprintf(msg, sizeof(msg), tr(STR_COVERS_RETRY_DONE), removed);
+            } else {
+              std::snprintf(msg, sizeof(msg), "%s", tr(STR_COVERS_RETRY_NONE));
+            }
+            GUI.drawPopup(renderer, msg);
+            delay(1200);
+            LOG_INF("HOME", "Retry failed covers: swept=%d; silent-restart for fresh heap", removed);
+            silentRestart();
+            // never returns
           }
           case FileBrowserAction::ViewOptimizedDetails: {
             // CrumBLE 4.2: user activated the Optimized header. Load the
@@ -1565,7 +1825,37 @@ void HomeActivity::showHomeBookActionMenu(const std::string& bookPath) {
       });
 }
 
+void HomeActivity::launchAddBooksToActiveCollection() {
+  const Collection* active = CollectionsStore::getInstance().getActiveCollection();
+  if (active == nullptr || active->isVirtual) return;
+  const std::string activeId = active->id;
+  const std::string activeName = active->name;
+  startActivityForResult(
+      std::make_unique<AddBooksToCollectionActivity>(renderer, mappedInput, activeId, activeName),
+      [this](const ActivityResult&) {
+        // v18.9.9.232: also flush the carousel cover snapshot + rendered-selector
+        // memo (same fix as v140 for the long-press action menu). Without these,
+        // returning from AddBooksActivity redraws the pre-return frame (long-press
+        // menu overlay or empty placeholder) instead of the fresh carousel/shelf
+        // now that the collection has real books.
+        invalidateShelfPathsCache();
+        shelfSnapshotValid = false;
+        shelfCoversLoaded = false;
+        coverBufferStored = false;
+        lastRenderedCoverSelectorValid = false;
+        requestUpdate();
+      });
+}
+
 void HomeActivity::openShelfEntry(const ShelfEntry& entry) {
+  // v18.9.9.230: synthetic empty-collection placeholder cell -- route to
+  // the AddBooksToCollection flow instead of opening a book. Sentinel
+  // path is injected by cachedShelfEntries() for empty non-virtual
+  // collections; see kEmptyCollectionCtaPath in the header.
+  if (entry.firstPath == kEmptyCollectionCtaPath) {
+    launchAddBooksToActiveCollection();
+    return;
+  }
   // Single-book cell — same as the pre-series behavior.
   if (entry.seriesName.empty() || entry.memberPaths.size() < 2) {
     if (!entry.firstPath.empty()) onSelectBook(entry.firstPath);
@@ -1619,7 +1909,7 @@ void HomeActivity::openSeriesMiniPicker(const ShelfEntry& entry) {
                          [this](const ActivityResult&) { requestUpdate(); });
 }
 
-void HomeActivity::showShelfHeaderActionMenu() {
+void HomeActivity::showShelfHeaderActionMenu(FileBrowserAction focusOn) {
   // Header context = the active collection's name tab. Builds a small
   // menu of collection-level operations. "Sort by..." is hidden for
   // Recently Added because that collection's order is intrinsic
@@ -1685,8 +1975,13 @@ void HomeActivity::showShelfHeaderActionMenu() {
   if (CollectionsStore::getInstance().getCollections().size() > 1) {
     items.push_back({FileBrowserAction::RearrangeCollections, StrId::STR_REARRANGE});
   }
+  // v18.9.9.355: show current STATE (Shown/Hidden) rather than the ACTION
+  // (Show/Hide). User feedback: "Hide" next to an already-hidden row
+  // read as an instruction to hide it further, not the current state.
+  // Now matches the shelf-header sort item pattern (right-value shows
+  // current selection).
   auto showHideValue = [](bool on) -> std::string {
-    return std::string(I18N.get(on ? StrId::STR_HIDE : StrId::STR_SHOW));
+    return std::string(I18N.get(on ? StrId::STR_COL_SHOWN : StrId::STR_COL_HIDDEN));
   };
   items.push_back({FileBrowserAction::ToggleShowAllBooks, StrId::STR_COL_ALL_BOOKS,
                    showHideValue(SETTINGS.showAllBooksCollection)});
@@ -1697,14 +1992,56 @@ void HomeActivity::showShelfHeaderActionMenu() {
   items.push_back({FileBrowserAction::ToggleShowFinished, StrId::STR_COL_FINISHED,
                    showHideValue(SETTINGS.showFinishedCollection)});
   items.push_back({FileBrowserAction::RescanLibrary, StrId::STR_RESCAN_LIBRARY});
+  // v18.9.9.356: also expose Retry failed covers here (global sweep, mirrors
+  // Settings > Utility). Some users landing on a shelf full of placeholders
+  // find the shelf-header menu before the book long-press.
+  items.push_back({FileBrowserAction::RetryFailedCovers, StrId::STR_RETRY_COVERS_SHORT});
 
   const std::string title = (active != nullptr) ? active->name : std::string();
 
+  // v18.9.9.342: when re-opening the menu after a Show/Hide toggle, land
+  // the selector on the row the user just toggled instead of resetting
+  // to index 0 — otherwise every toggle bounces focus back to the top
+  // of the list and the user has to re-navigate down each time.
+  int initialIndex = 0;
+  if (focusOn != FileBrowserAction::None) {
+    for (size_t i = 0; i < items.size(); ++i) {
+      if (items[i].action == focusOn) {
+        initialIndex = static_cast<int>(i);
+        break;
+      }
+    }
+  }
+
   startActivityForResult(
       std::make_unique<FileBrowserActionActivity>(renderer, mappedInput, title, std::move(items),
-                                                  /*ignoreInitialConfirmRelease=*/true),
+                                                  /*ignoreInitialConfirmRelease=*/true,
+                                                  /*headerRightLabel=*/std::string{},
+                                                  /*subtitle=*/std::string{},
+                                                  /*initialSelectedIndex=*/initialIndex),
       [this](const ActivityResult& result) {
         longPressConfirmHandled = false;
+        // v18.9.9.217: mirror the v18.9.9.140 fix from the book long-press
+        // menu callback (line ~1489). The collection-header menu draws its
+        // options over the carousel region; without invalidating these
+        // flags, drawRecentBookCover's skipCarouselCoverLoads fast path
+        // fires on return and leaves the menu pixels stuck on the
+        // framebuffer where the covers should be. Runs BEFORE the
+        // isCancelled check so cancelling the menu also cleans up.
+        pendingFullRefresh = true;
+        gCarouselCache.invalidate();
+        coverBufferStored = false;
+        lastRenderedCoverSelectorValid = false;
+        // v18.9.9.352: on menu close, heap is at its FRESHEST for this
+        // Home visit (menu overlay used a tiny working set; the shelf/
+        // cover/index caches from the previous Home paint haven't been
+        // rebuilt yet). Flush any deferred SETTINGS/collections save
+        // NOW so it lands before subsequent L/R nav re-inflates the
+        // shelf caches. User's field pattern: toggle show->L/R->L/R->
+        // revert to just Favorites, because the SETTINGS save was
+        // deferred and never retried before another crash lost it.
+        SETTINGS.retryDeferredSaveIfNeeded();
+        CollectionsStore::getInstance().retryDeferredSaveIfNeeded();
         if (result.isCancelled) {
           return;
         }
@@ -1720,9 +2057,29 @@ void HomeActivity::showShelfHeaderActionMenu() {
           invalidateShelfPathsCache();
           shelfSnapshotValid = false;
           lastRenderedCoverSelectorValid = false;
+          // v18.9.9.338: popup + toast were drawn straight into the
+          // framebuffer; force a clean full paint so they don't survive
+          // via the fast-path snapshot restore on the next render.
+          coverBufferStored = false;
+          pendingFullRefresh = true;
           drawHomeToast(renderer, tr(STR_LIBRARY_RESCANNED));
           delay(800);
           requestUpdate();
+        } else if (action == FileBrowserAction::RetryFailedCovers) {
+          // v18.9.9.356 + v18.9.9.365: sweep + silent-restart for fresh heap.
+          const int removed = CoverThumbStatus::sweepAllMarkers();
+          char msg[96];
+          if (removed > 0) {
+            std::snprintf(msg, sizeof(msg), tr(STR_COVERS_RETRY_DONE), removed);
+          } else {
+            std::snprintf(msg, sizeof(msg), "%s", tr(STR_COVERS_RETRY_NONE));
+          }
+          GUI.drawPopup(renderer, msg);
+          delay(1200);
+          LOG_INF("HOME", "Retry failed covers (shelf header): swept=%d; silent-restart for fresh heap",
+                  removed);
+          silentRestart();
+          // never returns
         } else if (action == FileBrowserAction::ToggleShowRecentlyAdded ||
                    action == FileBrowserAction::ToggleShowAllBooks ||
                    action == FileBrowserAction::ToggleShowFinished ||
@@ -1757,8 +2114,52 @@ void HomeActivity::showShelfHeaderActionMenu() {
               return;
           }
           const bool currentlyOn = *settingsByte != 0;
+          // v18.9.9.338: helper for the ON path. Encapsulates the settings +
+          // store + invalidate + ensureWalked sequence so both the "skip
+          // confirmation because already walked" and "confirm first" paths
+          // share one body. Re-opens the header picker at the end so the
+          // user can toggle more collections without navigating back --
+          // previously we bounced them to Home after every toggle.
+          const auto applyTurnOn = [this, settingsByte, vid, vname, action]() {
+            *settingsByte = 1;
+            SETTINGS.saveToFile();
+            CollectionsStore::getInstance().setVirtualCollectionVisible(vid, vname, true);
+            // ensureWalked self-skips if a walk already ran this session.
+            // Only draw the popup if we actually need to walk (avoids a
+            // spurious "Scanning..." flash when the library is already
+            // indexed from a previous action this session).
+            const bool needWalk = !LibraryIndex::getInstance().hasWalked();
+            if (needWalk) {
+              const Rect popupRect = GUI.drawPopup(renderer, tr(STR_RESCAN_LIBRARY));
+              LibraryIndex::getInstance().ensureWalked(
+                  [&](int pct) { GUI.fillPopupProgress(renderer, popupRect, pct); });
+            }
+            CollectionsStore::getInstance().invalidateScannedVirtuals();
+            invalidateShelfPathsCache();
+            shelfSnapshotValid = false;
+            lastRenderedCoverSelectorValid = false;
+            shelfCoversLoaded = false;
+            // v18.9.9.338: when a walk actually ran, the popup was drawn
+            // straight into the framebuffer -- if the follow-up render
+            // takes the restore-from-snapshot fast path, the popup pixels
+            // survive on top of the carousel ("Loading over carousel"
+            // symptom). Force a clean full paint so the popup is
+            // overwritten with real carousel+shelf content.
+            if (needWalk) {
+              coverBufferStored = false;
+              pendingFullRefresh = true;
+            }
+            // v18.9.9.338: re-open the header picker so the user lands back
+            // on the same menu they were in (with fresh Show/Hide labels
+            // reflecting this toggle). Common workflow: enable All Books,
+            // then also enable Recently Added -- both without going back
+            // to Home and long-pressing the header again.
+            showShelfHeaderActionMenu(action);
+          };
+
           if (currentlyOn) {
-            // Turn OFF — just hide it; no scan needed.
+            // Turn OFF — just hide it; no scan needed. Re-open picker so
+            // user can continue toggling.
             *settingsByte = 0;
             SETTINGS.saveToFile();
             CollectionsStore::getInstance().setVirtualCollectionVisible(vid, vname, false);
@@ -1766,31 +2167,20 @@ void HomeActivity::showShelfHeaderActionMenu() {
             shelfSnapshotValid = false;
             lastRenderedCoverSelectorValid = false;
             shelfCoversLoaded = false;
-            requestUpdate();
+            showShelfHeaderActionMenu(action);
+          } else if (LibraryIndex::getInstance().hasWalked()) {
+            // v18.9.9.338: library was already walked this session (e.g. user
+            // just enabled a different virtual, or opened the library via
+            // any other path). Skip the confirmation prompt -- the scan is
+            // free at this point. Directly apply the ON.
+            applyTurnOn();
           } else {
-            // Turn ON — confirm the (possibly first) library scan before walking SD.
+            // First-time turn-on this session: confirm the SD walk cost.
             startActivityForResult(
                 std::make_unique<ConfirmationActivity>(renderer, mappedInput, tr(STR_SCAN_LIBRARY_PROMPT), vname),
-                [this, settingsByte, vid, vname](const ActivityResult& confirm) {
+                [applyTurnOn](const ActivityResult& confirm) {
                   if (confirm.isCancelled) return;  // declined — stay hidden
-                  *settingsByte = 1;
-                  SETTINGS.saveToFile();
-                  CollectionsStore::getInstance().setVirtualCollectionVisible(vid, vname, true);
-                  // ensureWalked self-skips if a walk already ran this session
-                  // (e.g. another virtual is already on), so this only costs
-                  // the SD walk the first time.
-                  const Rect popupRect = GUI.drawPopup(renderer, tr(STR_RESCAN_LIBRARY));
-                  LibraryIndex::getInstance().ensureWalked(
-                      [&](int pct) { GUI.fillPopupProgress(renderer, popupRect, pct); });
-                  // Finished / New also need the per-book BookReadingStats
-                  // pass -- invalidate so resolveBookPaths rebuilds against
-                  // the freshly-walked library.
-                  CollectionsStore::getInstance().invalidateScannedVirtuals();
-                  invalidateShelfPathsCache();
-                  shelfSnapshotValid = false;
-                  lastRenderedCoverSelectorValid = false;
-                  shelfCoversLoaded = false;
-                  requestUpdate();
+                  applyTurnOn();
                 });
           }
         } else if (action == FileBrowserAction::ToggleCollapseSeries) {
@@ -1823,8 +2213,35 @@ void HomeActivity::showShelfHeaderActionMenu() {
               [this, activeId](const ActivityResult& pickRes) {
                 if (pickRes.isCancelled) return;
                 const auto& sr = std::get<SortPickerResult>(pickRes.data);
-                CollectionsStore::getInstance().setSortMode(activeId,
-                                                             static_cast<CollectionSort>(sr.sortMode));
+                const auto newMode = static_cast<CollectionSort>(sr.sortMode);
+                // v18.9.9.218: if the user picked an author-order sort AND
+                // any books in the library still have no author key cached
+                // (never opened -> populateAuthorKeysIfNeeded couldn't fill
+                // them when heap was tight -> they'd cluster at the end
+                // sorted as empty-string), show a progress popup and fill
+                // the missing keys just-in-time via OPF peek. ~50-100 ms
+                // per book, so typical libraries finish in seconds. Skips
+                // ones that are heap-blocked with a graceful degrade (they
+                // fall through to the background tick like before).
+                if ((newMode == CollectionSort::AuthorAlpha ||
+                     newMode == CollectionSort::AuthorAlphaDesc) &&
+                    LibraryIndex::getInstance().pendingAuthorKeyCount() > 0) {
+                  // v18.9.9.219: wipe the button-hints strip BEFORE drawing
+                  // the popup. The sort picker's "Back | Select | Up | Down"
+                  // labels stay in the framebuffer after it returns; without
+                  // this wipe, both those labels AND whatever the next
+                  // rendering pass puts there peek out from under our
+                  // popup, giving the user a "two Back buttons" look. Scan
+                  // is synchronous so no button input can happen during it
+                  // -- leaving the strip blank is correct.
+                  const int hintsStripH = 50;
+                  const int hintsStripY = renderer.getScreenHeight() - hintsStripH;
+                  renderer.fillRect(0, hintsStripY, renderer.getScreenWidth(), hintsStripH, false);
+                  const Rect popupRect = GUI.drawPopup(renderer, tr(STR_READING_METADATA));
+                  LibraryIndex::getInstance().populateAuthorKeysWithProgress(
+                      [&](int pct) { GUI.fillPopupProgress(renderer, popupRect, pct); });
+                }
+                CollectionsStore::getInstance().setSortMode(activeId, newMode);
                 invalidateShelfPathsCache();
                 shelfSnapshotValid = false;
                 shelfCoversLoaded = false;  // thumbs themselves are unchanged, but the visible window shifts.
@@ -2018,26 +2435,158 @@ void HomeActivity::showShelfHeaderActionMenu() {
                 requestUpdate();
               });
         } else if (action == FileBrowserAction::AddBooksToActiveCollection) {
-          const Collection* active = CollectionsStore::getInstance().getActiveCollection();
-          if (active == nullptr || active->isVirtual) return;
-          const std::string activeId = active->id;
-          const std::string activeName = active->name;
-          startActivityForResult(
-              std::make_unique<AddBooksToCollectionActivity>(renderer, mappedInput, activeId, activeName),
-              [this](const ActivityResult&) {
-                // Member list of the active collection just changed —
-                // re-evaluate shelf paths and force a repaint.
-                invalidateShelfPathsCache();
-                shelfSnapshotValid = false;
-                shelfCoversLoaded = false;
-                requestUpdate();
-              });
+          launchAddBooksToActiveCollection();
         }
       });
 }
 
 void HomeActivity::onEnter() {
   Activity::onEnter();
+
+  // v18.9.9.174: reader exited from an image page (cover, illustration).
+  // E-ink particles set for image content have high contrast; a light
+  // refresh cycle here leaves visible ghosting behind the shelf. Force a
+  // full refresh so the transition is clean. One-shot consume.
+  if (APP_STATE.readerExitedFromImagePage) {
+    APP_STATE.readerExitedFromImagePage = false;
+    pendingFullRefresh = true;
+  }
+  // v18.9.9.293: full-refresh when returning from a full-screen activity
+  // that clobbered the shelf snapshot (Reading Heatmap etc.). Without
+  // this, fast-refresh from the stale snapshot bakes leftover heatmap
+  // pixels into the shelf strip.
+  // v18.9.9.315: also invalidate the shelf/cover fast-path bits. Before,
+  // the flag alone left `shelfSnapshotValid` and
+  // `lastRenderedCoverSelectorValid` intact, so a fast-refresh two frames
+  // later could still bleed stats content through the covers -- which is
+  // why Reading Stats / Reading Heatmap return went through silentRestart
+  // as a heavier hammer. With the full set of invalidations here, plain
+  // requestUpdate suffices and menu focus survives naturally (no boot).
+  if (APP_STATE.pendingHomeFullRefresh) {
+    APP_STATE.pendingHomeFullRefresh = false;
+    pendingFullRefresh = true;
+    coverBufferStored = false;
+    shelfSnapshotValid = false;
+    lastRenderedCoverSelectorValid = false;
+    // v18.9.9.347: also invalidate the pre-baked carousel frames. The
+    // fast path in render() memcpy's a saved framebuffer snapshot and
+    // only re-draws the border overlay, so if we take that path on a
+    // return-from-full-screen-activity the shelf/menu/header areas
+    // keep whatever pixels the previous activity left (Reading Stats
+    // / Heatmap etc.), producing the "stats over carousel" ghost the
+    // user reported. Force the slow path which fully re-renders every
+    // region so FULL_REFRESH scrubs cleanly.
+    gCarouselCache.invalidate();
+    carouselFramesReady = false;
+    // v18.9.9.340: the source activity was a full-screen text/graphics
+    // takeover (Heatmap, Book Stats, Reading Stats). Their pixel content
+    // survives the panel's HALF_REFRESH_DEEP scrub; presentHomeBuffer
+    // needs FULL_REFRESH to properly overwrite. Set the hard-refresh
+    // hint here; presentHomeBuffer consumes + clears it.
+    pendingFullRefreshHard_ = true;
+  }
+
+  // v18.9.9.349: v343's post-Home silent-restart-to-HomeClockSync flow
+  // has been REPLACED by an inline boot-time sync in main.cpp setup(),
+  // so the user sees "Syncing time..." over the boot splash instead
+  // of a "Loading" flash after Home first renders. Home itself no
+  // longer initiates a clock sync; halClock either has valid time
+  // from that boot-time sync (or from X3's DS3231, or from a previous
+  // manual Sync Time), or the clock in the header stays hidden.
+  g_postHomeClockSyncSilentReboot = false;  // consume any legacy inflight flag
+
+  // v18.9.9.216: absolute low-heap guard at Home entry. Handles the case
+  // where a reader session thrashed heap so hard that maxAlloc carries
+  // into Home at <10 KB -- observed after dict lookups + glyph atlas
+  // reloads left the previous session with maxAlloc ~2 KB, causing
+  // Home's tile buffer alloc (5 KB per side cover) to fail and render
+  // solid-black side covers (v214 handled the visual fallback but the
+  // underlying state is still unhealthy for anything the user does
+  // next). Silent-restart to get a clean ~60 KB baseline.
+  //
+  // Uses the same one-shot flag as the predictive guard below so we
+  // can't loop-restart if the FIRST post-boot maxAlloc is somehow still
+  // low (should never happen but the safety belt is cheap).
+  //
+  // Threshold at 10 KB rather than higher: the predictive guard below
+  // catches the "will fail during render" case at 30 KB. This guard is
+  // for the EMERGENCY case where the render can't even start.
+  if (!hasAttemptedCoverHeapRestart() && !isContinuingFromSilentReboot()) {
+    constexpr uint32_t kAbsoluteFloorBytes = 10u * 1024u;
+    const uint32_t maxAllocNow = ESP.getMaxAllocHeap();
+    if (maxAllocNow < kAbsoluteFloorBytes) {
+      LOG_INF("HOME",
+              "Home entry absolute floor: maxAlloc=%u < %u -- silentRestart() to recover",
+              maxAllocNow, kAbsoluteFloorBytes);
+      markCoverHeapRestartAttempted();
+      silentRestart();  // flushes deferred saves via snapshotFrameBufferForSilentRestart
+      // never returns
+    }
+  }
+
+  // v18.9.5.6: predictive cover-heap-guard. When onEnter runs on a heap left
+  // fragmented by an earlier BT session, the guard inside loadShelfCovers
+  // will fire ~3 s into the first render (after ~2-3 s of carousel + shelf
+  // + library-index prep gets wasted). By checking now, before any of that
+  // work happens, we shave those ~3 s off the transition.
+  //
+  // v18.9.9.216: dropped the 24 KB shelf-strip reserve -- v206 deleted
+  // the Home shelf-strip pre-alloc, so that byte reservation was stale
+  // and made the prediction 24 KB too pessimistic. Now only reserves
+  // the 6 KB pre-render churn margin.
+  //
+  // Predict: post-alloc maxAlloc (current - 6 KB safety margin for
+  // carousel + library index heap churn) below the guard's 30 KB floor
+  // means loadShelfCovers WILL trip the guard. Silent-restart now.
+  //
+  // Preserves the one-shot-per-boot loop safety (hasAttemptedCoverHeapRestart)
+  // and skips on silent-reboot continuation (v18.9.2 same rationale --
+  // the defrag just fired, give the render a chance).
+  if (!hasAttemptedCoverHeapRestart() && !isContinuingFromSilentReboot()) {
+    constexpr uint32_t kPreRenderChurnReserveBytes = 6u * 1024u;
+    constexpr uint32_t kCoverGuardFloorBytes = 30u * 1024u;  // matches loadShelfCovers guard
+    // v18.9.9.287: post-v285 deinit(false) frees ~40 KB back to the heap
+    // when BT disables, but as fragmented chunks -- maxAlloc rises only
+    // ~3 KB. The MaxAlloc-only predictive gate then still trips and
+    // silent-restarts even though we have PLENTY of total free heap
+    // (60 KB+) to render covers via smaller allocations. Cover thumbnails
+    // decode in ~4-8 KB chunks per row/tile, not one giant block --
+    // fragmentation matters less than total free. Bypass the restart
+    // when free heap is comfortably above the working-set the render
+    // needs, regardless of contiguous maxAlloc.
+    // v18.9.9.313: lowered 50 KB -> 22 KB after field logs showed
+    // consecutive successful Home renders at maxAlloc ~13 KB / free ~18 KB
+    // then a spurious silent-restart triggered by a fluctuation to
+    // maxAlloc=12.7 KB / free=28.9 KB (JUST below the 50 KB bypass).
+    // The ~7-second reboot cost dominated over the ~3-second "wasted
+    // render prep" the guard was trying to save. If renders are
+    // succeeding at maxAlloc=13 KB, the 30 KB predicted-post-alloc
+    // floor is too pessimistic anyway; the bypass now covers cases
+    // where actual observation contradicts the prediction. Real OOM
+    // still catches via the reactive guard in loadShelfCovers itself
+    // (line ~1152 above), which only restarts when a visible thumb is
+    // actually missing.
+    constexpr uint32_t kFreeHeapBypassBytes = 22u * 1024u;
+    const uint32_t freeNow = ESP.getFreeHeap();
+    const uint32_t maxAllocNow = ESP.getMaxAllocHeap();
+    const uint32_t predictedPostAlloc =
+        maxAllocNow > kPreRenderChurnReserveBytes
+            ? maxAllocNow - kPreRenderChurnReserveBytes
+            : 0;
+    if (predictedPostAlloc < kCoverGuardFloorBytes && freeNow < kFreeHeapBypassBytes) {
+      LOG_INF("HOME",
+              "Cover heap-guard predictive: maxAlloc=%u predicts post-alloc=%u < %u "
+              "(free=%u also < bypass %u) -- silentRestart() now to skip ~3 s of wasted render prep",
+              maxAllocNow, predictedPostAlloc, kCoverGuardFloorBytes,
+              freeNow, kFreeHeapBypassBytes);
+      markCoverHeapRestartAttempted();
+      // v18.9.5.8: preserve the "Going Home" popup drawn by exitToHomeWithPopup
+      // instead of overlaying our own "Loading" on top of it. Boot restore
+      // shows a clean transition rather than two popups stacked.
+      silentRestartPreservingFrame();  // flushes deferred saves via snapshotFrameBufferForSilentRestart
+      // never returns
+    }
+  }
 
   // CrumBLE 4.6: if Cover Tone / Regenerate All Covers fired while Home was
   // on the back stack, drop the snapshot + carousel cache so we re-read the
@@ -2048,6 +2597,32 @@ void HomeActivity::onEnter() {
     gCarouselCache.invalidate();
     freeCarouselFrames();
   }
+
+  // CrumBLE 4.5.5+: pre-allocate the cover snapshot buffer right now, while
+  // heap is fresh (typical maxAlloc ~80 KB at activity entry). The Flow
+  // theme's storeCoverBuffer needs a single contiguous 48 KB block to save
+  // the framebuffer snapshot. If we wait until the first render to malloc
+  // it, by then the carousel cache (2 × 48 KB), font load, and other
+  // first-render allocations have eaten the contiguous space -- field log
+  // showed maxAlloc dropping to ~11 KB after first render, far below the
+  // 48 KB the snapshot needs. The snapshot then never gets saved, the
+  // shelf-focus-only-diff fast path can't restore, and every subsequent
+  // nav pays full render cost. Allocating here, before any of that, makes
+  // the buffer survive for the activity's lifetime; storeCoverBuffer's
+  // existing "reuse if already-allocated" path just hands it back.
+  //
+  // Skipped if a previous storeCoverBuffer already allocated the buffer
+  // (returning to Home from a sub-activity that didn't trigger
+  // freeCoverBuffer). Also skipped when running a theme without a Flow
+  // shelf (Carousel / Minimal) -- those use the smaller per-tile snapshot
+  // path which has its own gating.
+  // v18.9.9.206: dropped the 24 KB shelf-strip snapshot pre-alloc (again).
+  // v119 disabled it, v120 restored it for Home snappiness. But the pre-
+  // alloc holds a 24 KB contiguous hole for the whole Home visit, which
+  // carries into reader fragmentation and undermines BT/FT/dict maxAlloc
+  // gates on X3. Shelf-strip snapshot now takes the lazy storeCoverBuffer
+  // path on first render (allocated on demand at snapshot time; may fall
+  // through to full-shelf repaint if 24 KB isn't contiguous by then).
 
   // CrumBLE 4.2: rehydrate the in-RAM collection / series stores if a
   // previous activity (reader, File Transfer) called releaseMemory() to
@@ -2088,26 +2663,42 @@ void HomeActivity::onEnter() {
   minimalHomeNavIndex = -1;
   carouselFramesReady = false;
   carouselWarmupPending = isCarouselTheme;
+  // v18.9.9.208: capture (don't consume) the static flag — the warmup
+  // block consumes the static later; this instance copy suppresses the
+  // synchronous cover-gen/series popups until the first paint.
+  suppressLoadPopups_ = sArrivedWithGoingHomePopup;
   // Clear ghosting from the previous screen (e.g. a dense reader page) with one
   // full refresh on the first present of this Home visit; fast refreshes after.
   pendingFullRefresh = true;
-  // Force a re-check of shelf thumbnails on every onEnter so books that
-  // were just toggled into a collection (e.g. via the file browser long-
-  // press) get their cover generated on the next return to Home.
-  shelfCoversLoaded = false;
-  // Give covers that failed last session one fresh retry per home visit
-  // (the failure may have been transient — low heap, etc.).
-  failedShelfCovers.clear();
+
+  // v18.9.9.312: consume the "read-only side trip" flag. If an activity
+  // like Settings / Bookmarks / Stats explicitly set this before returning,
+  // the library / covers / shelf state can't have changed underneath us,
+  // so keep the caches warm. Cuts ~500-1500 ms off return-to-Home. Clear
+  // the flag one-shot so the NEXT return (which might come from a
+  // modifying activity like FileBrowser) defaults to the safe invalidate.
+  const bool preserveCaches = APP_STATE.preserveHomeStateOnReturn;
+  APP_STATE.preserveHomeStateOnReturn = false;
+
+  if (!preserveCaches) {
+    // Force a re-check of shelf thumbnails on every onEnter so books that
+    // were just toggled into a collection (e.g. via the file browser long-
+    // press) get their cover generated on the next return to Home.
+    shelfCoversLoaded = false;
+    // Give covers that failed last session one fresh retry per home visit
+    // (the failure may have been transient — low heap, etc.).
+    failedShelfCovers.clear();
+    // Drop any stale cached path list — the active collection's
+    // membership may have changed while we were elsewhere.
+    invalidateShelfPathsCache();
+    shelfSnapshotValid = false;
+    lastRenderedCoverSelectorValid = false;
+  }
   shelfHeaderFocused = false;
   lastShelfBookIndex = 0;  // every onEnter starts the row at book 0.
   shelfPosByCollection.clear();  // per-collection shelf positions reset each home visit.
   lastMenuIndex = 0;       // and the menu at icon 0.
   seriesEnrichmentNeededForActive = true;
-  // Drop any stale cached path list — the active collection's
-  // membership may have changed while we were elsewhere.
-  invalidateShelfPathsCache();
-  shelfSnapshotValid = false;
-  lastRenderedCoverSelectorValid = false;
 
   // CrumBLE: heal recent.json if a foreign firmware (e.g.
   // rhythmerc/crosspoint-reader) ran between boots and wiped or
@@ -2166,13 +2757,8 @@ void HomeActivity::onEnter() {
   // a few-ms one-time cost; per-press goes from 2 SD reads to a cache hit.
   // No-op on themes whose recentBooks is empty (e.g. minimal theme).
   loadAllBookStats();
-  // CrumBLE #125: pre-bake the 4 perspective side-cover tiles for the
-  // Flow carousel. ~24 KB tile cache; one-time SD load + perspective
-  // walk per book per side AT entry, so the per-press carousel L/R
-  // path becomes a pure 1bpp blit. No-op on non-Flow themes.
-  if (static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) == CrossPointSettings::UI_THEME::LYRA_FLOW) {
-    static_cast<const LyraFlowTheme&>(GUI).prerenderCarouselSideTiles(renderer, recentBooks);
-  }
+  // v18.9.9.206: side-tile prerender removed. Flow side covers now
+  // stream from SD/cache on each render.
   updateHighlightedBookContext();
 
   // CrumBLE #120: pick selectorIndex by priority:
@@ -2228,11 +2814,35 @@ void HomeActivity::onEnter() {
     }
   }
 
+  // CrumBLE 4.5.5+: post-silentRestart land-on-shelf-header. When the cover
+  // heap-guard fired silentRestart() while the user was on the collection
+  // label, this flag was set; consume it now and override the focus chain
+  // above so the cursor reappears on the shelf header (not the carousel).
+  // One-shot consume; naturally false on cold boot.
+  if (consumePendingHomeFocusOnShelfHeader()) {
+    const int bookCount = static_cast<int>(recentBooks.size());
+    shelfHeaderFocused = true;
+    // Park selectorIndex inside the shelf range so the existing
+    // header/shelf/menu disambiguation in render() reads the row as the
+    // header. The exact value doesn't show on screen while
+    // shelfHeaderFocused is true; using shelfStart (= bookCount + 0)
+    // keeps it bounded and consistent with the standard "enter shelf
+    // row at top" pattern.
+    selectorIndex = bookCount;
+    updateHighlightedBookContext();
+  }
+
   if (isCarouselTheme && hasValidCarouselDiskCache(recentBooks, renderer)) {
     preRenderCarouselFrames(false);
   }
 
   requestUpdate();
+
+  // v18.9.9.267: one-time sleep-bake suggestion. Runs after Home's
+  // initial layout is queued so the prompt lands on top of a fully-
+  // rendered Home rather than a partial paint. Static-flag gated so
+  // reader-exits back to Home don't re-prompt within a session.
+  maybeShowSleepBakePrompt();
 }
 
 int HomeActivity::getHighlightedBookIndex() const {
@@ -2289,16 +2899,36 @@ void HomeActivity::onExit() {
   hasSavedCursor_ = true;
 
   freeCoverBuffer();
+  // CrumBLE 4.5.5+: actually release the cover snapshot malloc on activity
+  // exit (transitioning to reader / file browser / settings / sleep). The
+  // 4.5.4 design kept the malloc alive across snapshots to dodge per-render
+  // realloc fragmentation, but that meant the 24-48 KB stayed pinned for
+  // the WHOLE session even when home wasn't on top. Reader open of heavy
+  // books (CJK, large EPUBs with embedded images) needs that contiguous
+  // budget for JPEG decoders + inflate dicts + font advance tables. Free
+  // here, re-pre-alloc on next onEnter when heap is fresh again.
+  if (coverBuffer != nullptr) {
+    free(coverBuffer);
+    coverBuffer = nullptr;
+    coverBufferSize = 0;
+  }
+  // Also release the carousel disk-frame cache (LYRA_CAROUSEL theme path).
+  // freeCarouselFrames just nulls instance pointers; the static cache holds
+  // the actual mallocs. Free them so the reader doesn't fight for that
+  // ~96 KB (2 slots * 48 KB) when reopening books on a tight-heap device.
+  for (int i = 0; i < kCarouselFrameCount; ++i) {
+    if (gCarouselCache.frames[i]) {
+      free(gCarouselCache.frames[i]);
+      gCarouselCache.frames[i] = nullptr;
+    }
+    gCarouselCache.frameBookIdx[i] = -1;
+  }
+  gCarouselCache.frameCount = 0;
   gCarouselCache.invalidate();
   freeCarouselFrames();
   carouselWarmupPending = false;
 
-  // CrumBLE #125: drop the pre-baked Flow carousel side-cover tiles
-  // (~24 KB) so the reader's heap envelope isn't squeezed by carousel
-  // state we're done with. Rebuilt on next home onEnter.
-  if (static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) == CrossPointSettings::UI_THEME::LYRA_FLOW) {
-    static_cast<const LyraFlowTheme&>(GUI).clearCarouselSideTiles();
-  }
+  // v18.9.9.206: side-tile cache removed; no per-theme clear needed.
 
   // CrumBLE #131: pre-shrink the in-RAM cover-bitmap cache only IF
   // heap is currently under pressure. Was renderer.clearImageCache()
@@ -2315,24 +2945,59 @@ void HomeActivity::onExit() {
 }
 
 bool HomeActivity::storeCoverBuffer() {
-  freeCoverBuffer();
+  // CrumBLE 4.5.4: REUSE existing allocation when it's big enough. The old
+  // freeCoverBuffer() + fresh malloc() churned 48 KB every render that
+  // needed a snapshot, which is the single biggest source of heap
+  // fragmentation observed in field logs. Now we hold onto the buffer
+  // across snapshots; only realloc when a size change demands it (Flow
+  // <-> non-Flow theme switch, never in a single session in practice).
+  coverBufferStored = false;
   const bool isFlow =
       static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) == CrossPointSettings::UI_THEME::LYRA_FLOW;
   if (isFlow) {
-    // CrumBLE Flow: the shelf-skip fast-path restores the WHOLE home
-    // (carousel + shelf + header + menu) on the next render, so snapshot the
-    // full framebuffer — not just the cover tile (1.3's optimization, used in
-    // the non-Flow carousel branch below).
-    uint8_t* frameBuffer = renderer.getFrameBuffer();
-    if (!frameBuffer) return false;
-    const size_t bufferSize = renderer.getBufferSize();
-    coverBuffer = static_cast<uint8_t*>(malloc(bufferSize));
-    if (!coverBuffer) {
-      LOG_ERR("HOME", "OOM: cover buffer (full, %u bytes)", (unsigned)bufferSize);
+    // CrumBLE 4.5.5+: snapshot ONLY the shelf strip rather than the full
+    // 48 KB framebuffer. The shelf-focus-only-diff fast path is the only
+    // consumer of the snapshot's restore behaviour, and it only needs
+    // the shelf region intact. Other regions (header, carousel, menu,
+    // hints) get re-rendered each frame; the slow-render path skips
+    // clearScreen when this restore fires, so they retain their previous-
+    // frame pixels until repainted (the paint functions self-clear). Net
+    // savings ~24-32 KB pinned heap per session -- enough for the side
+    // tile prerender to cache all 5 carousel books reliably.
+    if (shelfSnapshotRectW <= 0 || shelfSnapshotRectH <= 0) {
+      // render() hasn't stamped a rect yet (first call into a Flow theme
+      // session before the shelf branch ran). Skip; the next render will
+      // set the rect and snapshot will succeed.
       return false;
     }
-    coverBufferSize = bufferSize;
-    memcpy(coverBuffer, frameBuffer, bufferSize);
+    const size_t needed = renderer.getRegionByteSize(
+        shelfSnapshotRectX, shelfSnapshotRectY, shelfSnapshotRectW, shelfSnapshotRectH);
+    if (needed == 0) return false;
+    if (coverBuffer == nullptr || coverBufferSize < needed) {
+      if (coverBuffer) {
+        free(coverBuffer);
+        coverBuffer = nullptr;
+        coverBufferSize = 0;
+      }
+      const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+      if (maxAlloc < needed) {
+        LOG_DBG("HOME", "skip shelf-strip snapshot: maxAlloc=%u < %u",
+                static_cast<unsigned>(maxAlloc), static_cast<unsigned>(needed));
+        return false;
+      }
+      coverBuffer = static_cast<uint8_t*>(malloc(needed));
+      if (!coverBuffer) {
+        LOG_ERR("HOME", "OOM: shelf-strip snapshot buffer (%u bytes)", (unsigned)needed);
+        return false;
+      }
+      coverBufferSize = needed;
+    }
+    if (!renderer.copyRegionToBuffer(shelfSnapshotRectX, shelfSnapshotRectY, shelfSnapshotRectW,
+                                     shelfSnapshotRectH, coverBuffer, coverBufferSize)) {
+      // Copy failure leaves the buffer allocated but the contents stale.
+      // Don't free -- the next call will reuse the slot.
+      return false;
+    }
     return true;
   }
   // Non-Flow (CrossInk 1.3 carousel): snapshot just the cover tile. render()
@@ -2340,16 +3005,31 @@ bool HomeActivity::storeCoverBuffer() {
   if (coverRectW <= 0 || coverRectH <= 0) return false;
   const size_t needed = renderer.getRegionByteSize(coverRectX, coverRectY, coverRectW, coverRectH);
   if (needed == 0) return false;
-  coverBuffer = static_cast<uint8_t*>(malloc(needed));
-  if (!coverBuffer) {
-    LOG_ERR("HOME", "OOM: cover buffer (%u bytes)", (unsigned)needed);
-    return false;
+  if (coverBuffer == nullptr || coverBufferSize < needed) {
+    if (coverBuffer) {
+      free(coverBuffer);
+      coverBuffer = nullptr;
+      coverBufferSize = 0;
+    }
+    // CrumBLE 4.5.5: same maxAlloc gate as the Flow path above; same
+    // rationale (avoid the per-refresh retry cycle under fragmentation
+    // pressure).
+    const uint32_t maxAllocTile = ESP.getMaxAllocHeap();
+    if (maxAllocTile < needed) {
+      LOG_DBG("HOME", "skip cover-tile snapshot: maxAlloc=%u < %u",
+              static_cast<unsigned>(maxAllocTile), static_cast<unsigned>(needed));
+      return false;
+    }
+    coverBuffer = static_cast<uint8_t*>(malloc(needed));
+    if (!coverBuffer) {
+      LOG_ERR("HOME", "OOM: cover buffer (%u bytes)", (unsigned)needed);
+      return false;
+    }
+    coverBufferSize = needed;
   }
-  coverBufferSize = needed;
   if (!renderer.copyRegionToBuffer(coverRectX, coverRectY, coverRectW, coverRectH, coverBuffer, coverBufferSize)) {
-    free(coverBuffer);
-    coverBuffer = nullptr;
-    coverBufferSize = 0;
+    // Leave the buffer allocated -- a copy failure is transient and the
+    // next storeCoverBuffer() will reuse the slot.
     return false;
   }
   return true;
@@ -2357,24 +3037,50 @@ bool HomeActivity::storeCoverBuffer() {
 
 bool HomeActivity::restoreCoverBuffer() {
   if (!coverBuffer) return false;
-  // Distinguish a full-framebuffer snapshot (Flow) from a cover-tile snapshot
-  // (non-Flow) by the stored size.
+  // CrumBLE 4.5.5+: Flow theme now snapshots just the shelf strip rather
+  // than the full framebuffer. Three cases to handle:
+  //   (1) coverBufferSize matches full framebuffer -> legacy full-frame
+  //       restore (memcpy). Kept for backwards-compat in case a code
+  //       path still allocates a full-size buffer (e.g. mid-session
+  //       theme switch).
+  //   (2) shelfSnapshotRect is set and the buffer size matches -> Flow
+  //       partial-restore; copy back to the shelf strip region.
+  //   (3) coverRect is set and the buffer size matches -> non-Flow
+  //       cover-tile restore (1.3 carousel themes).
   if (coverBufferSize == renderer.getBufferSize()) {
     uint8_t* frameBuffer = renderer.getFrameBuffer();
     if (!frameBuffer) return false;
     memcpy(frameBuffer, coverBuffer, coverBufferSize);
     return true;
   }
+  if (shelfSnapshotRectW > 0 && shelfSnapshotRectH > 0) {
+    const size_t shelfBytes = renderer.getRegionByteSize(
+        shelfSnapshotRectX, shelfSnapshotRectY, shelfSnapshotRectW, shelfSnapshotRectH);
+    if (shelfBytes > 0 && shelfBytes <= coverBufferSize) {
+      // Buffer may be larger than the rect (we pre-alloc the landscape
+      // worst case at onEnter so a portrait shelf strip leaves headroom).
+      // copyBufferToRegion respects the rect bounds and only reads the
+      // first `shelfBytes`.
+      return renderer.copyBufferToRegion(shelfSnapshotRectX, shelfSnapshotRectY,
+                                         shelfSnapshotRectW, shelfSnapshotRectH,
+                                         coverBuffer, coverBufferSize);
+    }
+  }
   if (coverRectW <= 0 || coverRectH <= 0) return false;
   return renderer.copyBufferToRegion(coverRectX, coverRectY, coverRectW, coverRectH, coverBuffer, coverBufferSize);
 }
 
 void HomeActivity::freeCoverBuffer() {
-  if (coverBuffer) {
-    free(coverBuffer);
-    coverBuffer = nullptr;
-  }
-  coverBufferSize = 0;
+  // CrumBLE 4.5.4: KEEP the allocation, just mark its contents stale. The
+  // old free()+next-malloc() cycle was the dominant source of heap
+  // fragmentation -- every render that needed a snapshot churned a 48 KB
+  // (Flow) or ~30 KB (1.3) chunk in and out, and after a few minutes of
+  // home navigation the heap split into 9 KB-maxAlloc fragments that
+  // wedged shelf-resolve on All Books / Recently Added. Pinning the
+  // buffer once costs ~48 KB always-reserved but eliminates the
+  // fragmentation contribution entirely. HomeActivity is a process-
+  // lifetime singleton so 'leaking' the buffer is fine -- it lives as
+  // long as the device is on.
   coverBufferStored = false;
 }
 
@@ -2580,10 +3286,18 @@ bool HomeActivity::loadCarouselFrameFromDisk(uint64_t cacheKeyHash, int bookCoun
     return false;
   }
 
+  // CrumBLE 4.5.5+ profiling: instrument each SD step so we can see whether
+  // the per-slot disk-load cost is in the open(), header validate, seek, or
+  // the 48 KB read. RPROF showed disk-load cache-hit prep ~ 587-735 ms; the
+  // 48 KB framebuffer should only need ~10-15 ms at 40 MHz SPI -- everything
+  // above that is overhead we may be able to shave.
+  const unsigned long diskT0 = millis();
+
   FsFile file;
   if (!Storage.openFileForRead("HOME", CAROUSEL_CACHE_PATH, file)) {
     return false;
   }
+  const unsigned long diskT1 = millis();
 
   CarouselCacheHeader header{};
   if (!readCarouselCacheHeader(file, header) ||
@@ -2591,12 +3305,14 @@ bool HomeActivity::loadCarouselFrameFromDisk(uint64_t cacheKeyHash, int bookCoun
     file.close();
     return false;
   }
+  const unsigned long diskT2 = millis();
 
   const size_t frameOffset = sizeof(CarouselCacheHeader) + static_cast<size_t>(bookIdx) * renderer.getBufferSize();
   if (!file.seek(frameOffset)) {
     file.close();
     return false;
   }
+  const unsigned long diskT3 = millis();
   const size_t expectedBytes = renderer.getBufferSize();
   size_t totalBytesRead = 0;
   while (totalBytesRead < expectedBytes) {
@@ -2606,11 +3322,18 @@ bool HomeActivity::loadCarouselFrameFromDisk(uint64_t cacheKeyHash, int bookCoun
     }
     totalBytesRead += static_cast<size_t>(bytesRead);
   }
+  const unsigned long diskT4 = millis();
   file.close();
+  const unsigned long diskT5 = millis();
   if (totalBytesRead != expectedBytes) {
     LOG_ERR("HOME", "carousel: short read for slot %d (%zu/%zu bytes)", slotIdx, totalBytesRead, expectedBytes);
     return false;
   }
+
+  LOG_INF("RPROF",
+          "carousel disk-load: open=%lu hdr=%lu seek=%lu read=%lu close=%lu total=%lu (%zu bytes)",
+          diskT1 - diskT0, diskT2 - diskT1, diskT3 - diskT2, diskT4 - diskT3, diskT5 - diskT4,
+          diskT5 - diskT0, expectedBytes);
 
   gCarouselCache.frameBookIdx[slotIdx] = bookIdx;
   carouselFrames[slotIdx] = gCarouselCache.frames[slotIdx];
@@ -2726,6 +3449,31 @@ bool HomeActivity::preRenderCarouselFrames(bool showProgressPopup) {
 }
 
 void HomeActivity::loop() {
+  // v18.9.9.343: nav coalesce (v314) removed -- users reported "sometimes
+  // weird behavior" and the 80 ms defer wasn't a clear enough win.
+  // Left/Right handlers now fire requestUpdate() directly.
+
+  // CrumBLE 4.5.4: pump the deferred library-index author-key populate
+  // pass in tiny background batches. ensureWalked() no longer runs the
+  // populate inline when there's more than ~30 books pending (would
+  // block boot/home-enter for 50-100 s on big libraries); we drain
+  // those slowly here instead.
+  //
+  // Cadence:
+  //   - 400ms throttle: don't tick on every loop iteration, the device
+  //     would feel sluggish under input. 400ms gives ~2.5 ticks/sec.
+  //   - 4 books per tick: each book ~50-100ms of OPF peek, so a tick
+  //     spends ~200-400ms working before yielding. Bounded so a held
+  // v18.9.9.219: background populate tick REMOVED. A 500-book drag-drop
+  // library would previously churn ~50 s of silent OPF-peek work every
+  // Home visit, eating heap for a feature the user might never use. Now
+  // author keys populate ONLY when:
+  //   1. A book is opened (EpubReaderActivity::onEnter, near-free).
+  //   2. User picks Sort by Author -- v218 populates just-in-time with a
+  //      progress popup so the wait is user-initiated and visible.
+  //   3. Library rescan when pending <= 30 (still inline via ensureWalked).
+
+
   if (isMinimalTheme()) {
     const int pressedFrontButton = mappedInput.getPressedFrontButton();
     const int releasedFrontButton = mappedInput.getReleasedFrontButton();
@@ -2969,12 +3717,17 @@ void HomeActivity::loop() {
 
       const Collection* newActiveCollection = CollectionsStore::getInstance().getActiveCollection();
       if (newActiveCollection != nullptr && newActiveCollection->isVirtual) {
-        // Pre-warm the SD walk if it hasn't happened yet. ensureWalked
-        // self-skips after the first walk this session so this is free
-        // on subsequent cycles between virtuals.
-        const Rect popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
-        LibraryIndex::getInstance().ensureWalked(
-            [&](int pct) { GUI.fillPopupProgress(renderer, popupRect, pct); });
+        // Pre-warm the SD walk if it hasn't happened yet. The hasWalked()
+        // gate is critical: without it the popup draws unconditionally
+        // on every cycle, and even though ensureWalked() returns instantly
+        // when already walked, the popup hits the framebuffer for one
+        // frame and the next render clears it -- that's the persistent
+        // "Loading flash on virtual-collection switch" symptom.
+        if (!LibraryIndex::getInstance().hasWalked()) {
+          const Rect popupRect = GUI.drawPopup(renderer, tr(STR_LOADING_POPUP));
+          LibraryIndex::getInstance().ensureWalked(
+              [&](int pct) { GUI.fillPopupProgress(renderer, popupRect, pct); });
+        }
       }
     };
 
@@ -3013,6 +3766,7 @@ void HomeActivity::loop() {
         const int menuIdx = selectorIndex - menuStart;
         selectorIndex = menuStart + (menuIdx + 1) % menuItemCount;
       }
+      // v18.9.9.343: nav coalesce (v314) removed. Fire immediately.
       requestUpdate();
     }
     if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
@@ -3057,6 +3811,7 @@ void HomeActivity::loop() {
         const int menuIdx = selectorIndex - menuStart;
         selectorIndex = menuStart + (menuIdx + menuItemCount - 1) % menuItemCount;
       }
+      // v18.9.9.343: nav coalesce (v314) removed. Fire immediately.
       requestUpdate();
     }
     // Helper: clamp the remembered shelf-row index against the
@@ -3284,6 +4039,53 @@ void HomeActivity::loop() {
       showBookshelfCollectionPicker();
       return;
     }
+    // v18.9.9.306: long-press on Reading Stats icon opens the 12-week
+    // reading heatmap. Reading Heatmap used to live under Display >
+    // General as its own menu item; that entry is gone and the heatmap
+    // is now discoverable from the Home stats icon. Short-press stays
+    // as-is (BookStatsActivity: per-book + global counters).
+    if (menuSelectedIdxForLongPress >= 0 &&
+        menuSelectedIdxForLongPress < static_cast<int>(menuItemsForLongPress.size()) &&
+        menuItemsForLongPress[menuSelectedIdxForLongPress].action == HomeMenuAction::ReadingStats) {
+      longPressConfirmHandled = true;
+      // v18.9.9.306: silent-restart on return (same reason as the
+      // short-press BookStatsActivity path above): the heatmap's full-
+      // screen layout invalidates the carousel snapshot, and a plain
+      // requestUpdate leaves leftover heatmap pixels visible where the
+      // covers should re-render.
+      // v18.9.9.315: was silentRestart(); replaced with pendingHomeFullRefresh
+      // (already set in ReadingHeatmapActivity::onExit) + expanded snapshot
+      // invalidation on Home::onEnter. Skips the boot cycle and keeps focus
+      // on the Reading Stats icon. Same trade-off as the short-press stats
+      // return path in onReadingStatsOpen().
+      // v18.9.9.347: DROPPED the v319 auto-redirect to ClockSync when
+      // the clock isn't set. Users viewing their historical heatmap
+      // shouldn't be forced through a WiFi+NTP flow just to see it,
+      // and if they're offline that flow simply fails. ReadingHeatmap
+      // itself handles the "no valid time" case gracefully -- shows
+      // the grid from what it has and hides today's marker.
+      // v18.9.9.475: long-press now opens BSA on the All Books page (which
+      // hosts the ported heatmap since v472). User can Up/Down to flip to
+      // the most-recent-book stats. Short-press still opens BSA on page 0.
+      // Standalone ReadingHeatmapActivity remains for direct navigation
+      // paths but is no longer wired to the Home long-press.
+      const int highlightedIdx = getHighlightedBookIndex();
+      const std::string lpBookTitle =
+          highlightedIdx >= 0 ? recentBooks[highlightedIdx].title : std::string(tr(STR_READING_STATS));
+      const std::string lpBookPath = highlightedIdx >= 0 ? recentBooks[highlightedIdx].path : std::string();
+      const std::string lpCoverPath =
+          highlightedIdx >= 0 ? recentBooks[highlightedIdx].coverBmpPath : std::string();
+      startActivityForResult(
+          std::make_unique<BookStatsActivity>(renderer, mappedInput, lpBookPath, lpBookTitle, lpCoverPath,
+                                              currentBookStats, globalStats, /*backToHome=*/true,
+                                              /*startOnAllBooksPage=*/true),
+          // v18.9.9.478: was silentRestart() — preserved single-flash visual
+          // but wiped menu-icon focus so user landed back on the carousel.
+          // goHome preserves the Reading Stats icon focus (matches how a
+          // Bookshelf return lands on the Bookshelf icon).
+          [this](const ActivityResult&) { activityManager.goHome(HomeMenuItem::READING_STATS); });
+      return;
+    }
     const std::string focusedPath = getFocusedBookPath();
     if (!focusedPath.empty()) {
       longPressConfirmHandled = true;
@@ -3400,7 +4202,34 @@ void HomeActivity::updateFocusedBookMeta(const std::string& path) {
   // .txt / .md have no embedded metadata — leave title empty (filename fallback).
 }
 
+void HomeActivity::postFirstRenderCleanup_() {
+  // v18.9.9.345: once-per-session cleanup after the first successful Home
+  // render. Two cheap reclaims that don't hurt UX:
+  //   1. reconcileImageCacheBudget forces the new low-tier (16 KB) so any
+  //      carousel-side decodes from the first render evict down. Otherwise
+  //      the LRU cache carries them until natural eviction.
+  //   2. FontDecompressor::freeHotGroup() drops the decompressed glyph
+  //      hot-group buffer (~1-3 KB). It's re-decompressed on next draw
+  //      call but the intra-render caching didn't need to persist.
+  const uint32_t freeBefore = ESP.getFreeHeap();
+  const uint32_t maxAllocBefore = ESP.getMaxAllocHeap();
+  renderer.reconcileImageCacheBudgetExt();
+  fontDecompressor.releaseHotGroup();
+  LOG_INF("HOME", "postFirstRenderCleanup: free %u->%u maxAlloc %u->%u",
+          freeBefore, ESP.getFreeHeap(), maxAllocBefore, ESP.getMaxAllocHeap());
+}
+
 void HomeActivity::presentHomeBuffer() {
+  // CrumBLE 4.5.5+ profiling: stamp the moment we enter the present step so
+  // RPROF can split "render assembled the framebuffer" from "panel waveform
+  // settled." Anything between renderProfileStartMs_ and this stamp is
+  // pre-panel CPU/SD-IO work; from this stamp to the function return is
+  // the panel refresh wait.
+  const unsigned long renderPrepDoneMs = millis();
+  // v18.9.9.208: Home is about to paint — from here on, load popups are
+  // fine (they draw over Home, not over the reader's "Going home..."
+  // popup). Ends the arrival suppression window.
+  suppressLoadPopups_ = false;
   if (pendingFullRefresh) {
     pendingFullRefresh = false;
     // One full clear on entry wipes ghosting bled through from the previous
@@ -3411,13 +4240,109 @@ void HomeActivity::presentHomeBuffer() {
     // book->home transition occasionally flashes inverted. Other HALF
     // callers (sleep cycle, sleep entry/exit) stay on the cheaper single
     // resync. No-op vs HALF on X4.
-    renderer.displayBuffer(HalDisplay::HALF_REFRESH_DEEP);
-  } else {
-    renderer.displayBuffer();
+    //
+    // CrumBLE 4.5.7 v18.5: on silent-restart continuation, the panel is
+    // still holding the pre-restart frame (typically the user's Home
+    // shelf or a "Loading..." popup from the snapshot). Promote first
+    // paint to FAST_REFRESH (~500ms subtle) instead of HALF_REFRESH_DEEP
+    // (~1.7s visible flash). Matches the near-invisible silent-restart
+    // feel of the pre-freeink-sdk builds. Reader path already does this
+    // via ReaderUtils::displayWithRefreshCycle; this brings Home to
+    // parity.
+    if (pendingFullRefreshHard_) {
+      // v18.9.9.340: consume the one-shot hard-refresh hint set by the
+      // pendingHomeFullRefresh consume block. FULL_REFRESH uses the
+      // multi-flash GC waveform which reliably scrubs text-heavy pixels
+      // left by Heatmap / Book Stats / Reading Stats / Bookmarks /
+      // Settings returning to Home; HALF_REFRESH_DEEP does not.
+      // v18.9.9.344: MUST precede the isContinuingFromSilentReboot branch.
+      // v18.9.9.357: reverted v353's 2-pass whitewash scrub. That WAS
+      // added when we thought FULL_REFRESH wasn't scrubbing -- but the
+      // real bug was that pendingFullRefreshHard_ was never consumed on
+      // activity pop-return (fixed in v355 by moving the consume to
+      // render()). Single FULL_REFRESH scrubs cleanly now; the 2-pass
+      // scrub read as a triple flash to users.
+      pendingFullRefreshHard_ = false;
+      LOG_INF("HOME", "present: FULL_REFRESH (pendingFullRefreshHard consumed)");
+      renderer.displayBuffer(HalDisplay::FULL_REFRESH);
+    } else if (isContinuingFromSilentReboot()) {
+      renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+    } else {
+      renderer.displayBuffer(HalDisplay::HALF_REFRESH_DEEP);
+    }
+    homeDirtyRegion.clear();  // full-refresh path consumes any pending dirty
+    const unsigned long total = millis() - renderProfileStartMs_;
+    LOG_INF("RPROF",
+            "home full-refresh: prep=%lu panel=%lu total=%lu",
+            renderPrepDoneMs - renderProfileStartMs_, millis() - renderPrepDoneMs, total);
+    return;
   }
+  // 4.5.5+: dirty-region partial-refresh routing has been DISABLED because
+  // it didn't account for cross-region dependencies in the Home layout.
+  // The shelfFocusOnlyDiff path (a real perf win that skips a 4-cell SD-
+  // BMP reload) marked ONLY shelfRect as dirty -- but the icon bar's
+  // author label (LyraFlowTheme::focusedBookAuthorForLabel, set at line
+  // ~4074 of this file and consumed inside drawButtonMenu) also depends
+  // on shelfSelectedSpine. Pushing only shelfRect to the panel meant the
+  // icon bar's new author was drawn into the framebuffer every frame but
+  // never reached the screen, leaving stale text under the icons; the
+  // next restoreCoverBuffer round-tripped that stale state back in. User
+  // reports: "right to next book, often brings me back to the collection
+  // title" -- partial-refresh staleness under nav, not a logic bug.
+  //
+  // We keep the focus-only-diff RENDER path intact (the skip-SD-BMP-load
+  // perf win is real and survives this change) and just push the full
+  // framebuffer each time -- ~10 ms slower per nav (the windowed update's
+  // measured savings per the design comment in HalDisplay::displayBuffer
+  // Region) in exchange for correct rendering of every region that depends
+  // on shelfSelectedSpine. Re-enable once the dirty-region tracker covers
+  // every cross-region dependency.
+  // CrumBLE 4.5.5+: windowed-write disabled again. The shelf-focus-only-diff
+  // markDirty extends from shelfRect.y to pageHeight to also cover the icon
+  // bar's author label below the shelf -- the right shape in PORTRAIT, but
+  // in LANDSCAPE the panel is 480 tall and shelfRect.y ~ 468 gives a 12 px
+  // band that doesn't even cover the icon bar (which lives along the SIDE,
+  // not the bottom). Field log showed collection-cycle renders pushing only
+  // that 12 px sliver to the panel while the new shelf content sat invisible
+  // in the framebuffer. Until the dirty rect is laid-out-orientation-aware,
+  // every present pushes the whole frame -- correct, slightly slower.
+  homeDirtyRegion.clear();
+  renderer.displayBuffer();
+  const unsigned long total = millis() - renderProfileStartMs_;
+  LOG_INF("RPROF",
+          "home fast-refresh: prep=%lu panel=%lu total=%lu",
+          renderPrepDoneMs - renderProfileStartMs_, millis() - renderPrepDoneMs, total);
 }
 
 void HomeActivity::render(RenderLock&&) {
+  // v18.9.9.355: consume APP_STATE.pendingHomeFullRefresh HERE, not just
+  // in onEnter. Reason: startActivityForResult pushes Home to the
+  // activity stack; when the sub-activity (ReadingStats/Heatmap/
+  // Bookmarks) finishes and pops back, the ActivityManager does NOT
+  // call onEnter on the resumed Home. So the flag set by the child's
+  // onExit was never consumed, and every Stats/Heatmap return took
+  // the default HALF_REFRESH_DEEP branch -- ghost of the child
+  // activity survived on the panel. Consuming here catches both
+  // fresh-onEnter and pop-return renders. Same invalidation set as
+  // the onEnter block; kept in sync.
+  if (APP_STATE.pendingHomeFullRefresh) {
+    APP_STATE.pendingHomeFullRefresh = false;
+    pendingFullRefresh = true;
+    coverBufferStored = false;
+    shelfSnapshotValid = false;
+    lastRenderedCoverSelectorValid = false;
+    gCarouselCache.invalidate();
+    carouselFramesReady = false;
+    pendingFullRefreshHard_ = true;
+    LOG_INF("HOME", "render: consumed pendingHomeFullRefresh (child activity returned)");
+  }
+  // CrumBLE 4.5.5+ profiling: measure the home render's pre-panel time vs
+  // panel-refresh time. The panel refresh is ~417 ms FAST_REFRESH today
+  // (hardware-bound until a partial-mode LUT lands); everything else is
+  // software we can shave. This stamp + the matching `RPROF` log at the
+  // tail of presentHomeBuffer prints (total, pre-panel, panel-refresh)
+  // per nav so we can see where the budget actually goes.
+  renderProfileStartMs_ = millis();
   const auto& metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
@@ -3458,6 +4383,7 @@ void HomeActivity::render(RenderLock&&) {
 
     if (!firstRenderDone) {
       firstRenderDone = true;
+      postFirstRenderCleanup_();
       requestUpdate();
       return;
     }
@@ -3508,6 +4434,7 @@ void HomeActivity::render(RenderLock&&) {
       // render so the E-ink is already showing something before the SD work starts.
       if (!firstRenderDone) {
         firstRenderDone = true;
+        postFirstRenderCleanup_();
         requestUpdate();
       } else if (!recentsLoaded && !recentsLoading) {
         recentsLoading = true;
@@ -3517,8 +4444,25 @@ void HomeActivity::render(RenderLock&&) {
     }
   }
 
-  renderer.clearScreen();
+  // CrumBLE 4.5.5+ profiling: stage timing for the slow render path. Lets us
+  // see whether the 1000-1500 ms prep is dominated by the carousel JPEG
+  // decode (drawRecentBookCover), shelf cover loads (drawBookshelfStrip),
+  // or something else. Reports one RPROF line per slow render listing each
+  // stage's delta in ms.
+  const unsigned long slowT0 = millis();
+  // CrumBLE 4.5.5+: try the partial (shelf-only) restore FIRST. When it
+  // succeeds, the shelf strip is correct in the framebuffer and the rest
+  // of the framebuffer retains the previous frame's pixels (which is what
+  // we want -- the non-shelf paint functions all self-clear their regions
+  // and will overwrite stale content). If restore fails or wasn't possible
+  // (no snapshot yet, mid-theme switch, popup drew over it), fall back to
+  // a full clearScreen so the upcoming paint functions render onto a
+  // known-clean substrate.
   bool bufferRestored = coverBufferStored && restoreCoverBuffer();
+  if (!bufferRestored) {
+    renderer.clearScreen();
+  }
+  const unsigned long slowT1 = millis();
   // Reset per-render: set true if any progress popup gets drawn over the
   // framebuffer below (see homeRenderPopupShown doc). Drives the snapshot
   // skip + clean-repaint at end of render so popups don't get stuck.
@@ -3526,6 +4470,7 @@ void HomeActivity::render(RenderLock&&) {
 
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.homeTopPadding},
                  metrics.homeContinueReadingInMenu && !recentBooks.empty() ? recentBooks[0].title.c_str() : nullptr);
+  const unsigned long slowT2 = millis();
 
   // Flow theme decodes (selectorIndex - bookCount) as a "carousel center hint"
   // when no carousel slot is selected. Without this encoding the carousel
@@ -3600,6 +4545,7 @@ void HomeActivity::render(RenderLock&&) {
                           recentBooks, coverSelectorIndex, coverRendered, coverBufferStored, bufferRestored,
                           storer,
                           hasAnyBookStats(currentBookStats) ? &currentBookStats : nullptr, currentBookProgressPercent);
+  const unsigned long slowT3 = millis();
   // Remember what we just painted so the next render can short-circuit.
   // CrumBLE #125: store the DECODED center idx (not the encoded
   // coverSelectorIndex) so the next render's comparison correctly hits
@@ -3709,11 +4655,23 @@ void HomeActivity::render(RenderLock&&) {
     // repaint fast path (erase prev ring + redraw shadow it overlapped,
     // draw new ring, refresh title text strip) instead of the full
     // 4-cell repaint.
+    //
+    // Gate on BOTH spines being valid (>= 0). If either side is -1, the
+    // focus crossed a section boundary (shelf <-> icon bar / carousel /
+    // header), and the dirty-region path would push ONLY shelfRect to
+    // the panel via displayBufferRegion -- leaving the adjacent section's
+    // newly-highlighted (or stale-highlighted) state stuck in the
+    // framebuffer but never on screen. Symptom: pressing Down to enter
+    // the icon bar updates selectorIndex internally but the screen still
+    // shows focus on the shelf. Full redraw is required when focus
+    // crosses sections; the partial-refresh fast path is only safe when
+    // both old and new positions are in-shelf.
     const bool shelfFocusOnlyDiff = !shelfStateMatchesSnapshot && bufferRestored && shelfSnapshotValid &&
                                     currentShelfActiveId == shelfSnapshotActiveId &&
                                     shelfScrollOffset == shelfSnapshotScrollOffset &&
                                     shelfHeaderFocused == shelfSnapshotHeaderFocused &&
-                                    shelfSelectedSpine != shelfSnapshotFocusedSpine;
+                                    shelfSelectedSpine != shelfSnapshotFocusedSpine &&
+                                    shelfSelectedSpine >= 0 && shelfSnapshotFocusedSpine >= 0;
 
     // Position the strip slightly below the geometric midpoint of the empty
     // band between cover tile bottom (~y=401) and icon-bar label top (~y=686).
@@ -3728,6 +4686,20 @@ void HomeActivity::render(RenderLock&&) {
     constexpr int kEmptySpaceMidpointFromBottom = 242;
     const int shelfStripY = pageHeight - kEmptySpaceMidpointFromBottom - (kShelfStripHeight / 2);
     const Rect shelfRect{0, shelfStripY, pageWidth, kShelfStripHeight};
+
+    // CrumBLE 4.5.5+: stamp the shelf-strip bounds for the partial snapshot
+    // taken at end-of-render. drawBookshelfStrip clears `rect.height + 56`
+    // rows (the +56 covers shadow + focused-title strip below the cells),
+    // so the snapshot must capture that full painted region or the shadow
+    // and title text would not survive a restore. Bytes = pageWidth/8 *
+    // (kShelfStripHeight + 56) ≈ 14 KB portrait, 24 KB landscape -- down
+    // from the 48 KB full-framebuffer snapshot. Freed heap lets the side
+    // tile prerender cache all 5 carousel books instead of capping at 2.
+    constexpr int kShelfPaintBleed = 56;
+    shelfSnapshotRectX = 0;
+    shelfSnapshotRectY = shelfStripY;
+    shelfSnapshotRectW = pageWidth;
+    shelfSnapshotRectH = kShelfStripHeight + kShelfPaintBleed;
 
     const Collection* activeCollection2 = CollectionsStore::getInstance().getActiveCollection();
     const char* collectionName = (activeCollection2 != nullptr) ? activeCollection2->name.c_str() : "";
@@ -3749,7 +4721,13 @@ void HomeActivity::render(RenderLock&&) {
       const std::vector<ShelfEntry>& entries = cachedShelfEntries();
       if (shelfSelectedSpine < static_cast<int>(entries.size())) {
         const ShelfEntry& e = entries[shelfSelectedSpine];
-        if (!e.seriesName.empty() && e.memberPaths.size() >= 2) {
+        // v18.9.9.230: synthetic empty-collection placeholder -- title is
+        // already drawn INSIDE the cell (via cellTitles); painting it a
+        // second time below the strip would look redundant. Leave
+        // focusedTitle nullptr so drawBookshelfStrip skips the caption.
+        if (e.firstPath == kEmptyCollectionCtaPath) {
+          focusedTitleBuf.clear();  // suppress duplicate caption below strip
+        } else if (!e.seriesName.empty() && e.memberPaths.size() >= 2) {
           // Series cell: show "Series Name (N)" instead of filename.
           focusedTitleBuf = e.seriesName;
           focusedTitleBuf += " (";
@@ -3840,10 +4818,17 @@ void HomeActivity::render(RenderLock&&) {
             shelfCoverPaths[i] = std::move(resolved);
           }
         }
-        // Title fallback: series name for series cells, else filename.
+        // Title fallback: series name for series cells, sentinel CTA text
+        // for the synthetic empty-collection placeholder, else filename.
         if (i < static_cast<int>(entries.size())) {
           const ShelfEntry& e = entries[i];
-          if (!e.seriesName.empty() && e.memberPaths.size() >= 2) {
+          if (e.firstPath == kEmptyCollectionCtaPath) {
+            // v18.9.9.230: the theme's placeholder-cell path (no cover file
+            // exists at the sentinel path) reads this title and draws it
+            // wrapped in the cell -- the whole point of the placeholder-book
+            // approach vs the old floating button.
+            shelfCellTitles[i] = tr(STR_EMPTY_COLLECTION_ADD);
+          } else if (!e.seriesName.empty() && e.memberPaths.size() >= 2) {
             shelfCellTitles[i] = e.seriesName;
           } else {
             const size_t slash = path.find_last_of('/');
@@ -3868,11 +4853,62 @@ void HomeActivity::render(RenderLock&&) {
       // everything else (activeId, scroll, header focus) is unchanged
       // by the focus diff.
       shelfSnapshotFocusedSpine = shelfSelectedSpine;
+      // CrumBLE 4.5.5+: dirty region for within-shelf focus changes. Two
+      // regions on the panel actually change content when shelfSelectedSpine
+      // moves:
+      //   1. shelfRect itself -- ring + title band patched above by
+      //      drawBookshelfStripFocusUpdate.
+      //   2. The icon bar's author-label slot, which lives BELOW the
+      //      shelf and gets repainted by drawButtonMenu later in this
+      //      function with LyraFlowTheme::focusedBookAuthorForLabel set
+      //      to the newly-focused book's author. Without this in the
+      //      dirty region the icon bar's old author text stays on the
+      //      panel even though the framebuffer has the new one
+      //      (the cross-region staleness that forced the original
+      //      displayBufferRegion revert).
+      // We union both by stretching the dirty rect from shelfRect.y down
+      // to the bottom of the screen. That's roughly 50-56% of the panel
+      // on portrait, which stays under HalDisplay's 70% full-refresh
+      // auto-fallback threshold -- so the windowed-write path is
+      // actually used and saves ~10-15 ms of SPI / setRamArea overhead
+      // per nav.
+      const int unionTop = shelfRect.y;
+      const int unionH = pageHeight - unionTop;
+      homeDirtyRegion.markDirty(0, static_cast<uint16_t>(unionTop),
+                                static_cast<uint16_t>(pageWidth),
+                                static_cast<uint16_t>(unionH));
     } else if (!shelfStateMatchesSnapshot) {
       static_cast<const LyraFlowTheme&>(GUI).drawBookshelfStrip(
           renderer, shelfRect, collectionName, shelfCoverPaths, shelfSelectedSpine, shelfScrollOffset,
           shelfHeaderFocused, hasMultipleCollections, focusedTitle, &seriesMemberCounts, focusedAuthor,
           shelfRowCount, &shelfCellTitles);
+      // v18.9.9.221 MVP: empty-collection CTA. When the active collection
+      // has no resolved shelf entries, drawBookshelfStrip paints the
+      // header + an empty cell area. Overlay the CTA in the (otherwise
+      // empty) cell region so the user sees "you can add books here" or
+      // "this virtual collection is empty" instead of a blank strip.
+      //
+      // MVP is VISUAL ONLY -- not focusable, Confirm does nothing yet.
+      // Follow-up v222 adds focus routing (cursor Down from carousel lands
+      // on the CTA for user collections) and wires Confirm to the
+      // AddBooksToCollectionActivity flow. Meanwhile the header long-press
+      // menu already offers "Add books to collection" for user collections.
+      // v18.9.9.230: virtual empty state only. Non-virtual empty collections
+      // now render a synthetic placeholder cell (see cachedShelfEntries), so
+      // shelfCoverPaths is never empty for them. Virtual empties keep the
+      // non-focusable text overlay -- there is no "add" action to route to.
+      if (shelfCoverPaths.empty()) {
+        const char* msg = tr(STR_EMPTY_COLLECTION_VIRTUAL);
+        const auto layout = LyraFlowTheme::shelfLayoutFor(shelfRowCount);
+        const int cellAreaTop = shelfRect.y + (shelfRect.height - layout.stripHeight) / 2;
+        const int cellAreaH = layout.stripHeight;
+        constexpr int kCtaFontId = UI_10_FONT_ID;
+        const int textW = renderer.getTextWidth(kCtaFontId, msg, EpdFontFamily::REGULAR);
+        const int lineH = renderer.getLineHeight(kCtaFontId);
+        const int textX = shelfRect.x + (shelfRect.width - textW) / 2;
+        const int textY = cellAreaTop + (cellAreaH * 3 / 5) - lineH / 2;
+        renderer.drawText(kCtaFontId, textX, textY, msg, true, EpdFontFamily::REGULAR);
+      }
       // Remember the state of the shelf we just painted so the next
       // render can short-circuit if nothing about it has changed.
       shelfSnapshotActiveId = currentShelfActiveId;
@@ -3896,6 +4932,7 @@ void HomeActivity::render(RenderLock&&) {
       flowTheme.focusedBookAuthorForLabel = focusedAuthor;
     }
   }
+  const unsigned long slowT4 = millis();
 
   // While the shelf header is focused, force "no menu selection" so the
   // icon bar doesn't show a misleading highlight from the carousel/menu's
@@ -3921,6 +4958,7 @@ void HomeActivity::render(RenderLock&&) {
     labels = mappedInput.mapLabels("", tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   }
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  const unsigned long slowT5 = millis();
 
   // Flow theme: snapshot the framebuffer AFTER the whole home screen is
   // composed (header + carousel + shelf + menu + hints). Next render's
@@ -3944,6 +4982,15 @@ void HomeActivity::render(RenderLock&&) {
       coverRendered = false;
       requestUpdate();
     } else if (storeCoverBuffer()) {
+      // CrumBLE 4.5.5+: always save as the shelf snapshot. An earlier
+      // experiment tried using this same buffer as a 3rd carousel slot
+      // when the user was in the carousel row -- the idea was to extend
+      // the 2-slot carouselFrames cache by one. In practice the single
+      // buffer can only hold one book at a time, so sequential carousel
+      // nav got zero benefit (every press still missed both
+      // carouselFrames[] and the cover-buffer slot). And it shredded the
+      // shelf snapshot, making every carousel-to-shelf transition slow.
+      // Net regression. Keeping the simple "always snapshot" semantics.
       coverBufferStored = true;
     }
   } else if (homeRenderPopupShown) {
@@ -3956,11 +5003,17 @@ void HomeActivity::render(RenderLock&&) {
     // it. Schedule a clean repaint so the popup is wiped automatically.
     requestUpdate();
   }
+  const unsigned long slowT6 = millis();
+  LOG_INF("RPROF",
+          "slow-render stages: clear+restore=%lu header=%lu carousel=%lu shelf=%lu menu+hints=%lu snapshot=%lu total=%lu",
+          slowT1 - slowT0, slowT2 - slowT1, slowT3 - slowT2, slowT4 - slowT3, slowT5 - slowT4, slowT6 - slowT5,
+          slowT6 - slowT0);
 
   presentHomeBuffer();
 
   if (!firstRenderDone) {
     firstRenderDone = true;
+    postFirstRenderCleanup_();
     requestUpdate();
     return;
   }
@@ -3974,7 +5027,13 @@ void HomeActivity::render(RenderLock&&) {
     // Resolve any missing cover thumbs first, then warm the carousel snapshot.
     // Cover generation needs more contiguous heap than the frame cache path.
     carouselWarmupPending = false;
-    const bool showedWarmupProgress = preRenderCarouselFrames(true);
+    // v18.9.9.205: when we arrived under the reader's "Going home..."
+    // popup, warm silently behind it instead of stacking a "Loading"
+    // popup on top. Cold boot (no popup on-panel) keeps the popup so the
+    // warmup doesn't read as a hang.
+    const bool silentWarmup = sArrivedWithGoingHomePopup;
+    sArrivedWithGoingHomePopup = false;
+    const bool showedWarmupProgress = preRenderCarouselFrames(!silentWarmup);
     if (carouselFramesReady || showedWarmupProgress) {
       requestUpdate();
     }
@@ -4009,6 +5068,33 @@ void HomeActivity::onSelectBook(const std::string& path) {
   freeCarouselFrames();
   if (Storage.exists(CAROUSEL_CACHE_TMP_PATH)) {
     Storage.remove(CAROUSEL_CACHE_TMP_PATH);
+  }
+  // v18.9.9.383: heap-aware silent-restart on book open. Long Home sessions
+  // fragment the heap (carousel snapshots, cover thumb decode, shelf paint
+  // residue) so the reader lands with ~40 KB free / 20 KB maxAlloc even
+  // though Reader onEnter releases LibraryIndex/Series/Collections. CJK
+  // books (240 KB glyph atlas) and BT (55 KB contiguous need) then hit
+  // streaming mode or refuse to enable.
+  //
+  // Silent-restart to reader with the book path preserved via APP_STATE.
+  // Boot-time lean-boot gate already skips LibraryIndex/Series/Collections
+  // for reader target, so post-boot heap is ~95 KB free / 61 KB maxAlloc,
+  // fully contiguous. Only triggers when heap is genuinely degraded --
+  // fresh session (first book open after boot) skips the restart entirely
+  // and takes the fast direct-push path.
+  constexpr uint32_t kBookOpenMinFree = 55U * 1024U;
+  constexpr uint32_t kBookOpenMinMaxAlloc = 35U * 1024U;
+  const uint32_t freeNow = ESP.getFreeHeap();
+  const uint32_t maxAllocNow = ESP.getMaxAllocHeap();
+  if (freeNow < kBookOpenMinFree || maxAllocNow < kBookOpenMinMaxAlloc) {
+    LOG_INF("HOME",
+            "Book open heap-guard: free=%u<%u OR maxAlloc=%u<%u -- silent-restart to reader for fresh heap",
+            freeNow, static_cast<unsigned>(kBookOpenMinFree),
+            maxAllocNow, static_cast<unsigned>(kBookOpenMinMaxAlloc));
+    APP_STATE.openEpubPath = path;
+    APP_STATE.saveToFile();  // v363 debounced; snapshotFrameBufferForSilentRestart flushes
+    silentRestartToReader();
+    // never returns
   }
   activityManager.goToReader(path);
 }
@@ -4092,13 +5178,149 @@ void HomeActivity::onReadingStatsOpen() {
   // CrumBLE inherits chintanvajariya's richer BookStatsActivity (recent-books
   // navigation + cover image). The richer constructor needs path/cover and a
   // backToHome flag; launched from home, so back returns here.
+  // v18.9.9.315: was silentRestart(); replaced with pendingHomeFullRefresh
+  // + expanded snapshot invalidation on Home::onEnter. Saves the ~2.5 s
+  // boot cycle and preserves menu-icon focus so the user lands back on
+  // the Stats icon instead of the carousel.
   startActivityForResult(
       std::make_unique<BookStatsActivity>(renderer, mappedInput, bookPath, bookTitle, coverBmpPath, currentBookStats,
                                           globalStats, /*backToHome=*/true),
-      [this](const ActivityResult&) { requestUpdate(); });
+      // v18.9.9.478: was silentRestart() — preserved single-flash visual
+      // but wiped menu-icon focus so user landed back on the carousel.
+      // goHome preserves the Reading Stats icon focus (matches how
+      // Bookshelf / Browse return lands on their own icons).
+      [this](const ActivityResult&) { activityManager.goHome(HomeMenuItem::READING_STATS); });
 }
 
 void HomeActivity::onBookmarksOpen() {
   startActivityForResult(std::make_unique<BookmarksHomeActivity>(renderer, mappedInput),
                          [this](const ActivityResult&) { requestUpdate(); });
+}
+
+// v18.9.9.267: sleep-bake first-boot suggestion. See header comment.
+namespace {
+constexpr const char* kSleepBakeDeclinedSidecar = "/.crosspoint/sleep_bake_prompt_declined";
+
+// Count PNG/BMP files in /.sleep/ (or /sleep/) that DON'T have a
+// paired .slp companion. Bounded (<30 entries typical) and cheap --
+// each iteration is one Storage.exists() probe. Returns 0 if the
+// sleep dir doesn't exist. Also fills `outFirstDir` with the resolved
+// sleep dir string so caller can log it.
+int countUnbakedSleepImages() {
+  const char* candidates[] = {"/.sleep", "/sleep"};
+  for (const char* dirPath : candidates) {
+    FsFile dir = Storage.open(dirPath);
+    if (!dir || !dir.isDirectory()) {
+      if (dir) dir.close();
+      continue;
+    }
+    // Two-pass: collect names FIRST (dir handle open), THEN probe
+    // .slp existence per name (dir closed). Same pattern as v261's
+    // dict enumerator -- avoids nested-open interference with SDFat.
+    std::vector<std::string> names;
+    names.reserve(16);
+    char name[256];
+    for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
+      const bool isDir = file.isDirectory();
+      file.getName(name, sizeof(name));
+      file.close();
+      if (isDir) continue;
+      names.emplace_back(name);
+    }
+    dir.close();
+    int unbaked = 0;
+    int unbakeable = 0;
+    for (const auto& n : names) {
+      if (n.empty() || n[0] == '.') continue;
+      const bool isPng = FsHelpers::hasPngExtension(n);
+      const bool isBmp = FsHelpers::hasBmpExtension(n);
+      if (!isPng && !isBmp) continue;
+      const std::string full = std::string(dirPath) + "/" + n;
+      if (SleepCache::cacheExists(full)) continue;  // already baked
+      // v18.9.9.302: match the bake-skip criteria so the prompt count
+      // only reflects files the bake action can actually produce a .slp
+      // for. Transparent PNGs use the runtime composite path; grayscale
+      // BMPs need the runtime grayscale pass. Counting them as "unbaked"
+      // makes the prompt refire in an infinite loop after every
+      // successful bake=0/skipped=N run.
+      if (isPng && SleepCache::pngHasTransparency(full)) { unbakeable++; continue; }
+      if (isBmp) {
+        // Header sniff via Bitmap parser -- cheap (parses ~30 bytes).
+        FsFile bmpFile;
+        if (Storage.openFileForRead("SLPP", full, bmpFile)) {
+          Bitmap bitmap(bmpFile);
+          if (bitmap.parseHeaders() == BmpReaderError::Ok && bitmap.hasGreyscale()) {
+            unbakeable++;
+            bmpFile.close();
+            continue;
+          }
+          bmpFile.close();
+        }
+      }
+      unbaked++;
+    }
+    LOG_INF("SLPP", "%s: %u unbaked (of %u total; %u unbakeable transparent/grey)",
+            dirPath, (unsigned)unbaked, (unsigned)names.size(), (unsigned)unbakeable);
+    return unbaked;
+  }
+  return 0;
+}
+}  // namespace
+
+void HomeActivity::maybeShowSleepBakePrompt() {
+  // Once per session -- navigating in/out of Home shouldn't re-prompt.
+  static bool s_promptedThisSession = false;
+  if (s_promptedThisSession) return;
+  s_promptedThisSession = true;
+
+  // User picked "Never" previously -- respect that.
+  if (Storage.exists(kSleepBakeDeclinedSidecar)) return;
+
+  // Heap floor: if entry heap is already tight, skip the walk +
+  // certainly skip pushing another activity on the stack. Fresh Home
+  // entry heap is typically 50+ KB; we're being conservative.
+  if (ESP.getFreeHeap() < 40u * 1024u) return;
+
+  const int unbaked = countUnbakedSleepImages();
+  if (unbaked <= 0) return;
+
+  char body[256];
+  std::snprintf(body, sizeof(body), tr(STR_SLEEP_BAKE_PROMPT_BODY), unbaked);
+  startActivityForResult(
+      std::make_unique<ChoicePromptActivity>(
+          renderer, mappedInput,
+          tr(STR_SLEEP_BAKE_PROMPT_TITLE), body,
+          std::vector<std::string>{tr(STR_SLEEP_BAKE_OPT_BAKE),
+                                    tr(STR_SLEEP_BAKE_OPT_LATER),
+                                    tr(STR_SLEEP_BAKE_OPT_NEVER)},
+          /*ignoreInitialConfirmRelease=*/true),
+      [this](const ActivityResult& result) {
+        int chosen = -1;
+        if (const auto* cp = std::get_if<ChoicePromptResult>(&result.data)) chosen = cp->choice;
+        if (result.isCancelled || chosen < 0) {
+          // Treat cancel as "Later" -- don't set the never flag; ask
+          // again next boot in case they want to opt in later.
+          requestUpdate();
+          return;
+        }
+        if (chosen == 0) {
+          // "Bake now" -- silent-restart to run the bake with fresh
+          // ~93 KB heap. Same path Settings > Bake Sleep Images uses.
+          silentRestartToBakeSleepImages();
+          // never returns
+        } else if (chosen == 2) {
+          // "Never ask again" -- write the sidecar file. Tiny; no
+          // heap gate needed.
+          Storage.mkdir("/.crosspoint");
+          FsFile f;
+          if (Storage.openFileForWrite("SLPP", kSleepBakeDeclinedSidecar, f)) {
+            const uint8_t marker = 1;
+            f.write(&marker, 1);
+            f.close();
+          }
+        }
+        // "Later" (chosen == 1) falls through without setting the
+        // sidecar -- prompt fires again on next boot.
+        requestUpdate();
+      });
 }

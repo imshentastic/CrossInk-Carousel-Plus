@@ -56,6 +56,12 @@ class FontDecompressor {
     return v;
   }
 
+  // v18.9.9.345: public shim over the private freeHotGroup() so activities
+  // that know they're between renders (Home's postFirstRenderCleanup)
+  // can drop the hot-group buffer for a 1-3 KB reclaim. Safe to call
+  // anytime -- next getBitmap() re-decompresses on demand.
+  void releaseHotGroup() { freeHotGroup(); }
+
  private:
   Stats stats;
   bool oomOccurred = false;

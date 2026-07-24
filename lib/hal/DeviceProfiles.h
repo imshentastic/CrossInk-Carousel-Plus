@@ -74,12 +74,20 @@ constexpr DeviceProfile KNOWN_DEVICES[] = {
     // Free2-M page turner (common keyboard-mode mapping)
     {"Free2-M", nullptr, 0x02, 0x01, false, 2, false},
 
-    // Free3-M page turner (confirmed working keycodes from setup wizard)
-    {"Free3-M", nullptr, 0x02, 0x01, false, 2, false},
+    // Free3-M page turner (confirmed working keycodes from setup wizard).
+    // CrumBLE 4.5.5: flipped strictProfile -> true. Field log: user with a
+    // stale "Custom BLE Remote" learned profile (up=0x09 dn=0x08 idx=4) paired
+    // with a fresh Free3-M; the non-strict flag let the stale custom profile
+    // override this, so 0x02/0x01 at byte[2] never decoded and release frames
+    // (keycode=0) read as still-pressed -> activeInjectedButton stuck after the
+    // first press -> 2nd/3rd presses silently swallowed.
+    {"Free3-M", nullptr, 0x02, 0x01, false, 2, true},
 
     // Free3-R (R + sound mode): code in byte[0], clean 0x00 releases.
     // LEFT=0x01 (back), SELECT/RIGHT=0x02 (forward).
-    {"Free3-R", nullptr, 0x01, 0x02, false, 0, false},
+    // CrumBLE 4.5.5: byte[0] (vs the standard byte[2]) is genuinely device-
+    // specific framing; mark strict for the same reason as Free3-M above.
+    {"Free3-R", nullptr, 0x01, 0x02, false, 0, true},
 };
 
 constexpr int KNOWN_DEVICES_COUNT = sizeof(KNOWN_DEVICES) / sizeof(KNOWN_DEVICES[0]);

@@ -21,7 +21,17 @@ namespace glyphatlas {
 // every AtlasBlock. 'GATL' = 0x4C544147.
 constexpr uint32_t MAGIC = 0x4C544147;
 
-constexpr uint8_t FORMAT_VERSION = 1;
+// CrumBLE 4.5.5: v2 bumps bitmapBytes (BlockHeader) and bitmapOffset
+// (GlyphEntry) from uint16_t to uint32_t. The 64 KB cap that v1 imposed
+// truncated CJK 2-bit atlases (~500+ glyphs at 16 pt = 60+ KB and
+// climbing). v2 lifts that to 4 GB, which is meaningless on hardware
+// but trivially fits any realistic atlas. Reader (Section.cpp:tryInstall
+// GlyphAtlas) accepts both versions -- v1 atlases on device stay valid;
+// only re-baked sections upgrade to v2 with full glyph coverage. Writer
+// always emits v2 from this point.
+constexpr uint8_t FORMAT_VERSION_V1 = 1;
+constexpr uint8_t FORMAT_VERSION_V2 = 2;
+constexpr uint8_t FORMAT_VERSION = FORMAT_VERSION_V2;  // what the writer emits
 
 // Bit-depth options for the packed bitmap payload. Phase 1 ships 1-bit only;
 // 2-bit can be added later for higher-quality rendering when SD storage
@@ -48,9 +58,24 @@ struct BlockHeader {
   uint8_t styleMask;      // bit 0 = REGULAR, 1 = BOLD, 2 = ITALIC, 3 = BOLDITALIC
   uint8_t reserved;       // 0; reserved for future flags
   uint16_t totalGlyphs;   // sum of glyphCount across all styles
-  uint16_t bitmapBytes;   // size of raw bitmap data trailing the per-style
-                          // tables. Limit 64 KB per section, reasonable for
-                          // 600-glyph 1-bit atlases.
+  uint32_t bitmapBytes;   // size of raw bitmap data trailing the per-style
+                          // tables. v2 widened from uint16_t; 4 GB cap is
+                          // moot on this hardware but lifts the 64 KB
+                          // wire-format cap that was truncating CJK 2-bit
+                          // atlases (~500 glyphs at 16 pt = 60+ KB).
+} __attribute__((packed));
+
+// CrumBLE 4.5.5: legacy v1 wire layout, retained ONLY so Section.cpp's
+// reader can deserialise already-baked v41 prebakes on device. New
+// bakes never use this -- BlockHeader (above) is what the writer emits.
+struct BlockHeaderV1 {
+  uint32_t magic;
+  uint8_t version;
+  uint8_t bitDepth;
+  uint8_t styleMask;
+  uint8_t reserved;
+  uint16_t totalGlyphs;
+  uint16_t bitmapBytes;   // 64 KB cap, the reason for v2
 } __attribute__((packed));
 
 // Per-style metadata header. Written once per style bit set in styleMask,
@@ -78,8 +103,13 @@ struct GlyphEntry {
   uint32_t codepoint;     // UTF-32 (single code point per entry; ligatures
                           // are emitted as separate entries with codepoints
                           // from the LIG_FIRST range -- see ligatures.h)
-  uint16_t bitmapOffset;  // byte offset into the BlockHeader's bitmap
+  uint32_t bitmapOffset;  // byte offset into the BlockHeader's bitmap
                           // payload. 0 is a valid offset (first glyph).
+                          // v2 widened from uint16_t -- same reason as
+                          // BlockHeader::bitmapBytes above. EpdGlyph::
+                          // dataOffset already uint32_t so the runtime
+                          // path was always wide enough; only the wire
+                          // layout was constrained.
   uint8_t width;          // glyph bitmap width in pixels
   uint8_t height;         // glyph bitmap height in pixels
   int8_t left;            // x offset from cursor to bitmap's left edge
@@ -89,9 +119,22 @@ struct GlyphEntry {
   uint16_t advanceX;      // 12.4 fixed-point pixels (matches EpdGlyph)
 } __attribute__((packed));
 
-static_assert(sizeof(BlockHeader) == 12, "BlockHeader must be 12 bytes on the wire");
+// CrumBLE 4.5.5: legacy v1 wire layout, reader-only (see BlockHeaderV1).
+struct GlyphEntryV1 {
+  uint32_t codepoint;
+  uint16_t bitmapOffset;  // 64 KB-limited; widened in v2
+  uint8_t width;
+  uint8_t height;
+  int8_t left;
+  int8_t top;
+  uint16_t advanceX;
+} __attribute__((packed));
+
+static_assert(sizeof(BlockHeader) == 14, "BlockHeader (v2) must be 14 bytes on the wire");
+static_assert(sizeof(BlockHeaderV1) == 12, "BlockHeaderV1 must be 12 bytes on the wire");
 static_assert(sizeof(StyleHeader) == 12, "StyleHeader must be 12 bytes on the wire");
-static_assert(sizeof(GlyphEntry) == 12, "GlyphEntry must be 12 bytes on the wire");
+static_assert(sizeof(GlyphEntry) == 14, "GlyphEntry (v2) must be 14 bytes on the wire");
+static_assert(sizeof(GlyphEntryV1) == 12, "GlyphEntryV1 must be 12 bytes on the wire");
 
 // Helpers for packed bitmap addressing. The bitmap payload is a CONTINUOUS
 // bitstream (no per-row alignment) so a single (y*width + x) pixel index

@@ -1,11 +1,13 @@
 #define HAL_STORAGE_IMPL
 #include "HalStorage.h"
 
-#include <FS.h>  // need to be included before SdFat.h for compatibility with FS.h's File class
+#include <Arduino.h>  // ESP.getFreeHeap/getMaxAllocHeap for OOM diagnostics
+#include <FS.h>       // need to be included before SdFat.h for compatibility with FS.h's File class
 #include <Logging.h>
 #include <SDCardManager.h>
 
 #include <cassert>
+#include <new>  // std::nothrow
 
 #include "HalSpiBus.h"
 
@@ -14,7 +16,12 @@
 HalStorage HalStorage::instance;
 
 HalStorage::HalStorage() {
-  storageMutex = xSemaphoreCreateMutex();
+  // CrumBLE 4.5.6 (ported CP#2135): recursive mutex so the same task can
+  // re-enter StorageLock without self-deadlock. openFileForRead/Write take
+  // the lock and then assign to a HalFile& out-param; if that out-param
+  // already held an Impl, its dtor takes the lock again to close the prior
+  // FsFile under serialization (see HalFile::Impl::~Impl below).
+  storageMutex = xSemaphoreCreateRecursiveMutex();
   assert(storageMutex != nullptr);
 }
 
@@ -31,8 +38,8 @@ bool HalStorage::ready() const { return SDCard.ready(); }
 
 class HalStorage::StorageLock {
  public:
-  StorageLock() : spiLock() { xSemaphoreTake(HalStorage::getInstance().storageMutex, portMAX_DELAY); }
-  ~StorageLock() { xSemaphoreGive(HalStorage::getInstance().storageMutex); }
+  StorageLock() : spiLock() { xSemaphoreTakeRecursive(HalStorage::getInstance().storageMutex, portMAX_DELAY); }
+  ~StorageLock() { xSemaphoreGiveRecursive(HalStorage::getInstance().storageMutex); }
 
  private:
   HalSpiBus::Lock spiLock;
@@ -60,11 +67,87 @@ bool HalStorage::writeFile(const char* path, const String& content) {
   HAL_STORAGE_WRAPPED_CALL(writeFile, path, content);
 }
 
+// v18.9.9.311: header docstring explains the sequence. Retries once with a
+// 100 ms delay because the cheap bundled SD cards intermittently reject a
+// write that succeeds on retry -- one of the user-reported failure modes
+// the "Cannot save progress" incidents traced back to.
+bool HalStorage::writeFileWithBackup(const char* path, const String& content) {
+  if (!path || !*path) return false;
+  const String tmpPath = String(path) + ".tmp";
+  const String bakPath = String(path) + ".bak";
+
+  auto attemptSequence = [&]() -> bool {
+    // Step 1: write fresh content to tmp. If this fails there's nothing to
+    // clean up on disk (writeFile leaves partial files behind on error but
+    // they get overwritten next attempt).
+    if (!writeFile(tmpPath.c_str(), content)) {
+      LOG_ERR("HALSTOR", "writeFileWithBackup: tmp write failed for %s", path);
+      return false;
+    }
+    // Step 2: promote current path -> bak (only if current exists).
+    if (exists(path)) {
+      // Remove any stale .bak so rename can land. SdFat's rename may fail
+      // if destination exists depending on card; explicit remove is safe.
+      remove(bakPath.c_str());
+      if (!rename(path, bakPath.c_str())) {
+        LOG_ERR("HALSTOR", "writeFileWithBackup: rename %s -> %s failed", path, bakPath.c_str());
+        // tmp exists but we couldn't move current out of the way. Leave
+        // tmp for next attempt; primary and bak are untouched. Bail.
+        return false;
+      }
+    }
+    // Step 3: rename tmp -> path.
+    if (!rename(tmpPath.c_str(), path)) {
+      LOG_ERR("HALSTOR", "writeFileWithBackup: rename tmp -> %s failed", path);
+      // Fatal: primary is now gone (moved to bak in step 2) and tmp
+      // couldn't take its place. Try to restore bak -> primary so the
+      // caller isn't left with a hole. If THAT fails too, we're in a
+      // bad state but the bak file still holds the last good content.
+      rename(bakPath.c_str(), path);
+      return false;
+    }
+    return true;
+  };
+
+  if (attemptSequence()) return true;
+  // One retry after a short delay.
+  delay(100);
+  return attemptSequence();
+}
+
+String HalStorage::readFileWithFallback(const char* path, bool& outFromBackup) {
+  outFromBackup = false;
+  if (!path || !*path) return String();
+
+  String primary = readFile(path);
+  if (!primary.isEmpty()) return primary;
+
+  const String bakPath = String(path) + ".bak";
+  String bak = readFile(bakPath.c_str());
+  if (!bak.isEmpty()) {
+    LOG_INF("HALSTOR", "readFileWithFallback: primary %s empty/missing, using .bak", path);
+    outFromBackup = true;
+    return bak;
+  }
+  return String();
+}
+
 bool HalStorage::ensureDirectoryExists(const char* path) { HAL_STORAGE_WRAPPED_CALL(ensureDirectoryExists, path); }
 
 class HalFile::Impl {
  public:
   Impl(FsFile&& fsFile) : file(std::move(fsFile)) {}
+  // CrumBLE 4.5.6 (ported CP#2135): SdFat is not thread-safe; FsFile::close()
+  // touches SD/SPI and must run under StorageLock or it races SdSpiCard's
+  // m_spiActive across tasks and trips FreeRTOS's xTaskPriorityDisinherit
+  // assert. Recursive mutex (see HalStorage ctor above) lets the same task
+  // re-enter safely. The FsFile member destructor (DESTRUCTOR_CLOSES_FILE=1)
+  // will close() again after the lock releases, but close() on an already-
+  // closed FsFile is a no-op.
+  ~Impl() {
+    HalStorage::StorageLock lock;
+    file.close();
+  }
   FsFile file;
 };
 
@@ -80,7 +163,16 @@ HalFile& HalFile::operator=(HalFile&&) = default;
 
 HalFile HalStorage::open(const char* path, const oflag_t oflag) {
   StorageLock lock;  // ensure thread safety for the duration of this function
-  return HalFile(std::make_unique<HalFile::Impl>(SDCard.open(path, oflag)));
+  FsFile fsFile = SDCard.open(path, oflag);
+  // v18.9.9: nothrow Impl alloc. See main.cpp:1638 terminate-handler note --
+  // make_unique<Impl> throws bad_alloc under tight heap (BT + Simple
+  // Rendering), which -fno-exceptions converts to std::terminate + reboot.
+  auto* rawImpl = new (std::nothrow) HalFile::Impl(std::move(fsFile));
+  if (!rawImpl) {
+    LOG_ERR("HFS", "open(%s): Impl alloc failed free=%u maxAlloc=%u", path, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    return HalFile();
+  }
+  return HalFile(std::unique_ptr<HalFile::Impl>(rawImpl));
 }
 
 bool HalStorage::mkdir(const char* path, const bool pFlag) { HAL_STORAGE_WRAPPED_CALL(mkdir, path, pFlag); }
@@ -98,7 +190,14 @@ bool HalStorage::openFileForRead(const char* moduleName, const char* path, HalFi
   StorageLock lock;  // ensure thread safety for the duration of this function
   FsFile fsFile;
   bool ok = SDCard.openFileForRead(moduleName, path, fsFile);
-  file = HalFile(std::make_unique<HalFile::Impl>(std::move(fsFile)));
+  auto* rawImpl = new (std::nothrow) HalFile::Impl(std::move(fsFile));
+  if (!rawImpl) {
+    LOG_ERR("HFS", "openFileForRead(%s,%s): Impl alloc failed free=%u maxAlloc=%u", moduleName, path, ESP.getFreeHeap(),
+            ESP.getMaxAllocHeap());
+    file = HalFile();
+    return false;
+  }
+  file = HalFile(std::unique_ptr<HalFile::Impl>(rawImpl));
   return ok;
 }
 
@@ -114,7 +213,14 @@ bool HalStorage::openFileForWrite(const char* moduleName, const char* path, HalF
   StorageLock lock;  // ensure thread safety for the duration of this function
   FsFile fsFile;
   bool ok = SDCard.openFileForWrite(moduleName, path, fsFile);
-  file = HalFile(std::make_unique<HalFile::Impl>(std::move(fsFile)));
+  auto* rawImpl = new (std::nothrow) HalFile::Impl(std::move(fsFile));
+  if (!rawImpl) {
+    LOG_ERR("HFS", "openFileForWrite(%s,%s): Impl alloc failed free=%u maxAlloc=%u", moduleName, path,
+            ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    file = HalFile();
+    return false;
+  }
+  file = HalFile(std::unique_ptr<HalFile::Impl>(rawImpl));
   return ok;
 }
 
@@ -180,7 +286,13 @@ bool HalFile::close() { HAL_FILE_WRAPPED_CALL(close, ); }
 HalFile HalFile::openNextFile() {
   HalStorage::StorageLock lock;
   assert(impl != nullptr);
-  return HalFile(std::make_unique<Impl>(impl->file.openNextFile()));
+  FsFile next = impl->file.openNextFile();
+  auto* rawImpl = new (std::nothrow) Impl(std::move(next));
+  if (!rawImpl) {
+    LOG_ERR("HFS", "openNextFile: Impl alloc failed free=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    return HalFile();
+  }
+  return HalFile(std::unique_ptr<Impl>(rawImpl));
 }
 bool HalFile::isOpen() const { return impl != nullptr && impl->file.isOpen(); }  // already thread-safe, no need to wrap
 HalFile::operator bool() const { return isOpen(); }

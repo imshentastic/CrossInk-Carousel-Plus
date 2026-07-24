@@ -53,6 +53,46 @@ class EpdFontFamily {
     return false;
   }
 
+  // CrumBLE 4.5.4 UI font fallback. A single SD-card family can be
+  // registered as the fallback for all built-in UI fonts. When any
+  // EpdFontFamily's glyph lookup fails (in-family + typography
+  // substitutions all returned nothing), getGlyphData() consults the
+  // registered fallback BEFORE falling back to REPLACEMENT_GLYPH ('?').
+  // Lets a Latin built-in UI font render CJK book titles, settings labels,
+  // collection names, etc. when the user has loaded a CJK SD font for
+  // reading. The fallback never replaces glyphs the primary font already
+  // covers -- only fills in misses.
+  //
+  // Owner is SdCardFontSystem -- it calls setUiFallbackFamily() with the
+  // currently-loaded SD family on load, and nullptr on release. The
+  // pointer must outlive any rendering that might touch it; on font
+  // unload the system MUST clear this before deallocating the family.
+  static void setUiFallbackFamily(const EpdFontFamily* family);
+  static const EpdFontFamily* uiFallbackFamily();
+
+  // CrumBLE 4.5.4 task #5C: lazy-load hook for the UI fallback. When
+  // set AND uiFallbackFamily_ is null, the next glyph-miss in a UI
+  // render path triggers the loader callback, which loads + registers
+  // the SD-card font and sets uiFallbackFamily_. Subsequent renders
+  // use the resident pointer normally -- the hook fires exactly once.
+  // Purpose: avoid the ~15-25 KB resident cost at boot for users who
+  // never render CJK content (per field report: heap fragmentation
+  // at FT entry was dominated by the pre-loaded LXGW @14pt fallback).
+  // Owner is SdCardFontSystem; callback runs on the render task so
+  // it must not block on user input.
+  using LazyFallbackLoader = void (*)();
+  static void setLazyFallbackLoader(LazyFallbackLoader loader);
+
+  // CrumBLE 4.5.4 task #5C+: built-in fallback. Last-resort lookup after
+  // BOTH the primary font AND the UI fallback miss. Points at a built-in
+  // family with broad coverage (Bitter for Latin). Used when an SD CJK
+  // font is the primary -- LXGW etc. often ship CJK-only, so Latin /
+  // digits / punctuation in book text would render as '?' without this
+  // fallback. Owner is main.cpp / setupDisplayAndFonts which installs it
+  // alongside the font registration. Set once at boot, never cleared.
+  static void setBuiltInFallbackFamily(const EpdFontFamily* family);
+  static const EpdFontFamily* builtInFallbackFamily();
+
  private:
   const EpdFont* regular;
   const EpdFont* bold;

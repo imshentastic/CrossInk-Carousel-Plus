@@ -1,5 +1,6 @@
 #pragma once
 
+#include <HalStorage.h>  // v20 Phase B: parseFile_ member for resumable parse
 #include <expat.h>
 
 #include <climits>
@@ -181,9 +182,46 @@ class ChapterHtmlSlimParser {
         imageBasePath(imageBasePath) {}
 
   ~ChapterHtmlSlimParser() = default;
+
+  // One-shot parse: builds every page before returning (begin + step* + finish).
   bool parseAndBuildPages();
+
+  // v20 Phase B (from CrossPoint PR #2452 Smart Indexing): resumable parse
+  // for the incremental section builder. Drive as:
+  //   if (!beginParse()) fail;
+  //   loop: switch (parseStep()) { More: keep going/yield; Done: finishParse();
+  //                                Error: abortParse(); }
+  // Pages emit via completePageFn as they complete during parseStep(), so the
+  // caller can stop once enough pages exist and resume on a later tick.
+  //
+  // CrumBLE preserves parseAndBuildPages as the one-shot wrapper AND keeps
+  // every parse-time guard (popup tick, watchdog yield, lowMemoryAbort check,
+  // per-iter DBG log). The step methods themselves are cheap — no popup/yield
+  // inside — so an incremental caller can schedule its own pacing.
+  enum class ParseStatus { More, Done, Error };
+  bool beginParse();
+  ParseStatus parseStep();
+  bool finishParse();  // flush the trailing page and tear down; returns true
+  void abortParse();   // tear down without flushing (error / abandon)
+
+  // Byte progress of the in-flight parse — used by the incremental section
+  // builder to estimate a still-building section's total page count.
+  // Valid between beginParse() and finishParse()/abortParse().
+  size_t parseBytesConsumed() { return parseFile_ ? parseFile_.position() : 0; }
+  size_t parseTotalBytes() { return parseFile_ ? parseFile_.size() : 0; }
+
   void addLineToPage(std::shared_ptr<TextBlock> line);
   const std::vector<std::pair<std::string, uint16_t>>& getAnchors() const { return anchorData; }
   bool wasLowMemoryFallbackTriggered() const { return lowMemoryImageFallback; }
   bool wasLowMemoryAbortTriggered() const { return lowMemoryAbort; }
+
+ private:
+  // Resumable parse state. parseAndBuildPages() drives these internally; the
+  // incremental section builder drives them across render ticks so a large
+  // single chapter can yield between pages instead of blocking the UI until
+  // the whole thing is laid out. xmlParser_ + parseFile_ stay alive for the
+  // parse's lifetime so it can be paused and resumed at buffer boundaries.
+  XML_Parser xmlParser_ = nullptr;
+  FsFile parseFile_;
+  uint32_t parseStartTime_ = 0;
 };

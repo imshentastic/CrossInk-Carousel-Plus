@@ -7,6 +7,7 @@
 #include <Epub.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
+#include <HalClock.h>
 #include <HalPowerManager.h>
 #include <HalStorage.h>
 #include <I18n.h>
@@ -14,13 +15,22 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <numeric>
 #include <string>
 #include <vector>
 
 #include "RecentBooksStore.h"
 #include "activities/reader/BookReadingStats.h"
+#include "activities/reader/GlobalReadingStats.h"
+#include "activities/reader/ReadingStatsUtils.h"
 #include "components/UITheme.h"
+#include "components/icons/afternoon.h"
+#include "components/icons/book24.h"
 #include "components/icons/cover.h"
+#include "components/icons/evening.h"
+#include "components/icons/morning.h"
+#include "components/icons/night.h"
+#include "components/icons/streak.h"
 #include "fontIds.h"
 
 namespace {
@@ -262,12 +272,37 @@ void MinimalTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char
       renderer, Rect{batteryX, rect.y + 5, MinimalMetrics::values.batteryWidth, MinimalMetrics::values.batteryHeight},
       showBatteryPercentage);
 
+  // v18.9.9.470: mirror BaseTheme::drawHeader's Home clock render so the
+  // Dashboard theme (which inherits this drawHeader) can show a clock next
+  // to the battery when SETTINGS.homeClockShow is on and the system clock
+  // is valid. On X4 this fills in after SNTP; X3 always has DS3231 time.
+  if (SETTINGS.homeClockShow && halClock.hasValidTime()) {
+    char timeBuf[9];
+    if (halClock.formatTime(timeBuf, sizeof(timeBuf), SETTINGS.clockUtcOffsetQ, SETTINGS.clockFormat == 1)) {
+      int batteryClusterLeft = batteryX;
+      if (showBatteryPercentage) {
+        const std::string pct = std::to_string(powerManager.getBatteryPercentage()) + "%";
+        batteryClusterLeft -= renderer.getTextWidth(SMALL_FONT_ID, pct.c_str()) + 4;
+      }
+      constexpr int kClockToBatteryGap = 10;
+      const int clockTextWidth = renderer.getTextWidth(SMALL_FONT_ID, timeBuf);
+      const int clockX = batteryClusterLeft - kClockToBatteryGap - clockTextWidth;
+      renderer.drawText(SMALL_FONT_ID, clockX, rect.y + 5, timeBuf);
+    }
+  }
+
   if (title) {
     constexpr int titleInsetX = 12;
     const int maxTitleWidth = batteryX - rect.x - titleInsetX - MinimalMetrics::values.contentSidePadding;
     auto truncatedTitle = renderer.truncatedText(UI_12_FONT_ID, title, maxTitleWidth, EpdFontFamily::BOLD);
-    renderer.drawText(UI_12_FONT_ID, rect.x + titleInsetX, rect.y + MinimalMetrics::values.batteryBarHeight + 3,
-                      truncatedTitle.c_str(), true, EpdFontFamily::BOLD);
+    // v18.9.9.470: title was at batteryBarHeight+3 (43px from top) with the
+    // divider at headerHeight-3 (49px). UI_12 is ~20px tall so the bottom
+    // of the title bled ~14px past the divider — visible as a horizontal
+    // line slicing through "Settings" / "File Browser" / etc. Match
+    // LyraTheme's compact positioning: sit the title just below the battery
+    // icon row, well above the divider.
+    const int titleY = rect.y + MinimalMetrics::values.batteryHeight + 6;
+    renderer.drawText(UI_12_FONT_ID, rect.x + titleInsetX, titleY, truncatedTitle.c_str(), true, EpdFontFamily::BOLD);
     renderer.drawLine(rect.x, rect.y + rect.height - 3, rect.x + rect.width - 1, rect.y + rect.height - 3, 3, true);
   }
 }
@@ -521,15 +556,149 @@ void MinimalTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const s
   drawProgressBlock(renderer, coverRect, stats, progressPercent, false);
 }
 
+// v18.9.9.466: 1:1 port of CrossInk v1.4.0 MinimalTheme sleep code.
+// drawSleepScreen gains an `inverted` param (defaults false = BLACK background).
+// drawStatsSleepScreen is the new name (was CrumBLE drawSleepScreenWithStats).
+// Deviations from upstream:
+//   - Icons use Book24Icon placeholder (upstream has dedicated
+//     MorningReaderIcon/StreakIcon/etc that we haven't ported yet — v467 will).
+//   - X3-only overlay gate relaxed to isRtcCapable() so X4 users with SNTP
+//     still see the stats overlay.
+
+namespace {
+constexpr int kStatsFooterReaderIconSize = 24;
+constexpr int kStatsFooterStreakIconSize = 24;
+constexpr int kStatsFooterSideInset = 48;
+
+bool dominantReaderTypeBucket(const GlobalReadingStats& globalStats, ReadingTimeBucket& bucketOut) {
+  const auto& values = globalStats.timeOfDaySeconds;
+  const uint32_t totalSeconds = std::accumulate(values.begin(), values.end(), 0u);
+  if (totalSeconds == 0) return false;
+  const size_t dominantIndex =
+      static_cast<size_t>(std::distance(values.begin(), std::max_element(values.begin(), values.end())));
+  bucketOut = static_cast<ReadingTimeBucket>(dominantIndex);
+  return true;
+}
+
+const char* readerTypeLabel(const GlobalReadingStats& globalStats) {
+  ReadingTimeBucket bucket = ReadingTimeBucket::Night;
+  if (!dominantReaderTypeBucket(globalStats, bucket)) return tr(STR_STATS_NEW_READER);
+  switch (bucket) {
+    case ReadingTimeBucket::Morning: return tr(STR_STATS_MORNING_READER);
+    case ReadingTimeBucket::Afternoon: return tr(STR_STATS_AFTERNOON_READER);
+    case ReadingTimeBucket::Evening: return tr(STR_STATS_EVENING_READER);
+    case ReadingTimeBucket::Night:
+    default: return tr(STR_STATS_NIGHT_READER);
+  }
+}
+
+// v18.9.9.467: real reader-type icons ported 1:1 from CrossInk.
+const uint8_t* readerTypeIcon(const GlobalReadingStats& globalStats) {
+  ReadingTimeBucket bucket = ReadingTimeBucket::Night;
+  if (!dominantReaderTypeBucket(globalStats, bucket)) return Book24Icon;
+  switch (bucket) {
+    case ReadingTimeBucket::Morning: return MorningReaderIcon;
+    case ReadingTimeBucket::Afternoon: return AfternoonReaderIcon;
+    case ReadingTimeBucket::Evening: return EveningReaderIcon;
+    case ReadingTimeBucket::Night:
+    default: return NightReaderIcon;
+  }
+}
+
+void formatStreakStat(const GlobalReadingStats& globalStats, char* buf, const size_t len) {
+  if (len == 0) return;
+  ReadingStatsDateTime today;
+  const uint16_t streak =
+      getCurrentLocalReadingStatsDateTime(today) ? globalStats.currentReadingStreak(&today.date) : 0;
+  if (streak == 0) {
+    snprintf(buf, len, "%s", tr(STR_STATS_NO_STREAK));
+    return;
+  }
+  snprintf(buf, len, tr(STR_STATS_DAY_STREAK_FORMAT), static_cast<unsigned>(streak));
+}
+
+// v18.9.9.466: coverImageRectForFrame already defined earlier in this file
+// (line ~73); relying on that. Removed duplicate.
+
+int progressLabelBottomY(const GfxRenderer& renderer, const Rect& coverRect, const float progressPercent) {
+  if (progressPercent < 0.0f) return coverRect.y + coverRect.height;
+  const int durationY = coverRect.y + coverRect.height + kProgressBlockGap;
+  const int barY = durationY + renderer.getLineHeight(UI_10_FONT_ID) + kProgressBarGap;
+  const int labelY = barY + kProgressBarHeight + kProgressLabelGap;
+  return labelY + renderer.getLineHeight(UI_10_FONT_ID);
+}
+
+void drawCenteredStatsRow(const GfxRenderer& renderer, const uint8_t* icon, const int iconSize, const char* label,
+                          const int regionTop, const int regionBottom, const bool inverted) {
+  const int screenWidth = renderer.getScreenWidth();
+  const int regionHeight = regionBottom - regionTop;
+  if (regionHeight <= 0) return;
+  const int labelLineHeight = renderer.getLineHeight(UI_10_FONT_ID);
+  const int rowHeight = std::max(labelLineHeight, iconSize);
+  const int topY = regionTop + std::max(0, regionHeight - rowHeight) / 2;
+  const int availableWidth = std::max(1, screenWidth - kStatsFooterSideInset * 2);
+  const int iconTextGap = 10;
+  const std::string text = renderer.truncatedText(UI_10_FONT_ID, label, availableWidth - iconSize - iconTextGap);
+  const int textWidth = renderer.getTextWidth(UI_10_FONT_ID, text.c_str());
+  const int blockWidth = iconSize + iconTextGap + textWidth;
+  const int iconX = (screenWidth - blockWidth) / 2;
+  const int iconY = topY + (rowHeight - iconSize) / 2;
+  const int textX = iconX + iconSize + iconTextGap;
+  const int textY = topY + (rowHeight - labelLineHeight) / 2;
+  // Non-inverted: BLACK background → drawIconInverted gives WHITE icon.
+  // Inverted: WHITE background → drawIcon gives BLACK icon.
+  if (inverted) {
+    renderer.drawIcon(icon, iconX, iconY, iconSize, iconSize);
+  } else {
+    renderer.drawIconInverted(icon, iconX, iconY, iconSize, iconSize);
+  }
+  renderer.drawText(UI_10_FONT_ID, textX, textY, text.c_str(), inverted);
+}
+
+void drawStatsOverlay(const GfxRenderer& renderer, const GlobalReadingStats& globalStats, const Rect& coverRect,
+                      const float progressPercent, const bool inverted) {
+  // CrumBLE deviation: gate on isRtcCapable() (== clock-valid) rather than
+  // upstream's deviceIsX3(). X4 users with SNTP get the overlay.
+  ReadingStatsDateTime probe;
+  if (!getCurrentLocalReadingStatsDateTime(probe)) return;
+
+  char streakBuf[48];
+  formatStreakStat(globalStats, streakBuf, sizeof(streakBuf));
+  const char* readerLabel = readerTypeLabel(globalStats);
+
+  const int readerRegionTop = 0;
+  const int readerRegionBottom = coverImageRectForFrame(coverRect).y;
+  drawCenteredStatsRow(renderer, readerTypeIcon(globalStats), kStatsFooterReaderIconSize, readerLabel, readerRegionTop,
+                       readerRegionBottom, inverted);
+
+  const int streakRegionTop = progressLabelBottomY(renderer, coverRect, progressPercent);
+  const int streakRegionBottom = renderer.getScreenHeight();
+  drawCenteredStatsRow(renderer, StreakIcon, kStatsFooterStreakIconSize, streakBuf, streakRegionTop,
+                       streakRegionBottom, inverted);
+}
+}  // namespace
+
 void MinimalTheme::drawSleepScreen(const GfxRenderer& renderer, const RecentBook& book, const BookReadingStats* stats,
-                                   const float progressPercent) const {
-  renderer.clearScreen(0x00);
+                                   const float progressPercent, const bool inverted) const {
+  renderer.clearScreen(inverted ? 0xFF : 0x00);
 
   const Rect contentRect{0, MinimalMetrics::values.homeTopPadding, renderer.getScreenWidth(),
                          MinimalMetrics::values.homeCoverTileHeight};
   const Rect coverRect = coverRectForScreen(renderer, contentRect);
-  drawBookCover(renderer, coverRect, book, Color::Black);
-  drawProgressBlock(renderer, coverRect, stats, progressPercent, true);
+  drawBookCover(renderer, coverRect, book, inverted ? Color::White : Color::Black);
+  drawProgressBlock(renderer, coverRect, stats, progressPercent, !inverted);
+}
+
+void MinimalTheme::drawStatsSleepScreen(const GfxRenderer& renderer, const RecentBook& book,
+                                        const BookReadingStats* stats, const GlobalReadingStats* globalStats,
+                                        const float progressPercent, const bool inverted) const {
+  drawSleepScreen(renderer, book, stats, progressPercent, inverted);
+  if (globalStats != nullptr) {
+    const Rect contentRect{0, MinimalMetrics::values.homeTopPadding, renderer.getScreenWidth(),
+                           MinimalMetrics::values.homeCoverTileHeight};
+    const Rect coverRect = coverRectForScreen(renderer, contentRect);
+    drawStatsOverlay(renderer, *globalStats, coverRect, progressPercent, inverted);
+  }
 }
 
 void MinimalTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,

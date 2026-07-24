@@ -85,6 +85,18 @@ std::vector<FileBrowserActionActivity::MenuItem> buildBookActionItems(const std:
   if (options.showMetadata && isBookFile) {
     items.push_back({FileBrowserAction::ShowMetadata, StrId::STR_SHOW_METADATA});
   }
+  // v18.9.9.170: refresh cover thumbnail. Non-destructive -- placed above the
+  // cache/stats/delete cluster since it only regenerates derived state.
+  if (options.refreshCover && isBookFile) {
+    items.push_back({FileBrowserAction::RefreshCover, StrId::STR_REFRESH_COVER});
+  }
+  // v18.9.9.356: global "Retry failed covers" -- book-independent, sweeps
+  // every thumb-failed marker so stuck placeholders get another decode
+  // attempt on the next Home paint. Placed near RefreshCover so the two
+  // cover-related actions cluster together.
+  if (options.retryFailedCovers) {
+    items.push_back({FileBrowserAction::RetryFailedCovers, StrId::STR_RETRY_COVERS_SHORT});
+  }
   // 5. Delete book cache
   if (hasClearableBookCache(fullPath)) {
     items.push_back({FileBrowserAction::DeleteCache, StrId::STR_DELETE_CACHE});
@@ -95,6 +107,14 @@ std::vector<FileBrowserActionActivity::MenuItem> buildBookActionItems(const std:
   // destructive-but-bounded actions cluster together above plain Delete.
   if (FsHelpers::hasEpubExtension(fullPath)) {
     items.push_back({FileBrowserAction::DeleteStats, StrId::STR_DELETE_BOOK_STATS});
+  }
+  // 5c. v18.9.6.2: Simple Rendering toggle. EPUB-only (only path with the
+  // reader-side escalation hooks). Label flips based on current state so
+  // the row reads as an action, not a status.
+  if (FsHelpers::hasEpubExtension(fullPath)) {
+    const StrId label = hasSimpleRenderingSidecar(fullPath) ? StrId::STR_DISABLE_SIMPLE_RENDERING
+                                                            : StrId::STR_ENABLE_SIMPLE_RENDERING;
+    items.push_back({FileBrowserAction::ToggleSimpleRendering, label});
   }
   // 6. Delete file -- always last as the most destructive.
   items.push_back({FileBrowserAction::Delete, StrId::STR_DELETE});
@@ -179,6 +199,25 @@ BookHeaderText resolveBookHeaderText(const std::string& fullPath) {
     if (!a.empty()) out.author = a;
   }
 
+  // v18.9.9.225: sanitize the displayed author. EPUB dc:creator often
+  // ships with trailing punctuation (Calibre exports frequently do
+  // "Pierce Brown;") and multi-author strings split by ';'. Take the
+  // primary author (before first ';'), strip trailing punctuation.
+  // Mirrors the LibraryIndex key-derivation logic so display + sort
+  // agree on the same normalized form.
+  if (!out.author.empty()) {
+    const size_t semi = out.author.find(';');
+    if (semi != std::string::npos) out.author.resize(semi);
+    while (!out.author.empty()) {
+      const char c = out.author.back();
+      if (c == ' ' || c == '\t' || c == '.' || c == ',' || c == ';' || c == ':' || c == '!' || c == '?') {
+        out.author.pop_back();
+      } else {
+        break;
+      }
+    }
+  }
+
   return out;
 }
 
@@ -216,9 +255,128 @@ bool clearBookCache(const std::string& fullPath) {
   return false;
 }
 
+namespace {
+
+// Walk a directory and append child file paths that have associated metadata.
+// Mirrors the helper in FileBrowserActivity.cpp (kept local so the deferred-
+// delete code path in main.cpp doesn't have to reach into that activity's
+// translation unit). Recurses through subdirectories, no symlink handling
+// needed -- FAT.
+void collectChildPathsForDelete(const std::string& dirPath, std::vector<std::string>& paths) {
+  auto dir = Storage.open(dirPath.c_str());
+  if (!dir || !dir.isDirectory()) {
+    return;
+  }
+  char name[256];
+  for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
+    file.getName(name, sizeof(name));
+    std::string childPath = dirPath;
+    if (!childPath.empty() && childPath.back() != '/') childPath += '/';
+    childPath += name;
+    if (file.isDirectory()) {
+      collectChildPathsForDelete(childPath, paths);
+    } else {
+      // Push every file path -- clearFileMetadata is a no-op for paths
+      // without metadata (extension check + missing-cache return). Cheaper
+      // than gating on FsHelpers::hasEpubExtension here.
+      paths.push_back(childPath);
+    }
+    file.close();
+  }
+  dir.close();
+}
+
+}  // namespace
+
+void executeDeferredDelete(const std::string& fullPath, bool isDir) {
+  executeDeferredOperation(fullPath, isDir ? 1 : 0);
+}
+
+void executeDeferredOperation(const std::string& fullPath, uint8_t action) {
+  if (fullPath.empty()) {
+    LOG_INF("BookActions", "Deferred operation skipped: empty path");
+    return;
+  }
+  // action == 2 -> clear book cache. Same heap-shape as a directory delete
+  // (walks the prebake-cache subdir recursively), but the cleanup is scoped
+  // to the EPUB's cache directory rather than the SD path itself. Used when
+  // FileBrowserActivity's "Delete book cache" hit the heap floor and
+  // deferred via silent restart.
+  if (action == 2) {
+    LOG_INF("BookActions", "Executing deferred clearBookCache: %s (heap free=%u maxAlloc=%u)",
+            fullPath.c_str(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    if (!clearBookCache(fullPath)) {
+      LOG_ERR("BookActions", "Deferred clearBookCache failed: %s", fullPath.c_str());
+      return;
+    }
+    LOG_INF("BookActions", "Deferred clearBookCache complete: %s", fullPath.c_str());
+    return;
+  }
+  const bool isDir = (action == 1);
+  if (isDir) {
+    LOG_INF("BookActions", "Executing deferred dir-delete: %s (heap free=%u maxAlloc=%u)",
+            fullPath.c_str(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    std::vector<std::string> childPaths;
+    collectChildPathsForDelete(fullPath, childPaths);
+    if (!Storage.removeDir(fullPath.c_str())) {
+      LOG_ERR("BookActions", "Deferred dir-delete failed: %s", fullPath.c_str());
+      return;
+    }
+    for (const auto& child : childPaths) {
+      clearFileMetadata(child);
+    }
+    LOG_INF("BookActions", "Deferred dir-delete complete: %s (%u child(ren) cleaned)",
+            fullPath.c_str(), static_cast<unsigned>(childPaths.size()));
+    return;
+  }
+
+  LOG_INF("BookActions", "Executing deferred file-delete: %s (heap free=%u maxAlloc=%u)",
+          fullPath.c_str(), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  clearFileMetadata(fullPath);
+  if (!Storage.remove(fullPath.c_str())) {
+    LOG_ERR("BookActions", "Deferred file-delete failed: %s", fullPath.c_str());
+    return;
+  }
+  LOG_INF("BookActions", "Deferred file-delete complete: %s", fullPath.c_str());
+}
+
 bool isEpubCompleted(const std::string& fullPath) {
   const Epub epub(fullPath, "/.crosspoint");
   return BookReadingStats::load(epub.getCachePath()).isCompleted;
+}
+
+// v18.9.6.2: Simple Rendering sidecar helpers. Match EpubReaderActivity's
+// internal helpers -- same filename, same location -- so the file the
+// reader writes on escalation and the file this menu toggles are the
+// same one.
+namespace {
+constexpr const char* kSimpleRenderingSidecarFilename = "/simple_rendering.flag";
+}
+
+bool hasSimpleRenderingSidecar(const std::string& fullPath) {
+  if (!FsHelpers::hasEpubExtension(fullPath)) return false;
+  const Epub epub(fullPath, "/.crosspoint");
+  const std::string path = epub.getCachePath() + kSimpleRenderingSidecarFilename;
+  return Storage.exists(path.c_str());
+}
+
+bool toggleSimpleRenderingSidecar(const std::string& fullPath) {
+  Epub epub(fullPath, "/.crosspoint");
+  epub.setupCacheDir();
+  const std::string path = epub.getCachePath() + kSimpleRenderingSidecarFilename;
+  if (Storage.exists(path.c_str())) {
+    Storage.remove(path.c_str());
+    LOG_INF("BookActions", "Simple Rendering sidecar removed: %s", path.c_str());
+    return false;
+  }
+  HalFile f;
+  if (Storage.openFileForWrite("BookActions", path.c_str(), f)) {
+    f.close();
+    LOG_INF("BookActions", "Simple Rendering sidecar written: %s", path.c_str());
+    return true;
+  }
+  LOG_ERR("BookActions", "Failed to write Simple Rendering sidecar: %s", path.c_str());
+  return false;
 }
 
 bool toggleEpubCompleted(const std::string& fullPath, const std::string& displayName, bool& completed) {

@@ -37,6 +37,11 @@ def patch_websockets(env):
         )
         if os.path.isfile(ws_header):
             _apply_max_data_size_guard(ws_header)
+        ws_cpp = os.path.join(
+            libdeps_dir, env_dir, "WebSockets", "src", "WebSockets.cpp"
+        )
+        if os.path.isfile(ws_cpp):
+            _apply_static_payload_buffer(ws_cpp)
 
 
 def _apply_max_data_size_guard(filepath):
@@ -119,6 +124,115 @@ def _apply_flush_guard_fix(filepath):
     with open(filepath, "w") as f:
         f.write(content)
     print("Patched WebSockets: ESP32 Arduino 3.x clear()/flush() guard: %s" % filepath)
+
+
+def _apply_static_payload_buffer(filepath):
+    """
+    Patch WebSockets.cpp to use a single file-scope static buffer for
+    incoming frame payloads instead of malloc-per-frame. The library's
+    default behaviour is `malloc(payloadLen + 1)` in handleWebsocket()
+    and `free(payload)` in handleWebsocketPayloadCb() -- on tight-heap
+    targets (ESP32-C3 ~190 KB) sustained BIN uploads disconnect the
+    moment heap can't deliver one more contiguous 4 KB chunk. The
+    library bails with clientDisconnect(1011) and the upload stalls.
+
+    Fix: keep a static uint8_t buf[WEBSOCKETS_MAX_DATA_SIZE + 1] at
+    file scope. When a frame arrives AND the static buf isn't already
+    in flight, use it. Otherwise fall back to malloc (multi-client edge
+    cases, oversize frames). Frees: only free() if the buffer was
+    malloc-allocated, else just release the in-use flag.
+
+    Cost: WEBSOCKETS_MAX_DATA_SIZE + 1 bytes of permanent .bss (~4 KB
+    with the project's override). Benefit: eliminates the per-frame
+    malloc-failure-disconnect cycle entirely for the common case (one
+    client uploading at a time).
+
+    Idempotent.
+    """
+    marker = "// CrossPoint patch: static payload buffer"
+    with open(filepath, "r") as f:
+        content = f.read()
+
+    if marker in content:
+        return
+
+    decl = (
+        "\n" + marker + "\n"
+        "static uint8_t g_wsStaticPayloadBuf[WEBSOCKETS_MAX_DATA_SIZE + 1];\n"
+        "static bool g_wsStaticPayloadInUse = false;\n"
+    )
+
+    # Insert at file scope, OUTSIDE any extern "C" {...} block. WebSockets.cpp
+    # wraps the libsha1 include in extern "C" and a naive "after last #include"
+    # would drop the static decls inside that block -- `static bool` then trips
+    # a C-linkage redefinition error on the C++ compile. Anchor on the comment
+    # block that starts the first real function definition instead.
+    anchor = "/**\n *\n * @param client WSclient_t *  ptr to the client struct"
+    idx = content.find(anchor)
+    if idx == -1:
+        print("WARNING: WebSockets.cpp static-payload patch: anchor not found in %s" % filepath)
+        return
+    content = content[:idx] + decl.lstrip("\n") + "\n" + content[idx:]
+
+    malloc_old = (
+        "        payload = (uint8_t *)malloc(header->payloadLen + 1);\n"
+        "\n"
+        "        if(!payload) {\n"
+        "            DEBUG_WEBSOCKETS(\"[WS][%d][handleWebsocket] to less memory to handle payload %d!\\n\", "
+        "client->num, header->payloadLen);\n"
+        "            clientDisconnect(client, 1011);\n"
+        "            return;\n"
+        "        }"
+    )
+    malloc_new = (
+        "        " + marker + "\n"
+        "        if (!g_wsStaticPayloadInUse && header->payloadLen <= WEBSOCKETS_MAX_DATA_SIZE) {\n"
+        "            g_wsStaticPayloadInUse = true;\n"
+        "            payload = g_wsStaticPayloadBuf;\n"
+        "        } else {\n"
+        "            payload = (uint8_t *)malloc(header->payloadLen + 1);\n"
+        "            if(!payload) {\n"
+        "                DEBUG_WEBSOCKETS(\"[WS][%d][handleWebsocket] to less memory to handle payload %d!\\n\", "
+        "client->num, header->payloadLen);\n"
+        "                clientDisconnect(client, 1011);\n"
+        "                return;\n"
+        "            }\n"
+        "        }"
+    )
+    if malloc_old not in content:
+        print(
+            "WARNING: WebSockets.cpp static-payload patch malloc target not found in %s "
+            "- library may have been updated" % filepath
+        )
+        return
+    content = content.replace(malloc_old, malloc_new, 1)
+
+    free_old = (
+        "        if(payload) {\n"
+        "            free(payload);\n"
+        "        }"
+    )
+    free_new = (
+        "        if(payload) {\n"
+        "            " + marker + " release\n"
+        "            if (payload == g_wsStaticPayloadBuf) {\n"
+        "                g_wsStaticPayloadInUse = false;\n"
+        "            } else {\n"
+        "                free(payload);\n"
+        "            }\n"
+        "        }"
+    )
+    if free_old not in content:
+        print(
+            "WARNING: WebSockets.cpp static-payload patch free target not found in %s "
+            "- library may have been updated" % filepath
+        )
+        return
+    content = content.replace(free_old, free_new, 1)
+
+    with open(filepath, "w") as f:
+        f.write(content)
+    print("Patched WebSockets: per-frame malloc replaced with static buffer: %s" % filepath)
 
 
 patch_websockets(env)

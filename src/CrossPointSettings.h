@@ -28,6 +28,10 @@ class CrossPointSettings {
     READING_STATS_SLEEP = 7,
     MINIMAL_SLEEP = 8,
     QUICK_RESUME = 9,
+    // v18.9.9.445 (CrossInk parity): MINIMAL_SLEEP + reader-type label
+    // + streak text overlay. Requires a valid clock; on X4 we honor
+    // ReadingStats::isClockValid() (post-SNTP) rather than X3-only.
+    MINIMAL_STATS_SLEEP = 10,
     SLEEP_SCREEN_MODE_COUNT
   };
   enum SLEEP_SCREEN_COVER_MODE { FIT = 0, CROP = 1, SLEEP_SCREEN_COVER_MODE_COUNT };
@@ -261,7 +265,12 @@ class CrossPointSettings {
     ROUNDEDRAFF = 4,
     LYRA_CAROUSEL = 5,
     MINIMAL = 6,
-    UI_THEME_COUNT = 7
+    // v18.9.9.461 (CrossInk parity): Dashboard theme. Home + sleep both
+    // show cover(s) alongside a stats grid. MVP inherits Minimal's home
+    // layout with a distinct dashboard-styled sleep screen; P3b iterates
+    // to match upstream's cover-pair + stats-grid composition.
+    DASHBOARD = 7,
+    UI_THEME_COUNT = 8
   };
   enum RECENT_BOOKS_VIEW { RECENT_BOOKS_LIST = 0, RECENT_BOOKS_GRID = 1, RECENT_BOOKS_VIEW_COUNT };
 
@@ -284,6 +293,13 @@ class CrossPointSettings {
 
   // Image rendering in EPUB reader
   enum IMAGE_RENDERING { IMAGES_DISPLAY = 0, IMAGES_PLACEHOLDER = 1, IMAGES_SUPPRESS = 2, IMAGE_RENDERING_COUNT };
+
+  // v18.9.9.24: user-facing tables toggle. TABLES_DISPLAY renders tables as
+  // tables (borders + cell layout, uses PageTableFragment elements).
+  // TABLES_PARAGRAPHS collapses cell content into paragraph runs at parse
+  // time (same path Simple Rendering / Compat mode uses). Useful preemptive
+  // memory saver for heavy books before Compat mode auto-engages.
+  enum TABLE_RENDERING { TABLES_DISPLAY = 0, TABLES_PARAGRAPHS = 1, TABLE_RENDERING_COUNT };
 
   enum TILT_PAGE_TURN { TILT_OFF = 0, TILT_NORMAL = 1, TILT_INVERTED = 2, TILT_PAGE_TURN_COUNT };
 
@@ -357,8 +373,19 @@ class CrossPointSettings {
   uint8_t statusBarTitle = CHAPTER_TITLE;
   uint8_t statusBarBattery = 1;
   uint8_t xtcStatusBarMode = XTC_STATUS_BAR_HIDE;
-  // Clock display in status bar (X3 only, requires DS3231 RTC)
+  // Clock display in in-book status bar (X3 has DS3231 RTC and works
+  // out of the box; X4 needs an NTP sync each boot).
   uint8_t statusBarClock = 0;
+  // v18.9.9.463 (CrossInk parity): show estimated time-left in status bar,
+  // computed from stats.avgSecondsPerForwardPage × pagesRemaining. Renders
+  // alongside the page-count / progress-percent field when enabled.
+  // Default off — needs pace samples to be meaningful, users opt in.
+  uint8_t statusBarTimeLeft = 0;
+  // v18.9.9.343: separate toggle for the Home header clock. Split from
+  // statusBarClock so users can have the in-book clock without paying
+  // Home's boot-time NTP sync silent-restart cost (X4 only) -- clock
+  // in-book is X3-only anyway; clock on Home matters on both devices.
+  uint8_t homeClockShow = 0;
   // Clock UTC offset in quarter-hour steps, biased by 48 so it fits in uint8_t.
   // Value 48 = UTC+0, 0 = UTC-12:00, 104 = UTC+14:00.
   // Quarter-hour granularity supports oddball zones like Nepal (+5:45) and Chatham (+12:45).
@@ -372,6 +399,14 @@ class CrossPointSettings {
   uint8_t extraParagraphSpacing = 1;
   uint8_t forceParagraphIndents = 0;
   uint8_t textAntiAliasing = 1;
+  // v18.9.9.405: opt-in single-pass page turn. Default OFF preserves the
+  // current fast-then-fill two-stage paint (blacks appear quickly, greys
+  // fill in ~500 ms later). When ON, the reader skips the initial BW-only
+  // display on text pages that are going to get grayscale AA -- the page
+  // only appears once the grayscale render is ready, so users see the full
+  // AA'd page in one wave with no "black text jumping around then greys
+  // settle in" effect. Trade: ~300 ms longer time to first paint.
+  uint8_t singlePassPageTurn = 0;
   // Short power button action behaviour
   uint8_t shortPwrBtn = IGNORE;
   // Long power button action behaviour
@@ -431,6 +466,15 @@ class CrossPointSettings {
   uint8_t textDarkness = TEXT_DARKNESS_NORMAL;
   // Auto-sleep timeout setting (default 10 minutes). Legacy sleepTimeout enum values are migration-only.
   uint8_t sleepTimeoutMinutes = 10;
+  // v18.9.4: device-side BT auto-disconnect timeout in minutes. When BT has
+  // been idle (no HID input from any connected device) for this long AND BT
+  // is currently enabled AND at least one device is connected, disable BT
+  // to release ~58 KB of heap. Only device-side -- can't override the
+  // remote's own idle power-off. v18.9.5.1: mirror the Time to Sleep UI
+  // exactly (range 1-30, step 1, default 10) -- a 0=Never option confused
+  // the slider display and the "never" case is close enough to 30 min for
+  // most users.
+  uint8_t btAutoDisconnectMinutes = 10;
   // E-ink refresh frequency (default 15 pages)
   uint8_t refreshFrequency = REFRESH_15;
   uint8_t hyphenationEnabled = 0;
@@ -496,6 +540,15 @@ class CrossPointSettings {
   uint8_t bionicReadingEnabled = 0;
   // Guide Dots - places a middle dot between words to guide the eye
   uint8_t guideReadingEnabled = 0;
+  // v18.9.9.78: Stable Page Numbers (KOReader-style, CrossInk-parity). When on,
+  // status bar shows "Stable page X of Y" derived from byte position instead of
+  // section-local "Page N of M". Divisor is chars-per-page approximation --
+  // default 1500 matches CrossInk / KOReader (~230-300 words). Character
+  // approximation via UTF-8 byte count is exact for ASCII, drifts ~50-60% for
+  // dense CJK; acceptable for a "stable page number" whose point is a stable
+  // frame of reference, not literary precision.
+  uint8_t showStablePageNumbers = 0;
+  uint16_t stablePageChars = 1500;
   // Glyph atlas (v40 section format): when enabled, the reader installs and
   // renders from the prebake'd glyph atlas. Default ON to keep the existing
   // optimized render path. Turn OFF to A/B test the upload-reliability
@@ -504,14 +557,55 @@ class CrossPointSettings {
   uint8_t glyphAtlasEnabled = 1;
   // SD card font family name, including optional range suffix (empty = use built-in fontFamily)
   char sdFontFamilyName[64] = "";
+  // CrumBLE 4.5.4: SD card font family used as a UI glyph fallback when the
+  // primary UI font (built-in Bitter/Lexend/etc.) lacks a codepoint. The
+  // typical case is a Latin reader with CJK book titles -- the user's
+  // body font might still be Bitter but they pick a CJK font here so
+  // titles, settings labels, collection names render correctly. Empty =
+  // disabled. Loaded once at boot (before first home render) and stays
+  // resident independent of any per-book primary font load, so the
+  // carousel paint has the fallback ready.
+  char uiFontFallbackFamily[64] = "";
+  // CrumBLE 4.5.4: explicit point size for the UI fallback. 0 = auto =
+  // smallest available size in the family (the default; matches the
+  // original "tiny CJK as possible to avoid Latin/CJK mismatch" intent).
+  // Picker lets the user override when the smallest .cpfont still renders
+  // bigger than the surrounding 10-12 pt Latin (CJK glyphs cover the full
+  // em-square so they look ~20% bigger at the same nominal pt). When set
+  // and the requested size isn't in the family, ensureFallbackLoaded
+  // falls back to the smallest available and logs a warning.
+  uint8_t uiFontFallbackPointSize = 0;
   // Show hidden files/directories (starting with '.') in the file browser (0 = hidden, 1 = show)
   uint8_t showHiddenFiles = 0;
   // Remove a book from the Recent Books list when its End-of-Book screen is reached (0 = off, 1 = on)
   uint8_t removeReadBooksFromRecents = 0;
   // Move epub to /Read/ folder on SD card when marked as finished (0 = disabled, 1 = enabled)
   uint8_t moveFinishedToReadFolder = 0;
+
+  // v18.9.9.441 (CrossInk parity): idle-time threshold for reading-session
+  // detection, in units of 10 seconds. Default 30 = 300 s = 5 min. Min 3
+  // (30 s), Max 60 (600 s = 10 min). Applied by the reader: no page turn
+  // for > threshold ends the current session for stats purposes.
+  static constexpr uint8_t READING_IDLE_TIME_THRESHOLD_UNIT_SECONDS = 10;
+  static constexpr uint8_t READING_IDLE_TIME_THRESHOLD_UNITS_MIN = 3;
+  static constexpr uint8_t READING_IDLE_TIME_THRESHOLD_UNITS_MAX = 60;
+  static constexpr uint8_t READING_IDLE_TIME_THRESHOLD_UNITS_DEFAULT = 30;
+  uint8_t readingIdleTimeThresholdUnits = READING_IDLE_TIME_THRESHOLD_UNITS_DEFAULT;
+  uint32_t getReadingIdleTimeThresholdSeconds() const {
+    uint8_t u = readingIdleTimeThresholdUnits;
+    if (u < READING_IDLE_TIME_THRESHOLD_UNITS_MIN) u = READING_IDLE_TIME_THRESHOLD_UNITS_DEFAULT;
+    if (u > READING_IDLE_TIME_THRESHOLD_UNITS_MAX) u = READING_IDLE_TIME_THRESHOLD_UNITS_MAX;
+    return static_cast<uint32_t>(u) * READING_IDLE_TIME_THRESHOLD_UNIT_SECONDS;
+  }
+
+  // v18.9.9.441 (CrossInk parity): automatic daily backup of all-time stats
+  // to /.crossink-stats-backup/. Triggered on sleep-entry when clock valid.
+  // 0 = disabled, 1 = enabled (default).
+  uint8_t autoBackupStats = 1;
   // Image rendering mode in EPUB reader
   uint8_t imageRendering = IMAGES_DISPLAY;
+  // v18.9.9.24: table rendering mode in EPUB reader
+  uint8_t tableRendering = TABLES_DISPLAY;
   // Long-press Confirm (menu button) quick action in reader (0 = off)
   uint8_t longPressMenuAction = LONG_MENU_BOOK_SETTINGS;
   // Tilt-based page turning (X3 only — requires QMI8658 IMU)
@@ -534,12 +628,42 @@ class CrossPointSettings {
   // listens to a BLE HID remote and translates its keys into virtual button
   // presses (front buttons, side buttons) via HalGPIO::setVirtualButtonState.
   uint8_t bluetoothEnabled = 0;
+  // v18.9.9.343: one-time migration marker. First v343+ boot force-resets
+  // bluetoothEnabled to 0 so the ~58 KB BLE-controller heap tax is
+  // released for users who had BT on (~58 KB back gives Settings entry
+  // headroom and avoids the getSettingsList silent-restart). User can
+  // re-enable BT manually via Settings > Bluetooth Setup.
+  uint8_t hasAppliedBtOffMigration_v343 = 0;
   // Address (e.g. "AA:BB:CC:DD:EE:FF") and name of the last successfully bonded
   // BLE HID device. Used for auto-reconnect on next boot.
   char bleBondedDeviceAddr[18] = "";
   char bleBondedDeviceName[32] = "";
   // BLE address type (0 = public, 1 = random). Required by NimBLE on reconnect.
   uint8_t bleBondedDeviceAddrType = 0;
+
+  // CrumBLE 4.5.5: rich remote-button mapping (1:1 port of upstream
+  // crosspoint-reader feat-bluetooth BleKeyMapEntry). Replaces the old
+  // forward/back wizard which only persisted DeviceProfiles' two custom
+  // keycodes. Each entry binds a captured remote key (kind/value pair) to
+  // one of the local virtual buttons (HalGPIO::BTN_*). 12 slots = more
+  // than any realistic page-turner.
+  //   keyKind == 0xFF -> unused entry.
+  //   keyKind == 0   -> special key (PageUp/PageDown/arrows/etc) [reserved
+  //                     for future freeink-style SpecialKey support; right
+  //                     now CrumBLE only emits HID-usage keys].
+  //   keyKind == 1   -> raw HID usage code (the keycode CrumBLE already
+  //                     captures via BluetoothHIDManager's onReport hook).
+  //   keyValue       -> the special-key id (kind 0) or usage code (kind 1).
+  //   button         -> HalGPIO::BTN_BACK / CONFIRM / LEFT / RIGHT / UP /
+  //                     DOWN. 0xFF means the slot is empty even if keyKind
+  //                     is set (defensive).
+  struct BleKeyMapEntry {
+    uint8_t keyKind = 0xFF;
+    uint8_t keyValue = 0;
+    uint8_t button = 0xFF;
+  };
+  static constexpr uint8_t BLE_KEY_MAP_CAPACITY = 12;
+  BleKeyMapEntry bleKeyMap[BLE_KEY_MAP_CAPACITY] = {};
 
   // CrumBLE: skip the grayscale LSB/MSB double-pass when cycling through the
   // sleep screensaver. Each grayscale pass triggers an extra ~1-2 s e-ink
@@ -588,6 +712,15 @@ class CrossPointSettings {
   // prefer the slower live-parse path.
   uint8_t optimizeChapterIndexing = 1;
 
+  // v18.9.9.172: when 1, the indexing popup shows "Indexing page X of ~Y" once
+  // pageCount > 0. When 0, just "Indexing..." + animated dots (v55 behavior).
+  // v18.9.9.164: default flipped to 0. User feedback: the page-count form
+  // makes long indexes feel slower (you watch the number crawl toward the
+  // estimate). The classic "Indexing..." form takes the same wall-clock time
+  // but reads as patient rather than laboring. Users who want the count can
+  // opt in from Settings.
+  uint8_t showIndexingPageCount = 0;
+
   ~CrossPointSettings() = default;
 
   // Get singleton instance
@@ -625,12 +758,20 @@ class CrossPointSettings {
   // If count_only is true, returns the number of settings items that would be written.
   uint8_t writeSettings(FsFile& file, bool count_only = false) const;
 
+  // v18.9.9.363: saveToFile() now marks-dirty + returns immediately.
+  // Actual disk write happens on debounce elapsed (kSaveDebounceMs = 5s
+  // of no new mutations) via retryDeferredSaveIfNeeded() OR at critical
+  // exit points via flushIfDirtyNow(). Rationale: SD write failures under
+  // contention were causing settings to revert after reboot; batching
+  // reduces SD write pressure by ~10x for typical UI setting bursts.
   bool saveToFile() const;
-  // OOM-safe persistence: saveToFile() skips the write when heap is too low to
-  // build the settings JSON without risking an allocation-failure abort, marking
-  // the save deferred. The main loop calls retryDeferredSaveIfNeeded() so the
-  // change still lands once heap recovers (e.g. after a BLE remote disconnects).
+  // Force any pending debounced write to disk NOW. Called from critical
+  // exit paths (silent-restart, sleep entry, deep sleep) so the pending
+  // change lands before the boundary. No-op if nothing is dirty.
+  bool flushIfDirtyNow() const;
   static bool hasDeferredSave();
+  // v18.9.9.325: mark save deferred without triggering an inline write.
+  static void markSaveDeferred();
   void retryDeferredSaveIfNeeded() const;
   bool loadFromFile();
 

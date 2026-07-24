@@ -41,10 +41,17 @@ struct LibraryEntry {
   // same-path file was replaced and re-date it. 0 = unknown (legacy entry).
   uint32_t fileSize = 0;
   // CrumBLE 4.2.1: persisted lower-cased "last name" key for AuthorAlpha sort.
-  // Offset into LibraryIndex::authorKeyPool (null-terminated). 0 / "" means
-  // "not yet populated" — the sort path falls back to filename for those.
-  // Populated by populateAuthorKeys() (called from ensureWalked) and by
-  // every successful EpubReaderActivity::onEnter (cheap once the book is
+  // Offset into LibraryIndex::authorKeyPool (null-terminated).
+  //   0          = "not yet attempted" -- populate will try.
+  //   1          = "attempted but no author found" sentinel (CrumBLE 4.5.4) --
+  //                pool byte at offset 1 is '\0' so the sort reads back as "".
+  //                populate skips entries with this set so we don't re-peek
+  //                corrupt OPFs on every walk. Reset to 0 by the walker when
+  //                the underlying file changes (size/mtime mismatch), giving
+  //                replaced books a fresh attempt without manual intervention.
+  //   >= 2       = real key bytes in authorKeyPool.
+  // Populated by populateAuthorKeysIfNeeded() (called from ensureWalked) and
+  // by every successful EpubReaderActivity::onEnter (cheap once the book is
   // already loaded), so the cache fills both proactively and lazily.
   uint32_t authorKeyOffset = 0;
 };
@@ -84,6 +91,11 @@ class LibraryIndex {
   // for a visible loading bar during the first walk.
   void ensureWalked(const std::function<void(int /*progress0to100*/)>& progress = nullptr);
 
+  // True iff the SD walk has run this session. Lets callers skip the
+  // Loading-popup setup when ensureWalked() would be a no-op (the popup
+  // flash on every virtual-collection cycle was the symptom this fixes).
+  bool hasWalked() const { return walkPerformed; }
+
   // Force a rescan even if walkPerformed is already true (e.g. user
   // triggered "Rescan library" manually).
   void rescan(const std::function<void(int)>& progress = nullptr);
@@ -93,6 +105,10 @@ class LibraryIndex {
   // uploaded over WiFi — the walk itself is still lazy (deferred to
   // next virtual-collection access) so onExit stays snappy.
   void markStale() { walkPerformed = false; }
+
+  // CrumBLE 4.5.4: read-only accessor for HomeActivity's background
+  // populate pump -- only ticks when an SD walk has populated entries.
+  bool isWalkPerformed() const { return walkPerformed; }
 
   // CrumBLE: free both the entry vector AND the path pool to reclaim heap.
   // The path pool is the persistent state; releasing it returns one large
@@ -136,12 +152,10 @@ class LibraryIndex {
   // Walk the index and lazily populate any entries whose authorKey is still
   // empty by load()-ing the EPUB's metadata cache (no full re-index). Heap-
   // and watchdog-safe: yields every N books, breaks early if maxAllocHeap
-  // drops below a safe threshold (remaining books stay empty and retry on a
-  // future call). Idempotent — books that already have a cached key are
-  // skipped. Called from ensureWalked and rescan; safe to call manually
-  // (e.g. from a "Reindex authors" debug action). Saves the index when any
-  // new keys were populated.
-  void populateAuthorKeysIfNeeded();
+  // v18.9.9.223: populateAuthorKeysIfNeeded removed. Superseded by
+  // populateAuthorKeysWithProgress (below), the progress-callback
+  // variant. v219 removed the only two live callers (ensureWalked
+  // inline populate + HomeActivity background tick).
 
   // Bookkeeping after a destructive action elsewhere (e.g. file delete).
   // The next ensureWalked() would pick this up, but for instant UI
@@ -186,9 +200,43 @@ class LibraryIndex {
   // sentinel — newly-constructed LibraryEntry::authorKeyOffset defaults
   // to 0 and the pool is seeded with a single '\0' byte so authorKeyOf()
   // on an uncached entry returns "" cheaply.
+  // CrumBLE 4.5.4: pool now seeded with TWO '\0' bytes so offset 1 also
+  // reads back as "". Offset 1 is the "tried but no author found" sentinel
+  // that populateAuthorKeysIfNeeded sets on failure so we don't re-peek
+  // corrupt OPFs every walk.
+  static constexpr uint32_t kAuthorKeyOffsetTriedEmpty = 1u;
   std::vector<char> authorKeyPool;
   const char* authorKeyOf(const LibraryEntry& e) const { return authorKeyPool.data() + e.authorKeyOffset; }
   // Append `key` to authorKeyPool with a trailing '\0' and return the offset.
-  // 0-offset entry (the seeded sentinel '\0') means "no key cached".
+  // 0-offset entry = "not yet attempted"; 1-offset = "attempted, no author".
   uint32_t appendAuthorKey(std::string_view key);
+
+ public:
+  // CrumBLE 4.5.4: deferred / background populate.
+  //
+  // # of entries that still need an author-key population pass (offset 0).
+  // Cheap O(N) scan; intended for the UI to know whether deferred work is
+  // pending so it can show a 'still indexing N books' badge.
+  size_t pendingAuthorKeyCount() const;
+  // Process up to `maxBooks` entries from the populate queue. Returns true
+  // if more entries still need work after this batch (caller can pump
+  // again on the next idle tick). Yields the FreeRTOS scheduler every
+  // few books so a 50-book batch costs ~3-5 s wall but doesn't starve
+  // the UI task. Heap-aware: bails early if MaxAlloc drops below floor.
+  // Safe to call from HomeActivity's loop tick.
+  bool tickPopulateAuthorKeys(size_t maxBooks);
+  // v18.9.9.218: caller-driven variant of populateAuthorKeysIfNeeded() with
+  // a progress callback (0-100). Used by the Sort-by-Author trigger to
+  // fill missing keys just-in-time with a progress popup, so unopened
+  // books sort correctly on first-ever author-sort rather than clustering
+  // at the end. Optional callback fires ~once per book. Behavior otherwise
+  // identical to populateAuthorKeysIfNeeded(): same 15 KB heap floor,
+  // same yield cadence, same OPF-peek fallback.
+  void populateAuthorKeysWithProgress(std::function<void(int)> progress);
+  // v18.9.9.222: reset all cached author keys to 0 (never attempted) so a
+  // subsequent Sort by Author re-populates via OPF peek with any updated
+  // key-derivation logic. Used by Settings > "Rebuild author keys" to
+  // pick up v220's trailing-punctuation / ';' -split fixes on entries
+  // whose keys were populated before v220.
+  void resetAuthorKeys();
 };

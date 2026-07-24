@@ -11,12 +11,19 @@
 
 ChoicePromptActivity::ChoicePromptActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string heading,
                                            std::string body, std::vector<std::string> options,
-                                           bool ignoreInitialConfirmRelease)
+                                           bool ignoreInitialConfirmRelease, int defaultSelectedIndex)
     : Activity("ChoicePrompt", renderer, mappedInput),
       heading_(std::move(heading)),
       body_(std::move(body)),
       options_(std::move(options)),
-      ignoreConfirmRelease_(ignoreInitialConfirmRelease) {}
+      ignoreConfirmRelease_(ignoreInitialConfirmRelease) {
+  // v18.9.9.270: clamp the default cursor into range. If options_ was
+  // empty (caller mistake) the activity is broken anyway; leave at 0.
+  if (!options_.empty() && defaultSelectedIndex >= 0 &&
+      defaultSelectedIndex < static_cast<int>(options_.size())) {
+    selectedIndex_ = defaultSelectedIndex;
+  }
+}
 
 void ChoicePromptActivity::onEnter() {
   Activity::onEnter();

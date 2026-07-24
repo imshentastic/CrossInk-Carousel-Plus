@@ -5,11 +5,17 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <WiFi.h>
+#ifndef SIMULATOR
+#include <esp_err.h>
+#include <esp_wifi.h>
+#endif
 
 #include <map>
 
 #include "CrossPointSettings.h"
+#include "ReadingStats.h"
 #include "MappedInputManager.h"
+#include "SilentRestart.h"
 #include "WifiCredentialStore.h"
 #include "activities/util/KeyboardEntryActivity.h"
 #include "components/UITheme.h"
@@ -21,6 +27,16 @@ namespace {
 uint8_t sLastStaDisconnectReason = 0;
 bool sConnectionAttemptLoggingActive = false;
 bool sWifiEventLoggingRegistered = false;
+// v18.9.9.419: track consecutive AUTH_EXPIRE (reason=2) events. On silent-
+// reboot to FT the AP often holds stale association state for our old
+// session and rejects our new auth attempts for 10-15 seconds. Field log
+// showed 12 AUTH_EXPIRE events @ ~1s each before the AP finally released
+// the old state. checkConnectionStatus reads these counters and triggers
+// a full WiFi driver reset after 3 in a row -- forces the AP to see us
+// as a genuinely new client on the next auth.
+uint8_t sAuthExpireStreak = 0;
+uint32_t sLastAuthExpireMs = 0;
+bool sAuthExpireKickApplied = false;
 
 void logWifiStationEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   if (!sConnectionAttemptLoggingActive) {
@@ -30,6 +46,7 @@ void logWifiStationEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
       LOG_INF("WIFI", "STA event: connected to AP");
+      sAuthExpireStreak = 0;
       break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP: {
       const uint8_t* ip = reinterpret_cast<const uint8_t*>(&info.got_ip.ip_info.ip.addr);
@@ -44,6 +61,12 @@ void logWifiStationEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
       sLastStaDisconnectReason = reason;
       LOG_INF("WIFI", "STA event: disconnected reason=%u(%s)", reason,
               WiFi.disconnectReasonName(static_cast<wifi_err_reason_t>(reason)));
+      if (reason == WIFI_REASON_AUTH_EXPIRE) {
+        ++sAuthExpireStreak;
+        sLastAuthExpireMs = millis();
+      } else {
+        sAuthExpireStreak = 0;
+      }
       break;
     }
     case ARDUINO_EVENT_WIFI_STA_LOST_IP:
@@ -145,6 +168,55 @@ const char* wifiAuthName(const int authMode) {
 
 void WifiSelectionActivity::onEnter() {
   Activity::onEnter();
+  SET_CHECKPOINT("wifiSel:onEnter");
+
+  // v18.9.9.336: silent-restart pre-flight. WiFi.mode(WIFI_STA) has been
+  // observed to null-deref inside wpa_supplicant/eloop.c on an in-book
+  // fragmented heap (RTC checkpoint wifi:mode-STA -> Guru Meditation Load
+  // access fault at MEPC 0x4218dbf2). Fresh boot heap (~90 KB free /
+  // 60 KB maxAlloc) reliably clears the ESP-IDF WiFi init path.
+  //
+  // v18.9.9.350: MOVED before ensureWifiEventLoggingRegistered(). The event-
+  // handler registration eats ~50 KB of ESP-IDF WiFi driver init, which
+  // dropped a 106 KB entry heap to 52 KB and tripped the preflight AFTER
+  // we'd already committed the memory. Field symptom: FT auto-restore
+  // JOIN_NETWORK spawned WifiSelection with plenty of heap, but the
+  // preflight fired anyway and silent-restarted (losing the FT return
+  // context, so the connect eventually landed on Home not back in FT).
+  // Checking heap BEFORE the WiFi driver init reflects true fragmentation.
+  constexpr uint32_t kWifiEnterMinFree = 55U * 1024U;
+  constexpr uint32_t kWifiEnterMinMaxAlloc = 40U * 1024U;
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+  // v18.9.9.353: skip the preflight when WiFi is ALREADY in STA mode --
+  // the caller (e.g. FT auto-restore path in CrossPointWebServerActivity)
+  // has already called WiFi.mode(WIFI_STA), which is the exact call the
+  // preflight was designed to protect. Re-checking heap after that
+  // ~50 KB commitment is too late: WiFi is either already init'd
+  // successfully (no crash to protect against) or the panic already
+  // happened. Silent-restart in this case just loses the caller's
+  // return context (FT ends up on Home instead of getting the connect
+  // callback).
+  const bool wifiAlreadyStaMode = (WiFi.getMode() & WIFI_STA) != 0;
+  if (!g_postWifiSelectionSilentReboot && !wifiAlreadyStaMode &&
+      (freeHeap < kWifiEnterMinFree || maxAlloc < kWifiEnterMinMaxAlloc)) {
+    LOG_INF("WIFI",
+            "WifiSelection heap pre-flight tripped (free=%u<%u OR maxAlloc=%u<%u); "
+            "silent-restart-to-self to avoid wpa_supplicant crash",
+            freeHeap, static_cast<unsigned>(kWifiEnterMinFree),
+            maxAlloc, static_cast<unsigned>(kWifiEnterMinMaxAlloc));
+    silentRestartToWifiSelection();
+    return;  // never reached
+  }
+  if (wifiAlreadyStaMode) {
+    LOG_INF("WIFI", "WifiSelection: WiFi already in STA mode (from caller), skipping preflight (free=%u maxAlloc=%u)",
+            freeHeap, maxAlloc);
+  }
+  // Consume the flag so a subsequent in-session re-entry gets the
+  // pre-flight again (if the heap re-degraded between the boot and the
+  // user's second WiFi visit).
+  g_postWifiSelectionSilentReboot = false;
+
   ensureWifiEventLoggingRegistered();
 
   // Load saved WiFi credentials - SD card operations need lock as we use SPI
@@ -229,12 +301,16 @@ void WifiSelectionActivity::startWifiScan() {
   // Set WiFi mode to station
   LOG_INF("WIFI", "Starting WiFi scan (mode=%d status=%d/%s heap=%u maxAlloc=%u)", static_cast<int>(WiFi.getMode()),
           static_cast<int>(WiFi.status()), wifiStatusName(WiFi.status()), ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  SET_CHECKPOINT("wifi:mode-STA");
   WiFi.mode(WIFI_STA);
+  SET_CHECKPOINT("wifi:disconnect");
   WiFi.disconnect();
   delay(100);
 
   // Start async scan
+  SET_CHECKPOINT("wifi:scanNetworks");
   const int scanStartResult = WiFi.scanNetworks(true);  // true = async scan
+  SET_CHECKPOINT("wifi:scan-requested");
   LOG_INF("WIFI", "WiFi scan requested (result=%d)", scanStartResult);
 }
 
@@ -325,6 +401,9 @@ void WifiSelectionActivity::selectNetwork(const int index) {
   usedSavedPassword = false;
   enteredPassword.clear();
   autoConnecting = false;
+  // Manual selection -> fresh retry budget for the new network. (The
+  // previous network's failures shouldn't count against this one.)
+  autoConnectRetryCount = 0;
 
   // Check if we have saved credentials for this network
   const auto* savedCred = WIFI_STORE.findCredential(selectedSSID);
@@ -372,6 +451,9 @@ void WifiSelectionActivity::attemptConnection() {
 #ifndef SIMULATOR
   sLastStaDisconnectReason = 0;
   sConnectionAttemptLoggingActive = false;
+  sAuthExpireStreak = 0;
+  sLastAuthExpireMs = 0;
+  sAuthExpireKickApplied = false;
 #endif
   requestUpdate();
 
@@ -380,6 +462,44 @@ void WifiSelectionActivity::attemptConnection() {
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   WiFi.persistent(false);  // Credentials are managed by WifiCredentialStore; suppress SDK NVS auto-connect
+
+#ifndef SIMULATOR
+  // v18.9.9.431: WiFi runtime override. v430 confirmed that sdkconfig
+  // CONFIG_ESP_WIFI_* trims are ignored -- Arduino's WiFi.mode() calls
+  // esp_wifi_init(WIFI_INIT_CONFIG_DEFAULT()) which materializes the
+  // full-fat default buffer counts (10 static RX, 32 dynamic RX/TX,
+  // AMPDU enabled). To actually apply our trims, call esp_wifi_init()
+  // ourselves with a custom wifi_init_config_t BEFORE Arduino's implicit
+  // init runs -- if we succeed, Arduino's subsequent call to
+  // esp_wifi_init() will return ESP_ERR_WIFI_INIT_STATE (already inited)
+  // and its own default cfg is ignored. Target savings: ~10-15 KB of
+  // RX buffer pool + AMPDU block-ack state. One-shot; safe if it fails.
+  {
+    static bool sCustomWifiInitAttempted = false;
+    if (!sCustomWifiInitAttempted && WiFi.getMode() == WIFI_MODE_NULL) {
+      sCustomWifiInitAttempted = true;
+      wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+      cfg.static_rx_buf_num = 4;
+      cfg.dynamic_rx_buf_num = 8;
+      cfg.dynamic_tx_buf_num = 8;
+      cfg.ampdu_rx_enable = false;
+      cfg.ampdu_tx_enable = false;
+      cfg.mgmt_sbuf_num = 8;
+      const uint32_t freeBefore = ESP.getFreeHeap();
+      const esp_err_t err = esp_wifi_init(&cfg);
+      const uint32_t freeAfter = ESP.getFreeHeap();
+      if (err == ESP_OK) {
+        LOG_INF("WIFI",
+                "Runtime WiFi init OK: rx=4/8 tx=8 ampdu=off mgmt=8 (heap %u -> %u, delta=%d)",
+                freeBefore, freeAfter, static_cast<int>(freeBefore - freeAfter));
+      } else {
+        LOG_INF("WIFI", "Runtime WiFi init skipped: %s (Arduino may have inited first)",
+                esp_err_to_name(err));
+      }
+    }
+  }
+#endif
+
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true, true);  // Abort any in-progress SDK auto-connect and clear NVS-saved SSID
   delay(100);
@@ -419,6 +539,42 @@ void WifiSelectionActivity::checkConnectionStatus() {
     lastConnectionStatusLogTime = now;
   }
 
+#ifndef SIMULATOR
+  // v18.9.9.419: AUTH_EXPIRE cascade kick. On silent-reboot-to-FT the AP
+  // often refuses re-auth for 10-15 s while it clears the stale association
+  // from our previous session. The internal WiFi driver just keeps retrying
+  // silently. Once we've seen 3 AUTH_EXPIRE events in a row within the last
+  // ~4 s, cycle the STA driver hard -- disconnect(true, true) + mode(OFF)
+  // + short delay + mode(STA) + begin() again. That kicks the AP into
+  // seeing us as a fresh client and skips ~10 s of waiting for the old
+  // association to naturally time out. One-shot per connect attempt.
+  if (!sAuthExpireKickApplied && sAuthExpireStreak >= 3 &&
+      now - sLastAuthExpireMs < 4000) {
+    LOG_INF("WIFI",
+            "AUTH_EXPIRE kick: %u consecutive AUTH_EXPIRE events -- cycling STA driver to force fresh association",
+            static_cast<unsigned>(sAuthExpireStreak));
+    sAuthExpireKickApplied = true;
+    sAuthExpireStreak = 0;
+    // Suspend event-driven counter updates while we tear the stack down;
+    // the disconnect/mode-off calls will fire their own STA_DISCONNECTED
+    // events which we don't want to count against a future streak.
+    sConnectionAttemptLoggingActive = false;
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
+    delay(500);
+    WiFi.mode(WIFI_STA);
+    delay(50);
+    sConnectionAttemptLoggingActive = true;
+    sLastStaDisconnectReason = 0;
+    // Re-issue the same begin() the initial attemptConnection() used.
+    if (selectedRequiresPassword && !enteredPassword.empty()) {
+      WiFi.begin(selectedSSID.c_str(), enteredPassword.c_str());
+    } else {
+      WiFi.begin(selectedSSID.c_str());
+    }
+  }
+#endif
+
   if (status == WL_CONNECTED) {
     // Successfully connected
     IPAddress ip = WiFi.localIP();
@@ -430,16 +586,39 @@ void WifiSelectionActivity::checkConnectionStatus() {
     sConnectionAttemptLoggingActive = false;
 #endif
     LOG_INF("WIFI", "Connected to ssid=%s ip=%s rssi=%d", selectedSSID.c_str(), connectedIP.c_str(), WiFi.RSSI());
+    // Clean connect -> reset the auto-retry budget for the NEXT failure
+    // cycle. Without this, a network that took 2 retries this session
+    // would start the next failure cycle with only 1 retry left.
+    autoConnectRetryCount = 0;
 
     // Sync RTC from NTP on the first successful WiFi connection only. The DS3231
     // drifts ~2 ppm so one sync is enough; users can force a re-sync from
-    // Settings > Customise Status Bar > Sync clock now.
-    if (halClock.isAvailable() && !SETTINGS.clockHasBeenSynced) {
+    // Settings > Sync & Network > Sync Time.
+    // v18.9.9.292: also do the sync on X4 (no DS3231) so the ESP32
+    // system clock gets set for ReadingStats. syncFromNTP no longer
+    // early-returns on !_available; it skips the DS3231 write instead.
+    // v18.9.9.347: gate on !halClock.hasValidTime() instead of
+    // !halClock.isAvailable(). On X4, isAvailable() always returns
+    // false (no DS3231), so the old gate ALWAYS ran NTP on every WiFi
+    // connect within a session -- including the FT auto-restore
+    // JOIN_NETWORK path. Each SNTP setup leaks ~15-25 KB that the
+    // subsequent FT web-server allocs couldn't absorb, hitting OOM +
+    // std::terminate at wifiSel:onEnter. hasValidTime() checks the
+    // ESP32 SoC system clock which survives within a boot cycle, so
+    // this reduces to "NTP once per cold boot on X4" -- matching the
+    // X3 "NTP once per SD-persisted clockHasBeenSynced" cadence.
+    if (!SETTINGS.clockHasBeenSynced || !halClock.hasValidTime()) {
+      SET_CHECKPOINT("wifiSel:ntpBegin");
       if (halClock.syncFromNTP()) {
-        SETTINGS.clockHasBeenSynced = 1;
-        SETTINGS.saveToFile();
+        SET_CHECKPOINT("wifiSel:ntpDone");
+        if (halClock.isAvailable()) {
+          SETTINGS.clockHasBeenSynced = 1;
+          SETTINGS.saveToFile();
+        }
+        ReadingStats::reevaluateClockStatus();
       }
     }
+    SET_CHECKPOINT("wifiSel:postNtp");
 
     // Save this as the last connected network - SD card operations need lock as
     // we use SPI for both
@@ -612,18 +791,39 @@ void WifiSelectionActivity::loop() {
 
   // Handle connection failed state
   if (state == WifiSelectionState::CONNECTION_FAILED) {
+    // CrumBLE 4.5.5+: silent-retry on transient failure for auto-connect /
+    // saved-password attempts. AUTH_EXPIRE / HANDSHAKE_TIMEOUT during a
+    // post-restart auto-reconnect is almost always the AP being briefly
+    // busy (recovering from its own load, mid-scan from another client,
+    // etc.) rather than a credential problem. Previously this routed
+    // straight to FORGET_PROMPT, which is destructive UX -- one transient
+    // blip and the user is one click away from losing the saved password
+    // that was perfectly correct. Now we silently retry the same network
+    // up to kMaxAutoRetries times before falling back to the network list,
+    // and we NEVER auto-offer to forget. The Forget affordance stays
+    // reachable via the explicit Left-button shortcut in the network list
+    // for users who genuinely want to remove a credential.
+    if ((autoConnecting || usedSavedPassword) &&
+        autoConnectRetryCount < kMaxAutoRetries) {
+      autoConnectRetryCount++;
+      LOG_INF("WIFI",
+              "Auto-retry %d/%d after transient failure on %s; retrying same network",
+              autoConnectRetryCount, kMaxAutoRetries, selectedSSID.c_str());
+      attemptConnection();
+      requestUpdate();
+      return;
+    }
     if (mappedInput.wasPressed(MappedInputManager::Button::Back) ||
         mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-      // If we were auto-connecting or using a saved credential, offer to forget
-      // the network
-      if (autoConnecting || usedSavedPassword) {
-        autoConnecting = false;
-        state = WifiSelectionState::FORGET_PROMPT;
-        forgetPromptSelection = 0;  // Default to "Cancel"
-      } else {
-        // Go back to network list on failure for non-saved credentials
-        state = WifiSelectionState::NETWORK_LIST;
-      }
+      // Out of retry budget (or this was a manual attempt that failed).
+      // Go back to the network list either way -- the user can re-pick
+      // the same network to start a fresh attempt cycle, or pick a
+      // different one. No auto-forget prompt; that path is only
+      // user-initiated via the Left-button shortcut on a saved-network
+      // entry in the list.
+      autoConnecting = false;
+      autoConnectRetryCount = 0;
+      state = WifiSelectionState::NETWORK_LIST;
       requestUpdate();
       return;
     }

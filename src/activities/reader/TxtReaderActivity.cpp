@@ -10,6 +10,7 @@
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "MappedInputManager.h"
+#include "SdCardFontSystem.h"
 #include "util/CacheWriteRecovery.h"
 #include "ReaderUtils.h"
 #include "RecentBooksStore.h"
@@ -95,6 +96,14 @@ void TxtReaderActivity::onEnter() {
     return;
   }
 
+  // CrumBLE 4.5.116: alias primary as UI fallback; fall through to
+  // suppress-and-release if no primary is loaded. See EpubReaderActivity
+  // ::onEnter for the full rationale.
+  if (!sdFontSystem.aliasPrimaryAsFallback(renderer)) {
+    sdFontSystem.setFallbackSuppressed(true);
+    sdFontSystem.releaseFallback(renderer);
+  }
+
   ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
 
   // Activate reader-specific front button mapping (if configured).
@@ -117,6 +126,10 @@ void TxtReaderActivity::onEnter() {
 
 void TxtReaderActivity::onExit() {
   Activity::onExit();
+
+  // CrumBLE 4.5.116: tear down reader's fallback state (alias or suppression).
+  sdFontSystem.releaseFallback(renderer);
+  sdFontSystem.setFallbackSuppressed(false);
 
   // Deactivate reader-specific front button mapping.
   mappedInput.setReaderMode(false);

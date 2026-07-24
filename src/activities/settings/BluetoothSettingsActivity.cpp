@@ -3,7 +3,12 @@
 #include <GfxRenderer.h>
 #include <I18n.h>
 #include <Logging.h>
+#include <cstdio>
 #include <cstring>
+
+#include <HalGPIO.h>  // BTN_* constants for the button-map UI
+
+#include <algorithm>
 
 #include "../reader/EpubReaderActivity.h"  // prewarmReaderTextBuffer
 #include "CrossPointSettings.h"
@@ -14,91 +19,137 @@
 #include "fontIds.h"
 
 namespace {
-// CrumBLE 4.4: pre-flight before starting a BT scan. With NimBLE up and a
-// book open in the background, free heap can be < 7 KB / MaxAlloc < 5 KB --
-// not enough for the scan callback to grow its result list + the post-scan
-// picker activity to allocate per-device strings. The result was an abort()
-// after "Scan complete, found N devices". Returns true (ok to scan) when
-// there's enough headroom; otherwise sets `outError` and returns false so
-// the caller can show the user a clear message rather than crashing.
-bool checkScanHeapOrError(std::string& outError) {
-  // Need to cover: scan onResult callbacks (~12 * std::string copies) +
-  // picker activity (vector<MenuItem> with ~80 B per entry) + render path.
-  constexpr uint32_t kScanMinFreeHeap = 14u * 1024u;
-  constexpr uint32_t kScanMinMaxAlloc = 8u * 1024u;
-  const uint32_t freeHeap = ESP.getFreeHeap();
-  const uint32_t maxAlloc = ESP.getMaxAllocHeap();
-  if (freeHeap >= kScanMinFreeHeap && maxAlloc >= kScanMinMaxAlloc) {
-    return true;
-  }
-  // CrumBLE 4.5.3: silent-restart to recover heap instead of just telling
-  // the user to power-cycle. Post-restart we land back in BT settings on
-  // a clean ~150KB free heap. g_postBtSilentReboot guards against looping
-  // if even a fresh boot can't clear the floor (extremely unlikely but
-  // possible if BT is enabled and the very first scan tries it).
-  if (!g_postBtSilentReboot) {
-    LOG_INF("BT", "BT scan pre-flight low (free=%u maxAlloc=%u) -- silent-restart to recover heap",
-            freeHeap, maxAlloc);
-    silentRestartToBluetoothSettings();
-    // never returns
-  }
-  LOG_ERR("BT", "BT scan pre-flight refused after silent-restart: free=%u maxAlloc=%u (need %u/%u)",
-          freeHeap, maxAlloc, kScanMinFreeHeap, kScanMinMaxAlloc);
-  outError = "Memory low even after recovery restart. Please power-cycle the device.";
-  return false;
-}
+// CrumBLE 4.5.5: rich button-map function table. Six map to CrumBLE's
+// virtual buttons (HalGPIO::BTN_*, there's no separate PageForward/PageBack
+// on this hardware -- Up/Down doubles as page navigation in the reader).
+// The 7th is a special "action" sentinel (0xFE, out of HalGPIO::BTN_*
+// range 0-6) that the button injector lambda in main.cpp routes to the
+// same FORCE_REFRESH path the Power button's short-press uses -- gives the
+// user a way to map a remote button to a screen-ghost cleanup refresh.
+struct MapFn {
+  uint8_t button;
+  const char* label;
+};
+constexpr uint8_t kBtnActionRefreshScreen = 0xFE;
+constexpr MapFn kMapFns[] = {
+    {HalGPIO::BTN_DOWN,        "Page Forward / Down"},
+    {HalGPIO::BTN_UP,          "Page Back / Up"},
+    {HalGPIO::BTN_CONFIRM,     "Confirm"},
+    {HalGPIO::BTN_BACK,        "Back"},
+    {HalGPIO::BTN_RIGHT,       "Right"},
+    {HalGPIO::BTN_LEFT,        "Left"},
+    {kBtnActionRefreshScreen,  "Refresh Screen"},
+};
+constexpr uint8_t kMapFnCount = sizeof(kMapFns) / sizeof(kMapFns[0]);
 }  // namespace
+
+// CrumBLE 4.5.5: rewrite ported from upstream crosspoint-reader feat-bluetooth
+// (Free-Ink/freeink-sdk) BluetoothSettingsActivity. See the .h for view/action
+// model. CrumBLE-specific additions kept: checkScanHeapOrBanner pre-flight,
+// learn-keys wizard sub-view, optional debug monitor sub-view, ctor params
+// (onComplete, exitOnSuccessfulConnect) that all call sites depend on.
+
+namespace {
+constexpr unsigned long kBannerMs = 2000;
+constexpr unsigned long kForgetHoldMs = 1200;  // hold Confirm this long in Paired view to forget
+constexpr uint32_t kScanMs = 10000;
+constexpr unsigned long kScanAnimIntervalMs = 700;  // e-ink-safe repaint rate
+}  // namespace
+
+// ============================================================================
+// Lifecycle
+// ============================================================================
 
 void BluetoothSettingsActivity::onEnter() {
   Activity::onEnter();
-  
-  selectedIndex = 0;
-  viewMode = ViewMode::MAIN_MENU;
-  lastError = "";
-  lastScanTime = 0;
-  pendingLearnKey = 0;
-  pendingLearnIndex = 0xFF;
-  learnedPrevKey = 0;
-  learnedNextKey = 0;
-  learnedReportIndex = 2;
-  learnTestDeadlineMs = 0;
-  learnTestForwardSeen = false;
-  learnTestBackSeen = false;
-  learnTestForwardCount = 0;
-  learnTestBackCount = 0;
+
+  view = View::Menu;
+  menuIndex = 0;
+  scanIndex = 0;
+  pairedIndex = 0;
+  banner.clear();
+  bannerUntil = 0;
+  awaitingConnect = false;
+  pairedActionTaken = false;
+  lastScanAnimMs = 0;
+
+  // Reset button-map + debug-monitor state so a previous entry's leftovers
+  // don't leak across re-entries.
+  mapStep = MapStep::WaitForKey;
+  pendingKeyKind = 0xFF;
+  pendingKeyValue = 0;
+  functionIndex = 0;
   debugLastKeycode = 0;
   debugEventCount = 0;
   debugLastEventMs = 0;
   debugUniqueCount = 0;
   memset(debugUniqueKeys, 0, sizeof(debugUniqueKeys));
   memset(debugUniqueCounts, 0, sizeof(debugUniqueCounts));
-  learnStep = LearnStep::WAIT_PREV;
-  
-  // Get BLE manager instance
+
   btMgr = &BluetoothHIDManager::getInstance();
-  LOG_INF("BT", "BluetoothHIDManager ready");
-  
-  // Restore Bluetooth persistent state on entry
-  if (SETTINGS.bluetoothEnabled && !btMgr->isEnabled()) {
-    LOG_INF("BT", "Restoring Bluetooth from settings (enabled)");
+
+  // v18.9.9.370: BT is now on-demand. Anyone entering this activity is either
+  // scanning + pairing, checking status, or debugging -- every use-case wants
+  // BT on. Unconditional auto-enable removes the "toggle BT then scan" two-
+  // step and matches the leave-menu-turns-BT-off symmetry (disableOnExit).
+  // Persistent SETTINGS.bluetoothEnabled becomes an "auto-connect on reader
+  // open" intent flag, not a "BT stays on 24/7" flag.
+  const bool autoEnableForBtRestart = g_postBtSilentReboot && !btMgr->isEnabled();
+  if (!btMgr->isEnabled()) {
     // CrumBLE Phase 1 fast-open: pre-grow the reader glyph buffer before
-    // NimBLE claims its ~58 KB. Without this, the first text page after
-    // returning to the reader can't allocate its page buffer, glyphs
-    // starve, and BLE supervision-timeouts within seconds. Cheap no-op
-    // when we're not in a reader context.
-    EpubReaderActivity::prewarmReaderTextBuffer(renderer);
-    if (btMgr->enable()) {
-      lastError = "Bluetooth restored";
-    } else {
-      lastError = "Failed to restore BT";
-      SETTINGS.bluetoothEnabled = 0;
+    // NimBLE claims its ~58 KB so the first text page after returning to
+    // the reader can allocate its page buffer.
+    //
+    // CrumBLE 4.5.5: only do the prewarm when this activity was opened from
+    // the in-book quick-connect path. From Settings / silent-restart-recover,
+    // the reader is not in the activity stack -- prewarming here just eats
+    // ~50 KB of contiguous heap right before NimBLE wants 50 KB of its own,
+    // tripping the new maxAlloc floor in enable(). Field log: user toggled
+    // BT -> first enable failed the floor -> silentRestartToBluetoothSettings
+    // -> post-restart onEnter prewarmed -> enable failed again under the
+    // same floor -> BT stayed off after the "screen flash", forcing a
+    // second manual toggle. The reader's own onEnter will re-prewarm next
+    // time we open a book.
+    if (exitOnSuccessfulConnect) {
+      EpubReaderActivity::prewarmReaderTextBuffer(renderer);
     }
-  } else if (!SETTINGS.bluetoothEnabled && btMgr->isEnabled()) {
-    LOG_INF("BT", "Disabling Bluetooth per settings (disabled)");
-    btMgr->disable();
-    lastError = "Bluetooth disabled per settings";
+    if (btMgr->enable()) {
+      setBanner("Bluetooth restored");
+      // 4.5.5: catch up persistence. The pre-silent-restart saveToFile may
+      // have deferred (low-heap), so disk still reads bluetoothEnabled = 0.
+      // Now that post-restart heap is healthy, persist the user's intent
+      // so a power-cycle (or a normal exit) brings BT back next boot.
+      if (autoEnableForBtRestart && !SETTINGS.bluetoothEnabled) {
+        SETTINGS.bluetoothEnabled = 1;
+        SETTINGS.saveToFile();
+      }
+    } else {
+      // Don't reset SETTINGS.bluetoothEnabled here -- the user explicitly
+      // asked for BT on, and our auto-restore is best-effort. Leaving the
+      // intent persisted lets the next entry retry under a fresh heap.
+      setBanner("Failed to restore BT");
+    }
   }
-  
+  // v18.9.9.370: dropped the "BT-on-but-SETTINGS-off resync" branch. Under
+  // the on-demand model this activity's onEnter is the ONLY thing that
+  // enables BT (setting-toggle keeps the persistent intent alive but doesn't
+  // control real BT state anymore), so entering with BT-on-and-SETTINGS-off
+  // isn't reachable in normal flow.
+
+  rebuildMenuRows();
+
+  // v18.9: if the user tapped "Scan & Pair" and the scan pre-flight
+  // silent-restarted us here, jump straight into scan view. Otherwise the
+  // NO_REFRESH restart looks like a "quick refresh" and drops focus on
+  // menu row 0 -- indistinguishable from "the tap did nothing." One-shot.
+  if (g_postBtSilentRebootScanIntent) {
+    g_postBtSilentRebootScanIntent = false;
+    if (btMgr && btMgr->isEnabled()) {
+      startScanView();
+      return;
+    }
+  }
+
   requestUpdate();
 }
 
@@ -106,302 +157,155 @@ void BluetoothSettingsActivity::onExit() {
   if (btMgr) {
     btMgr->setLearnInputCallback(nullptr);
     btMgr->setInputCallback(nullptr);
-    // CrumBLE 4.5.3: with this activity now reachable from Settings (not
-    // just from the reader), exiting to Home/Settings would otherwise leave
-    // NimBLE running and holding ~60KB of heap -- Home/carousel/Bookshelf
-    // has historically OOM'd under that load (the reason FT mode does
-    // aggressive BT teardown and BT-scan needs the silent-restart-to-
-    // recover path). Disable here so Home renders on a clean heap. The
-    // bond + SETTINGS.bluetoothEnabled persist, so when the user opens a
-    // book the reader's onEnter auto-re-enables and reconnects to the
-    // bonded device in ~5-10s -- no UX regression vs leaving it on.
-    if (btMgr->isEnabled()) {
-      LOG_INF("BT", "Disabling BT on settings exit to free heap for Home");
+    // CrumBLE 4.5.5: gated by the ctor's disableOnExit flag. Main Settings
+    // entry still passes true so Home/Bookshelf gets a clean heap (NimBLE
+    // holds ~60 KB; Home OOM'd under that load historically). Reader
+    // entry points (reader menu, drawer's BT-flow bounce) pass false --
+    // user is going back to a book that wants the link alive, and
+    // disabling here meant a "BT drops every time I peek at its settings"
+    // regression vs CrumBLE pre-4.5.5.
+    if (disableOnExit && btMgr->isEnabled()) {
       btMgr->disable();
+      // v18.9: NimBLE disable frees ~60 KB but through many small free()s,
+      // leaving heap deeply fragmented. Home's cover-shelf load right after
+      // has been observed to OOM/crash on Back-to-Home. Silent-restart on
+      // a clean heap instead of unwinding into a starving Home.
+      // v18.9.5: target Settings instead of Home so Back-from-BT-menu goes
+      // one level up in the menu tree (matches every other Back on the
+      // device) rather than jumping the user all the way out.
+      Activity::onExit();
+      silentRestartToSettings();
+      return;  // never returns
     }
   }
   Activity::onExit();
 }
 
-void BluetoothSettingsActivity::loop() {
-  // Use the Back *release* edge, not the press edge: every other activity in
-  // the stack (EpubReaderMenu, EpubReader) also handles Back on release. If
-  // this activity exits on the press edge, the same physical tap's release
-  // arrives at whichever activity is now current, popping a second time —
-  // sending the user from BT settings → reader menu → book in one tap and
-  // sometimes triggering the reader's onExit BLE auto-disable.
-  if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
-    if (viewMode == ViewMode::DEVICE_LIST) {
-      // Return to main menu
-      viewMode = ViewMode::MAIN_MENU;
-      selectedIndex = 0;
-      if (btMgr && btMgr->isScanning()) {
-        btMgr->stopScan();
-      }
-      requestUpdate();
-      return;
-    } else if (viewMode == ViewMode::LEARN_KEYS) {
-      if (btMgr) {
-        btMgr->setLearnInputCallback(nullptr);
-      }
-      viewMode = ViewMode::MAIN_MENU;
-      selectedIndex = 0;
-      if (learnStep != LearnStep::DONE) {
-        lastError = "Learn mode canceled";
-      }
-      requestUpdate();
-      return;
-    } else if (viewMode == ViewMode::DEBUG_MONITOR) {
-      if (btMgr) {
-        btMgr->setInputCallback(nullptr);
-      }
-      viewMode = ViewMode::MAIN_MENU;
-      selectedIndex = 0;
-      requestUpdate();
-      return;
-    } else {
-      if (onComplete) onComplete();
-      return;
-    }
-  }
+// ============================================================================
+// Menu (dynamic rows)
+// ============================================================================
 
-  // Re-render on a throttle to animate the "Searching..." dots during a scan.
-  // ~700 ms: faster would strobe the e-ink panel.
-  if (btMgr && viewMode == ViewMode::DEVICE_LIST && btMgr->isScanning()) {
-    constexpr unsigned long kScanAnimIntervalMs = 700;
-    if (millis() - lastScanAnimMs > kScanAnimIntervalMs) {
-      lastScanAnimMs = millis();
-      requestUpdate();
+void BluetoothSettingsActivity::rebuildMenuRows() {
+  menuRows.clear();
+  menuRows.reserve(6);
+  // BT on/off is always the first row.
+  menuRows.push_back({Action::ToggleBt, "Bluetooth"});
+  if (btMgr && btMgr->isEnabled()) {
+    menuRows.push_back({Action::Scan, "Scan & Pair"});
+    if (!btMgr->getConnectedDevices().empty()) {
+      menuRows.push_back({Action::Disconnect, "Disconnect"});
     }
-  }
-
-  // Check if scan completed
-  if (btMgr && viewMode == ViewMode::DEVICE_LIST && !btMgr->isScanning() && lastScanTime > 0) {
-    if (millis() - lastScanTime > 500) { // Small delay to see final results
-      lastScanTime = 0;
-      requestUpdate();
+    if (hasBondedDevice()) {
+      menuRows.push_back({Action::PairedDevices, "Paired Device"});
     }
+    menuRows.push_back({Action::MapButtons, "Map Buttons"});
+#ifdef ENABLE_BT_DEBUG_MONITOR
+    menuRows.push_back({Action::DebugMonitor,
+                        btMgr->isDebugCaptureEnabled() ? "Debug Monitor (ON)" : "Debug Monitor"});
+#endif
   }
-
-  if (viewMode == ViewMode::MAIN_MENU) {
-    handleMainMenuInput();
-  } else if (viewMode == ViewMode::DEVICE_LIST) {
-    handleDeviceListInput();
-  } else if (viewMode == ViewMode::DEBUG_MONITOR) {
-    handleDebugInput();
-  } else {
-    handleLearnInput();
-  }
+  if (menuIndex >= static_cast<int>(menuRows.size())) menuIndex = 0;
 }
 
-void BluetoothSettingsActivity::handleMainMenuInput() {
-  constexpr int kMainMenuItemCount =
-#ifdef ENABLE_BT_DEBUG_MONITOR
-      8;
-#else
-      7;
-#endif
-
-  constexpr int kToggleBluetoothIndex = 0;
-  constexpr int kReconnectBondedIndex = 1;
-  constexpr int kDisconnectDevicesIndex = 2;
-  constexpr int kScanForDevicesIndex = 3;
-  constexpr int kRemoteSetupWizardIndex = 4;
-#ifdef ENABLE_BT_DEBUG_MONITOR
-  constexpr int kDebugMonitorIndex = 5;
-  constexpr int kClearLearnedKeysIndex = 6;
-  constexpr int kForgetBondedRemoteIndex = 7;
-#else
-  constexpr int kClearLearnedKeysIndex = 5;
-  constexpr int kForgetBondedRemoteIndex = 6;
-#endif
-
-  // Match Reader Options / Controls Options convention: both side U/D and
-  // front L/R drive the same Up/Down navigation. Hint labels (line ~675)
-  // render this as "Up/Down" since that's the conceptual operation.
-  const bool prevPressed = mappedInput.wasPressed(MappedInputManager::Button::Up) ||
-                            mappedInput.wasPressed(MappedInputManager::Button::Left);
-  const bool nextPressed = mappedInput.wasPressed(MappedInputManager::Button::Down) ||
-                            mappedInput.wasPressed(MappedInputManager::Button::Right);
-  if (prevPressed) {
-    selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : (kMainMenuItemCount - 1);
-    requestUpdate();
-  } else if (nextPressed) {
-    selectedIndex = (selectedIndex < (kMainMenuItemCount - 1)) ? selectedIndex + 1 : 0;
-    requestUpdate();
-  }
-  
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    if (!btMgr) {
-      lastError = "BLE not available";
-      LOG_ERR("BT", "BLE manager not available");
-      requestUpdate();
-      return;
-    }
-
-    if (selectedIndex == kToggleBluetoothIndex) {
-      // Toggle Bluetooth
+void BluetoothSettingsActivity::handleMenuConfirm() {
+  if (!btMgr || menuRows.empty()) return;
+  const Action action = menuRows[menuIndex].action;
+  switch (action) {
+    case Action::ToggleBt: {
       if (btMgr->isEnabled()) {
-        LOG_INF("BT", "Disabling Bluetooth...");
         if (btMgr->disable()) {
-          lastError = "Bluetooth disabled";
           SETTINGS.bluetoothEnabled = 0;
           SETTINGS.saveToFile();
+          setBanner("Bluetooth disabled");
         } else {
-          lastError = "Failed to disable";
+          setBanner("Failed to disable");
         }
       } else {
-        LOG_INF("BT", "Enabling Bluetooth...");
-        // CrumBLE Phase 1 fast-open: pre-grow the reader glyph buffer
-        // before NimBLE eats heap. See onEnter restore above for the
-        // full reasoning.
         EpubReaderActivity::prewarmReaderTextBuffer(renderer);
         if (btMgr->enable()) {
-          lastError = "Bluetooth enabled";
           SETTINGS.bluetoothEnabled = 1;
           SETTINGS.saveToFile();
+          setBanner("Bluetooth enabled");
         } else {
-          // CrumBLE 4.5.3: enable() refuses below 66 KB free heap (NimBLE
-          // init needs that much contiguous). Silent-restart to recover
-          // instead of just showing "Not enough memory" -- post-restart
-          // boot has ~150 KB free so the next click works. Skip on
-          // already-post-restart to avoid an infinite loop on a stuck
-          // heap (vanishingly unlikely).
-          if (!g_postBtSilentReboot && ESP.getFreeHeap() < 70u * 1024u) {
-            LOG_INF("BT", "Enable failed under low heap (free=%u) -- silent-restart to recover",
-                    ESP.getFreeHeap());
-            SETTINGS.bluetoothEnabled = 1;  // persist intent so onEnter auto-restores post-boot
+          // CrumBLE 4.5.3 ported through 4.5.5: enable() refuses below the
+          // free/maxAlloc floors that NimBLE's controller_init demands. A
+          // fresh reboot lands us with ~150 KB free / ~94 KB maxAlloc and
+          // the next click works. Silent-restart back to BT settings to
+          // recover instead of just showing "Failed". g_postBtSilentReboot
+          // guards against an infinite loop if a fresh boot can't clear
+          // the floor either (vanishingly unlikely).
+          if (!g_postBtSilentReboot) {
+            LOG_INF("BT", "Enable failed (free=%u maxAlloc=%u) -- silent-restart to recover",
+                    ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+            // Persist intent so the post-boot auto-restore brings BT up.
+            SETTINGS.bluetoothEnabled = 1;
             SETTINGS.saveToFile();
-            silentRestartToBluetoothSettings();
+            // 4.5.5: when this activity was opened from the in-book BT
+            // quick-connect entry, restart back into the reader (not into
+            // BT settings) so the user lands on their book with BT auto-
+            // re-enabled. The reader-side dispatch (EnableBt action) does
+            // the actual btMgr->enable() + connectToDevice on the bonded
+            // address after boot. Without this branch, exiting BT settings
+            // would push the user back to Home.
+            if (exitOnSuccessfulConnect) {
+              silentRestartToReaderWithAction(ReaderPostBootAction::EnableBt);
+            } else {
+              // v18.9.9.367: fromReader=false so Back-from-BT after the
+              // restart pops to Settings (parent), not to the last book.
+              silentRestartToBluetoothSettings(/*fromReader=*/false);
+            }
             // never returns
           }
-          lastError = btMgr->lastError.empty() ? "Failed to enable" : btMgr->lastError;
+          setBanner(btMgr->lastError.empty() ? "Failed to enable" : btMgr->lastError.c_str(), 4000);
         }
       }
+      rebuildMenuRows();
       requestUpdate();
-    } else if (selectedIndex == kReconnectBondedIndex) {
-      if (!btMgr->isEnabled()) {
-        lastError = "Enable BT first";
-      } else if (SETTINGS.bleBondedDeviceAddr[0] == '\0') {
-        lastError = "No bonded remote saved";
-      } else if (btMgr->isConnected(SETTINGS.bleBondedDeviceAddr)) {
-        lastError = "Bonded remote already connected";
-      } else {
-        LOG_INF("BT", "Reconnecting to bonded remote %s (%s)", SETTINGS.bleBondedDeviceName,
-                SETTINGS.bleBondedDeviceAddr);
-        lastError = "Reconnecting...";
-        requestUpdate();
-
-        const unsigned long reconnectStart = millis();
-        const bool reconnected = btMgr->connectToDevice(SETTINGS.bleBondedDeviceAddr);
-        if (reconnected) {
-          lastError = std::string("Reconnected to ") +
-                      (SETTINGS.bleBondedDeviceName[0] ? SETTINGS.bleBondedDeviceName : "bonded remote");
-        } else {
-          lastError = btMgr->lastError.empty() ? "Reconnect failed" : btMgr->lastError;
-        }
-        // connectToDevice can block 2-3 s. If the user impatiently tapped
-        // Back during the freeze, swallow that release so it doesn't pop us
-        // out of the BT menu (and cascade into a reader exit + BLE disable).
-        if (millis() - reconnectStart > 500) {
-          mappedInput.suppressNextBackRelease();
-        }
-        // Auto-pop back to the reader on success when the caller opted in
-        // (in-book menu uses exitOnSuccessfulConnect=true). Signals
-        // autoExitParent so the EpubReaderMenu launching us also finishes
-        // itself, taking the user straight back to the book.
-        if (reconnected && exitOnSuccessfulConnect) {
-          MenuResult result;
-          result.autoExitParent = true;
-          setResult(ActivityResult{result});
-          finish();
-          return;
-        }
-      }
-      requestUpdate();
-    } else if (selectedIndex == kDisconnectDevicesIndex) {
-      if (!btMgr->isEnabled()) {
-        lastError = "Enable BT first";
-      } else {
-        const auto& connectedDevices = btMgr->getConnectedDevices();
-        if (connectedDevices.empty()) {
-          lastError = "No devices connected";
-        } else {
-          std::vector<std::string> deviceAddresses = connectedDevices;
-          for (const auto& addr : deviceAddresses) {
-            btMgr->disconnectFromDevice(addr);
-          }
-          lastError = "Disconnected";
-        }
-      }
-      requestUpdate();
-    } else if (selectedIndex == kScanForDevicesIndex) {
-      // CrumBLE 4.5.4 follow-up: auto-enable BT if it's off when user hits
-      // Scan. Previously the activity bounced with 'Enable BT first',
-      // forcing the user to back up, toggle Enable, then re-pick Scan --
-      // and many users perceived this as 'scan turned BT off' since the
-      // BT label flipped back to Enable. One-tap scan keeps the affordance
-      // obvious. Persist SETTINGS so the post-NimBLE-init silent-restart
-      // path also lands with BT auto-restored.
-      if (!btMgr->isEnabled()) {
-        LOG_INF("BT", "Auto-enabling Bluetooth before scan (user hit Scan from BT-off state)");
-        EpubReaderActivity::prewarmReaderTextBuffer(renderer);
-        if (btMgr->enable()) {
-          SETTINGS.bluetoothEnabled = 1;
-          SETTINGS.saveToFile();
-        } else if (!g_postBtSilentReboot && ESP.getFreeHeap() < 70u * 1024u) {
-          LOG_INF("BT", "Auto-enable for scan failed under low heap -- silent-restart to recover");
-          SETTINGS.bluetoothEnabled = 1;
-          SETTINGS.saveToFile();
-          silentRestartToBluetoothSettings();
-          // never returns
-        } else {
-          lastError = btMgr->lastError.empty() ? "Failed to enable BT" : btMgr->lastError;
-          requestUpdate();
-          return;
-        }
-      }
-      if (btMgr->isEnabled() && checkScanHeapOrError(lastError)) {
-        btMgr->startScan(10000);
-        lastScanTime = millis();
-        viewMode = ViewMode::DEVICE_LIST;
-        selectedIndex = 0;
-        lastError = "";
-      }
-      requestUpdate();
-    } else if (selectedIndex == kRemoteSetupWizardIndex) {
-      if (!btMgr->isEnabled()) {
-        lastError = "Enable BT first";
-      } else if (btMgr->getConnectedDevices().empty()) {
-        lastError = "Connect a remote first";
-      } else {
-        viewMode = ViewMode::LEARN_KEYS;
-        learnStep = LearnStep::WAIT_PREV;
-        pendingLearnKey = 0;
-        pendingLearnIndex = 0xFF;
-        learnedPrevKey = 0;
-        learnedNextKey = 0;
-        learnedReportIndex = 2;
-        learnTestDeadlineMs = 0;
-        learnTestForwardSeen = false;
-        learnTestBackSeen = false;
-        learnTestForwardCount = 0;
-        learnTestBackCount = 0;
-        btMgr->setLearnInputCallback([this](uint8_t keycode, uint8_t reportIndex) {
-          if (viewMode == ViewMode::LEARN_KEYS && keycode > 0 && reportIndex != 0xFF) {
-            pendingLearnKey = keycode;
-            pendingLearnIndex = reportIndex;
-          }
-        });
-        lastError = "Wizard: press FORWARD button";
-      }
-      requestUpdate();
+      break;
     }
-#ifdef ENABLE_BT_DEBUG_MONITOR
-    else if (selectedIndex == kDebugMonitorIndex) {
-      if (!btMgr->isDebugCaptureEnabled()) {
-        btMgr->setDebugCaptureEnabled(true);
+    case Action::Scan:
+      startScanView();
+      break;
+    case Action::Disconnect: {
+      const auto connected = btMgr->getConnectedDevices();
+      for (const auto& addr : connected) {
+        btMgr->disconnectFromDevice(addr);
       }
+      setBanner("Disconnected");
+      rebuildMenuRows();
+      requestUpdate();
+      break;
+    }
+    case Action::PairedDevices:
+      view = View::Paired;
+      pairedIndex = 0;
+      pairedActionTaken = false;
+      requestUpdate();
+      break;
+    case Action::MapButtons:
+      // Mapping needs a connected remote so the device can hear its HID keys.
+      if (btMgr->getConnectedDevices().empty()) {
+        setBanner("Connect a remote first");
+        requestUpdate();
+        return;
+      }
+      view = View::ButtonMap;
+      mapStep = MapStep::WaitForKey;
+      pendingKeyKind = 0xFF;
+      pendingKeyValue = 0;
+      functionIndex = 0;
+      btMgr->setLearnInputCallback([this](uint8_t keycode, uint8_t /*reportIndex*/) {
+        if (view == View::ButtonMap && mapStep == MapStep::WaitForKey && keycode != 0 && keycode != 0xFF) {
+          pendingKeyKind = 1;  // HID usage code
+          pendingKeyValue = keycode;
+        }
+      });
+      setBanner("Press a remote button to map");
+      requestUpdate();
+      break;
+#ifdef ENABLE_BT_DEBUG_MONITOR
+    case Action::DebugMonitor:
+      if (!btMgr->isDebugCaptureEnabled()) btMgr->setDebugCaptureEnabled(true);
       debugLastKeycode = 0;
       debugEventCount = 0;
       debugLastEventMs = 0;
@@ -412,588 +316,593 @@ void BluetoothSettingsActivity::handleMainMenuInput() {
         debugLastKeycode = keycode & 0xFF;
         debugEventCount++;
         debugLastEventMs = millis();
-
         const uint8_t code = static_cast<uint8_t>(keycode & 0xFF);
         bool found = false;
         for (uint8_t i = 0; i < debugUniqueCount; i++) {
           if (debugUniqueKeys[i] == code) {
-            if (debugUniqueCounts[i] < 65535) {
-              debugUniqueCounts[i]++;
-            }
+            if (debugUniqueCounts[i] < 65535) debugUniqueCounts[i]++;
             found = true;
             break;
           }
         }
-
         if (!found && debugUniqueCount < kDebugUniqueKeyMax) {
           debugUniqueKeys[debugUniqueCount] = code;
           debugUniqueCounts[debugUniqueCount] = 1;
           debugUniqueCount++;
         }
       });
-      viewMode = ViewMode::DEBUG_MONITOR;
-      lastError = "BT debug monitor";
+      view = View::DebugMonitor;
       requestUpdate();
-    }
+      break;
 #endif
-    else if (selectedIndex == kClearLearnedKeysIndex) {
-      DeviceProfiles::clearCustomProfile();
-      lastError = "Learned mapping cleared";
-      requestUpdate();
-    } else if (selectedIndex == kForgetBondedRemoteIndex) {
-      SETTINGS.bleBondedDeviceAddr[0] = '\0';
-      SETTINGS.bleBondedDeviceName[0] = '\0';
-      SETTINGS.bleBondedDeviceAddrType = 0;
-      SETTINGS.saveToFile();
-      btMgr->setBondedDevice("", "");
-      lastError = "Bonded remote cleared";
-      requestUpdate();
-    }
   }
 }
 
-void BluetoothSettingsActivity::handleLearnInput() {
-  if (pendingLearnKey != 0) {
-    const uint8_t capturedKey = pendingLearnKey;
-    const uint8_t capturedIndex = pendingLearnIndex;
-    pendingLearnKey = 0;
-    pendingLearnIndex = 0xFF;
-
-    if (learnStep == LearnStep::WAIT_PREV) {
-      learnedNextKey = capturedKey;  // Wizard step 1 = forward/next
-      learnedReportIndex = (capturedIndex == 0xFF) ? 2 : capturedIndex;
-      learnStep = LearnStep::WAIT_NEXT;
-      char buf[96];
-      snprintf(buf, sizeof(buf), "Forward=0x%02X @byte[%u], press BACK", learnedNextKey,
-               static_cast<unsigned>(learnedReportIndex));
-      lastError = buf;
-      requestUpdate();
-      return;
-    }
-
-    if (learnStep == LearnStep::WAIT_NEXT) {
-      if (capturedKey == learnedNextKey) {
-        lastError = "Back key must be different";
-        requestUpdate();
-        return;
-      }
-
-      learnedPrevKey = capturedKey;  // Wizard step 2 = back/prev
-      learnStep = LearnStep::WAIT_TEST;
-      learnTestDeadlineMs = millis() + 10000;
-      learnTestForwardSeen = false;
-      learnTestBackSeen = false;
-      learnTestForwardCount = 0;
-      learnTestBackCount = 0;
-      char buf[96];
-      snprintf(buf, sizeof(buf), "Test 10s: press both keys, then Confirm to save");
-      lastError = buf;
-      requestUpdate();
-      return;
-    }
-
-    if (learnStep == LearnStep::WAIT_TEST) {
-      if (capturedKey == learnedNextKey) {
-        learnTestForwardSeen = true;
-        if (learnTestForwardCount < 65535) {
-          learnTestForwardCount++;
-        }
-      } else if (capturedKey == learnedPrevKey) {
-        learnTestBackSeen = true;
-        if (learnTestBackCount < 65535) {
-          learnTestBackCount++;
-        }
-      }
-
-      char buf[96];
-      snprintf(buf, sizeof(buf), "Test Fwd:%s(%u) Back:%s(%u)", learnTestForwardSeen ? "OK" : "--",
-               static_cast<unsigned>(learnTestForwardCount), learnTestBackSeen ? "OK" : "--",
-               static_cast<unsigned>(learnTestBackCount));
-      lastError = buf;
-      requestUpdate();
-      return;
-    }
-  }
-
-  if (learnStep == LearnStep::WAIT_TEST && millis() > learnTestDeadlineMs) {
-    if (btMgr) {
-      btMgr->setLearnInputCallback(nullptr);
-    }
-    viewMode = ViewMode::MAIN_MENU;
-    selectedIndex = 0;
-    lastError = "Wizard timed out (not saved)";
+void BluetoothSettingsActivity::startScanView() {
+  if (!checkScanHeapOrBanner()) {
     requestUpdate();
     return;
   }
+  view = View::Scan;
+  scanIndex = 0;
+  awaitingConnect = false;
+  btMgr->startScan(kScanMs);
+  setBanner(tr(STR_SCANNING));
+  requestUpdate();
+}
 
-  if (learnStep == LearnStep::WAIT_TEST && mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    DeviceProfiles::setCustomProfile(learnedPrevKey, learnedNextKey, learnedReportIndex);
-    if (btMgr) {
-      const auto& connected = btMgr->getConnectedDevices();
-      for (const auto& addr : connected) {
-        DeviceProfiles::setCustomProfileForDevice(addr, learnedPrevKey, learnedNextKey, learnedReportIndex);
-      }
-      btMgr->setLearnInputCallback(nullptr);
-    }
-    learnStep = LearnStep::DONE;
-    char buf[96];
-    snprintf(buf, sizeof(buf), "Saved! Back=0x%02X Fwd=0x%02X", learnedPrevKey, learnedNextKey);
-    lastError = buf;
-
-    // On successful wizard completion, return immediately to menu (or back to book).
-    viewMode = ViewMode::MAIN_MENU;
-    selectedIndex = 0;
+bool BluetoothSettingsActivity::checkScanHeapOrBanner() {
+  // CrumBLE 4.4: NimBLE running + a book in the background can leave free
+  // heap < 7 KB / MaxAlloc < 5 KB -- not enough for the scan's onResult
+  // result list + post-scan picker strings. Silent-restart back to this
+  // activity when below floor; g_postBtSilentReboot guards against looping.
+  constexpr uint32_t kScanMinFreeHeap = 14u * 1024u;
+  constexpr uint32_t kScanMinMaxAlloc = 8u * 1024u;
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+  if (freeHeap >= kScanMinFreeHeap && maxAlloc >= kScanMinMaxAlloc) return true;
+  if (!g_postBtSilentReboot) {
+    LOG_INF("BT", "BT scan pre-flight low (free=%u maxAlloc=%u) -- silent-restart to recover heap",
+            freeHeap, maxAlloc);
+    // 4.5.5: route to the right post-restart target so back-from-BT lands
+    // where the user came from. exitOnSuccessfulConnect signals "opened
+    // from in-book"; without this branch, silentRestartToBluetoothSettings
+    // makes BT-settings the ROOT activity and a Back press jumps the user
+    // out to Home instead of back to their book.
     if (exitOnSuccessfulConnect) {
-      MenuResult result;
-      result.autoExitParent = true;
-      setResult(ActivityResult{result});
-      finish();
-      return;
+      silentRestartToReaderWithAction(ReaderPostBootAction::EnableBt);
+    } else {
+      // v18.9: preserve scan-intent across the restart so the user isn't
+      // dropped on menu row 0 and forced to tap "Scan & Pair" a second time.
+      // v18.9.9.367: fromReader=false -- came from Settings, Back must
+      // return to Settings, not the last book.
+      silentRestartToBluetoothSettingsWithScanIntent(/*fromReader=*/false);
     }
-
-    requestUpdate();
-    return;
+    // never returns
   }
-
-  if (learnStep == LearnStep::DONE && mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    if (btMgr) {
-      btMgr->setLearnInputCallback(nullptr);
-    }
-    viewMode = ViewMode::MAIN_MENU;
-    selectedIndex = 0;
-    requestUpdate();
-  }
+  LOG_ERR("BT", "BT scan pre-flight refused even after silent-restart: free=%u maxAlloc=%u (need %u/%u)",
+          freeHeap, maxAlloc, kScanMinFreeHeap, kScanMinMaxAlloc);
+  setBanner("Memory low. Power-cycle the device.");
+  return false;
 }
 
-void BluetoothSettingsActivity::handleDeviceListInput() {
-  if (!btMgr) return;
+void BluetoothSettingsActivity::setBanner(const char* text, unsigned long durationMs) {
+  banner = text ? text : "";
+  bannerUntil = millis() + (durationMs > 0 ? durationMs : kBannerMs);
+}
 
-  // Don't index the device list mid-scan (mutated on the BLE task); only cancel.
-  if (btMgr->isScanning()) {
-    if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
-      btMgr->stopScan();
-      viewMode = ViewMode::MAIN_MENU;
-      selectedIndex = 0;
+// ============================================================================
+// loop (input + async polling)
+// ============================================================================
+
+void BluetoothSettingsActivity::loop() {
+  // Clear an expired banner so the hint line returns to its usual content.
+  if (bannerUntil > 0 && millis() > bannerUntil) {
+    banner.clear();
+    bannerUntil = 0;
+    requestUpdate();
+  }
+
+  // ButtonMap / debug sub-views own their own input + render flow.
+  if (view == View::ButtonMap) {
+    // ---- WaitForKey: a remote key arrives, advance to SelectFunction ----
+    if (mapStep == MapStep::WaitForKey && pendingKeyKind != 0xFF) {
+      mapStep = MapStep::SelectFunction;
+      functionIndex = 0;
       requestUpdate();
     }
-    return;
-  }
 
-  const auto& devices = btMgr->getDiscoveredDevices();
-  const auto& connectedDevices = btMgr->getConnectedDevices();
-  
-  // Calculate menu items: devices + "Refresh" + "Disconnect" (if connected)
-  int menuItems = devices.size() + 1; // +1 for Refresh
-  if (!connectedDevices.empty()) {
-    menuItems++; // +1 for Disconnect
-  }
-  int maxIndex = menuItems - 1;
-
-  if (mappedInput.wasPressed(MappedInputManager::Button::Up)) {
-    selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : maxIndex;
-    requestUpdate();
-  } else if (mappedInput.wasPressed(MappedInputManager::Button::Down)) {
-    selectedIndex = (selectedIndex < maxIndex) ? selectedIndex + 1 : 0;
-    requestUpdate();
-  }
-  
-  // Left/Right for back/refresh
-  if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
-    // Go back to main menu
-    viewMode = ViewMode::MAIN_MENU;
-    selectedIndex = 0;
-    if (btMgr && btMgr->isScanning()) {
-      btMgr->stopScan();
-    }
-    requestUpdate();
-    return;
-  }
-  
-  if (mappedInput.wasPressed(MappedInputManager::Button::Right)) {
-    // Quick rescan
-    if (!checkScanHeapOrError(lastError)) {
+    // Back leaves the sub-view at any step.
+    if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+      if (btMgr) btMgr->setLearnInputCallback(nullptr);
+      view = View::Menu;
+      rebuildMenuRows();
       requestUpdate();
       return;
     }
-    LOG_INF("BT", "Quick rescan...");
-    lastError = "Scanning...";
-    btMgr->startScan(10000);
-    lastScanTime = millis();
-    selectedIndex = 0;
-    requestUpdate();
-    return;
-  }
-  
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    // Check if "Refresh" is selected
-    if (selectedIndex == static_cast<int>(devices.size())) {
-      if (!checkScanHeapOrError(lastError)) {
+
+    // ---- SelectFunction: scroll through kMapFns, Confirm assigns -------
+    if (mapStep == MapStep::SelectFunction) {
+      if (mappedInput.wasPressed(MappedInputManager::Button::Down) ||
+          mappedInput.wasPressed(MappedInputManager::Button::Right)) {
+        functionIndex = ButtonNavigator::nextIndex(functionIndex, kMapFnCount);
         requestUpdate();
-        return;
+      } else if (mappedInput.wasPressed(MappedInputManager::Button::Up) ||
+                 mappedInput.wasPressed(MappedInputManager::Button::Left)) {
+        functionIndex = ButtonNavigator::previousIndex(functionIndex, kMapFnCount);
+        requestUpdate();
+      } else if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+        if (assignCapturedKey(kMapFns[functionIndex].button)) {
+          // v18.4: distinguish "saved to disk" from "saved to RAM only,
+          // heap too low to persist." Before, a deferred save was silent
+          // -- user thought mapping was persisted but on next reboot it
+          // was gone. Now we tell them explicitly to disconnect BT (frees
+          // ~50KB) or reboot so the deferred save can catch up.
+          if (SETTINGS.hasDeferredSave()) {
+            char buf[96];
+            snprintf(buf, sizeof(buf),
+                     "Mapped %s (heap low, disk write deferred - disconnect BT or reboot to persist)",
+                     kMapFns[functionIndex].label);
+            setBanner(buf, 5000);
+          } else {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "Mapped %s", kMapFns[functionIndex].label);
+            setBanner(buf, 2500);
+          }
+        } else {
+          setBanner("Map full (12 slots)", 3000);
+        }
+        // Loop back to capture the next key so the user can map multiple buttons
+        // in one session.
+        mapStep = MapStep::WaitForKey;
+        pendingKeyKind = 0xFF;
+        pendingKeyValue = 0;
+        requestUpdate();
       }
-      LOG_INF("BT", "Refreshing scan...");
-      lastError = "Scanning...";
-      btMgr->startScan(10000);
-      lastScanTime = millis();
-      selectedIndex = 0;
+    }
+    return;
+  }
+#ifdef ENABLE_BT_DEBUG_MONITOR
+  if (view == View::DebugMonitor) {
+    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) && btMgr) {
+      const bool next = !btMgr->isDebugCaptureEnabled();
+      btMgr->setDebugCaptureEnabled(next);
+      setBanner(next ? "Debug capture: ON" : "Debug capture: OFF");
       requestUpdate();
       return;
     }
-    
-    // Check if "Disconnect" is selected
-    if (!connectedDevices.empty() && selectedIndex == static_cast<int>(devices.size()) + 1) {
-      LOG_INF("BT", "Disconnecting from all devices...");
-      // Make a copy of addresses to avoid iterator invalidation
-      std::vector<std::string> deviceAddresses = connectedDevices;
-      for (const auto& addr : deviceAddresses) {
-        LOG_DBG("BT", "Disconnecting from %s", addr.c_str());
-        btMgr->disconnectFromDevice(addr);
-      }
-      lastError = "Disconnected";
-      selectedIndex = 0;
+    if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+      if (btMgr) btMgr->setInputCallback(nullptr);
+      view = View::Menu;
+      rebuildMenuRows();
       requestUpdate();
       return;
     }
-    
-    // Otherwise, connect to selected device
-    if (selectedIndex >= 0 && selectedIndex < static_cast<int>(devices.size())) {
-      const auto& device = devices[selectedIndex];
-      
-      LOG_INF("BT", "Connecting to %s (%s)", device.name.c_str(), device.address.c_str());
-      lastError = "Connecting...";
-      requestUpdate();
-      
-      if (btMgr->connectToDevice(device.address)) {
-        strncpy(SETTINGS.bleBondedDeviceAddr, device.address.c_str(), sizeof(SETTINGS.bleBondedDeviceAddr) - 1);
+    return;
+  }
+#endif
+
+  // ---- Watch for async connect result --------------------------------
+  if (awaitingConnect && btMgr) {
+    // CrumBLE single-bonded model: success = at least one connected device.
+    if (!btMgr->getConnectedDevices().empty()) {
+      awaitingConnect = false;
+      // 4.5.5: persist the bond. Without this, SETTINGS.bleBondedDeviceAddr
+      // stays empty after a fresh pair and the in-book drawer's BT quick-
+      // connect falls into the "no bonded -> launch pairing UI" branch
+      // instead of "have bonded -> reconnect directly", so the user has to
+      // re-pair on every launch. The Paired view path doesn't reach this
+      // code (its connect target was already SETTINGS.bleBondedDeviceAddr).
+      if (!pendingConnectAddress.empty()) {
+        strncpy(SETTINGS.bleBondedDeviceAddr, pendingConnectAddress.c_str(),
+                sizeof(SETTINGS.bleBondedDeviceAddr) - 1);
         SETTINGS.bleBondedDeviceAddr[sizeof(SETTINGS.bleBondedDeviceAddr) - 1] = '\0';
-        strncpy(SETTINGS.bleBondedDeviceName, device.name.c_str(), sizeof(SETTINGS.bleBondedDeviceName) - 1);
+        strncpy(SETTINGS.bleBondedDeviceName, pendingConnectName.c_str(),
+                sizeof(SETTINGS.bleBondedDeviceName) - 1);
         SETTINGS.bleBondedDeviceName[sizeof(SETTINGS.bleBondedDeviceName) - 1] = '\0';
         SETTINGS.bleBondedDeviceAddrType = 0;
         SETTINGS.saveToFile();
-        btMgr->setBondedDevice(device.address, device.name);
-
-        // CrumBLE 4.5.4 follow-up: explicit 'connected and saved' message
-        // instead of the misleading 'Bluetooth enabled' (BT was already
-        // enabled to scan -- the meaningful new state is that THIS remote
-        // is now bonded). Truncate device name so the bottom status line
-        // doesn't overflow on long remote names.
-        std::string shortName = device.name.empty() ? std::string("remote") : device.name;
-        if (shortName.size() > 24) shortName = shortName.substr(0, 21) + "...";
-        lastError = "Connected: " + shortName + " (saved)";
-        LOG_INF("BT", "Successfully connected to %s", device.name.c_str());
-        if (exitOnSuccessfulConnect) {
-          MenuResult result;
-          result.autoExitParent = true;
-          setResult(ActivityResult{result});
-          finish();
-          return;
-        }
-      } else {
-        lastError = btMgr->lastError.empty() ? "Connection failed" : btMgr->lastError;
-        LOG_ERR("BT", "Failed to connect: %s", lastError.c_str());
+        btMgr->setBondedDevice(pendingConnectAddress, pendingConnectName);
       }
+      char buf[64];
+      const std::string& name = pendingConnectName.empty() ? connectedDeviceName() : pendingConnectName;
+      snprintf(buf, sizeof(buf), "Connected: %s (saved)", name.empty() ? "device" : name.c_str());
+      setBanner(buf);
+      pendingConnectAddress.clear();
+      pendingConnectName.clear();
+      if (exitOnSuccessfulConnect) {
+        MenuResult result;
+        result.autoExitParent = true;
+        setResult(ActivityResult{result});
+        finish();
+        return;
+      }
+      view = View::Menu;
+      rebuildMenuRows();
+      requestUpdate();
+    } else if (awaitingConnectStartedAt > 0 && (millis() - awaitingConnectStartedAt) > 15000) {
+      // 4.5.5: connect timeout. No takeConnectFailure equivalent in our
+      // manager -- without this, awaitingConnect would stick if NimBLE
+      // failed silently, blocking subsequent button presses on the menu.
+      awaitingConnect = false;
+      pendingConnectAddress.clear();
+      pendingConnectName.clear();
+      setBanner("Connect timed out", 3000);
       requestUpdate();
     }
   }
-}
 
-void BluetoothSettingsActivity::render(RenderLock&&) {
-  if (viewMode == ViewMode::MAIN_MENU) {
-    renderMainMenu();
-  } else if (viewMode == ViewMode::DEVICE_LIST) {
-    renderDeviceList();
-  } else if (viewMode == ViewMode::DEBUG_MONITOR) {
-    renderDebugMonitor();
-  } else {
-    renderLearnKeys();
-  }
-}
-
-void BluetoothSettingsActivity::handleDebugInput() {
-  if (!btMgr) {
-    return;
+  // Repaint scan view as devices stream in (or the spinner-equivalent ticks).
+  if (view == View::Scan && btMgr && btMgr->isScanning()) {
+    if (millis() - lastScanAnimMs > kScanAnimIntervalMs) {
+      lastScanAnimMs = millis();
+      requestUpdate();
+    }
   }
 
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    const bool next = !btMgr->isDebugCaptureEnabled();
-    btMgr->setDebugCaptureEnabled(next);
-    lastError = next ? "BT debug capture: ON" : "BT debug capture: OFF";
+  // ---- Back returns from a sub-view, or finishes from Menu -----------
+  if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+    if (view == View::Menu) {
+      if (onComplete) onComplete();
+      return;
+    }
+    if (view == View::Scan && btMgr && btMgr->isScanning()) {
+      btMgr->stopScan();
+    }
+    view = View::Menu;
+    rebuildMenuRows();
     requestUpdate();
     return;
   }
+
+  // ---- List navigation: Up/Down (and Left/Right alias) ---------------
+  const int count = view == View::Menu                  ? static_cast<int>(menuRows.size())
+                    : view == View::Scan
+                        ? static_cast<int>(btMgr ? btMgr->getDiscoveredDevices().size() : 0)
+                        : (hasBondedDevice() ? 1 : 0);  // Paired -> single-bonded model
+  int* idx = view == View::Menu ? &menuIndex : view == View::Scan ? &scanIndex : &pairedIndex;
+  const bool nextPressed = mappedInput.wasPressed(MappedInputManager::Button::Down) ||
+                           mappedInput.wasPressed(MappedInputManager::Button::Right);
+  const bool prevPressed = mappedInput.wasPressed(MappedInputManager::Button::Up) ||
+                           mappedInput.wasPressed(MappedInputManager::Button::Left);
+  if (count > 0 && nextPressed) {
+    *idx = ButtonNavigator::nextIndex(*idx, count);
+    requestUpdate();
+  } else if (count > 0 && prevPressed) {
+    *idx = ButtonNavigator::previousIndex(*idx, count);
+    requestUpdate();
+  }
+
+  // ---- Paired view: tap to connect, HOLD to forget -------------------
+  if (view == View::Paired) {
+    if (mappedInput.isPressed(MappedInputManager::Button::Confirm)) {
+      if (!pairedActionTaken && mappedInput.getHeldTime() >= kForgetHoldMs && hasBondedDevice()) {
+        forgetBondedDevice();
+        setBanner(tr(STR_FORGET_BUTTON));
+        pairedActionTaken = true;
+        view = View::Menu;
+        rebuildMenuRows();
+        requestUpdate();
+      }
+    } else if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+      if (!pairedActionTaken && !awaitingConnect && hasBondedDevice()) {
+        awaitingConnect = true;
+        setBanner(tr(STR_CONNECTING));
+        const std::string addr = SETTINGS.bleBondedDeviceAddr;
+        btMgr->connectToDevice(addr);
+        requestUpdate();
+      }
+      pairedActionTaken = false;
+    }
+    return;
+  }
+
+  // ---- Menu / Scan: Confirm ------------------------------------------
+  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    if (view == View::Menu) {
+      handleMenuConfirm();
+    } else if (view == View::Scan && btMgr) {
+      if (!awaitingConnect) {
+        if (btMgr->isScanning()) btMgr->stopScan();
+        const auto& devices = btMgr->getDiscoveredDevices();
+        if (scanIndex >= 0 && scanIndex < static_cast<int>(devices.size())) {
+          const auto& d = devices[scanIndex];
+          awaitingConnect = true;
+          pendingConnectAddress = d.address;
+          pendingConnectName = d.name;
+          awaitingConnectStartedAt = millis();
+          setBanner(tr(STR_CONNECTING));
+          btMgr->connectToDevice(d.address);
+          requestUpdate();
+        }
+      }
+    }
+    return;
+  }
 }
 
-void BluetoothSettingsActivity::renderMainMenu() {
-  auto metrics = UITheme::getInstance().getMetrics();
+// ============================================================================
+// Helpers (single-bonded model)
+// ============================================================================
+
+std::string BluetoothSettingsActivity::connectedDeviceName() const {
+  if (!btMgr) return {};
+  // BluetoothHIDManager::getConnectedDevices() returns just addresses; reach
+  // into the device list to find the name. Single-connected model in
+  // practice (CrumBLE only ever pairs one HID).
+  const auto addrs = btMgr->getConnectedDevices();
+  if (addrs.empty()) return {};
+  // The manager stores names alongside addresses internally; SETTINGS holds
+  // the last bonded name as a friendlier fallback.
+  if (SETTINGS.bleBondedDeviceName[0] != '\0') return SETTINGS.bleBondedDeviceName;
+  return addrs.front();
+}
+
+bool BluetoothSettingsActivity::hasBondedDevice() const {
+  return SETTINGS.bleBondedDeviceAddr[0] != '\0';
+}
+
+void BluetoothSettingsActivity::forgetBondedDevice() {
+  if (btMgr) {
+    const std::string addr = SETTINGS.bleBondedDeviceAddr;
+    if (!addr.empty() && btMgr->isConnected(addr.c_str())) {
+      btMgr->disconnectFromDevice(addr);
+    }
+  }
+  SETTINGS.bleBondedDeviceAddr[0] = '\0';
+  SETTINGS.bleBondedDeviceName[0] = '\0';
+  SETTINGS.saveToFile();
+}
+
+// ============================================================================
+// render dispatch
+// ============================================================================
+
+void BluetoothSettingsActivity::render(RenderLock&&) {
+  if (view == View::ButtonMap) {
+    renderButtonMap();
+    return;
+  }
+#ifdef ENABLE_BT_DEBUG_MONITOR
+  if (view == View::DebugMonitor) {
+    renderDebugMonitor();
+    return;
+  }
+#endif
+
+  renderer.clearScreen();
+  const auto& metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
 
-  renderer.clearScreen();
-
-  // Header with Bluetooth title
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, tr(STR_BLUETOOTH));
 
-  // Status subheader
-  std::string statusLine;
-  if (btMgr) {
-    if (btMgr->isEnabled()) {
-      auto connDevices = btMgr->getConnectedDevices();
-      if (!connDevices.empty()) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "Enabled, %zu device(s) connected", connDevices.size());
-        statusLine = buf;
-      } else {
-        statusLine = "Enabled, no devices connected";
-      }
-    } else {
-      statusLine = "Disabled";
-    }
+  // Sub-header: live status. Mirrors upstream: connected name OR "Not
+  // connected" (CrumBLE-extended: "Disabled" when BT is off).
+  std::string status;
+  if (btMgr && btMgr->isEnabled()) {
+    const std::string name = connectedDeviceName();
+    status = name.empty() ? "Not connected" : name;
   } else {
-    statusLine = "Error initializing Bluetooth";
+    status = "Disabled";
   }
-  
   GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight},
-                    statusLine.c_str());
+                    status.c_str());
 
-  int listOffsetY = 0;
-  if (btMgr && btMgr->isEnabled() && SETTINGS.bleBondedDeviceName[0] != '\0') {
-    const int nameY = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 4;
-    std::string deviceLine = std::string("Remote: ") + SETTINGS.bleBondedDeviceName;
-    deviceLine = renderer.truncatedText(UI_10_FONT_ID, deviceLine.c_str(), pageWidth - metrics.contentSidePadding * 2);
-    renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, nameY, deviceLine.c_str(), true);
-    listOffsetY = renderer.getLineHeight(UI_10_FONT_ID) + 4;
+  const int topOffset = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing;
+  const int contentHeight = pageHeight - topOffset - metrics.buttonHintsHeight - metrics.verticalSpacing;
+  const Rect listRect{0, topOffset, pageWidth, contentHeight};
+
+  if (view == View::Menu) {
+    renderMenu();
+  } else if (view == View::Scan) {
+    renderScan();
+  } else {
+    renderPaired();
   }
 
-  // Use GUI.drawList for consistent formatting with main settings
-  const char* items[] = {
-    btMgr && btMgr->isEnabled() ? "Disable Bluetooth" : "Enable Bluetooth",
-    "Reconnect Bonded Remote",
-    "Disconnect Device(s)",
-    "Scan for Devices",
-    "Remote Setup Wizard",
-#ifdef ENABLE_BT_DEBUG_MONITOR
-    btMgr && btMgr->isDebugCaptureEnabled() ? "Disable BT Debug Capture" : "Enable BT Debug Capture",
-#endif
-    "Clear Learned Keys",
-    "Forget Bonded Remote"
-  };
-
-  std::vector<std::string> itemLabels;
-  for (int i = 0; i < static_cast<int>(sizeof(items) / sizeof(items[0])); i++) {
-    itemLabels.push_back(items[i]);
+  // Transient banner above the button hints.
+  if (!banner.empty()) {
+    GUI.drawHelpText(renderer,
+                     Rect{0, pageHeight - metrics.buttonHintsHeight - 22, pageWidth, 20},
+                     banner.c_str());
+  } else if (view == View::Paired && hasBondedDevice()) {
+    // Surface the hold-to-forget hint when there's nothing else to say.
+    GUI.drawHelpText(renderer,
+                     Rect{0, pageHeight - metrics.buttonHintsHeight - 22, pageWidth, 20},
+                     "Hold Confirm to forget");
   }
 
+  const char* confirmHint = view == View::Menu ? tr(STR_SELECT) : tr(STR_CONNECT);
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirmHint, tr(STR_DIR_UP), tr(STR_DIR_DOWN));
+  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
+  renderer.displayBuffer();
+
+  // Avoid unused-variable warnings when the menu/scan/paired branch above
+  // doesn't reach for listRect itself (the sub-renderers reach for it via
+  // their own metrics calls, which is fine -- this just keeps the symbol
+  // live in case a future renderer wants it).
+  (void)listRect;
+}
+
+void BluetoothSettingsActivity::renderMenu() {
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const auto pageWidth = renderer.getScreenWidth();
+  const auto pageHeight = renderer.getScreenHeight();
+  const int topOffset = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing;
+  const int contentHeight = pageHeight - topOffset - metrics.buttonHintsHeight - metrics.verticalSpacing;
+  const Rect listRect{0, topOffset, pageWidth, contentHeight};
   GUI.drawList(
-      renderer,
-      Rect{0,
-           metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing + listOffsetY,
-           pageWidth,
-           pageHeight - (metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.buttonHintsHeight +
-                         metrics.verticalSpacing * 2 + listOffsetY)},
-      static_cast<int>(itemLabels.size()), selectedIndex,
-      [&itemLabels](int index) { return itemLabels[index]; }, nullptr, nullptr,
-      [this](int i) {
-        if (i == 0) {
+      renderer, listRect, static_cast<int>(menuRows.size()), menuIndex,
+      [this](int i) { return std::string(menuRows[i].label); },
+      nullptr, nullptr,
+      [this](int i) -> std::string {
+        // Show On/Off chip next to the BT toggle; bonded-name chip next to
+        // PairedDevices. Other rows have no value.
+        const Action a = menuRows[i].action;
+        if (a == Action::ToggleBt) {
           return std::string(btMgr && btMgr->isEnabled() ? tr(STR_STATE_ON) : tr(STR_STATE_OFF));
         }
-        if (i == 1 && SETTINGS.bleBondedDeviceName[0] != '\0') {
-          return renderer.truncatedText(UI_10_FONT_ID, SETTINGS.bleBondedDeviceName,
-                                        renderer.getScreenWidth() - UITheme::getInstance().getMetrics().contentSidePadding * 4);
+        if (a == Action::PairedDevices && hasBondedDevice()) {
+          return std::string(SETTINGS.bleBondedDeviceName);
         }
         return std::string("");
       },
       true);
-
-  if (!lastError.empty()) {
-    std::string statusText = renderer.truncatedText(UI_10_FONT_ID, lastError.c_str(),
-                                                    pageWidth - metrics.contentSidePadding * 2);
-    const int statusY = pageHeight - metrics.buttonHintsHeight - metrics.contentSidePadding - renderer.getLineHeight(UI_10_FONT_ID);
-    renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, statusY, statusText.c_str(), true);
-  }
-
-  // Button hints — front L/R are aliased to Up/Down navigation just like
-  // Reader Options / Controls, so label them as Up/Down to match.
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
-  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-
-  renderer.displayBuffer();
 }
 
-void BluetoothSettingsActivity::renderDeviceList() {
-  auto metrics = UITheme::getInstance().getMetrics();
+void BluetoothSettingsActivity::renderScan() {
+  const auto& metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
-
-  renderer.clearScreen();
-
-  if (!btMgr) {
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, "Bluetooth error");
+  const int topOffset = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing;
+  const int contentHeight = pageHeight - topOffset - metrics.buttonHintsHeight - metrics.verticalSpacing;
+  const auto& devices = btMgr ? btMgr->getDiscoveredDevices() : std::vector<BluetoothDevice>{};
+  if (devices.empty()) {
+    GUI.drawHelpText(renderer, Rect{0, topOffset, pageWidth, 24},
+                     btMgr && btMgr->isScanning() ? tr(STR_SCANNING) : "No HID devices found");
     return;
   }
-
-  const auto& devices = btMgr->getDiscoveredDevices();
-  const auto& connectedDevices = btMgr->getConnectedDevices();
-
-  // Header with device count
-  char countStr[32];
-  snprintf(countStr, sizeof(countStr), btMgr->isScanning() ? tr(STR_SCANNING) : "Found %zu", devices.size());
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, 
-                 tr(STR_BLUETOOTH), countStr);
-
-  // Subheader with scan status
-  std::string subheaderText;
-  if (btMgr->isScanning()) {
-    // Animated trailing dots; trailing spaces keep the width fixed so it doesn't reflow.
-    const int dotCount = static_cast<int>((millis() / 700) % 4);
-    subheaderText = "Searching for devices" + std::string(dotCount, '.') +
-                    std::string(3 - dotCount, ' ');
-  } else {
-    if (devices.empty()) {
-      subheaderText = "No devices found";
-    } else {
-      char buf[64];
-      snprintf(buf, sizeof(buf), "%d device(s) available", (int)devices.size());
-      subheaderText = buf;
-    }
-  }
-  
-  GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight},
-                    subheaderText.c_str());
-
-  // During a scan the list is mutated on the BLE task; don't iterate it here
-  // (race). Show a hint; build the interactive list once the scan finishes.
-  if (btMgr->isScanning()) {
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight / 2, "Looking for nearby remotes...");
-  } else {
-    // Build device list labels. `GUI.drawList()` already paginates based on
-    // `selectedIndex`, so keep the full device list here and let the user scroll
-    // through every discovered device instead of truncating after the first page.
-    std::vector<std::string> deviceLabels;
-    std::vector<std::string> deviceValues;
-    char buf[128];
-
-    if (!devices.empty()) {
-      for (const auto& device : devices) {
-        const bool connected = btMgr->isConnected(device.address.c_str());
-
-        // Device name with indicators
-        const char* connSymbol = connected ? "[*] " : "";
-        const char* hidSymbol = device.isHID ? "[HID] " : "";
-        snprintf(buf, sizeof(buf), "%s%s%s", connSymbol, hidSymbol, device.name.c_str());
-        deviceLabels.push_back(buf);
-
-        // RSSI/signal strength
-        const std::string signalBars = getSignalStrengthIndicator(device.rssi);
-        snprintf(buf, sizeof(buf), "%s (%d dBm)", signalBars.c_str(), device.rssi);
-        deviceValues.push_back(buf);
-      }
-    }
-
-    // Add action buttons after the full device list.
-    deviceLabels.push_back("< Rescan >");
-    deviceValues.push_back("");
-
-    if (!connectedDevices.empty()) {
-      deviceLabels.push_back("< Disconnect All >");
-      deviceValues.push_back("");
-    }
-
-    // Render the list using GUI.drawList for consistency
-    GUI.drawList(
-        renderer,
-        Rect{0, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing, pageWidth,
-             pageHeight - (metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.buttonHintsHeight +
-                           metrics.verticalSpacing * 2)},
-        deviceLabels.size(), selectedIndex,
-        [&deviceLabels](int index) { return deviceLabels[index]; }, nullptr, nullptr,
-        [&deviceValues](int i) { return i < (int)deviceValues.size() ? deviceValues[i] : std::string(""); },
-        true);
-  }
-
-  // Help text
-  GUI.drawHelpText(renderer,
-                   Rect{0, pageHeight - metrics.buttonHintsHeight - metrics.contentSidePadding - 15, pageWidth, 20},
-                   btMgr->isScanning() ? "Left/Back: Cancel scan" : "Up/Down: Scroll | Right: Rescan");
-
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_CONNECT), tr(STR_DIR_LEFT), tr(STR_RETRY));
-  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-
-  renderer.displayBuffer();
+  GUI.drawList(
+      renderer, Rect{0, topOffset, pageWidth, contentHeight},
+      static_cast<int>(devices.size()), scanIndex,
+      [&devices](int i) {
+        // Devices are HID-only post 4.5.5 filter. Show name first, fall back
+        // to address; RSSI as a value chip.
+        return devices[static_cast<size_t>(i)].name;
+      },
+      nullptr, nullptr,
+      [&devices](int i) -> std::string {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", devices[static_cast<size_t>(i)].rssi);
+        return std::string(buf);
+      },
+      false);
 }
 
-std::string BluetoothSettingsActivity::getSignalStrengthIndicator(const int32_t rssi) const {
-  // BLE RSSI tends to be lower than WiFi at similar distance.
-  // Use BLE-friendly thresholds so nearby remotes are not shown as always weak.
-  if (rssi >= -60) {
-    return "||||";  // Excellent
+void BluetoothSettingsActivity::renderPaired() {
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const auto pageWidth = renderer.getScreenWidth();
+  const auto pageHeight = renderer.getScreenHeight();
+  const int topOffset = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing;
+  const int contentHeight = pageHeight - topOffset - metrics.buttonHintsHeight - metrics.verticalSpacing;
+  if (!hasBondedDevice()) {
+    GUI.drawHelpText(renderer, Rect{0, topOffset, pageWidth, 24}, "No paired device");
+    return;
   }
-  if (rssi >= -70) {
-    return " |||";  // Good
-  }
-  if (rssi >= -80) {
-    return "  ||";  // Fair
-  }
-  return "   |";  // Very weak
+  // Single-bonded model: one row.
+  GUI.drawList(
+      renderer, Rect{0, topOffset, pageWidth, contentHeight}, 1, pairedIndex,
+      [](int) { return std::string(SETTINGS.bleBondedDeviceName); },
+      nullptr, nullptr, nullptr, false);
 }
 
-void BluetoothSettingsActivity::renderLearnKeys() {
+// ============================================================================
+// Sub-view renderers (CrumBLE-only -- preserved verbatim from prior version)
+// ============================================================================
+
+void BluetoothSettingsActivity::describeMapKey(uint8_t kind, uint8_t value, char* out, size_t outLen) const {
+  if (!out || outLen == 0) return;
+  // CrumBLE captures HID usage codes today; the kind == 0 (special key) branch
+  // is here so a future SpecialKey decoder can plug in without churning the UI.
+  if (kind == 1) {
+    snprintf(out, outLen, "Key 0x%02X", static_cast<unsigned>(value));
+  } else if (kind == 0) {
+    snprintf(out, outLen, "Special %u", static_cast<unsigned>(value));
+  } else {
+    snprintf(out, outLen, "Unknown");
+  }
+}
+
+bool BluetoothSettingsActivity::assignCapturedKey(uint8_t button) {
+  using Entry = CrossPointSettings::BleKeyMapEntry;
+  auto& map = SETTINGS.bleKeyMap;
+  const uint8_t kind = pendingKeyKind;
+  const uint8_t value = pendingKeyValue;
+
+  // One key per action: drop any other key currently bound to this action so
+  // the same virtual button can't be triggered by two different remote keys.
+  std::replace_if(
+      std::begin(map), std::end(map),
+      [&](const Entry& e) { return e.button == button && !(e.keyKind == kind && e.keyValue == value); },
+      Entry{});
+
+  // Reuse the slot already bound to this key, else find the first free slot.
+  auto* slot = std::find_if(std::begin(map), std::end(map), [&](const Entry& e) {
+    return e.button != 0xFF && e.keyKind == kind && e.keyValue == value;
+  });
+  if (slot == std::end(map)) {
+    slot = std::find_if(std::begin(map), std::end(map),
+                        [](const Entry& e) { return e.button == 0xFF || e.keyKind == 0xFF; });
+  }
+  if (slot == std::end(map)) return false;  // table full
+
+  slot->keyKind = kind;
+  slot->keyValue = value;
+  slot->button = button;
+  SETTINGS.saveToFile();
+  // Return true = in-RAM assignment landed (slot was available). Save
+  // outcome is signalled separately via SETTINGS.hasDeferredSave() so the
+  // caller can distinguish "table full" (return false) from "captured but
+  // heap too low to persist" (return true, hasDeferredSave() true).
+  return true;
+}
+
+void BluetoothSettingsActivity::renderButtonMap() {
   auto metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
 
   renderer.clearScreen();
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, "Remote Setup Wizard");
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, "Map Buttons");
 
-  const char* stepText = "Press FORWARD button";
-  if (learnStep == LearnStep::WAIT_NEXT) {
-    stepText = "Press BACK button";
-  } else if (learnStep == LearnStep::WAIT_TEST) {
-    stepText = "Test both buttons (10s)";
-  } else if (learnStep == LearnStep::DONE) {
-    stepText = "Learning complete";
-  }
-
-  GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight},
-                    stepText);
-
-  char line1[64];
-  char line2[64];
-  snprintf(line1, sizeof(line1), "Forward key: %s", learnedNextKey ? "captured" : "waiting");
-  snprintf(line2, sizeof(line2), "Back key: %s", learnedPrevKey ? "captured" : "waiting");
-
-  renderer.drawCenteredText(UI_12_FONT_ID, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 32,
-                            line1);
-  renderer.drawCenteredText(UI_12_FONT_ID, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 56,
-                            line2);
-
-  if (learnedNextKey || learnedPrevKey) {
-    char line3[48];
-    char line4[64];
-    if (learnStep == LearnStep::WAIT_TEST) {
-      unsigned int remaining = (learnTestDeadlineMs > millis()) ? (learnTestDeadlineMs - millis()) / 1000 : 0;
-      snprintf(line3, sizeof(line3), "Time left: %us", remaining);
-      snprintf(line4, sizeof(line4), "Fwd:%u Back:%u", static_cast<unsigned>(learnTestForwardCount),
-               static_cast<unsigned>(learnTestBackCount));
-      renderer.drawCenteredText(UI_10_FONT_ID, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 100,
-                                line4);
-    } else {
-      snprintf(line3, sizeof(line3), "Report byte: [%u]", static_cast<unsigned>(learnedReportIndex));
+  if (mapStep == MapStep::WaitForKey) {
+    GUI.drawSubHeader(
+        renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight},
+        "Press a remote button");
+    // List currently-mapped bindings so the user sees progress.
+    const int topOffset = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing;
+    int row = 0;
+    for (const auto& e : SETTINGS.bleKeyMap) {
+      if (e.button == 0xFF || e.keyKind == 0xFF) continue;
+      char keyName[24];
+      describeMapKey(e.keyKind, e.keyValue, keyName, sizeof(keyName));
+      const char* fnName = "?";
+      for (uint8_t i = 0; i < kMapFnCount; i++) {
+        if (kMapFns[i].button == e.button) {
+          fnName = kMapFns[i].label;
+          break;
+        }
+      }
+      char line[64];
+      snprintf(line, sizeof(line), "%s  ->  %s", keyName, fnName);
+      GUI.drawHelpText(renderer, Rect{0, topOffset + row * 22, pageWidth, 20}, line);
+      row++;
     }
-    renderer.drawCenteredText(UI_10_FONT_ID, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 80,
-                              line3);
+    if (row == 0) {
+      GUI.drawHelpText(renderer, Rect{0, topOffset, pageWidth, 22},
+                       "No bindings yet -- press any remote key to start");
+    }
+  } else {
+    char captured[24];
+    describeMapKey(pendingKeyKind, pendingKeyValue, captured, sizeof(captured));
+    GUI.drawSubHeader(
+        renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight}, captured);
+    const int topOffset = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing;
+    const int contentHeight = pageHeight - topOffset - metrics.buttonHintsHeight - metrics.verticalSpacing;
+    GUI.drawList(
+        renderer, Rect{0, topOffset, pageWidth, contentHeight}, kMapFnCount, functionIndex,
+        [](int i) { return std::string(kMapFns[i].label); },
+        nullptr, nullptr, nullptr, false);
   }
 
-  if (!lastError.empty()) {
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight - metrics.buttonHintsHeight - 16, lastError.c_str());
+  if (!banner.empty()) {
+    GUI.drawHelpText(renderer, Rect{0, pageHeight - metrics.buttonHintsHeight - 22, pageWidth, 20}, banner.c_str());
   }
 
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK),
-                        (learnStep == LearnStep::DONE || learnStep == LearnStep::WAIT_TEST)
-                          ? tr(STR_SELECT)
-                          : "",
-                                            "", "");
+  const char* confirm = mapStep == MapStep::SelectFunction ? tr(STR_SELECT) : "";
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), confirm, tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
-
   renderer.displayBuffer();
 }
 
@@ -1004,84 +913,59 @@ void BluetoothSettingsActivity::renderDebugMonitor() {
 
   renderer.clearScreen();
   GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, "Bluetooth Debug");
+  const char* sub = btMgr && btMgr->isDebugCaptureEnabled() ? "Capture ON" : "Capture OFF";
+  GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight}, sub);
 
-  std::string sub = btMgr && btMgr->isDebugCaptureEnabled() ? "Capture ON" : "Capture OFF";
-  GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight},
-                    sub.c_str());
-
-  char line1[64];
-  char line2[64];
-  char line3[64];
-  char line4[64];
-
+  char l1[64], l2[64], l3[64], l4[64];
   unsigned int connectedCount = btMgr ? static_cast<unsigned int>(btMgr->getConnectedDevices().size()) : 0;
-  snprintf(line1, sizeof(line1), "Connected: %u", connectedCount);
-  snprintf(line2, sizeof(line2), "Key events: %u", static_cast<unsigned>(debugEventCount));
-  snprintf(line3, sizeof(line3), "Unique keys: %u", static_cast<unsigned>(debugUniqueCount));
-  snprintf(line4, sizeof(line4), "Last key: 0x%02X", static_cast<unsigned>(debugLastKeycode & 0xFF));
-
-  renderer.drawCenteredText(UI_12_FONT_ID, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 24,
-                            line1);
-  renderer.drawCenteredText(UI_12_FONT_ID, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 48,
-                            line2);
-  renderer.drawCenteredText(UI_12_FONT_ID, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 72,
-                            line3);
-  renderer.drawCenteredText(UI_12_FONT_ID, metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 96,
-                            line4);
-
+  snprintf(l1, sizeof(l1), "Connected: %u", connectedCount);
+  snprintf(l2, sizeof(l2), "Key events: %u", static_cast<unsigned>(debugEventCount));
+  snprintf(l3, sizeof(l3), "Unique keys: %u", static_cast<unsigned>(debugUniqueCount));
+  snprintf(l4, sizeof(l4), "Last key: 0x%02X", static_cast<unsigned>(debugLastKeycode & 0xFF));
+  const int base = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight;
+  renderer.drawCenteredText(UI_12_FONT_ID, base + 24, l1);
+  renderer.drawCenteredText(UI_12_FONT_ID, base + 48, l2);
+  renderer.drawCenteredText(UI_12_FONT_ID, base + 72, l3);
+  renderer.drawCenteredText(UI_12_FONT_ID, base + 96, l4);
   if (debugLastEventMs > 0) {
-    char eventAgeLine[64];
-    snprintf(eventAgeLine, sizeof(eventAgeLine), "Last event: %lus ago", (millis() - debugLastEventMs) / 1000);
-    renderer.drawCenteredText(UI_10_FONT_ID,
-                              metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 114,
-                              eventAgeLine);
+    char eventAge[64];
+    snprintf(eventAge, sizeof(eventAge), "Last event: %lus ago", (millis() - debugLastEventMs) / 1000);
+    renderer.drawCenteredText(UI_10_FONT_ID, base + 114, eventAge);
   }
-
-  const int uniqueStartY = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + 132;
+  const int uniqueStartY = base + 132;
   if (debugUniqueCount == 0) {
     renderer.drawCenteredText(UI_10_FONT_ID, uniqueStartY, "No key presses captured yet");
   } else {
-    uint8_t sortedIndices[kDebugUniqueKeyMax] = {0};
-    for (uint8_t i = 0; i < debugUniqueCount; i++) {
-      sortedIndices[i] = i;
-    }
-
+    uint8_t order[kDebugUniqueKeyMax] = {0};
+    for (uint8_t i = 0; i < debugUniqueCount; i++) order[i] = i;
     for (uint8_t i = 0; i + 1 < debugUniqueCount; i++) {
       uint8_t best = i;
       for (uint8_t j = i + 1; j < debugUniqueCount; j++) {
-        const uint16_t bestCount = debugUniqueCounts[sortedIndices[best]];
-        const uint16_t candidateCount = debugUniqueCounts[sortedIndices[j]];
-        if (candidateCount > bestCount) {
-          best = j;
-        }
+        if (debugUniqueCounts[order[j]] > debugUniqueCounts[order[best]]) best = j;
       }
       if (best != i) {
-        const uint8_t tmp = sortedIndices[i];
-        sortedIndices[i] = sortedIndices[best];
-        sortedIndices[best] = tmp;
+        const uint8_t tmp = order[i];
+        order[i] = order[best];
+        order[best] = tmp;
       }
     }
-
-    const uint8_t renderCount = (debugUniqueCount < 4) ? debugUniqueCount : 4;
+    const uint8_t renderCount = debugUniqueCount < 4 ? debugUniqueCount : 4;
     for (uint8_t i = 0; i < renderCount; i++) {
-      const uint8_t idx = sortedIndices[i];
+      const uint8_t idx = order[i];
       char keyLine[64];
       snprintf(keyLine, sizeof(keyLine), "Key 0x%02X  x%u", static_cast<unsigned>(debugUniqueKeys[idx]),
                static_cast<unsigned>(debugUniqueCounts[idx]));
       renderer.drawCenteredText(UI_10_FONT_ID, uniqueStartY + static_cast<int>(i) * 16, keyLine);
     }
-
     if (debugUniqueCount > renderCount) {
       char moreLine[48];
       snprintf(moreLine, sizeof(moreLine), "+%u more keys", static_cast<unsigned>(debugUniqueCount - renderCount));
       renderer.drawCenteredText(UI_10_FONT_ID, uniqueStartY + static_cast<int>(renderCount) * 16, moreLine);
     }
   }
-
-  if (!lastError.empty()) {
-    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight - metrics.buttonHintsHeight - 16, lastError.c_str());
+  if (!banner.empty()) {
+    renderer.drawCenteredText(UI_10_FONT_ID, pageHeight - metrics.buttonHintsHeight - 16, banner.c_str());
   }
-
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), "", "");
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
   renderer.displayBuffer();

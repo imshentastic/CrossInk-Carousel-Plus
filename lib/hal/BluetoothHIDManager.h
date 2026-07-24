@@ -63,6 +63,10 @@ public:
   bool enable();
   bool disable();
   bool isEnabled() const { return _enabled; }
+  // v18.9.9.48: true after a disable() that skipped NimBLE deinit.
+  // The reader's BT-enable pre-flight should force a silent-restart
+  // rather than trying to re-enable on top of the stale in-memory state.
+  bool nimbleStateSkippedTeardown() const { return _nimbleStateSkippedTeardown; }
 
   // Deferred disable. EpubReaderActivity::onExit sets this; the main loop
   // drains it after activityManager.loop() releases the render lock — calling
@@ -94,6 +98,11 @@ public:
   void requestEnableLater() {
     _enableLaterRequested = true;
     _disableLaterRequested = false;  // a fresh enable cancels any pending disable
+    // CrumBLE 4.5.6: reset the give-up window each time the caller asks; a
+    // finished render or chapter change on healthier heap should get a fresh
+    // budget of retry time, not inherit a stale timestamp.
+    _enableLaterFirstAttemptMs = 0;
+    _enableLaterLastAttemptMs = 0;
   }
   bool tryEnableIfRequested();
 
@@ -119,6 +128,14 @@ public:
   void setInputCallback(std::function<void(uint16_t keycode)> callback);
   void setLearnInputCallback(std::function<void(uint8_t keycode, uint8_t reportIndex)> callback);
   void setButtonInjector(std::function<void(uint8_t buttonIndex, bool pressed)> injector);
+  // CrumBLE 4.5.5: rich BLE button map override. Wired by the application at
+  // boot to consult SETTINGS.bleKeyMap[]. Called from mapKeycodeToButton on
+  // every HID report; return HalGPIO::BTN_* if (kind, value) is mapped, or
+  // 0xFF to fall through to device-profile defaults. HAL stays
+  // CrossPointSettings-free this way.
+  void setBleKeyMapResolver(std::function<uint8_t(uint8_t kind, uint8_t value)> resolver) {
+    _bleKeyMapResolver = std::move(resolver);
+  }
   void setReaderContextCallback(std::function<bool()> callback);
     void setButtonActivityNotifier(std::function<void(uint8_t buttonIndex)> notifier);
   void setDebugCaptureEnabled(bool enabled) { _debugCaptureEnabled = enabled; }
@@ -130,6 +147,10 @@ public:
   // Check if BLE has had activity recently (within last 4 minutes)
   // Used by power manager to prevent sleep during BLE use
   bool hasRecentActivity() const;
+  // v18.9.4: elapsed millis since the newest HID input across all connected
+  // devices. Returns ULONG_MAX when nothing is connected. Drives the user-
+  // configurable auto-disconnect timeout in main.cpp.
+  unsigned long getMillisSinceLastActivity() const;
   bool hadRecentFree2Input(unsigned long windowMs = 1500) const;
 
   // State persistence
@@ -157,6 +178,15 @@ public:
     _connectionLostAlertPending = false;
     return v;
   }
+  // v18.9.6c: consume the pending "enable-gave-up" flag (one-shot). Set from
+  // tryEnableIfRequested when its rate-limited retry burns through
+  // kGiveUpAfterMs of refusals. The reader polls this and can trigger a
+  // silent-restart-with-EnableBt to recover on a fresh heap.
+  bool takeEnableGaveUpAlert() {
+    bool v = _enableGaveUpAlertPending;
+    _enableGaveUpAlertPending = false;
+    return v;
+  }
   // CrumBLE 4.4 post-bisect: one-shot auto-reconnect request. Set by
   // noteClientDisconnect when an early supervision-timeout drop is
   // observed. The reader's loop polls this and calls connectToDevice()
@@ -179,13 +209,29 @@ private:
   uint8_t mapKeycodeToButton(uint8_t keycode, ConnectedDevice* device);
 
   bool _enabled = false;
+  // v18.9.9.48 (task #33): set true when disable() skips the crash-prone
+  // NimBLE deinit. Read by the reader's BT-enable pre-flight check so it
+  // can force a silent-restart-with-EnableBt instead of trying to
+  // re-enable on top of stale NimBLE state (which is likely wedged from
+  // the same corruption that would have crashed deinit).
+  bool _nimbleStateSkippedTeardown = false;
   bool _disableLaterRequested = false;
   bool _enableLaterRequested = false;
+  // CrumBLE 4.5.6: tryEnableIfRequested rate-limit + give-up. Before this,
+  // a requestEnableLater whose heap floor kept refusing spammed the log
+  // every ~10 ms forever (once per main-loop tick). Now: no more than one
+  // retry per 500 ms, and give up entirely after ~6 s of continuous refusal.
+  // On a book whose steady-state heap can't fit NimBLE, retrying every tick
+  // can't fix that; it just floods the log. Reset on success or on any new
+  // requestEnableLater().
+  unsigned long _enableLaterFirstAttemptMs = 0;
+  unsigned long _enableLaterLastAttemptMs = 0;
   bool _scanning = false;
   // CrumBLE: connect-stability tracking for the "couldn't stay connected" alert.
   unsigned long _lastConnectMillis = 0;        // when a link was last established
   bool _intentionalDisconnect = false;         // suppress the alert for disconnects we initiate
   bool _connectionLostAlertPending = false;    // one-shot: a link dropped unexpectedly soon after connecting
+  bool _enableGaveUpAlertPending = false;      // v18.9.6c: one-shot: tryEnableIfRequested burned its retry budget
   bool _autoReconnectPending = false;          // one-shot: an early drop has fired; reader should retry connect
   bool _autoReconnectConsumedThisCycle = false;  // gate so we only auto-retry once per enable() cycle
   // A drop in the first SETTLE_MS after connect is almost always benign bonding/
@@ -202,6 +248,7 @@ private:
   std::function<void(uint16_t)> _inputCallback;
   std::function<void(uint8_t, uint8_t)> _learnInputCallback;
   std::function<void(uint8_t, bool)> _buttonInjector;
+  std::function<uint8_t(uint8_t, uint8_t)> _bleKeyMapResolver;  // 4.5.5: rich-map override
   std::function<bool()> _readerContextCallback;
     std::function<void(uint8_t)> _buttonActivityNotifier;
   bool _debugCaptureEnabled = false;

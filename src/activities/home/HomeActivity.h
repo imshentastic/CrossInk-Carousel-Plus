@@ -6,10 +6,12 @@
 #include <unordered_map>
 #include <vector>
 
+#include "./FileBrowserActionActivity.h"
 #include "./FileBrowserActivity.h"
 #include "CollectionsStore.h"  // ShelfEntry
 #include "activities/Activity.h"
 #include "activities/reader/BookReadingStats.h"
+#include "util/DirtyRegion.h"
 #include "activities/reader/GlobalReadingStats.h"
 #include "util/ButtonNavigator.h"
 
@@ -25,14 +27,24 @@ void invalidateHomeCoverCachesGlobal();
 
 class HomeActivity final : public Activity {
  public:
-  // CrumBLE 4.4: bumped 1->2. With 1 frame, every Left/Right press was a
-  // guaranteed RAM miss → SD seek + ~48 KB read per move. 2 frames give
-  // back-and-forth a hit (LRU evicts the older direction) while still
-  // costing only one extra framebuffer (~48 KB heap) vs the original 3.
-  // Continuous L/L/L travel still pays SD on every move, but the user-
-  // perceived "feels slow" was mostly the back-and-forth case. Additional
-  // frames remain available through the SD snapshot cache.
-  static constexpr int kCarouselFrameCount = 2;
+  // v18.9.9.450: bumped 1->3 (current + next + prev). Enables the pre-
+  // existing neighbor-slot code at preRenderCarouselFrames() so L/R nav
+  // hits RAM instead of an SD read per press. Cost: ~144 KB total held
+  // during a Home visit (~48 KB per slot * 3 on X4).
+  //
+  // History:
+  //   v206 reverted 2->1 because the 2-slot version's freed slots caused
+  //   fragmentation that carried through Home->Reader, breaking BT/FT/dict
+  //   maxAlloc gates on X3. Since v206 the heap-management story has
+  //   tightened significantly (v383 book-open heap-restart, v432/v433
+  //   framebuffer release during FT, v441+ stats bitfield trims, etc.)
+  //   so the fragmentation carry-through is less load-bearing than it was.
+  //   HomeActivity::onExit already frees these slots (see the loop at
+  //   ~2898) so the Reader/FT paths get the full heap back on transition.
+  //
+  //   If field reports show renewed X3 fragmentation post-Home, either
+  //   condition the count on device (X4=3, X3=2) or revert to 2.
+  static constexpr int kCarouselFrameCount = 3;
   // Must be >= max(homeRecentBooksCount) across themes — asserted in .cpp.
   // Bumped from 3 to 5 (CrumBLE #124) so Flow's 5-slot carousel can also hit
   // the BookReadingStats / progress cache. Cost is ~32 extra bytes total
@@ -196,11 +208,56 @@ class HomeActivity final : public Activity {
   bool recentsLoading = false;
   bool recentsLoaded = false;
   bool firstRenderDone = false;
+  // v18.9.9.345: fires the ONCE-per-session cleanup that follows the
+  // first successful Home render -- shrink imageCache budget to the
+  // new low-tier (16 KB) and free the font decompressor's hot-group
+  // buffer (1-3 KB). Both are wins with essentially no UX cost after
+  // the first paint has settled.
+  void postFirstRenderCleanup_();
   // CrumBLE: set on every onEnter so the first time Home presents after a
   // transition it does one full (HALF) refresh to clear ghosting bled through
   // from the previous screen (e.g. a dense reader page). Consumed by
   // presentHomeBuffer(); subsequent in-place updates stay fast.
   bool pendingFullRefresh = false;
+  // v18.9.9.340: promote presentHomeBuffer's HALF_REFRESH_DEEP to a full
+  // FULL_REFRESH when this bit is set. Purpose: returns from full-screen
+  // activities (Reading Heatmap, Book Stats, Reading Stats) leave text-
+  // heavy pixels on the panel that HALF (which is a single-pass 0xD7
+  // waveform on X4) can't fully overwrite -- symptom: user reports
+  // "heatmap still visible over carousel" after Back. FULL uses the
+  // multi-flash GC waveform which reliably scrubs. Consumed once per
+  // present, then reset. Sourced from pendingHomeFullRefresh's consume
+  // block in onEnter.
+  bool pendingFullRefreshHard_ = false;
+
+  // v18.9.9.343: nav-coalesce (v314) removed. Users reported "sometimes
+  // weird behavior" and the added complexity (deferred render, drain
+  // tick in loop()) didn't win them enough. Reverted to direct
+  // requestUpdate() on every arrow press.
+  // (Removed: homeFastLutBaselineReady_ field. The displayBufferFastLut
+  // experiment using lut_grayscale_revert ran but failed on hardware --
+  // dark pixels accumulated over-drive, getting darker each nav. The SDK
+  // primitive is kept for a future re-enable once a proper partial-mode
+  // LUT is sourced from Good Display.)
+  // CrumBLE 4.5.5+: render-profile timing. Stamped at the top of render()
+  // and read at the bottom of presentHomeBuffer() to log a per-nav
+  // (prep, panel-refresh, total) breakdown. Drives the "where can we
+  // actually shave home nav latency" investigation. Free at runtime
+  // (a single millis() read + a LOG_INF line per render).
+  unsigned long renderProfileStartMs_ = 0;
+  // 4.5.5+: per-frame dirty-region tracking for partial-refresh routing.
+  // Render paths that update only a small slice of the screen (e.g. the
+  // shelfFocusOnlyDiff fast-path that patches just the focus ring + title
+  // strip) call markDirty(rect) on this. presentHomeBuffer() inspects it:
+  // non-empty + sub-screen -> displayBufferRegion(bbox); empty or full-
+  // screen -> regular displayBuffer (full refresh). Cleared after each
+  // present so each new render starts with a fresh dirty slate.
+  //
+  // Today L1 (displayBufferRegion) forwards to full displayBuffer, so this
+  // wiring is plumbing-only -- user sees no behavior change. When L1 v2
+  // (SSD1677 windowed-update sequence) lands, the speed-up appears for
+  // every render path that opted in here, with no further Home changes.
+  DirtyRegion homeDirtyRegion;
   bool hasReadingStats = false;
   bool hasBookmarks = false;
   bool hasOpdsServers = false;
@@ -225,6 +282,15 @@ class HomeActivity final : public Activity {
   int coverRectY = 0;
   int coverRectW = 0;
   int coverRectH = 0;
+  // CrumBLE 4.5.5+: Flow theme's shelf-only snapshot rect. Used by
+  // storeCoverBuffer + restoreCoverBuffer (Flow path) so we only snapshot
+  // the shelf strip (~14-24 KB) instead of the full framebuffer (48 KB).
+  // The freed heap lets the side-tile prerender cache all 5 carousel
+  // books. Set in render() before storeCoverBuffer is called.
+  int shelfSnapshotRectX = 0;
+  int shelfSnapshotRectY = 0;
+  int shelfSnapshotRectW = 0;
+  int shelfSnapshotRectH = 0;
   float currentBookProgressPercent = -1.0f;
   BookReadingStats currentBookStats;
   GlobalReadingStats globalStats;
@@ -256,6 +322,22 @@ class HomeActivity final : public Activity {
   bool restoreCoverBuffer();  // Restore frame buffer from stored cover
   void freeCoverBuffer();     // Free the stored cover buffer
   bool preRenderCarouselFrames(bool showProgressPopup = false);
+
+ public:
+  // v18.9.9.205: set by Activity::exitToHomeWithPopup so the next Home
+  // carousel warmup runs silently behind the already-visible "Going
+  // home..." popup instead of stacking a "Loading" popup on top of it.
+  // Consumed (cleared) by the first warmup after arrival.
+  static void noteGoingHomePopupShown();
+
+ private:
+  static bool sArrivedWithGoingHomePopup;
+  // v18.9.9.208: instance-scoped companion to the static flag. Captured
+  // in onEnter, cleared at the first presentHomeBuffer — suppresses the
+  // synchronous load popups (cover gen, series scan) that draw DURING the
+  // first render pass, before Home has ever painted, which stacked
+  // "Loading" on top of the reader's "Going home..." popup.
+  bool suppressLoadPopups_ = false;
   void freeCarouselFrames();
   bool allocateCarouselFrameSlots(int targetFrameCount);
   bool buildCarouselCacheFile(const std::string& cacheKey, uint64_t cacheKeyHash, int bookCount,
@@ -326,7 +408,12 @@ class HomeActivity final : public Activity {
   // re-walks the SD card and refreshes the LibraryIndex. Carved off as a
   // separate menu (vs. the per-book one) so the items always match the
   // collection-level context.
-  void showShelfHeaderActionMenu();
+  // focusOn: when set to a valid FileBrowserAction, opens the menu with
+  // the initial selection on that row (falls back to index 0 if the
+  // action is not present in the built item list). Used to keep the
+  // user on the row they just toggled instead of resetting focus to
+  // the first item every time the menu re-opens after Show/Hide.
+  void showShelfHeaderActionMenu(FileBrowserAction focusOn = FileBrowserAction::None);
   // CrumBLE #81: long-press handler for the icon-bar's Bookshelf entry.
   // Opens a ChoicePromptActivity listing the visible collections; on
   // confirm, sets the picked collection as active and opens the
@@ -337,6 +424,17 @@ class HomeActivity final : public Activity {
   // most-recently-read member if any is in RECENT_BOOKS; otherwise
   // opens the SeriesMiniPicker.
   void openShelfEntry(const ShelfEntry& entry);
+  // v18.9.9.230: launch AddBooksToCollectionActivity for the current
+  // active collection. Extracted from the inline call site in the
+  // long-press header menu so the empty-collection placeholder cell's
+  // Confirm handler can route to the same flow.
+  void launchAddBooksToActiveCollection();
+  // Sentinel firstPath used for the synthetic "empty user collection"
+  // ShelfEntry that cachedShelfEntries() injects when the active
+  // non-virtual collection has no members. The strip renders it as a
+  // placeholder cell whose title is STR_EMPTY_COLLECTION_ADD; Confirm
+  // routes to launchAddBooksToActiveCollection().
+  static constexpr const char* kEmptyCollectionCtaPath = "__EMPTY_CTA__";
   // Always opens the SeriesMiniPicker for a series cell (used by the
   // long-press path).
   void openSeriesMiniPicker(const ShelfEntry& entry);
@@ -345,6 +443,16 @@ class HomeActivity final : public Activity {
   // left empty when no metadata is available so the caller falls back to the
   // filename. No-op when `path` already matches the cached one.
   void updateFocusedBookMeta(const std::string& path);
+
+  // v18.9.9.267: one-time first-boot suggestion for the sleep-image
+  // bake. Walks /.sleep/ (or /sleep/) counting *.png / *.bmp files that
+  // don't have a paired .slp cache companion, and if that count > 0
+  // pushes a ChoicePromptActivity ("Bake now / Later / Never ask
+  // again"). "Never" writes a tiny sidecar file so the check skips on
+  // future boots. Called once per HomeActivity session, gated on a
+  // static flag so navigating in/out of Home doesn't re-prompt. Cheap:
+  // ~10 ms filesystem walk with typical <30 sleep files.
+  void maybeShowSleepBakePrompt();
 
  public:
   explicit HomeActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,

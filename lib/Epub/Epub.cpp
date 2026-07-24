@@ -802,6 +802,16 @@ namespace {
 // continuing past per-entry failures, then removes the now-empty directories.
 // Returns true only if the directory is finally gone. (Bounded depth: book
 // caches are at most cachePath/sections/<file>, so recursion is shallow.)
+//
+// CrumBLE 4.5.5: yields delay(1) after every file remove. The prebake
+// landed ~250 section files per book in sections-prebake/ on top of the
+// existing pxc-cache + thumbnails + section files (live), so a fully-
+// baked CJK book's cache dir is 500-1000 files. Without yields the
+// recursive delete pegs the main task for 10+ s -- WiFi heartbeat
+// stutters, render task starves, watchdog complains. A 1 ms yield per
+// file lets the render task / WiFi / FT websocket stay responsive
+// during the cleanup at the cost of ~500 ms extra total wall time.
+// Worth it; the delete already wasn't on a hot path.
 bool bestEffortRemoveDir(const std::string& dirPath) {
   auto dir = Storage.open(dirPath.c_str());
   if (dir && dir.isDirectory()) {
@@ -818,7 +828,10 @@ bool bestEffortRemoveDir(const std::string& dirPath) {
     }
     dir.close();
     for (const auto& sub : subdirs) bestEffortRemoveDir(sub);
-    for (const auto& f : files) Storage.remove(f.c_str());
+    for (const auto& f : files) {
+      Storage.remove(f.c_str());
+      delay(1);  // see header comment -- yield so co-tasks aren't starved
+    }
   } else if (dir) {
     dir.close();
   }
@@ -833,16 +846,20 @@ bool Epub::clearCache() const {
     return true;
   }
 
-  if (Storage.removeDir(cachePath.c_str())) {
-    LOG_DBG("EPB", "Cache cleared successfully");
-    return true;
-  }
-
-  // removeDir() can fail partway on a partially-corrupt directory. Fall back to
-  // a best-effort file-by-file walk that reclaims as much as possible.
-  LOG_ERR("EPB", "removeDir failed; attempting best-effort recursive delete");
+  // CrumBLE 4.5.5: skip the Storage.removeDir (SdFat rmRf) fast path and
+  // go straight to bestEffortRemoveDir. rmRf is faster on small caches
+  // but runs as one tight C++ loop with no yields -- on a fully-prebaked
+  // CJK book (500+ files in sections-prebake/ + sections/ + pxc-cache/)
+  // it pegs the web-server task for 10+ s and the FT page sits there
+  // frozen. bestEffortRemoveDir below now yields delay(1) per file, so
+  // the cleanup takes a bit longer wall-clock but the device stays
+  // responsive (render task can still draw, WiFi heartbeat keeps the
+  // connection alive, watchdog stays fed). The fast path also still
+  // failed silently on some partial-corruption cases and we'd fall
+  // through to bestEffortRemoveDir anyway, so flipping the default is
+  // strictly a behaviour improvement.
   if (bestEffortRemoveDir(cachePath)) {
-    LOG_DBG("EPB", "Cache cleared via best-effort delete");
+    LOG_DBG("EPB", "Cache cleared via yielding recursive delete");
     return true;
   }
 
@@ -1091,6 +1108,36 @@ bool Epub::generateThumbBmpNoIndex(int width, int height) {
 
 bool Epub::convertCoverToThumbBmp(const std::string& coverImageHref, const std::string& thumbPath, int width,
                                   int height, bool adaptiveContain) const {
+  // v18.9.9.291: check for pre-baked thumbnail from optimizer.js.
+  // Zero on-device PNG decode when present -- skips the 32 KB DEFLATE
+  // window entirely. Falls through to legacy PNG/JPG path on miss so
+  // books not run through the v291+ optimizer still work.
+  {
+    char preBakedPath[80];
+    snprintf(preBakedPath, sizeof(preBakedPath),
+             "META-INF/crumble-covers/thumb_%dx%d.bmp", width, height);
+    size_t preBakedSize = 0;
+    uint8_t* preBakedBytes = readItemContentsToBytes(preBakedPath, &preBakedSize, false);
+    if (preBakedBytes != nullptr && preBakedSize > 62) {  // >header
+      FsFile thumbBmp;
+      bool ok = false;
+      if (Storage.openFileForWrite("EBP", thumbPath, thumbBmp)) {
+        const size_t n = thumbBmp.write(preBakedBytes, preBakedSize);
+        thumbBmp.close();
+        ok = (n == preBakedSize);
+      }
+      free(preBakedBytes);
+      if (ok) {
+        LOG_INF("EBP", "convertCoverToThumbBmp: used pre-baked thumb %dx%d (%zu bytes)",
+                width, height, preBakedSize);
+        return true;
+      }
+      LOG_ERR("EBP", "convertCoverToThumbBmp: pre-baked found but write failed, falling through");
+    } else if (preBakedBytes != nullptr) {
+      free(preBakedBytes);
+    }
+  }
+
   if (coverImageHref.empty()) {
     LOG_DBG("EBP", "No known cover image for thumbnail");
   } else if (FsHelpers::hasJpgExtension(coverImageHref)) {

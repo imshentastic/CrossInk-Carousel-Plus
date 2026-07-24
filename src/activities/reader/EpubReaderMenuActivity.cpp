@@ -4,12 +4,16 @@
 #include <GfxRenderer.h>
 #include <HalDisplay.h>
 #include <I18n.h>
+#include <Logging.h>
 
 #include <cstring>
 
+#include "../../SilentRestart.h"
+#include "../../util/SettingsViewCache.h"
 #include "../settings/BluetoothSettingsActivity.h"
 #include "../util/ConfirmationActivity.h"
 #include "CrossPointSettings.h"
+#include "CrossPointState.h"
 #include "EpubReaderActivity.h"  // prewarmReaderTextBuffer
 #include "MappedInputManager.h"
 #include "components/UITheme.h"
@@ -341,23 +345,45 @@ void EpubReaderMenuActivity::loop() {
       auto& bt = BluetoothHIDManager::getInstance();
       const bool bleWasOn = bt.isEnabled();
 
-      // CrumBLE: silent BLE drop on entry. The previous "Turn off Bluetooth?"
-      // prompt is gone -- the disconnect is a forced consequence of the heap
-      // pressure (Reader Options' settings-list build OOM-crashes under BLE),
-      // not a user choice. Just do it. Auto-reconnect via requestEnableLater()
-      // when the user exits Reader Options, so they don't have to manually
-      // re-enable from the BT menu afterwards.
+      // v18.9.9.74 Phase 4: dropped the nimbleStale branch. Under BleHid,
+      // disable() truly deinits and never sets a stale-state flag; the v48
+      // skip-deinit code path is gone.
+      //
+      // Kept the bleWasOn silent-restart path: ROA's settings-list build
+      // peaks ~14 KB maxAlloc / 28 KB free, and while disable() now really
+      // does free ~50 KB, doing it inline here without silent-restart would
+      // still leave any accumulated fragmentation. Silent-restart lands on
+      // a clean ~90 KB heap with NimBLE cold — cheaper for the user than a
+      // build-refuse dead-end. SD-cached view snapshot path preserved so
+      // the user can spot-check settings without paying the restart.
       if (bleWasOn) {
-        GUI.drawPopup(renderer, "Updating layout...");
-        renderer.displayBuffer(HalDisplay::FAST_REFRESH);
-        bt.disable();
+        if (settingsViewCacheExists()) {
+          LOG_INF("ERM",
+                  "Reader Options with BT on -- opening in view-mode from SD cache; "
+                  "ROA silent-restarts itself if user taps to edit");
+        } else {
+          LOG_INF("ERM",
+                  "Reader Options with BT on and no view cache; "
+                  "silent-restart with OpenReaderOptions to bootstrap on fresh ~90 KB heap");
+          (void)before;  // dropped across restart; reader recomputes on next open
+          silentRestartToReaderWithAction(ReaderPostBootAction::OpenReaderOptions);
+          // never returns
+        }
       }
 
       startActivityForResult(std::make_unique<ReaderOptionsActivity>(renderer, mappedInput),
                              [this, before, bleWasOn](const ActivityResult&) {
                                settingsChanged = settingsChanged || haveReaderLayoutSettingsChanged(before);
+                               // v18.9.9.27: the user toggled Compatibility Mode inside
+                               // ReaderOptionsActivity -- treat it like any other layout-
+                               // affecting setting change so the section rebuilds.
+                               if (APP_STATE.compatModeChanged) {
+                                 settingsChanged = true;
+                                 APP_STATE.compatModeChanged = false;
+                               }
                                pendingOrientation = SETTINGS.orientation;  // sync in case orientation changed
                                if (bleWasOn) {
+                                 SET_CHECKPOINT("reader-menu:bt-enable-clicked");
                                  // CrumBLE Phase 1 fast-open: pre-grow the glyph
                                  // buffer before the deferred enable drains, so
                                  // NimBLE init doesn't race a cold-buffer first
@@ -367,6 +393,7 @@ void EpubReaderMenuActivity::loop() {
                                  // re-layout from settings changes finishes. Prevents
                                  // NimBLE init from racing the section rebuild.
                                  BluetoothHIDManager::getInstance().requestEnableLater();
+                                 SET_CHECKPOINT("reader-menu:bt-request-queued");
                                }
                                requestUpdate();
                              });
@@ -387,15 +414,15 @@ void EpubReaderMenuActivity::loop() {
 
     if (selectedAction == MenuAction::BLUETOOTH) {
 #ifndef SIMULATOR
-      // exitOnSuccessfulConnect=true: when the user pairs a new remote or
-      // reconnects to a bonded one from inside the book, BluetoothSettings
-      // sets MenuResult.autoExitParent=true and pops itself. We then also
-      // finish this menu so the user lands straight back in the book —
-      // ActivityManager chains the two pops in the same loop iteration so
-      // the menu never visibly re-renders.
+      // CrumBLE 4.5.5: exitOnSuccessfulConnect=FALSE so the in-book BT entry
+      // behaves like the Main Settings BT entry. The user gets the full menu
+      // (scan, pair, map buttons, etc) and explicitly backs out when done.
+      // The drawer's BT Quick Connect path is the one-tap silent reconnect
+      // affordance; this menu entry is the configuration affordance.
       startActivityForResult(
           std::make_unique<BluetoothSettingsActivity>(renderer, mappedInput, [] { activityManager.popActivity(); },
-                                                      /*exitOnSuccessfulConnect=*/true),
+                                                      /*exitOnSuccessfulConnect=*/false,
+                                                      /*disableOnExit=*/false),
           [this](const ActivityResult& result) {
             const auto* menu = std::get_if<MenuResult>(&result.data);
             if (menu && menu->autoExitParent) {

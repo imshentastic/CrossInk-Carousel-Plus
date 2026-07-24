@@ -50,10 +50,14 @@ class ZipFile {
 
   bool loadFileStatSlim(const char* filename, FileStatSlim* fileStat);
   long getDataOffset(const FileStatSlim& fileStat);
-  bool loadZipDetails();
 
  public:
   explicit ZipFile(const std::string& filePath) : filePath(filePath) {}
+  // v18.9.9.331: promoted from private. Used by the FT upload tail-sanity
+  // check to verify EOCD parses cleanly at upload time (catches
+  // truncation/garbage/Zip64 that the old 32-byte tail heuristic missed).
+  // Lightweight: one 4 KB buffer + streaming tail scan up to 64 KB.
+  bool loadZipDetails();
   ~ZipFile() = default;
   // Zip file can be opened and closed by hand in order to allow for quick calculation of inflated file size
   // It is NOT recommended to pre-open it for any kind of inflation due to memory constraints

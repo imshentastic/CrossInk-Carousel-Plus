@@ -58,6 +58,12 @@ const uint8_t* GfxRenderer::getGlyphBitmap(const EpdFontData* fontData, const Ep
       return sdFont->getOverflowBitmap(glyph);  // may be nullptr for zero-width glyphs
     }
   }
+  // CrumBLE 4.5.5: hybrid streaming atlas. Metadata is resident; bitmap bytes
+  // are not. Route through the per-font fetch callback, which reads the
+  // glyph's bytes on demand into a small scratch owned by the ctx.
+  if (fontData->glyphBitmapFetch) {
+    return fontData->glyphBitmapFetch(fontData->glyphBitmapCtx, glyph);
+  }
   return &fontData->bitmap[glyph->dataOffset];
 }
 
@@ -125,6 +131,25 @@ void GfxRenderer::begin() {
   panelHeight = display.getDisplayHeight();
   panelWidthBytes = display.getDisplayWidthBytes();
   frameBufferSize = display.getBufferSize();
+}
+
+// v18.9.9.70 (ported from crosspoint 05c1e9aa): release the framebuffer's ~40 KB
+// to make it available for the section cold-build. Nothing may render between
+// this call and restoreFrameBufferAfterBuild().
+void GfxRenderer::releaseFrameBufferForBuild() {
+  display.releaseFrameBuffers();
+  frameBuffer = nullptr;
+}
+
+// v18.9.9.70: restore the framebuffer allocation after a build phase. Returns
+// false if realloc fails. Buffer comes back white (0xFF); caller must redraw.
+bool GfxRenderer::restoreFrameBufferAfterBuild() {
+  if (!display.reallocFrameBuffers()) {
+    LOG_ERR("GFX", "Framebuffer realloc failed after build");
+    return false;
+  }
+  frameBuffer = display.getFrameBuffer();
+  return frameBuffer != nullptr;
 }
 
 void GfxRenderer::freeBitmapScratchBuffers() {
@@ -738,6 +763,45 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
     lastBaseTop = glyph->top;
     prevAdvanceFP = glyph->advanceX;  // 12.4 fixed-point
 
+    // CrumBLE 4.5.4 diag: stacking-glyph bug. Field report shows CJK in
+    // an SD-CJK book renders visible glyphs but with zero horizontal
+    // advance -- every char draws at the same x. The visible draw means
+    // the glyph pointer is non-null and the bitmap renders; the stacking
+    // means advanceX is 0. Suspect: the prebake-installed embedded
+    // atlas entry for CJK codepoints has advanceX=0 (CLI built it with
+    // a default-init EpdGlyph instead of copying LXGW's real metric).
+    // One-shot per cp range so reading logs stays bounded.
+    static bool dumpedZeroAdvance = false;
+    if (!dumpedZeroAdvance && glyph->advanceX == 0 && cp >= 0x2000) {
+      dumpedZeroAdvance = true;
+      LOG_INF("ADV0", "Zero-advance glyph drawn: cp=U+%04lX style=%u "
+                      "w=%u h=%u left=%d top=%d dataLen=%u "
+                      "(glyph %p -- likely from embedded atlas with bad advanceX)",
+              static_cast<unsigned long>(cp),
+              static_cast<uint8_t>(style) & 0x03,
+              glyph->width, glyph->height, glyph->left, glyph->top,
+              static_cast<unsigned>(glyph->dataLength),
+              static_cast<const void*>(glyph));
+    }
+
+    // v18.9.9.442 diag: X3 overflow investigation. If this glyph's LOGICAL
+    // right edge would land past the viewable screen width, log (cp, x,
+    // width) before rendering — the pixel-level "Outside range" log fires
+    // for every pixel but doesn't tell us WHICH glyph or WHERE the layout
+    // engine decided to place it. Rate-limited to 30 per boot so a runaway
+    // page doesn't flood the console.
+    {
+      static int s_overflowLogsThisBoot = 0;
+      const int glyphRight = lastBaseX + glyph->left + static_cast<int>(glyph->width);
+      const int screenW = getScreenWidth();
+      if (glyphRight > screenW && s_overflowLogsThisBoot < 30) {
+        s_overflowLogsThisBoot++;
+        LOG_INF("GLYX", "OVERFLOW cp=U+%04lX drawX=%d glyph.left=%d glyph.w=%u right=%d screenW=%d overshoot=%d",
+                static_cast<unsigned long>(cp), lastBaseX, glyph->left,
+                static_cast<unsigned>(glyph->width), glyphRight, screenW, glyphRight - screenW);
+      }
+    }
+
     renderCharImpl<TextRotation::None>(*this, renderMode, font, cp, lastBaseX, yPos, black, style);
     prevCp = cp;
   }
@@ -926,6 +990,104 @@ void GfxRenderer::fillRect(const int x, const int y, const int width, const int 
     fillRectImpl<Color::Black>(x, y, width, height);
   } else {
     fillRectImpl<Color::White>(x, y, width, height);
+  }
+}
+
+// CrumBLE 4.5.6: byte-aligned ADDITIVE lattice. Every (step-th, step-th)
+// pixel in the rect is ANDed to black; other pixels are UNTOUCHED. Structurally
+// mirrors fillRectImpl<LightGray>() (rotate 2 corners, per-row byte walk,
+// memset for interior bytes) but uses `&=` semantics so the text glyphs
+// underneath the highlight are preserved. Falls back to a per-pixel loop
+// for non-step=2 (rare; ~11% grey step=3 kept for callers who need it).
+void GfxRenderer::fillSparseInkLatticeInRect(const int x, const int y, const int width, const int height,
+                                              const int step, const bool state) const {
+  if (width <= 0 || height <= 0 || step <= 0) return;
+  if (state && step == 2) {
+    // Byte-aligned fast path (matches fillRectImpl<LightGray> structure).
+    const int screenW = getScreenWidth();
+    const int screenH = getScreenHeight();
+    const int lx0 = std::max(0, x);
+    const int ly0 = std::max(0, y);
+    const int lx1 = std::min(screenW, x + width);
+    const int ly1 = std::min(screenH, y + height);
+    if (lx0 >= lx1 || ly0 >= ly1) return;
+
+    int paX, paY, pbX, pbY;
+    rotateCoordinates(orientation, lx0, ly0, &paX, &paY, panelWidth, panelHeight);
+    rotateCoordinates(orientation, lx1 - 1, ly1 - 1, &pbX, &pbY, panelWidth, panelHeight);
+    const int phyX0 = std::min(paX, pbX);
+    const int phyX1 = std::max(paX, pbX);
+    const int phyY0 = std::min(paY, pbY);
+    const int phyY1 = std::max(paY, pbY);
+
+    const int byteStart = phyX0 >> 3;
+    const int byteEnd = phyX1 >> 3;
+    const uint8_t headMask = static_cast<uint8_t>(0xFFu >> (phyX0 & 7));
+    const uint8_t tailMask = static_cast<uint8_t>(0xFFu << (7 - (phyX1 & 7)));
+    const int32_t panelStride = static_cast<int32_t>(panelWidthBytes);
+
+    // Encode the LightGray lattice ("black at even lx AND even ly") for each
+    // physical row. The lattice is period 2 in both logical axes, so it's
+    // period 2 in the physical axis too. Precompute both parity variants
+    // outside the row loop.
+    int dlxPerPhyX = 0, dlyPerPhyX = 0;
+    switch (orientation) {
+      case Portrait:                  dlxPerPhyX =  0; dlyPerPhyX =  1; break;
+      case PortraitInverted:          dlxPerPhyX =  0; dlyPerPhyX = -1; break;
+      case LandscapeClockwise:        dlxPerPhyX = -1; dlyPerPhyX =  0; break;
+      case LandscapeCounterClockwise: dlxPerPhyX =  1; dlyPerPhyX =  0; break;
+    }
+
+    for (int py = phyY0; py <= phyY1; ++py) {
+      int lxBase = 0, lyBase = 0;
+      switch (orientation) {
+        case Portrait:                  lxBase = panelHeight - 1 - py; lyBase = byteStart * 8; break;
+        case PortraitInverted:          lxBase = py;                    lyBase = panelWidth - 1 - byteStart * 8; break;
+        case LandscapeClockwise:        lxBase = panelWidth  - 1 - byteStart * 8; lyBase = panelHeight - 1 - py; break;
+        case LandscapeCounterClockwise: lxBase = byteStart * 8;         lyBase = py; break;
+      }
+      // blackMask: bits where lattice wants BLACK (period 2 x period 2 dot).
+      uint8_t blackMask = 0;
+      for (int b = 0; b < 8; ++b) {
+        const int lx = lxBase + b * dlxPerPhyX;
+        const int ly = lyBase + b * dlyPerPhyX;
+        if (((lx & 1) == 0) && ((ly & 1) == 0)) {
+          blackMask |= static_cast<uint8_t>(1u << (7 - b));
+        }
+      }
+      // ADDITIVE: only clear bits that lattice wants black. Framebuffer
+      // convention: 1 = white, 0 = black. So AND with ~blackMask darkens
+      // those bits without touching the others.
+      const uint8_t clearMask = static_cast<uint8_t>(~blackMask);
+      uint8_t* row = frameBuffer + static_cast<int32_t>(py) * panelStride;
+      if (byteStart == byteEnd) {
+        const uint8_t rectMask = headMask & tailMask;
+        row[byteStart] &= static_cast<uint8_t>(clearMask | ~rectMask);
+      } else {
+        row[byteStart] &= static_cast<uint8_t>(clearMask | ~headMask);
+        if (byteEnd > byteStart + 1) {
+          // Fast interior: each byte's black-slots are cleared.
+          uint8_t* interior = row + byteStart + 1;
+          const int n = byteEnd - byteStart - 1;
+          for (int i = 0; i < n; ++i) interior[i] &= clearMask;
+        }
+        row[byteEnd] &= static_cast<uint8_t>(clearMask | ~tailMask);
+      }
+    }
+    return;
+  }
+  // Fallback: per-pixel loop for non-step=2 or state=false.
+  const int screenW = getScreenWidth();
+  const int screenH = getScreenHeight();
+  const int x0 = std::max(0, x);
+  const int y0 = std::max(0, y);
+  const int x1 = std::min(screenW, x + width);
+  const int y1 = std::min(screenH, y + height);
+  if (x0 >= x1 || y0 >= y1) return;
+  for (int py = y0; py < y1; py += step) {
+    for (int px = x0; px < x1; px += step) {
+      drawPixel(px, py, state);
+    }
   }
 }
 
@@ -1601,11 +1763,18 @@ void GfxRenderer::reconcileImageCacheBudget() const {
   // ~58 KB, off entirely when the chapter / book also demands big buffers.
   // Numbers are based on the standing CrumBLE heap envelope (~197 KB free
   // fresh, ~140 KB with BLE on). See the design discussion in #90.
+  // v18.9.9.345: dropped the 64 KB top tier -- field-observed Home
+  // steady-state was 60+ KB heap consumed on entry, and the cache
+  // getting up to 64 KB was a major contributor. On a healthy boot
+  // (fresh heap ~140 KB) the cache would balloon to 64 KB before the
+  // first eviction, holding decoded carousel side covers that Home
+  // never re-uses this session. Capped at 16 KB across the whole
+  // "comfortable" range -- next-render for a tile-miss book is ~140 ms
+  // slower once but Home has 48 KB more contiguous heap for shelf /
+  // menu / settings work.
   const uint32_t freeHeap = esp_get_free_heap_size();
   size_t newBudget;
-  if (freeHeap >= 120u * 1024u) {
-    newBudget = 64u * 1024u;
-  } else if (freeHeap >= 80u * 1024u) {
+  if (freeHeap >= 80u * 1024u) {
     newBudget = 16u * 1024u;
   } else {
     newBudget = 0u;
@@ -1617,11 +1786,20 @@ void GfxRenderer::reconcileImageCacheBudget() const {
 }
 
 void GfxRenderer::evictImageCacheToBudget() const {
-  while (imageCacheBytes_ > imageCacheBudget_ && !imageCache_.empty()) {
-    auto victim = imageCache_.begin();
+  // v18.9.9.192: skip pinned entries. Their bytes are still counted in
+  // imageCacheBytes_ but they never become eviction candidates. If the
+  // remaining unpinned entries alone can't bring us under budget, that's
+  // fine -- the pinned cap prevents unbounded pinned growth (see
+  // lookupCachedBitmapPinned's cap enforcement).
+  while (imageCacheBytes_ > imageCacheBudget_) {
+    auto victim = imageCache_.end();
     for (auto it = imageCache_.begin(); it != imageCache_.end(); ++it) {
-      if (it->second.lastUsedTick < victim->second.lastUsedTick) victim = it;
+      if (it->second.pinned) continue;
+      if (victim == imageCache_.end() || it->second.lastUsedTick < victim->second.lastUsedTick) {
+        victim = it;
+      }
     }
+    if (victim == imageCache_.end()) break;  // only pinned entries left
     imageCacheBytes_ -= victim->second.pixelsBytes + victim->second.scaledPixelsBytes;
     imageCache_.erase(victim);
   }
@@ -1630,6 +1808,7 @@ void GfxRenderer::evictImageCacheToBudget() const {
 void GfxRenderer::clearImageCache() const {
   imageCache_.clear();
   imageCacheBytes_ = 0;
+  imageCachePinnedBytes_ = 0;  // v18.9.9.192
 }
 
 GfxRenderer::CachedBitmap* GfxRenderer::lookupCachedBitmap(const char* path) const {
@@ -1644,7 +1823,13 @@ GfxRenderer::CachedBitmap* GfxRenderer::lookupCachedBitmap(const char* path) con
 
   // Miss: open + decode + insert. Pre-flight the heap budget so the new
   // decode doesn't push us past what BLE / the reader need.
+  // v18.9.9.192: pinned callers (lookupCachedBitmapPinned) skip the budget=0
+  // refuse and force a small-budget floor so the decode succeeds even when
+  // NimBLE has starved the general cache to zero.
   reconcileImageCacheBudget();
+  if (pinnedRequestDepth_ > 0 && imageCacheBudget_ < 8u * 1024u) {
+    imageCacheBudget_ = 8u * 1024u;
+  }
   if (imageCacheBudget_ == 0) return nullptr;
 
   FsFile file;
@@ -1672,12 +1857,16 @@ GfxRenderer::CachedBitmap* GfxRenderer::lookupCachedBitmap(const char* path) con
     file.close();
     return nullptr;
   }
-  // Evict LRU until the new entry fits.
-  while (imageCacheBytes_ + bufBytes > imageCacheBudget_ && !imageCache_.empty()) {
-    auto victim = imageCache_.begin();
+  // Evict LRU until the new entry fits. v18.9.9.192: pinned entries survive.
+  while (imageCacheBytes_ + bufBytes > imageCacheBudget_) {
+    auto victim = imageCache_.end();
     for (auto candidate = imageCache_.begin(); candidate != imageCache_.end(); ++candidate) {
-      if (candidate->second.lastUsedTick < victim->second.lastUsedTick) victim = candidate;
+      if (candidate->second.pinned) continue;
+      if (victim == imageCache_.end() || candidate->second.lastUsedTick < victim->second.lastUsedTick) {
+        victim = candidate;
+      }
     }
+    if (victim == imageCache_.end()) break;
     imageCacheBytes_ -= victim->second.pixelsBytes + victim->second.scaledPixelsBytes;
     imageCache_.erase(victim);
   }
@@ -1726,6 +1915,65 @@ GfxRenderer::CachedBitmap* GfxRenderer::lookupCachedBitmap(const char* path) con
   return &inserted->second;
 }
 
+// v18.9.9.192: cap on total pinned bytes. Sized to hold one shelf page of
+// 100x150 2bpp thumbs (~3.7 KB each) plus a couple neighbors -- about 4-6
+// covers. If a caller pins beyond this, the oldest pinned entry gets
+// unpinned (becomes an ordinary LRU eviction candidate).
+static constexpr size_t kImageCachePinnedCap = 24u * 1024u;
+
+GfxRenderer::CachedBitmap* GfxRenderer::lookupCachedBitmapPinned(const char* path) const {
+  if (path == nullptr || path[0] == '\0') return nullptr;
+
+  // Hit: bump LRU, mark pinned if not already (accounting bytes).
+  auto it = imageCache_.find(path);
+  if (it != imageCache_.end()) {
+    it->second.lastUsedTick = ++imageCacheTick_;
+    if (!it->second.pinned) {
+      it->second.pinned = true;
+      imageCachePinnedBytes_ += it->second.pixelsBytes + it->second.scaledPixelsBytes;
+    }
+    // No cap enforcement on hit -- the entry was already counted or is
+    // just being reclassified. Fall through to below only on miss.
+    return &it->second;
+  }
+
+  // Miss: force the decode-and-insert to succeed even under NimBLE-tight
+  // heap. pinnedRequestDepth_ tells lookupCachedBitmap to skip the
+  // budget=0 refuse and floor the budget at 8 KB.
+  ++pinnedRequestDepth_;
+  CachedBitmap* handle = lookupCachedBitmap(path);
+  --pinnedRequestDepth_;
+  if (!handle) return nullptr;
+
+  handle->pinned = true;
+  imageCachePinnedBytes_ += handle->pixelsBytes + handle->scaledPixelsBytes;
+
+  // Cap enforcement: while pinned total is over cap, unpin oldest pinned
+  // entry (but never the one we just inserted). It becomes an ordinary
+  // eviction candidate; evictImageCacheToBudget or a later reconcile can
+  // drop it if pressure demands. This bounds pinned growth so a pathological
+  // caller can't starve NimBLE by pinning the whole library.
+  while (imageCachePinnedBytes_ > kImageCachePinnedCap) {
+    auto oldest = imageCache_.end();
+    for (auto candidate = imageCache_.begin(); candidate != imageCache_.end(); ++candidate) {
+      if (!candidate->second.pinned) continue;
+      if (&candidate->second == handle) continue;  // never demote what we just pinned
+      if (oldest == imageCache_.end() || candidate->second.lastUsedTick < oldest->second.lastUsedTick) {
+        oldest = candidate;
+      }
+    }
+    if (oldest == imageCache_.end()) break;
+    oldest->second.pinned = false;
+    imageCachePinnedBytes_ -= oldest->second.pixelsBytes + oldest->second.scaledPixelsBytes;
+  }
+  return handle;
+}
+
+void GfxRenderer::unpinAllCachedBitmaps() const {
+  for (auto& kv : imageCache_) kv.second.pinned = false;
+  imageCachePinnedBytes_ = 0;
+}
+
 bool GfxRenderer::getCachedBitmapDimensions(CachedBitmap* handle, int* outWidth, int* outHeight) const {
   if (handle == nullptr || !handle->pixels) return false;
   if (outWidth) *outWidth = handle->width;
@@ -1738,6 +1986,9 @@ void GfxRenderer::buildScaledBitmap(CachedBitmap* entry, const int targetW, cons
   if (entry == nullptr) return;
   if (entry->scaledPixels) {
     imageCacheBytes_ -= entry->scaledPixelsBytes;
+    // v18.9.9.192: keep pinned-byte counter in sync when a pinned entry's
+    // scaled buffer gets rebuilt at a different target size.
+    if (entry->pinned) imageCachePinnedBytes_ -= entry->scaledPixelsBytes;
     entry->scaledPixels.reset();
     entry->scaledPixelsBytes = 0;
   }
@@ -1796,6 +2047,7 @@ void GfxRenderer::buildScaledBitmap(CachedBitmap* entry, const int targetW, cons
   entry->scaledCropX = clampedCropX;
   entry->scaledCropY = clampedCropY;
   imageCacheBytes_ += scaledBytes;
+  if (entry->pinned) imageCachePinnedBytes_ += scaledBytes;  // v18.9.9.192
 }
 
 template <bool Opaque>
@@ -2133,6 +2385,370 @@ void GfxRenderer::renderPerspectiveBitmapToPacked1bpp(CachedBitmap* handle, cons
   }
 }
 
+void GfxRenderer::renderPerspectiveBitmapToPacked1bpp(const Bitmap& bitmap, const int w, const int hL, const int hR,
+                                                      uint8_t* dst) const {
+  // Same geometry as the CachedBitmap overload above so a tile baked here
+  // blits identically at the same (w, hL, hR). Source rows come from
+  // Bitmap::readNextRow instead of a 2bpp cache buffer, so no imageCache_
+  // budget is consumed. Caller must have already called parseHeaders().
+  if (dst == nullptr) return;
+  if (w <= 0 || hL <= 0 || hR <= 0) return;
+
+  const int srcW = bitmap.getWidth();
+  const int srcH = bitmap.getHeight();
+  if (srcW <= 0 || srcH <= 0) return;
+
+  const int hMax = std::max(hL, hR);
+  const bool topDown = bitmap.isTopDown();
+
+  BitmapScratchLock scratchLock(*this);
+  if (!scratchLock.isLocked()) return;
+
+  const int outputRowSize = (srcW + 3) / 4;
+  if (!ensureBitmapScratchBuffers(outputRowSize, bitmap.getRowBytes())) {
+    return;
+  }
+  auto* outputRow = bitmapScratchOutputRow_;
+  auto* rowBytes = bitmapScratchRowBytes_;
+  const int dstStride = (w + 7) / 8;
+
+  for (int srcY = 0; srcY < srcH; srcY++) {
+    if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
+      LOG_ERR("GFX", "Failed to read row %d from bitmap (prerender tile)", srcY);
+      return;
+    }
+    const int srcRowIndex = topDown ? srcY : (srcH - 1 - srcY);
+
+    for (int dx = 0; dx < w; dx++) {
+      const int colH = (w == 1) ? hL : (hL + (hR - hL) * dx / (w - 1));
+      if (colH <= 0) continue;
+      const int colTop = (hMax - colH) / 2;
+
+      const int srcX = (dx * srcW) / w;
+      const uint8_t val = (outputRow[srcX / 4] >> (6 - ((srcX * 2) % 8))) & 0x3;
+      if (val >= 3) continue;  // pure white, skip
+
+      const int dstYStart = (srcRowIndex * colH) / srcH;
+      const int dstYEnd = ((srcRowIndex + 1) * colH) / srcH;
+      for (int dy = dstYStart; dy < dstYEnd; ++dy) {
+        const int outY = colTop + dy;
+        if (outY < 0 || outY >= hMax) continue;
+        dst[outY * dstStride + (dx >> 3)] |= static_cast<uint8_t>(0x80u >> (dx & 7));
+      }
+    }
+  }
+}
+
+void GfxRenderer::renderPerspectiveBitmapToPacked1bppDual(const Bitmap& bitmap, const int w,
+                                                          const int hL_a, const int hR_a, uint8_t* dst_a,
+                                                          const int hL_b, const int hR_b, uint8_t* dst_b) const {
+  if (dst_a == nullptr || dst_b == nullptr) return;
+  if (w <= 0 || hL_a <= 0 || hR_a <= 0 || hL_b <= 0 || hR_b <= 0) return;
+
+  const int srcW = bitmap.getWidth();
+  const int srcH = bitmap.getHeight();
+  if (srcW <= 0 || srcH <= 0) return;
+
+  const int hMax_a = std::max(hL_a, hR_a);
+  const int hMax_b = std::max(hL_b, hR_b);
+  const bool topDown = bitmap.isTopDown();
+
+  BitmapScratchLock scratchLock(*this);
+  if (!scratchLock.isLocked()) return;
+
+  const int outputRowSize = (srcW + 3) / 4;
+  if (!ensureBitmapScratchBuffers(outputRowSize, bitmap.getRowBytes())) {
+    return;
+  }
+  auto* outputRow = bitmapScratchOutputRow_;
+  auto* rowBytes = bitmapScratchRowBytes_;
+  const int dstStride = (w + 7) / 8;
+
+  for (int srcY = 0; srcY < srcH; srcY++) {
+    if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
+      LOG_ERR("GFX", "Failed to read row %d from bitmap (prerender dual)", srcY);
+      return;
+    }
+    const int srcRowIndex = topDown ? srcY : (srcH - 1 - srcY);
+
+    for (int dx = 0; dx < w; dx++) {
+      const int srcX = (dx * srcW) / w;
+      const uint8_t val = (outputRow[srcX / 4] >> (6 - ((srcX * 2) % 8))) & 0x3;
+      if (val >= 3) continue;  // pure white, skip in both tiles
+
+      // Tile A
+      const int colH_a = (w == 1) ? hL_a : (hL_a + (hR_a - hL_a) * dx / (w - 1));
+      if (colH_a > 0) {
+        const int colTop_a = (hMax_a - colH_a) / 2;
+        const int dstYStart_a = (srcRowIndex * colH_a) / srcH;
+        const int dstYEnd_a = ((srcRowIndex + 1) * colH_a) / srcH;
+        for (int dy = dstYStart_a; dy < dstYEnd_a; ++dy) {
+          const int outY = colTop_a + dy;
+          if (outY < 0 || outY >= hMax_a) continue;
+          dst_a[outY * dstStride + (dx >> 3)] |= static_cast<uint8_t>(0x80u >> (dx & 7));
+        }
+      }
+
+      // Tile B
+      const int colH_b = (w == 1) ? hL_b : (hL_b + (hR_b - hL_b) * dx / (w - 1));
+      if (colH_b > 0) {
+        const int colTop_b = (hMax_b - colH_b) / 2;
+        const int dstYStart_b = (srcRowIndex * colH_b) / srcH;
+        const int dstYEnd_b = ((srcRowIndex + 1) * colH_b) / srcH;
+        for (int dy = dstYStart_b; dy < dstYEnd_b; ++dy) {
+          const int outY = colTop_b + dy;
+          if (outY < 0 || outY >= hMax_b) continue;
+          dst_b[outY * dstStride + (dx >> 3)] |= static_cast<uint8_t>(0x80u >> (dx & 7));
+        }
+      }
+    }
+  }
+}
+
+// v18.9.9.210 Phase 2: 2bpp packed variants of the perspective tile
+// pipeline. Preserve the source cover's 4-gray value per pixel so the
+// baked tile renders identically to the direct drawPerspectiveBitmap
+// path (BW / GRAY_MSB / GRAY_LSB per-plane logic). Semantics per pixel:
+//   * Dst is 2bpp packed, MSB-first per byte, 4 px per byte.
+//   * Init: caller must fill dst with 0xFF (all pixels = 3 = white).
+//     Pixels outside colTop..colTop+colH stay at their init value.
+//   * Multiple src rows contributing to same dst pixel (colH < srcH):
+//     last-write-wins, matching drawPerspectiveBitmap's per-pixel
+//     drawPixel-overwrite behavior.
+namespace {
+
+inline void write2bppPacked(uint8_t* row, const int dx, const uint8_t val) {
+  const int shift = 6 - (dx & 3) * 2;
+  const uint8_t mask = static_cast<uint8_t>(0x3u << shift);
+  row[dx >> 2] = static_cast<uint8_t>((row[dx >> 2] & ~mask) | ((val & 0x3u) << shift));
+}
+
+}  // namespace
+
+void GfxRenderer::renderPerspectiveBitmapToPacked2bpp(CachedBitmap* handle, const int w, const int hL, const int hR,
+                                                      uint8_t* dst) const {
+  if (handle == nullptr || !handle->pixels || dst == nullptr) return;
+  if (w <= 0 || hL <= 0 || hR <= 0) return;
+
+  const int srcW = handle->width;
+  const int srcH = handle->height;
+  if (srcW <= 0 || srcH <= 0) return;
+
+  const int hMax = std::max(hL, hR);
+  const bool topDown = handle->topDown;
+  const int srcStride = (srcW + 3) / 4;
+  const int dstStride = (w + 3) / 4;
+
+  for (int srcY = 0; srcY < srcH; srcY++) {
+    const int srcRowIndex = topDown ? srcY : (srcH - 1 - srcY);
+    const uint8_t* srcRow = handle->pixels.get() + srcY * srcStride;
+
+    for (int dx = 0; dx < w; dx++) {
+      const int colH = (w == 1) ? hL : (hL + (hR - hL) * dx / (w - 1));
+      if (colH <= 0) continue;
+      const int colTop = (hMax - colH) / 2;
+
+      const int srcX = (dx * srcW) / w;
+      const uint8_t val = (srcRow[srcX / 4] >> (6 - ((srcX * 2) % 8))) & 0x3;
+
+      const int dstYStart = (srcRowIndex * colH) / srcH;
+      const int dstYEnd = ((srcRowIndex + 1) * colH) / srcH;
+      for (int dy = dstYStart; dy < dstYEnd; ++dy) {
+        const int outY = colTop + dy;
+        if (outY < 0 || outY >= hMax) continue;
+        write2bppPacked(dst + outY * dstStride, dx, val);
+      }
+    }
+  }
+}
+
+void GfxRenderer::renderPerspectiveBitmapToPacked2bpp(const Bitmap& bitmap, const int w, const int hL, const int hR,
+                                                      uint8_t* dst) const {
+  if (dst == nullptr) return;
+  if (w <= 0 || hL <= 0 || hR <= 0) return;
+
+  const int srcW = bitmap.getWidth();
+  const int srcH = bitmap.getHeight();
+  if (srcW <= 0 || srcH <= 0) return;
+
+  const int hMax = std::max(hL, hR);
+  const bool topDown = bitmap.isTopDown();
+
+  BitmapScratchLock scratchLock(*this);
+  if (!scratchLock.isLocked()) return;
+
+  const int outputRowSize = (srcW + 3) / 4;
+  if (!ensureBitmapScratchBuffers(outputRowSize, bitmap.getRowBytes())) {
+    return;
+  }
+  auto* outputRow = bitmapScratchOutputRow_;
+  auto* rowBytes = bitmapScratchRowBytes_;
+  const int dstStride = (w + 3) / 4;
+
+  for (int srcY = 0; srcY < srcH; srcY++) {
+    if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
+      LOG_ERR("GFX", "Failed to read row %d from bitmap (2bpp prerender tile)", srcY);
+      return;
+    }
+    const int srcRowIndex = topDown ? srcY : (srcH - 1 - srcY);
+
+    for (int dx = 0; dx < w; dx++) {
+      const int colH = (w == 1) ? hL : (hL + (hR - hL) * dx / (w - 1));
+      if (colH <= 0) continue;
+      const int colTop = (hMax - colH) / 2;
+
+      const int srcX = (dx * srcW) / w;
+      const uint8_t val = (outputRow[srcX / 4] >> (6 - ((srcX * 2) % 8))) & 0x3;
+
+      const int dstYStart = (srcRowIndex * colH) / srcH;
+      const int dstYEnd = ((srcRowIndex + 1) * colH) / srcH;
+      for (int dy = dstYStart; dy < dstYEnd; ++dy) {
+        const int outY = colTop + dy;
+        if (outY < 0 || outY >= hMax) continue;
+        write2bppPacked(dst + outY * dstStride, dx, val);
+      }
+    }
+  }
+}
+
+void GfxRenderer::drawPacked2bpp(const uint8_t* src, const int srcStride, const int x, const int y, const int w,
+                                 const int h) const {
+  if (src == nullptr || w <= 0 || h <= 0 || srcStride <= 0) return;
+  const int screenW = getScreenWidth();
+  const int screenH = getScreenHeight();
+  // Per-plane logic mirrors drawPerspectiveBitmap (see GfxRenderer.cpp:2256-2262).
+  // Uses the active renderMode to decide which plane to touch per pixel:
+  //   BW           -> paint if val < 3
+  //   GRAYSCALE_MSB -> paint if val is 1 or 2 (medium tones)
+  //   GRAYSCALE_LSB -> paint if val is 1 (darkest gray)
+  // val == 3 (pure white) is always a no-op; val == 0 (pure black) only
+  // paints in BW mode.
+  for (int row = 0; row < h; ++row) {
+    const int dstY = y + row;
+    if (dstY < 0 || dstY >= screenH) continue;
+    const uint8_t* srcRow = src + row * srcStride;
+    for (int col = 0; col < w; ++col) {
+      const int dstX = x + col;
+      if (dstX < 0 || dstX >= screenW) continue;
+      const uint8_t val = (srcRow[col >> 2] >> (6 - ((col & 3) * 2))) & 0x3;
+      if (renderMode == BW && val < 3) {
+        drawPixel(dstX, dstY);
+      } else if (renderMode == GRAYSCALE_MSB && (val == 1 || val == 2)) {
+        drawPixel(dstX, dstY, false);
+      } else if (renderMode == GRAYSCALE_LSB && val == 1) {
+        drawPixel(dstX, dstY, false);
+      }
+    }
+  }
+}
+
+// v18.9.9.211 Phase 3: aspect-fit scaled 2bpp packed render for center
+// covers. Same walk shape as buildScaledBitmap (cropX/cropY, xRatio/
+// yRatio, nearest-neighbor source sample per dst pixel) but preserves
+// the source's 4-gray value into 2bpp packed dst instead of thresholding
+// to 1bpp. Enables role=5 center-thumb tiles that skip the BMP header
+// parse + row decode + scaling walk on every carousel L/R press.
+void GfxRenderer::renderCachedBitmapToPacked2bpp(CachedBitmap* handle, const int dstW, const int dstH,
+                                                  uint8_t* dst, const float cropX, const float cropY) const {
+  if (handle == nullptr || !handle->pixels || dst == nullptr) return;
+  if (dstW <= 0 || dstH <= 0) return;
+  const int srcW = handle->width;
+  const int srcH = handle->height;
+  if (srcW <= 0 || srcH <= 0) return;
+
+  const int srcStride = (srcW + 3) / 4;
+  const int dstStride = (dstW + 3) / 4;
+
+  const float clampedCropX = std::clamp(cropX, 0.0f, 0.99f);
+  const float clampedCropY = std::clamp(cropY, 0.0f, 0.99f);
+  const float visibleSrcW = static_cast<float>(srcW) * (1.0f - clampedCropX);
+  const float visibleSrcH = static_cast<float>(srcH) * (1.0f - clampedCropY);
+  const float srcXOffset = static_cast<float>(srcW) * clampedCropX * 0.5f;
+  const float srcYOffset = static_cast<float>(srcH) * clampedCropY * 0.5f;
+  const float xRatio = visibleSrcW / static_cast<float>(dstW);
+  const float yRatio = visibleSrcH / static_cast<float>(dstH);
+
+  for (int ty = 0; ty < dstH; ++ty) {
+    const int srcRenderY = static_cast<int>(srcYOffset + ty * yRatio);
+    const int srcRowIndex = handle->topDown ? srcRenderY : (srcH - 1 - srcRenderY);
+    const int clampedRow = std::clamp(srcRowIndex, 0, srcH - 1);
+    const uint8_t* srcRowPtr = handle->pixels.get() + clampedRow * srcStride;
+    uint8_t* dstRowPtr = dst + ty * dstStride;
+    for (int tx = 0; tx < dstW; ++tx) {
+      const int srcX = std::clamp(static_cast<int>(srcXOffset + tx * xRatio), 0, srcW - 1);
+      const uint8_t val = (srcRowPtr[srcX / 4] >> (6 - ((srcX * 2) % 8))) & 0x3;
+      write2bppPacked(dstRowPtr, tx, val);
+    }
+  }
+}
+
+void GfxRenderer::renderBitmapToPacked2bpp(const Bitmap& bitmap, const int dstW, const int dstH,
+                                            uint8_t* dst, const float cropX, const float cropY) const {
+  if (dst == nullptr) return;
+  if (dstW <= 0 || dstH <= 0) return;
+  const int srcW = bitmap.getWidth();
+  const int srcH = bitmap.getHeight();
+  if (srcW <= 0 || srcH <= 0) return;
+
+  BitmapScratchLock scratchLock(*this);
+  if (!scratchLock.isLocked()) return;
+
+  const int outputRowSize = (srcW + 3) / 4;
+  if (!ensureBitmapScratchBuffers(outputRowSize, bitmap.getRowBytes())) return;
+  auto* outputRow = bitmapScratchOutputRow_;
+  auto* rowBytes = bitmapScratchRowBytes_;
+  const int dstStride = (dstW + 3) / 4;
+
+  // Streaming variant: read source rows one at a time, distribute each
+  // source row to the dst row range it covers. Matches drawPerspectiveBitmap's
+  // "for each srcY, compute dstYStart/End" pattern for consistency.
+  //
+  // Aspect-fit scaling with crop: same math as buildScaledBitmap. Because
+  // we're streaming (can't random-access source rows), we invert the
+  // mapping -- given srcY, compute which dst rows sample from it.
+  const float clampedCropX = std::clamp(cropX, 0.0f, 0.99f);
+  const float clampedCropY = std::clamp(cropY, 0.0f, 0.99f);
+  const float visibleSrcW = static_cast<float>(srcW) * (1.0f - clampedCropX);
+  const float visibleSrcH = static_cast<float>(srcH) * (1.0f - clampedCropY);
+  const float srcXOffset = static_cast<float>(srcW) * clampedCropX * 0.5f;
+  const float srcYOffset = static_cast<float>(srcH) * clampedCropY * 0.5f;
+  const float xRatio = visibleSrcW / static_cast<float>(dstW);
+  const float yRatio = visibleSrcH / static_cast<float>(dstH);
+
+  // Pre-compute for each dst row which source row it wants (top-down mapping);
+  // as we stream, we buffer the current source row and copy-out to any dst
+  // rows whose target srcY matches. Simplest robust approach: build a
+  // targetY->srcY table up front, then during streaming for each srcRenderY
+  // find the dstY that maps to it and fill that dst row.
+  //
+  // Memory: temporary uint16_t[dstH] table = 2 * dstH bytes (~640 B for
+  // dstH=320). Transient, small.
+  std::unique_ptr<uint16_t[]> dstToSrcRow(new (std::nothrow) uint16_t[dstH]);
+  if (!dstToSrcRow) return;
+  for (int ty = 0; ty < dstH; ++ty) {
+    const int srcRenderY = static_cast<int>(srcYOffset + ty * yRatio);
+    dstToSrcRow[ty] = static_cast<uint16_t>(std::clamp(srcRenderY, 0, srcH - 1));
+  }
+
+  for (int srcY = 0; srcY < srcH; srcY++) {
+    if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
+      LOG_ERR("GFX", "Failed to read row %d from bitmap (2bpp center tile)", srcY);
+      return;
+    }
+    const int srcRowIndex = bitmap.isTopDown() ? srcY : (srcH - 1 - srcY);
+    // For each dst row that samples from this source row, fill it.
+    for (int ty = 0; ty < dstH; ++ty) {
+      if (dstToSrcRow[ty] != srcRowIndex) continue;
+      uint8_t* dstRowPtr = dst + ty * dstStride;
+      for (int tx = 0; tx < dstW; ++tx) {
+        const int srcX = std::clamp(static_cast<int>(srcXOffset + tx * xRatio), 0, srcW - 1);
+        const uint8_t val = (outputRow[srcX / 4] >> (6 - ((srcX * 2) % 8))) & 0x3;
+        write2bppPacked(dstRowPtr, tx, val);
+      }
+    }
+  }
+}
+
 void GfxRenderer::drawPacked1bpp(const uint8_t* src, const int srcStride, const int x, const int y, const int w,
                                  const int h, const bool state) const {
   if (src == nullptr || w <= 0 || h <= 0 || srcStride <= 0) return;
@@ -2239,6 +2855,15 @@ void GfxRenderer::displayBuffer(const HalDisplay::RefreshMode refreshMode, const
   auto elapsed = millis() - start_ms;
   LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBuffer", elapsed);
   display.displayBuffer(refreshMode, fadingFix || turnOffScreen);
+}
+
+void GfxRenderer::displayBufferRegion(uint16_t x, uint16_t y, uint16_t w,
+                                      uint16_t h,
+                                      HalDisplay::RefreshMode refreshMode) const {
+  auto elapsed = millis() - start_ms;
+  LOG_DBG("GFX", "Time = %lu ms from clearScreen to displayBufferRegion(%u,%u,%ux%u)",
+          elapsed, x, y, w, h);
+  display.displayBufferRegion(x, y, w, h, refreshMode);
 }
 
 std::string GfxRenderer::truncatedText(const int fontId, const char* text, const int maxWidth,
@@ -2712,6 +3337,12 @@ void GfxRenderer::copyGrayscaleMsbBuffers() const { display.copyGrayscaleMsbBuff
 void GfxRenderer::displayGrayBuffer(const bool turnOffScreen) const {
   display.displayGrayBuffer(fadingFix || turnOffScreen);
 }
+
+void GfxRenderer::displayBufferFastLut(const bool turnOffScreen) const {
+  display.displayBufferFastLut(fadingFix || turnOffScreen);
+}
+
+void GfxRenderer::discardStoredBwBuffer() { freeBwCompressedBackup(); }
 
 void GfxRenderer::freeBwCompressedBackup() {
   if (bwCompressedBackup) {

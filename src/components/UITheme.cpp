@@ -16,6 +16,7 @@
 #include "components/themes/lyra/LyraCarouselTheme.h"
 #include "components/themes/lyra/LyraFlowTheme.h"
 #include "components/themes/lyra/LyraTheme.h"
+#include "components/themes/dashboard/DashboardTheme.h"
 #include "components/themes/minimal/MinimalTheme.h"
 #include "components/themes/roundedraff/RoundedRaffTheme.h"
 
@@ -84,6 +85,13 @@ void UITheme::setTheme(CrossPointSettings::UI_THEME type) {
       LOG_DBG("UI", "Using Minimal theme");
       currentTheme = std::make_unique<MinimalTheme>();
       currentMetrics = &MinimalMetrics::values;
+      break;
+    case CrossPointSettings::UI_THEME::DASHBOARD:
+      LOG_DBG("UI", "Using Dashboard theme");
+      // v18.9.9.465 (P3d): full CrossInk-parity DashboardMetrics — larger
+      // cover height + tile so the stats grid + book text fit alongside.
+      currentTheme = std::make_unique<DashboardTheme>();
+      currentMetrics = &DashboardMetrics::values;
       break;
     default:
       LOG_ERR("UI", "Unknown theme %d, falling back to Classic", static_cast<int>(type));

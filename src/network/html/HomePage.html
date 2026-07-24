@@ -408,7 +408,24 @@
     }
     // ----------------------------------------------------------------------
 
+    // The ESP32-C3 has no battery-backed RTC -- without this every uploaded
+    // file gets the same boot-default mtime (~Dec 31 2025 23:xx). We send the
+    // browser's wall clock already shifted to local time (Date.now() - tzOffset)
+    // so the device can just settimeofday() directly; FAT stores wall-clock
+    // with no TZ field so this lands as the user's local time in listings.
+    // Fire-and-forget: a failure here doesn't block the page; mtimes just stay
+    // stale until the next FT connect.
+    function syncDeviceTime() {
+      const localEpochMs = Date.now() - new Date().getTimezoneOffset() * 60000;
+      return fetch('/api/sync-time', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ epochMs: localEpochMs })
+      }).catch(err => console.warn('time sync failed (non-fatal):', err));
+    }
+
     async function fetchStatusAndCheckUpdate() {
+      syncDeviceTime();
       await fetchStatus();
       const ver = document.getElementById('version').textContent;
       checkForUpdate(ver);

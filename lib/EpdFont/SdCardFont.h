@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -22,7 +23,30 @@
 
 class SdCardFont {
  public:
+  // Cap on unique codepoints prewarmed in a single call. The prebake CLI calls
+  // prewarm() for an entire SECTION at once -- CJK chapters routinely have
+  // 1300-1500 unique chars, so a 512 cap silently dropped 60-80% of glyphs and
+  // left the atlas under-populated (pages rendered as ?-diamonds at runtime).
+  //
+  // On-device runtime calls prewarm() per RENDERED PAGE, never exceeding ~200
+  // unique chars -- 512 is enormously oversized for the device, and the static
+  // codepoints[] buffer costs 4 * MAX_PAGE_GLYPHS bytes of permanent BSS.
+  // Bumping the device-side cap to 2048 cost 6 KB of free heap, which under
+  // FT page-serve traffic dropped the WiFi stack's TX buffer below a tipping
+  // point where 30 KB HTML serves slowed from ~140ms to ~10s (75x slowdown,
+  // observed in the field). So split: device keeps the original 512 cap (2 KB
+  // BSS, plenty for any real page); prebake CLI / WASM gets 2048 (8 KB BSS in
+  // host heap, irrelevant on multi-MB host platforms) so CJK sections emit
+  // complete atlases.
+  //
+  // ESP_PLATFORM is set automatically by the ESP-IDF toolchain on device
+  // builds; host_shim/Arduino.h doesn't define it, so CLI + WASM builds take
+  // the larger value.
+#ifdef ESP_PLATFORM
   static constexpr uint16_t MAX_PAGE_GLYPHS = 512;
+#else
+  static constexpr uint16_t MAX_PAGE_GLYPHS = 2048;
+#endif
   static constexpr uint8_t MAX_STYLES = 4;
 
   SdCardFont() = default;
@@ -130,6 +154,12 @@ class SdCardFont {
   uint32_t miniIntervalCount(uint8_t styleIdx) const;
   uint32_t miniGlyphCount(uint8_t styleIdx) const;
   uint32_t miniBitmapSize(uint8_t styleIdx) const;
+  // CrumBLE 4.5.4 task #5A: drop the prewarmed mini-data for a single style
+  // without touching the other styles. Used by the prebake's coverage gate
+  // when prewarm hit a too-low coverage rate -- without this, the atlas
+  // emit path would still pick up the partial mini-data and ship a broken
+  // atlas that masks the runtime SD-font miss-handler fallback.
+  void clearMiniDataForStyle(uint8_t styleIdx);
   const EpdUnicodeInterval* miniIntervalsPtr(uint8_t styleIdx) const;
   const EpdGlyph* miniGlyphsPtr(uint8_t styleIdx) const;
   const uint8_t* miniBitmapPtr(uint8_t styleIdx) const;
@@ -150,6 +180,16 @@ class SdCardFont {
   const EpdKernClassEntry* miniKernRightClassesPtr(uint8_t styleIdx) const;
   const int8_t* miniKernMatrixPtr(uint8_t styleIdx) const;
   const EpdLigaturePair* miniLigaturePairsPtr(uint8_t styleIdx) const;
+
+  // v18.9.9.311: peek at a .cpfont file's contentHash without a full load.
+  // Reads only the 32B header + (styleCount * 32B) TOC entries -- at most
+  // 160 bytes. Returns false on I/O failure, bad magic, or bad version.
+  // Used by the "auto-match font by fontId" rescue path in
+  // EpubReaderActivity when a prebake manifest lies about which font it
+  // was baked with: we hash each installed .cpfont, compute fontId with
+  // SdCardFontManager::computeFontId, and find the family whose fontId
+  // matches the section-file fingerprint.
+  static bool peekContentHash(const char* path, uint32_t& outHash);
 
  private:
   // Per-style metadata (parsed from file header/TOC)
@@ -205,6 +245,23 @@ class SdCardFont {
     uint32_t miniIntervalCount = 0;
     uint32_t miniGlyphCount = 0;
 
+    // v18.9.9.307: chunked bitmap storage for the fallback path when the
+    // contiguous miniBitmap alloc can't find room. Field driver: under BT,
+    // maxAlloc dips to ~15 KB but total prewarm bitmap need for a CJK page
+    // can exceed 20 KB. A contiguous 20 KB block can't be carved but four
+    // 6 KB chunks each fit individually. When chunks is non-empty,
+    // miniBitmap is nullptr, miniData.bitmap is nullptr, and
+    // miniData.glyphBitmapFetch is wired to chunkedBitmapFetch which
+    // resolves per-glyph pointers via miniBitmapChunkPos.
+    //
+    // miniBitmapChunkPos is one entry per glyph, packed as
+    // (chunkIdx << 20) | localOffset. 12-bit chunk index (4096 max chunks,
+    // more than enough) + 20-bit offset (1 MB per chunk max, way more than
+    // needed at 6 KB actual chunk size). Zero-length glyphs get
+    // (invalidChunkIdx, 0) sentinel; the fetch callback returns nullptr.
+    std::vector<std::unique_ptr<uint8_t[]>> miniBitmapChunks;
+    std::vector<uint32_t> miniBitmapChunkPos;
+
     // Per-page mini kern matrix (built by buildMiniKernMatrix on each full
     // prewarm). miniKernLeftClasses/miniKernRightClasses map ONLY the codepoints
     // used on the current page to renumbered class IDs (1..miniKern*ClassCount).
@@ -218,6 +275,16 @@ class SdCardFont {
     uint8_t miniKernLeftClassCount = 0;
     uint8_t miniKernRightClassCount = 0;
     int8_t* miniKernMatrix = nullptr;
+    // v18.9.7: single-block owner. The three pointers above are ALIASES
+    // into this block (sliced by offset), not independent allocations.
+    // Fragmentation-resilient under BT: instead of 3 small sequential
+    // news that each independently need to find a hole, one contiguous
+    // block only has to find ONE hole of the total size. Field logs
+    // showed the previous 3-alloc pattern failing at maxAlloc=16 KB
+    // even when total need was 1.5 KB, because the middle alloc landed
+    // in a way that fragmented the last one. Owned lifetime = the
+    // three-pointer group; delete[] this block in freeStyleMiniKern.
+    uint8_t* miniKernBlock = nullptr;
 
     // The EpdFont whose data pointer we manage
     EpdFont epdFont{&stubData};
@@ -313,4 +380,10 @@ class SdCardFont {
 
   // Static callback for EpdFontData::glyphMissHandler (per-style via OverflowContext)
   static const EpdGlyph* onGlyphMiss(void* ctx, uint32_t codepoint);
+
+  // v18.9.9.307: static callback for EpdFontData::glyphBitmapFetch, used when
+  // the prewarmed bitmap had to be split into chunks. Recovers the style from
+  // the OverflowContext ctx, resolves per-glyph position via
+  // miniBitmapChunkPos, returns a pointer into the correct chunk.
+  static const uint8_t* chunkedBitmapFetch(void* ctx, const EpdGlyph* glyph);
 };

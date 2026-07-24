@@ -423,6 +423,15 @@ std::unique_ptr<TextBlock> TextBlock::deserialize(FsFile& file) {
 
   // Pre-flight: skip the alloc entirely if MaxAlloc can't cover the block.
   // 128 byte margin for allocator metadata overhead.
+  //
+  // CrumBLE 4.5.7 v18.2 tried trimming to 24 and REVERTED: the 128 margin
+  // is not conservative, it's a safety valve. When BT connect leaves the
+  // heap at ~10 KB free with heavy fragmentation, refusing the first
+  // text-block deserialize triggers the graceful BT-cycle recovery (the
+  // page then loads at 68 KB free with BT off). Allowing that first small
+  // alloc through instead lets rendering advance until a DOWNSTREAM alloc
+  // fails with bad_alloc -> std::terminate mid-render, leaving the panel
+  // half-painted before the panic reset. Refusing early wins.
   if (ESP.getMaxAllocHeap() < totalBytes + 128) {
     LOG_ERR("TXB", "Refusing dataBlock alloc(%u): maxAlloc=%u < needed=%u (wc=%u)", totalBytes,
             ESP.getMaxAllocHeap(), totalBytes + 128, wc);

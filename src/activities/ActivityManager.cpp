@@ -1,6 +1,10 @@
 #include "ActivityManager.h"
 
+#include <HalDisplay.h>
 #include <HalPowerManager.h>
+#include <Logging.h>
+
+#include "SilentRestart.h"
 
 #include <algorithm>
 
@@ -17,7 +21,10 @@
 #include "home/RecentBooksActivity.h"
 #include "home/RecentBooksGridActivity.h"
 #include "network/CrossPointWebServerActivity.h"
+#include "network/WifiSelectionActivity.h"
+#include "settings/ClockSyncActivity.h"
 #include "reader/ReaderActivity.h"
+#include "settings/FontDownloadActivity.h"
 #include "settings/OpdsServerListActivity.h"
 #include "settings/KOReaderAuthActivity.h"
 #include "settings/BluetoothSettingsActivity.h"
@@ -47,7 +54,12 @@ void ActivityManager::renderTaskLoop() {
     // Acquire the lock before reading currentActivity to avoid a TOCTOU race
     // where the main task deletes the activity between the null-check and render().
     RenderLock lock;
-    if (currentActivity) {
+    // v18.9.9.433: skip render entirely when the framebuffer has been
+    // released (WS upload in progress). GfxRenderer's direct frameBuffer[]
+    // writes would crash on null. E-ink panel retains the last painted
+    // image so nothing visibly changes; when the buffer is reallocated
+    // (via reboot on FT exit) the next boot repaints from scratch.
+    if (currentActivity && display.getFrameBuffer() != nullptr) {
       HalPowerManager::Lock powerLock;  // Ensure we don't go into low-power mode while rendering
       currentActivity->render(std::move(lock));
     }
@@ -199,8 +211,46 @@ void ActivityManager::goToOtaUpdate() {
 void ActivityManager::goToBluetoothSettings() {
   // CrumBLE 4.5.3: replaceActivity (not push) -- used by the silent-restart
   // dispatch at boot, where we want BT settings to BE the root activity
-  // rather than stacked over Home. exitOnSuccessfulConnect=false so the
-  // user explicitly backs out when done (same shape as goToSettings).
+  // rather than stacked over Home.
+  //
+  // v18.9.1: bring back the return-to-reader routing scoped to Back-from-BT
+  // (v17 had removed it after unrelated regressions with the
+  // reader-with-EnableBt bounce). Field flow this restores:
+  //   in-book -> drawer BT quick connect -> BT enable fails floor
+  //   -> silentRestartToBluetoothSettings sets returnToReaderAfterBtMagic
+  //      because APP_STATE.openEpubPath was non-empty at restart time
+  //   -> post-restart lands in BT settings, but as ROOT (book context lost)
+  //   -> user maps buttons / connects, presses Back
+  //   -> WITHOUT this branch: default onComplete is popActivity, and the
+  //      disableOnExit=true default disables BT then silent-restarts to
+  //      Home (v18.9 fix) -- dropping the user out of their book
+  //   -> WITH this branch: onComplete silent-restarts to reader with no
+  //      post-action, and disableOnExit=false keeps BT alive for the book
+  const bool returnToReader = (returnToReaderAfterBtMagic == RETURN_TO_READER_AFTER_BT_MAGIC);
+  if (returnToReader) {
+    returnToReaderAfterBtMagic = 0;
+    // v18.9.5.5: exitOnSuccessfulConnect=false so a successful connect leaves
+    // the user on BT settings (matches reader-menu semantics -- they may want
+    // to Map Buttons, forget a device, etc). v18.9.1 had this as TRUE, which
+    // finish()ed the activity on connect -- and since this is a replaceActivity
+    // root, empty stack fell through to Home. Users were being ejected from
+    // both the BT menu AND the reader when all they wanted was to connect.
+    //
+    // v18.9.5.7: onComplete restarts to reader with post-action = EnableBt so
+    // NimBLE comes back up and reconnects to the bonded remote after boot.
+    // v18.9.5.5 had this as None -- silent-restart killed NimBLE and the
+    // book resumed with BT cold + remote disconnected. EnableBt reuses the
+    // reader's own pendingBleQuickConnect_ QC handler, which does the enable
+    // + connectToDevice + HID subscribe sequence against a fresh heap.
+    // disableOnExit=false is now cosmetic (the reboot ends NimBLE either
+    // way) but kept for clarity of intent.
+    replaceActivity(std::make_unique<BluetoothSettingsActivity>(
+        renderer, mappedInput,
+        [] { silentRestartToReaderWithAction(ReaderPostBootAction::EnableBt); },
+        /*exitOnSuccessfulConnect=*/false,
+        /*disableOnExit=*/false));
+    return;
+  }
   replaceActivity(std::make_unique<BluetoothSettingsActivity>(
       renderer, mappedInput, [this] { popActivity(); }, /*exitOnSuccessfulConnect=*/false));
 }
@@ -211,7 +261,30 @@ void ActivityManager::goToKoreaderAuth() {
   replaceActivity(std::make_unique<KOReaderAuthActivity>(renderer, mappedInput));
 }
 
-void ActivityManager::goToSettings() { replaceActivity(std::make_unique<SettingsActivity>(renderer, mappedInput)); }
+void ActivityManager::goToFontDownload() {
+  // v18.9.9.308: same pattern as goToKoreaderAuth -- boot dispatch for
+  // SILENT_REBOOT_TARGET_FONT_DOWNLOAD lands the user back in the
+  // Manage Fonts wizard on a fresh heap, instead of dumping them on
+  // Home and forcing them to re-navigate Settings > Reader > Font >
+  // Manage Fonts.
+  replaceActivity(std::make_unique<FontDownloadActivity>(renderer, mappedInput));
+}
+
+void ActivityManager::goToWifiSelection() {
+  // v18.9.9.336: same pattern as goToFontDownload. Fresh-heap re-launch
+  // of the WiFi picker after a silentRestartToWifiSelection tripped the
+  // wpa_supplicant crash guard.
+  replaceActivity(std::make_unique<WifiSelectionActivity>(renderer, mappedInput));
+}
+
+void ActivityManager::goToClockSync() {
+  // v18.9.9.337: fresh-heap re-launch of the Clock Sync activity after
+  // silentRestartToClockSync tripped the same wpa_supplicant crash guard.
+  replaceActivity(std::make_unique<ClockSyncActivity>(renderer, mappedInput));
+}
+
+// v18.9.9.335: goToSettings moved below goToReader; see that block for the
+// instrumented single definition. Placeholder here would duplicate-define.
 
 void ActivityManager::goToFileBrowser(std::string path) {
   replaceActivity(std::make_unique<FileBrowserActivity>(renderer, mappedInput, std::move(path)));
@@ -244,7 +317,13 @@ void ActivityManager::goToBrowser() {
 }
 
 void ActivityManager::goToReader(std::string path, const bool suppressBackRelease) {
+  SET_CHECKPOINT("activityMgr:goToReader");
   replaceActivity(std::make_unique<ReaderActivity>(renderer, mappedInput, std::move(path), suppressBackRelease));
+}
+
+void ActivityManager::goToSettings() {
+  SET_CHECKPOINT("activityMgr:goToSettings");
+  replaceActivity(std::make_unique<SettingsActivity>(renderer, mappedInput));
 }
 
 void ActivityManager::goToSleep(bool fromTimeout) {
@@ -438,3 +517,13 @@ void RenderLock::unlock() {
  * @note Must not be called from ISR context — xSemaphoreGetMutexHolder is not ISR-safe.
  */
 bool RenderLock::peek() { return xSemaphoreGetMutexHolder(activityManager.renderingMutex) != nullptr; }
+
+bool RenderLock::heldByCurrentTask() {
+  return xSemaphoreGetMutexHolder(activityManager.renderingMutex) == xTaskGetCurrentTaskHandle();
+}
+
+bool RenderLock::tryLockFor(TickType_t ticks) {
+  return xSemaphoreTake(activityManager.renderingMutex, ticks) == pdTRUE;
+}
+
+void RenderLock::forceUnlock() { xSemaphoreGive(activityManager.renderingMutex); }

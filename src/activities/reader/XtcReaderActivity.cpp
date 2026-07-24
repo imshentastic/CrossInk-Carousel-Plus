@@ -14,11 +14,15 @@
 
 #include <algorithm>
 
+#include "../../SdCardFontSystem.h"
+#include "../../SilentRestart.h"
 #include "CrossPointSettings.h"
 #include "CrossPointState.h"
 #include "MappedInputManager.h"
 #include "ReaderUtils.h"
 #include "util/CacheWriteRecovery.h"
+#include "GlobalReadingStats.h"
+#include "ReadingStatsUtils.h"
 #include "RecentBooksStore.h"
 #include "XtcReaderChapterSelectionActivity.h"
 #include "activities/boot_sleep/SleepCoverAssets.h"
@@ -33,6 +37,23 @@ void XtcReaderActivity::onEnter() {
     return;
   }
 
+  // CrumBLE 4.5.116: alias primary as UI fallback; fall through to
+  // suppress-and-release if no primary is loaded. See EpubReaderActivity
+  // ::onEnter for the full rationale.
+  if (!sdFontSystem.aliasPrimaryAsFallback(renderer)) {
+    sdFontSystem.setFallbackSuppressed(true);
+    sdFontSystem.releaseFallback(renderer);
+  }
+
+  // v18.9.9.40: consume the XTC defrag continuation flag. If this open is
+  // the boot after silentRestartToXtcReaderWithDefragRetry, the flag is
+  // now cleared so subsequent XTC opens in this session start fresh.
+  // renderPage checks isXtcDefragRetryContinuation() BEFORE we clear so
+  // the first render's alloc failure still sees "budget spent".
+  if (isXtcDefragRetryContinuation()) {
+    LOG_INF("XTR", "XTC opened continuing from defrag retry -- next alloc failure will show memory error");
+  }
+
   xtc->setupCacheDir();
 
   // Activate reader-specific front button mapping (if configured).
@@ -40,6 +61,20 @@ void XtcReaderActivity::onEnter() {
 
   // Load saved progress
   loadProgress();
+
+  // v18.9.9.462 (P4b): XTC/XTCH stats parity. Mirror EpubReader's pattern:
+  // load stats file (creates if missing so "Unopened" collection flips off
+  // as soon as the book is entered), snapshot session-start markers.
+  // Commit on onExit + sleep entry. Also auto-populate startDate on first
+  // session when clock is valid (matches v443 per-book v5 behavior).
+  const bool statsExisted = BookReadingStats::exists(xtc->getCachePath());
+  stats = BookReadingStats::load(xtc->getCachePath());
+  if (!statsExisted) {
+    stats.save(xtc->getCachePath());
+  }
+  stats_sessionStartMs = millis();
+  stats_pageAtSessionStart = currentPage;
+  stats_sessionCounted = false;
 
   // Save current XTC as last opened book and add to recent books
   APP_STATE.openEpubPath = xtc->getPath();
@@ -53,6 +88,72 @@ void XtcReaderActivity::onEnter() {
 
 void XtcReaderActivity::onExit() {
   Activity::onExit();
+
+  // v18.9.9.462 (P4b): commit reading session before teardown. Same
+  // thresholds as EpubReader: session count bumps at >=60s cumulative;
+  // reading seconds accumulate unconditionally; pages tracked via
+  // currentPage delta from session start.
+  if (xtc) {
+    const uint32_t elapsedMs = millis() - stats_sessionStartMs;
+    const uint32_t elapsedSecs = elapsedMs / 1000u;
+    if (!stats_sessionCounted && elapsedMs >= 60000u) {
+      stats.sessionCount++;
+      GlobalReadingStats globalStats = GlobalReadingStats::load();
+      globalStats.totalSessions++;
+      globalStats.save();
+      stats_sessionCounted = true;
+    }
+    if (elapsedSecs > 0) {
+      stats.totalReadingSeconds += elapsedSecs;
+      GlobalReadingStats globalStats = GlobalReadingStats::load();
+      globalStats.totalReadingSeconds += elapsedSecs;
+
+      // Fold segment into global ToD/DoW/streak buckets when clock valid.
+      ReadingStatsDateTime nowLocal;
+      if (getCurrentLocalReadingStatsDateTime(nowLocal)) {
+        ReadingStatsDateTime localStart = nowLocal;
+        int32_t sod = static_cast<int32_t>(localStart.hour) * 3600 +
+                      static_cast<int32_t>(localStart.minute) * 60 +
+                      static_cast<int32_t>(localStart.second) - static_cast<int32_t>(elapsedSecs);
+        while (sod < 0) {
+          addDaysToReadingStatsDate(localStart.date, -1);
+          sod += 24 * 3600;
+        }
+        localStart.hour = static_cast<uint8_t>(sod / 3600);
+        localStart.minute = static_cast<uint8_t>((sod % 3600) / 60);
+        localStart.second = static_cast<uint8_t>(sod % 60);
+        globalStats.recordReadingSpan(localStart, elapsedSecs);
+        // Auto-populate per-book startDate on first-ever session.
+        if (!stats.startDate.isValid() && !(stats.flags & BookReadingStats::FLAG_START_DATE_MANUAL)) {
+          stats.startDate = nowLocal.date;
+        }
+      }
+      globalStats.save();
+    }
+    // Pages turned: total delta from session start. Direction agnostic —
+    // XTC "pages" are display pages, so any change counts as a page turn.
+    const int32_t pageDelta =
+        static_cast<int32_t>(currentPage) - static_cast<int32_t>(stats_pageAtSessionStart);
+    const uint32_t pagesTurned = static_cast<uint32_t>(pageDelta < 0 ? -pageDelta : pageDelta);
+    if (pagesTurned > 0) {
+      stats.totalPagesTurned += pagesTurned;
+      GlobalReadingStats globalStats = GlobalReadingStats::load();
+      globalStats.totalPagesTurned += pagesTurned;
+      globalStats.save();
+    }
+    stats.save(xtc->getCachePath());
+  }
+
+  // CrumBLE 4.5.116: tear down reader's fallback state (alias or suppression).
+  sdFontSystem.releaseFallback(renderer);
+  sdFontSystem.setFallbackSuppressed(false);
+
+  // v18.9.9.40: clear the XTC defrag continuation flag so a subsequent
+  // open of a different XTC file (or the same one after returning to
+  // library) gets a fresh defrag budget. Within a single XTC session
+  // we keep the flag true after the reopen boot to prevent a
+  // loop-restart if the alloc still fails.
+  clearXtcDefragRetryContinuation();
 
   mappedInput.setReaderMode(false);
 
@@ -325,7 +426,46 @@ void XtcReaderActivity::renderPage() {
   // Allocate page buffer
   uint8_t* pageBuffer = static_cast<uint8_t*>(malloc(pageBufferSize));
   if (!pageBuffer) {
-    LOG_ERR("XTR", "Failed to allocate page buffer (%lu bytes)", pageBufferSize);
+    LOG_ERR("XTR", "Failed to allocate page buffer (%lu bytes) free=%u maxAlloc=%u",
+            pageBufferSize, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    // v18.9.9.37 (task #22) + v18.9.9.40 (task #25): if this boot
+    // didn't already come from an XTC defrag retry, AND the requested
+    // page buffer size is small enough that a clean boot could plausibly
+    // fit it, silent-restart-with-XTC-defrag so the reopen lands on a
+    // fresh contiguous heap. Boot dispatch re-opens the same file via
+    // ReaderActivity's extension-detection route (see main.cpp XTC
+    // dispatch branch). One-shot per open -- if the retry boot still
+    // can't alloc, the file genuinely doesn't fit and we fall through
+    // to the memory-error message.
+    //
+    // Pre-flight ceiling: fresh boot on this device typically leaves
+    // ~90 KB max contiguous. If pageBufferSize is above 80 KB, the
+    // restart is very unlikely to help (physical device limit, not
+    // fragmentation) and the ~5 s reboot cost isn't worth trying.
+    // Landscape 800x480 XTH files sit right at 96 KB and hit this
+    // ceiling -- they can't render at all on the tiny-bitter env.
+    constexpr size_t kFreshBootPageBufferCeilingBytes = 80 * 1024;
+    const bool haveBudget = !isXtcDefragRetryContinuation();
+    const bool couldFitOnFreshBoot = pageBufferSize <= kFreshBootPageBufferCeilingBytes;
+    if (haveBudget && couldFitOnFreshBoot && xtc) {
+      LOG_INF("XTR",
+              "Page buffer alloc failed (need %lu bytes); silent-restart-to-XTC-defrag to reopen on clean heap",
+              pageBufferSize);
+      silentRestartToXtcReaderWithDefragRetry(xtc->getPath().c_str());
+      // never returns
+    }
+    if (!haveBudget) {
+      LOG_INF("XTR",
+              "Skipping XTC defrag restart: budget already spent this open (%lu bytes needed) -- showing memory error",
+              pageBufferSize);
+    } else if (!couldFitOnFreshBoot) {
+      LOG_INF("XTR",
+              "Skipping XTC defrag restart: page buffer %lu > fresh-boot ceiling %lu; restart wouldn't help on this "
+              "device -- showing memory error",
+              pageBufferSize, static_cast<unsigned long>(kFreshBootPageBufferCeilingBytes));
+    } else if (!xtc) {
+      LOG_INF("XTR", "Skipping XTC defrag restart: xtc handle unavailable");
+    }
     renderer.clearScreen();
     renderer.drawCenteredText(UI_12_FONT_ID, 300, tr(STR_MEMORY_ERROR), true, EpdFontFamily::BOLD);
     renderer.displayBuffer();

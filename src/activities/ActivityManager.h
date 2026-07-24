@@ -24,7 +24,7 @@ class Activity;    // forward declaration
 class RenderLock;  // forward declaration
 
 enum class RequestUpdateResult { Rendered, Rejected };
-enum class HomeMenuItem { NONE, FILE_BROWSER, RECENTS, OPDS_BROWSER, FILE_TRANSFER, SETTINGS_MENU };
+enum class HomeMenuItem { NONE, FILE_BROWSER, RECENTS, OPDS_BROWSER, FILE_TRANSFER, SETTINGS_MENU, READING_STATS };
 
 /**
  * ActivityManager
@@ -101,6 +101,16 @@ class ActivityManager {
   // KOReader auth wizard. Used by the silent-restart-to-koreader-auth
   // dispatch when the activity's WiFi+HTTPS pre-flight tripped.
   void goToKoreaderAuth();
+  // v18.9.9.308: Font Download wizard entry point. Same shape as
+  // goToKoreaderAuth; used by the silent-restart-to-font-download
+  // dispatch after the WiFi+HTTPS heap pre-flight tripped.
+  void goToFontDownload();
+  // v18.9.9.336: WifiSelectionActivity direct-land entry point. Used by the
+  // silent-restart-to-wifi-selection dispatch to reopen the picker on a
+  // fresh ~150 KB heap after Settings > Network detected a fragmented
+  // state that would crash wpa_supplicant.
+  void goToWifiSelection();
+  void goToClockSync();
   void goToSettings();
   void goToFileBrowser(std::string path = {});
   void goToRecentBooks();

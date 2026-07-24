@@ -1,7 +1,6 @@
 #pragma once
 
-#include <memory>
-#include <unordered_map>
+#include <string>
 
 #include "components/themes/lyra/LyraTheme.h"
 
@@ -138,23 +137,13 @@ class LyraFlowTheme : public LyraTheme {
   };
   static ShelfLayout shelfLayoutFor(int rowCount);
 
-  // CrumBLE #125: pre-bake the 4 perspective side-cover tiles for every
-  // book in `recentBooks` once at home-entry. drawStackedCover then blits
-  // the matching tile per book/side instead of re-walking ~70k source
-  // pixels per cover. Each book contributes 2 unique tile shapes (left
-  // perspective and right perspective — near and far positions on the
-  // same side share the shape, only drawX differs). Caches per-book by
-  // path so the table survives recentBooks reordering (e.g. just-read
-  // book promotion). HomeActivity invokes this after loadRecentCovers
-  // populates the in-RAM cover cache; if a source cover is not in the
-  // cache, that book's tile is skipped and drawStackedCover falls back
-  // to the original perspective-render path.
-  void prerenderCarouselSideTiles(GfxRenderer& renderer, const std::vector<RecentBook>& recentBooks) const;
-
-  // Drop all baked tiles (~24 KB). Called from HomeActivity::onExit so
-  // the cache doesn't stay resident while the user is in the reader (the
-  // reader's heap envelope is tight, especially under BLE).
-  void clearCarouselSideTiles() const;
+  // v18.9.9.212: bulk-bake all 3 tile roles (L-side, R-side, center) for
+  // the book at `coverBmpPath`. Skips tile roles that already pass current
+  // format validation, so re-running is a fast no-op. Returns count of
+  // tiles NEWLY written (0..3) on success, or -1 if the source cover is
+  // missing/unreadable. Called from Settings > Bake Carousel Covers to
+  // pre-warm the Phase 1-3 cache without needing the user to nav Home first.
+  static int bakeAllTilesForCover(GfxRenderer& renderer, const std::string& coverBmpPath);
 
  public:
   // Set by HomeActivity right before invoking drawRecentBookCover. When
@@ -213,19 +202,9 @@ class LyraFlowTheme : public LyraTheme {
   // yet" (first render after onEnter; treat as full repaint).
   mutable int lastDrawnSelectionBorder_ = -1;  // -1 = unknown, 0 = absent, 1 = present
 
-  // CrumBLE #125: pre-baked perspective side-cover tile cache. See
-  // prerenderCarouselSideTiles() / clearCarouselSideTiles() docstrings.
-  // Tile pixels are 1bpp packed MSB-first, sized (sideCoverWidth + 7) / 8
-  // bytes per row * sideInnerHeight rows ~= 2.4 KB. Two tiles per book
-  // (left/right perspective) -> ~24 KB for the 5-book carousel.
-  struct PerspectiveTile {
-    std::unique_ptr<uint8_t[]> pixels;
-    int width = 0;
-    int height = 0;
-  };
-  struct BookSideTiles {
-    PerspectiveTile left;   // hL = sideInnerHeight, hR = sideOuterHeight
-    PerspectiveTile right;  // hL = sideOuterHeight, hR = sideInnerHeight
-  };
-  mutable std::unordered_map<std::string, BookSideTiles> sideTileCache_;
+  // v18.9.9.206: side-tile prerender cache removed. The ~24 KB pinned
+  // cache traded contiguous heap for ~140 ms/press of streaming decode
+  // avoidance; the heap cost hurt X3 BT/FT/dict maxAlloc more than the
+  // press latency helped. drawStackedCover now always takes the
+  // renderPerspectiveBitmap streaming path.
 };

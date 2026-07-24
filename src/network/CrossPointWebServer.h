@@ -42,6 +42,17 @@ bool consumeFirmwareInstallRequest();
 // at the back. Consumed one-shot.
 bool consumePendingLibraryRefreshRequest();
 
+// CrumBLE 4.5.4: callable from anywhere to (re-)arm the pending-library-
+// refresh flag. WEBACT uses this to defer a low-heap walk for one tick.
+void requestLibraryRefresh();
+
+// v18.9.9.384: post-large-upload defrag restart. Returns true when the
+// armed millisecond timestamp has elapsed. WEBACT loop consumes this
+// and silent-restart-to-FT; browser's post-upload workflow (font fetch,
+// prebake, cache uploads) reconnects via existing retry logic and runs
+// on the freshly-booted 95K/61K heap.
+bool consumeFtDefragRestartIfDue();
+
 // Structure to hold file information
 struct FileInfo {
   String name;
@@ -73,12 +84,23 @@ class CrossPointWebServer {
 
     // Upload write buffer - batches small writes into larger SD card operations
     // 4KB is a good balance: large enough to reduce syscall overhead, small enough
-    // to keep individual write times short and avoid watchdog issues
+    // to keep individual write times short and avoid watchdog issues.
+    // v18.9.9.85: lazy allocation. Was allocated eagerly in UploadState ctor,
+    // which meant every FT session paid 4 KB in `new CrossPointWebServer()`
+    // even when no upload was ever attempted (settings-only browsing, prebake
+    // manifest viewing, etc). Field repro: the 4 KB tipped the post-WiFi
+    // budget below the web-server-begin floor, killing FT for browse-only
+    // users. Now resized on first handleUpload tick — no cost for non-upload
+    // sessions, same cost when needed.
     static constexpr size_t UPLOAD_BUFFER_SIZE = 4096;  // 4KB buffer
     std::vector<uint8_t> buffer;
     size_t bufferPos = 0;
 
-    UploadState() { buffer.resize(UPLOAD_BUFFER_SIZE); }
+    UploadState() = default;
+
+    void ensureBufferAllocated() {
+      if (buffer.empty()) buffer.resize(UPLOAD_BUFFER_SIZE);
+    }
   } upload;
 
   CrossPointWebServer();
@@ -123,6 +145,13 @@ class CrossPointWebServer {
   std::string cachedSettingsJson_;
   bool running = false;
   bool apMode = false;  // true when running in AP mode, false for STA mode
+  // v18.9.9.91: WS server is lazily created 3 s after begin() so the HTML
+  // serve window doesn't compete with the WS client-slot buffer (~4 KB) for
+  // peak-alloc. Browser JS only opens a WebSocket when the user actually
+  // starts an upload, and the upload path already retries "WebSocket
+  // connection failed" (see FilesPage.html: uploadFileWebSocket retry
+  // loop). Set to 0 once WS is up; nonzero means "not yet started".
+  uint32_t wsPendingBeginAt_ = 0;
   GfxRenderer* renderer_ = nullptr;
   uint16_t port = 80;
   uint16_t wsPort = 81;  // WebSocket port
@@ -152,8 +181,10 @@ class CrossPointWebServer {
   void handleCrumblePrebakeWasm() const;
   void handleNotFound() const;
   void handleStatus() const;
+  void handleSyncTime();
   void handleFileList() const;
   void handleFileListData() const;
+  void handlePrebakeManifest() const;
   void handleDownload() const;
   void handleUpload(UploadState& state) const;
   void handleUploadPost(UploadState& state) const;
@@ -177,6 +208,15 @@ class CrossPointWebServer {
   // saveToFile() persists to flash on success. Used by the optimizer's
   // preflight modal so the user can correct any setting that's wrong
   // before locking it into the prebake's manifest.
+  //
+  // CrumBLE 4.5.5: optional body field "dryRun":true switches to preview
+  // mode -- the requested changes are applied, derived values (fontId,
+  // viewportWidth/Height, lineCompression, emSize, ...) are computed,
+  // then SETTINGS is RESTORED before saveToFile() is called. Response
+  // body is the same shape as /api/reader-render-info, so the modal can
+  // use it directly as the bake's renderInfo without mutating device
+  // state. Lets the preflight picker stay "what to bake against THIS
+  // time" instead of silently rewriting persistent reader settings.
   void handleSaveReaderSettings() const;
 
   // Font management handlers

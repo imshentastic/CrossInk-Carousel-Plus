@@ -46,8 +46,17 @@ class MinimalTheme : public LyraTheme {
                            int selectorIndex, bool& coverRendered, bool& coverBufferStored, bool& bufferRestored,
                            const std::function<bool()>& storeCoverBuffer, const BookReadingStats* stats = nullptr,
                            float progressPercent = -1.0f) const override;
+  // v18.9.9.466: 1:1 signatures with CrossInk v1.4.0 MinimalTheme.
+  // drawSleepScreen — inverted flag: false = BLACK background (default),
+  //                                  true = WHITE background.
   void drawSleepScreen(const GfxRenderer& renderer, const RecentBook& book, const BookReadingStats* stats = nullptr,
-                       float progressPercent = -1.0f) const;
+                       float progressPercent = -1.0f, bool inverted = false) const;
+  // drawStatsSleepScreen — base sleep screen + reader-type/streak overlay.
+  // Renamed from CrumBLE's drawSleepScreenWithStats. Overlay is a no-op
+  // when clock invalid (CrumBLE gate — upstream is X3-only).
+  void drawStatsSleepScreen(const GfxRenderer& renderer, const RecentBook& book, const BookReadingStats* stats,
+                            const struct GlobalReadingStats* globalStats, float progressPercent = -1.0f,
+                            bool inverted = false) const;
   void drawButtonMenu(GfxRenderer& renderer, Rect rect, int buttonCount, int selectedIndex,
                       const std::function<std::string(int index)>& buttonLabel,
                       const std::function<UIIcon(int index)>& rowIcon) const override;

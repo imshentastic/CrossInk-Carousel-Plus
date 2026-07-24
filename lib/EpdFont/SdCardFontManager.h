@@ -36,6 +36,12 @@ class SdCardFontManager {
   // 0 if nothing loaded.
   uint8_t currentPointSize() const { return loadedPointSize_; };
 
+  // CrumBLE 4.5.4: fontId of the currently-loaded family. 0 if nothing
+  // loaded. Used by SdCardFontSystem::ensureFallbackLoaded to look up
+  // the EpdFontFamily entry in the renderer's font map after a successful
+  // load, then register it as the UI glyph fallback.
+  int currentFontId() const { return loadedFontId_; }
+
   // CrumBLE 4.2: exposed for the off-device prebake WASM, which needs to
   // compute the exact same fontId the device will derive at reader-open
   // time so the manifest's baked-in fontId matches the runtime fontId
@@ -51,5 +57,8 @@ class SdCardFontManager {
 
   std::string loadedFamilyName_;
   uint8_t loadedPointSize_ = 0;
+  // CrumBLE 4.5.4: shadow of loaded_.back().fontId, mirrored at load /
+  // unload so accessors don't need to crack the vector layout.
+  int loadedFontId_ = 0;
   std::vector<LoadedFont> loaded_;
 };

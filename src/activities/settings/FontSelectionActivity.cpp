@@ -97,18 +97,34 @@ void FontSelectionActivity::onEnter() {
     }
   }
 
-  // Find current selection
+  // v18.9.9.317: iterate fonts_ directly instead of computing an offset via
+  // CrossPointSettings::BUILTIN_FONT_COUNT (always 3, regardless of OMITs).
+  // On tiny-bitter (OMIT_LEXENDDECA_FONT + OMIT_CHAREINK_FONT) fonts_ only
+  // holds 1 builtin + SD families, so `BUILTIN_FONT_COUNT + i` walked past
+  // the actual array -- the SD picker landed on whatever fonts_ happened
+  // to have at the wrong offset (typical symptom: picking "ChareInk"
+  // opens the picker showing "Readerly" as selected). Same story for the
+  // else-branch that used SETTINGS.fontFamily as a display index -- enum
+  // value 2 (CHAREINK) mapped into fonts_[2] which on an OMIT build is an
+  // SD family, not the intended builtin.
   selectedIndex_ = 0;
-  if (SETTINGS.sdFontFamilyName[0] != '\0' && registry_) {
-    const auto& families = registry_->getFamilies();
-    for (int i = 0; i < static_cast<int>(families.size()); i++) {
-      if (families[i].name == SETTINGS.sdFontFamilyName) {
-        selectedIndex_ = CrossPointSettings::BUILTIN_FONT_COUNT + i;
+  bool found = false;
+  if (SETTINGS.sdFontFamilyName[0] != '\0') {
+    for (size_t i = 0; i < fonts_.size(); i++) {
+      if (!fonts_[i].isBuiltin && fonts_[i].name == SETTINGS.sdFontFamilyName) {
+        selectedIndex_ = static_cast<int>(i);
+        found = true;
         break;
       }
     }
-  } else {
-    selectedIndex_ = SETTINGS.fontFamily < CrossPointSettings::BUILTIN_FONT_COUNT ? SETTINGS.fontFamily : 0;
+  }
+  if (!found) {
+    for (size_t i = 0; i < fonts_.size(); i++) {
+      if (fonts_[i].isBuiltin && fonts_[i].settingIndex == SETTINGS.fontFamily) {
+        selectedIndex_ = static_cast<int>(i);
+        break;
+      }
+    }
   }
 
   // CrumBLE 4.4 task #43: use immediate notify so the first render fires
@@ -198,18 +214,27 @@ void FontSelectionActivity::render(RenderLock&&) {
   const int contentTop = metrics.topPadding + metrics.headerHeight + metrics.verticalSpacing;
   const int contentHeight = pageHeight - contentTop - metrics.buttonHintsHeight - metrics.verticalSpacing;
 
-  // Determine which font index is currently active (to mark as "Selected")
-  int currentFontIndex = 0;
-  if (SETTINGS.sdFontFamilyName[0] != '\0' && registry_) {
-    const auto& families = registry_->getFamilies();
-    for (int i = 0; i < static_cast<int>(families.size()); i++) {
-      if (families[i].name == SETTINGS.sdFontFamilyName) {
-        currentFontIndex = CrossPointSettings::BUILTIN_FONT_COUNT + i;
+  // v18.9.9.317: same OMIT-aware lookup as onEnter -- iterate fonts_
+  // directly instead of computing via CrossPointSettings::BUILTIN_FONT_COUNT.
+  // Bug that shipped for months on tiny-bitter: "Selected" tag rendered
+  // next to the wrong row because the offset assumed all 3 builtins were
+  // present in fonts_.
+  int currentFontIndex = -1;
+  if (SETTINGS.sdFontFamilyName[0] != '\0') {
+    for (size_t i = 0; i < fonts_.size(); i++) {
+      if (!fonts_[i].isBuiltin && fonts_[i].name == SETTINGS.sdFontFamilyName) {
+        currentFontIndex = static_cast<int>(i);
         break;
       }
     }
-  } else {
-    currentFontIndex = SETTINGS.fontFamily < CrossPointSettings::BUILTIN_FONT_COUNT ? SETTINGS.fontFamily : 0;
+  }
+  if (currentFontIndex < 0) {
+    for (size_t i = 0; i < fonts_.size(); i++) {
+      if (fonts_[i].isBuiltin && fonts_[i].settingIndex == SETTINGS.fontFamily) {
+        currentFontIndex = static_cast<int>(i);
+        break;
+      }
+    }
   }
 
   GUI.drawList(

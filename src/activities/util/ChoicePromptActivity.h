@@ -20,8 +20,13 @@
 // choice >= 0 is the picked option index.
 class ChoicePromptActivity final : public Activity {
  public:
+  // v18.9.9.270: added `defaultSelectedIndex` so callers can pre-cursor
+  // on a preferred option (e.g. the dict picker parking the cursor on
+  // the last-picked dictionary so a "same choice" flow is one tap).
+  // Clamped to [0, options.size()-1]; out-of-range values fall back to 0.
   ChoicePromptActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string heading, std::string body,
-                       std::vector<std::string> options, bool ignoreInitialConfirmRelease = false);
+                       std::vector<std::string> options, bool ignoreInitialConfirmRelease = false,
+                       int defaultSelectedIndex = 0);
 
   void onEnter() override;
   void loop() override;

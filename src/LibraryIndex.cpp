@@ -87,15 +87,40 @@ std::string lastNameLowerForKey(const std::string& author) {
   if (l == std::string::npos) return {};
   size_t r = author.find_last_not_of(" \t\r\n");
   std::string s = author.substr(l, r - l + 1);
+
+  // v18.9.9.220: split on ';' first -- it's the standard multi-author
+  // separator in EPUB dc:creator. "Pierce Brown; Coauthor Name" would
+  // otherwise fall through to find_last_of(" ") and pick up "Name" as
+  // the "last name", which is wrong (that's the coauthor's surname, not
+  // the primary author's). Trailing single-author semis ("Pierce Brown;")
+  // are handled by the same slice.
+  const size_t semi = s.find(';');
+  if (semi != std::string::npos) {
+    s = s.substr(0, semi);
+    size_t rr = s.find_last_not_of(" \t\r\n");
+    if (rr != std::string::npos) s.resize(rr + 1); else s.clear();
+  }
+
   const size_t comma = s.find(',');
   if (comma != std::string::npos) {
     s = s.substr(0, comma);
     size_t rr = s.find_last_not_of(" \t\r\n");
-    if (rr != std::string::npos) s = s.substr(0, rr + 1);
+    if (rr != std::string::npos) s.resize(rr + 1);
   } else {
     const size_t sp = s.find_last_of(" \t");
     if (sp != std::string::npos) s = s.substr(sp + 1);
   }
+
+  // v18.9.9.220: strip trailing punctuation. EPUB metadata frequently
+  // has trailing periods / commas / semis in author names (Calibre and
+  // some export tools do this). Without stripping, "Brown" and "Brown."
+  // sort separately.
+  while (!s.empty()) {
+    const char c = s.back();
+    if (c == '.' || c == ',' || c == ';' || c == ':' || c == '!' || c == '?') s.pop_back();
+    else break;
+  }
+
   std::transform(s.begin(), s.end(), s.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   // Also strip any embedded tabs -- they'd corrupt our on-disk format. (Author
@@ -127,9 +152,17 @@ uint32_t LibraryIndex::appendPath(std::string_view path) {
 
 // CrumBLE 4.2.1: ensure offset 0 of authorKeyPool is a NUL byte so any
 // LibraryEntry whose authorKeyOffset = 0 reads back as "" via authorKeyOf().
-// Called inline by appendAuthorKey() the first time the pool is empty.
+// CrumBLE 4.5.4: ALSO seed offset 1 as a second NUL so the "attempted but
+// no author found" sentinel (kAuthorKeyOffsetTriedEmpty) reads back as ""
+// too. Without the second byte, an entry written with offset=1 would
+// dereference past the buffer end on load before any real key was appended.
 static void ensureAuthorKeyPoolSentinel(std::vector<char>& pool) {
-  if (pool.empty()) pool.push_back('\0');
+  if (pool.empty()) {
+    pool.push_back('\0');
+    pool.push_back('\0');
+  } else if (pool.size() == 1) {
+    pool.push_back('\0');
+  }
 }
 
 uint32_t LibraryIndex::appendAuthorKey(std::string_view key) {
@@ -343,11 +376,12 @@ void LibraryIndex::rescan(const std::function<void(int)>& progress) {
   // virtuals (Finished, New) might be stale relative to the new path set.
   // Invalidate so the next access rescans.
   CollectionsStore::getInstance().invalidateScannedVirtuals();
-  // CrumBLE 4.2.1: lazily populate any missing author keys (typical on the
-  // first walk after a v1 -> v2 upgrade, or whenever new books were added).
-  // Heap-aware + watchdog-safe; gracefully stops if heap pressure rises
-  // and resumes on the next walk.
-  populateAuthorKeysIfNeeded();
+  // v18.9.9.219: inline populate REMOVED. Even the "small library"
+  // (<=30 pending) path silently spent ~3 s of OPF-peek work on rescan,
+  // eating heap for a feature the user might never use. Now author keys
+  // populate ONLY on book-open (via EpubReaderActivity::onEnter, free
+  // because the book is already loaded) and on user-picked Sort by
+  // Author (via populateAuthorKeysWithProgress -- v218 progress popup).
   if (progress) progress(100);
 }
 
@@ -477,7 +511,12 @@ bool LibraryIndex::loadFromFile() {
   entries.clear();
   pathPool.clear();
   authorKeyPool.clear();
-  authorKeyPool.push_back('\0');  // seed sentinel so offset 0 reads back as ""
+  // CrumBLE 4.5.4: seed TWO '\0' bytes. Offset 0 = "not yet attempted"
+  // (legacy default). Offset 1 = "attempted, no author found" sentinel
+  // set by populateAuthorKeysIfNeeded so corrupt OPFs aren't re-peeked
+  // forever. Both read back as "" through authorKeyOf().
+  authorKeyPool.push_back('\0');
+  authorKeyPool.push_back('\0');
   LineReader reader(file);
   std::string line;
   // CrumBLE 4.2.1: 0 = no header read yet, 1 = v1, 2 = v2. Header v1 and v2
@@ -567,17 +606,42 @@ bool LibraryIndex::saveToFile() const {
   // JsonDocument + serialized String copy of the whole index in RAM
   // (the OOM-on-save that boot-looped large libraries). v1 lines without
   // the size field still load fine via the v1 read fallback.
+  // v18.9.9.329: snapshot EVERYTHING before touching SD. v328's per-print
+  // snapshot only protected the printed pointer but the for-loop iterator
+  // itself (entries.begin() / iterator++) still reads from entries between
+  // file.print() calls. Each SD I/O yields to other FreeRTOS tasks; if
+  // setAuthorFromRaw() runs on that other task, its appendAuthorKey()
+  // reallocates the authorKeyPool AND potentially entries (if a new book
+  // was just indexed via a concurrent path). Iterating a vector while
+  // another task reallocates it -> iterator dereferences into freed
+  // memory -> load fault (observed field: MTVAL=0x33c0d077 at
+  // saveToFile:612 iterator++). This full snapshot copies every entry's
+  // relevant fields into a local vector; the write loop only touches
+  // the snapshot, never entries or the pools. Cost: ~60 bytes per
+  // entry (~3 KB for 44 books) of transient heap -- well within budget.
+  struct Row {
+    uint64_t firstSeenMillis;
+    uint32_t fileSize;
+    std::string authorKey;
+    std::string path;
+  };
+  std::vector<Row> snapshot;
+  snapshot.reserve(entries.size());
+  for (const auto& e : entries) {
+    snapshot.push_back({e.firstSeenMillis, e.fileSize, std::string(authorKeyOf(e)), std::string(pathOf(e))});
+  }
+
   file.print(LIBRARY_INDEX_HEADER);
   file.print("\n");
   char numbuf[48];
-  for (const auto& e : entries) {
-    snprintf(numbuf, sizeof(numbuf), "%llu\t%lu", static_cast<unsigned long long>(e.firstSeenMillis),
-             static_cast<unsigned long>(e.fileSize));
+  for (const auto& r : snapshot) {
+    snprintf(numbuf, sizeof(numbuf), "%llu\t%lu", static_cast<unsigned long long>(r.firstSeenMillis),
+             static_cast<unsigned long>(r.fileSize));
     file.print(numbuf);
     file.print("\t");
-    file.print(authorKeyOf(e));  // empty string when no key cached yet
+    file.print(r.authorKey.c_str());  // empty string when no key cached yet
     file.print("\t");
-    file.print(pathOf(e));
+    file.print(r.path.c_str());
     file.print("\n");
   }
   file.close();
@@ -613,43 +677,73 @@ void LibraryIndex::setAuthorFromRaw(const std::string& path, const std::string& 
   if (changed) saveToFile();
 }
 
-void LibraryIndex::populateAuthorKeysIfNeeded() {
-  // CrumBLE 4.5.2: two-pass fill so the AuthorAlpha sort works for books
-  // the user has NEVER opened. The original 4.2.1 path only handled books
-  // whose book.bin cache existed (Epub::load(buildIfMissing=false)); never-
-  // opened books stayed empty and clustered at the end of the sort, making
-  // the feature appear broken on fresh libraries.
-  //
-  //   Pass 1 (cheap path): if book.bin exists, read the cached author --
-  //   ~milliseconds, no zip open. Same as the 4.2.1 hotfix.
-  //
-  //   Pass 2 (fallback): for books WITHOUT a cache, extractSeriesFromOpf()
-  //   peeks just container.xml + content.opf (no spine/CSS/manifest build).
-  //   ~50-100 ms per book, ~10-15 KB transient heap -- cheap enough to fit
-  //   under chronic-low-heap conditions where the full load() would OOM.
-  //   Author lands in epub.getLastAuthorPeek() alongside the series fields.
-  //
-  // Heap-aware: per-book pre-flight at 15 KB maxAllocHeap (was 30 KB --
-  // halved because the peek path is much lighter than full load). Yields
-  // every 8 books to feed the IDLE WDT on large libraries.
+// v18.9.9.223: populateAuthorKeysIfNeeded() removed. Was the
+// eager whole-library populate path; v219 stopped calling it, and
+// v218's populateAuthorKeysWithProgress (progress-callback variant)
+// is now the only live entry point. Dead-code audit flagged this
+// for cleanup.
+
+size_t LibraryIndex::pendingAuthorKeyCount() const {
+  size_t n = 0;
+  for (const auto& e : entries) {
+    if (e.authorKeyOffset == 0) n++;
+  }
+  return n;
+}
+
+void LibraryIndex::resetAuthorKeys() {
+  // v18.9.9.222: wipe cached keys so the v220 punctuation/semi fixes
+  // apply on the next populate. Also clears the "tried empty" sentinels
+  // so books whose OPF was previously unreadable get another chance.
+  // Author-key pool bytes stay orphaned in the file until the next full
+  // saveToFile rewrites the pool; that's a modest waste of SD bytes but
+  // no correctness issue. Cheap to run: pure metadata, no per-book IO.
+  size_t cleared = 0;
+  for (auto& e : entries) {
+    if (e.authorKeyOffset != 0) {
+      e.authorKeyOffset = 0;
+      cleared++;
+    }
+  }
+  LOG_INF("LIB", "resetAuthorKeys: cleared %zu key(s); will re-populate on next Sort by Author", cleared);
+  saveToFile();
+}
+
+void LibraryIndex::populateAuthorKeysWithProgress(std::function<void(int)> progress) {
+  // v18.9.9.218: same logic as populateAuthorKeysIfNeeded() (see comments
+  // at line ~646) but reports 0-100 progress via `progress` callback so
+  // the Sort-by-Author trigger can render a progress popup while missing
+  // keys get filled in. Runs unconditionally regardless of the inline vs
+  // deferred threshold that ensureWalked() uses -- the caller has already
+  // decided the wait is worth it (user picked author sort).
   constexpr size_t kYieldEvery = 8;
   constexpr uint32_t kPopulateMinMaxAlloc = 15 * 1024;
+
+  // Pre-count so progress reports meaningful percentages even when many
+  // entries in the vector are already populated (typical warm case).
+  const size_t totalPending = pendingAuthorKeyCount();
+  if (totalPending == 0) {
+    if (progress) progress(100);
+    return;
+  }
+
+  if (progress) progress(0);
   size_t populated = 0;
   size_t peeked = 0;
   size_t skippedHeap = 0;
+  size_t processed = 0;
   for (size_t i = 0; i < entries.size(); ++i) {
     LibraryEntry& e = entries[i];
-    // Already cached -> skip (this is what makes the method cheap on warm
-    // boots: only books that were added since the last walk need work).
     if (e.authorKeyOffset != 0) continue;
     const std::string path{pathOf(e)};
-    if (!FsHelpers::hasEpubExtension(path)) continue;  // only EPUBs have author metadata here
+    if (!FsHelpers::hasEpubExtension(path)) continue;
 
     if (ESP.getMaxAllocHeap() < kPopulateMinMaxAlloc) {
       skippedHeap++;
       if (skippedHeap == 1) {
         LOG_INF("LIB",
-                "populateAuthorKeysIfNeeded: heap-skipped at %zu/%zu (maxAlloc=%u below %u) -- retry on next walk",
+                "populateAuthorKeysWithProgress: heap-skipped at %zu/%zu (maxAlloc=%u below %u) -- "
+                "remaining books stay pending",
                 i, entries.size(), ESP.getMaxAllocHeap(), static_cast<unsigned>(kPopulateMinMaxAlloc));
       }
       break;
@@ -657,30 +751,90 @@ void LibraryIndex::populateAuthorKeysIfNeeded() {
     std::string raw;
     {
       Epub epub(path, "/.crosspoint");
-      // Pass 1: cheap cache hit.
       if (epub.load(/*buildIfMissing=*/false, /*skipLoadingCss=*/true)) {
         raw = epub.getAuthor();
       } else if (epub.extractSeriesFromOpf()) {
-        // Pass 2: cache miss -- peek the OPF directly. ~50-100 ms.
         raw = epub.getLastAuthorPeek();
         peeked++;
       }
-    }  // Force Epub dtor before the yield so freed allocations are visible
-       // to the heap consolidator on the next tick.
+    }
+    bool gotRealKey = false;
     if (!raw.empty()) {
       const std::string key = lastNameLowerForKey(raw);
       if (!key.empty()) {
         e.authorKeyOffset = appendAuthorKey(std::string_view{key});
         populated++;
+        gotRealKey = true;
       }
+    }
+    if (!gotRealKey) {
+      e.authorKeyOffset = kAuthorKeyOffsetTriedEmpty;
+    }
+    processed++;
+    if (progress) {
+      const int pct = static_cast<int>(std::min<size_t>(99, (processed * 100) / totalPending));
+      progress(pct);
     }
     if ((i & (kYieldEvery - 1)) == 0) vTaskDelay(1);
   }
   if (populated > 0) {
-    LOG_INF("LIB", "populateAuthorKeysIfNeeded: cached %zu key(s) (%zu via OPF peek), saving index",
+    LOG_INF("LIB", "populateAuthorKeysWithProgress: cached %zu key(s) (%zu via OPF peek), saving index",
             populated, peeked);
     saveToFile();
   } else {
-    LOG_DBG("LIB", "populateAuthorKeysIfNeeded: 0 new keys (peeked=%zu heap-skipped=%zu)", peeked, skippedHeap);
+    LOG_DBG("LIB", "populateAuthorKeysWithProgress: 0 new keys (peeked=%zu heap-skipped=%zu)", peeked, skippedHeap);
   }
+  if (progress) progress(100);
+}
+
+bool LibraryIndex::tickPopulateAuthorKeys(size_t maxBooks) {
+  // Same per-book guard / yield cadence as populateAuthorKeysIfNeeded but
+  // capped to `maxBooks` so the caller (HomeActivity loop) controls how
+  // much wall time we spend per tick. Persists changes ONLY when we
+  // actually populated something this batch.
+  constexpr size_t kYieldEvery = 4;
+  constexpr uint32_t kPopulateMinMaxAlloc = 15 * 1024;
+  size_t processed = 0;
+  size_t populated = 0;
+  size_t peeked = 0;
+  for (size_t i = 0; i < entries.size() && processed < maxBooks; ++i) {
+    LibraryEntry& e = entries[i];
+    if (e.authorKeyOffset != 0) continue;
+    const std::string path{pathOf(e)};
+    if (!FsHelpers::hasEpubExtension(path)) {
+      e.authorKeyOffset = kAuthorKeyOffsetTriedEmpty;  // never going to have a key
+      continue;
+    }
+    if (ESP.getMaxAllocHeap() < kPopulateMinMaxAlloc) break;
+    std::string raw;
+    {
+      Epub epub(path, "/.crosspoint");
+      if (epub.load(/*buildIfMissing=*/false, /*skipLoadingCss=*/true)) {
+        raw = epub.getAuthor();
+      } else if (epub.extractSeriesFromOpf()) {
+        raw = epub.getLastAuthorPeek();
+        peeked++;
+      }
+    }
+    bool gotRealKey = false;
+    if (!raw.empty()) {
+      const std::string key = lastNameLowerForKey(raw);
+      if (!key.empty()) {
+        e.authorKeyOffset = appendAuthorKey(std::string_view{key});
+        populated++;
+        gotRealKey = true;
+      }
+    }
+    if (!gotRealKey) e.authorKeyOffset = kAuthorKeyOffsetTriedEmpty;
+    processed++;
+    if ((processed & (kYieldEvery - 1)) == 0) vTaskDelay(1);
+  }
+  if (populated > 0 || (processed > 0 && peeked == 0)) {
+    // Persist incrementally: we wrote sentinels for tried-empty books too,
+    // so even a 0-real-key batch advances state worth saving (otherwise
+    // the next boot would re-peek them all over again).
+    saveToFile();
+  }
+  // Caller pumps again next tick iff more entries are still pending.
+  return pendingAuthorKeyCount() > 0;
 }

@@ -24,6 +24,7 @@ constexpr size_t kHeapReserveHeadroom = 8u * 1024u;  // leave for non-WiFi alloc
 }  // namespace
 
 #include "AppVersion.h"
+#include "BluetoothHIDManager.h"
 #include "MappedInputManager.h"
 #include "SilentRestart.h"
 #include "activities/network/WifiSelectionActivity.h"
@@ -176,6 +177,15 @@ void OtaUpdateActivity::onEnter() {
   // the only large contiguous block. Released right before the HTTPS handshake
   // (in onWifiSelectionComplete), giving mbedTLS a guaranteed ~50KB chunk.
   acquireHeapReserve();
+
+  // v18.9.9.265: stop BLE before WiFi init. ESP32-C3 shared radio +
+  // WiFi RX/TX pool sizing at init leaves WiFi permanently starved if
+  // NimBLE's ~52 KB is resident at that moment. Ported from CrossPoint
+  // feat-bluetooth c1a396c1.
+  if (BluetoothHIDManager::getInstance().isEnabled()) {
+    LOG_INF("OTA", "Disabling BT before WiFi init to free radio+heap");
+    BluetoothHIDManager::getInstance().disable();
+  }
 
   // Turn on WiFi immediately
   LOG_DBG("OTA", "Turning on WiFi...");

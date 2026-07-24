@@ -1,6 +1,7 @@
 #include "LyraTheme.h"
 
 #include <GfxRenderer.h>
+#include <HalClock.h>
 #include <HalGPIO.h>
 #include <HalPowerManager.h>
 #include <HalStorage.h>
@@ -133,12 +134,35 @@ void LyraTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* t
                    Rect{batteryX, rect.y + 2, LyraMetrics::values.batteryWidth, LyraMetrics::values.batteryHeight},
                    showBatteryPercentage);
 
+  // v18.9.9.343: Home header clock. Uses SETTINGS.homeClockShow (Display >
+  // Theme & Layout > Show clock on Home) -- distinct from statusBarClock
+  // which controls the in-book status bar. Only draws when time is
+  // valid; on X4 that means after an NTP sync.
+  int clockTextWidth = 0;
+  if (SETTINGS.homeClockShow && halClock.hasValidTime()) {
+    char timeBuf[9];
+    if (halClock.formatTime(timeBuf, sizeof(timeBuf), SETTINGS.clockUtcOffsetQ, SETTINGS.clockFormat == 1)) {
+      clockTextWidth = renderer.getTextWidth(SMALL_FONT_ID, timeBuf);
+      int batteryClusterLeft = batteryX;
+      if (showBatteryPercentage) {
+        const std::string pct = std::to_string(powerManager.getBatteryPercentage()) + "%";
+        batteryClusterLeft -= renderer.getTextWidth(SMALL_FONT_ID, pct.c_str()) + batteryPercentSpacing;
+      }
+      constexpr int kClockToBatteryGap = 10;
+      const int clockX = batteryClusterLeft - kClockToBatteryGap - clockTextWidth;
+      renderer.drawText(SMALL_FONT_ID, clockX, rect.y + 2, timeBuf);
+    }
+  }
+
   int maxTitleWidth = title != nullptr ? renderer.getTextWidth(UI_12_FONT_ID, title, EpdFontFamily::BOLD) : 0;
   int maxSubtitleWidth =
       subtitle != nullptr ? renderer.getTextWidth(SMALL_FONT_ID, subtitle, EpdFontFamily::REGULAR) : 0;
 
   // Available space is the distance between the side paddings, and a with side padding between title and subtitle.
-  const int availableSpace = rect.width - LyraMetrics::values.contentSidePadding * 3;
+  // v18.9.9.341: subtract clock text width + gap when clock is shown so
+  // long titles / subtitles truncate before overrunning the clock.
+  const int availableSpace = rect.width - LyraMetrics::values.contentSidePadding * 3
+                             - (clockTextWidth > 0 ? clockTextWidth + 10 : 0);
 
   if (maxTitleWidth + maxSubtitleWidth > availableSpace) {
     if ((maxTitleWidth > availableSpace / 2) && (maxSubtitleWidth > availableSpace / 2)) {

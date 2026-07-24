@@ -291,58 +291,126 @@ bool ZipFile::loadZipDetails() {
     return false;  // Minimum EOCD size is 22 bytes
   }
 
-  // We scan the tail of the file for the EOCD signature 0x06054b50 (stored
-  // as 0x50, 0x4b, 0x05, 0x06 in little-endian).
-  //
-  // CrumBLE 4.4: scan window is progressive. The ZIP spec allows the EOCD
-  // comment field to be up to 65535 bytes; re-packaged EPUBs (Anna's
-  // Archive, calibre-modified, signed bundles) sometimes push the EOCD
-  // signature tens of KB back from EOF. Iron Gold from Anna's Archive
-  // wasn't found with a 4 KB scan; needs much more. Try 64 KB (covers
-  // the full ZIP spec) first; if alloc fails under heap pressure, step
-  // down through 16 KB / 4 KB / 1 KB so every heap state still gets the
-  // best window we can afford. Last fallback (1 KB) matches the
-  // pre-CrumBLE-4.4 behaviour -- books that worked then still work now.
-  static constexpr int kScanRangeTiers[] = {65536, 16384, 4096, 1024};
-  uint8_t* buffer = nullptr;
-  int scanRange = 0;
-  for (int tier : kScanRangeTiers) {
-    scanRange = fileSize > tier ? tier : static_cast<int>(fileSize);
-    buffer = static_cast<uint8_t*>(malloc(scanRange));
-    if (buffer) break;
-  }
+  // v18.9.9.320: streaming tail scan. Fixed 4 KB window slid backwards
+  // through the file up to 64 KB (ZIP spec max EOCD comment). Adjacent
+  // windows overlap by 3 bytes so a 4-byte signature straddling a
+  // boundary is still caught. Replaces the {65536, 16384, 4096, 1024}
+  // tier-ladder malloc that failed under fragmented heap: on ESP32-C3
+  // after a long session maxAlloc collapses toward the 4 KB tier, and
+  // repackaged EPUBs (Anna's Archive, calibre-signed, etc.) that push
+  // the EOCD 10-30 KB back from EOF then read as "EOCD signature not
+  // found" -- surfaced to the user as an unresponsive reader on the
+  // decline-prebake path. With this streaming approach there is no
+  // fragmentation dependency: any book that has 4 KB contiguous heap
+  // available (essentially always) can be opened.
+  constexpr size_t kWindowSize = 4096;
+  constexpr size_t kOverlap = 3;  // signature is 4 bytes; N-1 = 3-byte overlap catches straddles
+  // ZIP spec max EOCD comment is 65535 bytes; +22 for the record itself.
+  constexpr size_t kMaxScanBytes = 65535 + 22;
+
+  uint8_t* buffer = static_cast<uint8_t*>(malloc(kWindowSize));
   if (!buffer) {
-    LOG_ERR("ZIP", "Failed to allocate memory for EOCD scan buffer");
+    LOG_ERR("ZIP", "Failed to allocate 4KB EOCD scan buffer");
     return false;
   }
 
-  file.seek(fileSize - scanRange);
-  file.read(buffer, scanRange);
+  // windowHigh is the exclusive upper file-offset of the current window.
+  // First iteration reads the tail chunk ending at fileSize.
+  size_t windowHigh = fileSize;
+  size_t totalScanned = 0;
+  int64_t foundSigFileOffset = -1;
 
-  // Scan backwards for the signature
-  int foundOffset = -1;
-  for (int i = scanRange - 22; i >= 0; i--) {
-    constexpr uint32_t signature = 0x06054b50;
-    if (*reinterpret_cast<uint32_t*>(&buffer[i]) == signature) {
-      foundOffset = i;
-      break;
+  while (windowHigh > 0 && totalScanned < kMaxScanBytes) {
+    const size_t chunkSize = windowHigh < kWindowSize ? windowHigh : kWindowSize;
+    const size_t readAt = windowHigh - chunkSize;
+    file.seek(readAt);
+    const size_t nread = file.read(buffer, chunkSize);
+    if (nread != chunkSize) {
+      LOG_ERR("ZIP", "EOCD scan short read at %u (want %u got %u)",
+              static_cast<unsigned>(readAt), static_cast<unsigned>(chunkSize),
+              static_cast<unsigned>(nread));
+      free(buffer);
+      return false;
     }
+
+    // Scan this window backwards for the 4-byte signature. Assemble via
+    // byte reads so we don't rely on unaligned uint32_t deref (works on
+    // ESP32-C3 but the byte-safe form is portable and no measurably
+    // slower for the maybe-16 iterations we do here).
+    for (int i = static_cast<int>(chunkSize) - 4; i >= 0; i--) {
+      constexpr uint32_t kSignature = 0x06054b50u;
+      const uint32_t v = static_cast<uint32_t>(buffer[i]) |
+                         (static_cast<uint32_t>(buffer[i + 1]) << 8) |
+                         (static_cast<uint32_t>(buffer[i + 2]) << 16) |
+                         (static_cast<uint32_t>(buffer[i + 3]) << 24);
+      if (v == kSignature) {
+        foundSigFileOffset = static_cast<int64_t>(readAt) + i;
+        break;
+      }
+    }
+    if (foundSigFileOffset >= 0) break;
+
+    totalScanned += chunkSize;
+    // Slide window backwards by (kWindowSize - kOverlap). Stop when we've
+    // reached the start of file (windowHigh <= chunkSize means chunk was
+    // the whole remaining file and we've covered it).
+    if (chunkSize < kWindowSize) break;  // ran out of file
+    windowHigh -= (kWindowSize - kOverlap);
   }
 
-  if (foundOffset == -1) {
-    LOG_ERR("ZIP", "EOCD signature not found in zip file");
+  if (foundSigFileOffset < 0) {
+    // v18.9.9.322: dump the tail 32 bytes so the user + field reports can
+    // distinguish "file truncated" (last bytes are zeros / random garbage
+    // or don't look like a ZIP tail) from "Zip64 EOCD locator present"
+    // (0x50 0x4b 0x06 0x07 signature within the last 40 bytes) from
+    // "genuinely no ZIP structure." Also log file size vs scanned so the
+    // shape of the file is captured.
+    const size_t tailLen = fileSize < 32 ? fileSize : 32;
+    file.seek(fileSize - tailLen);
+    uint8_t tail[32];
+    const size_t tailRead = file.read(tail, tailLen);
+    char tailHex[65];
+    tailHex[0] = '\0';
+    for (size_t i = 0; i < tailRead && i < 32; ++i) {
+      snprintf(tailHex + i * 2, 3, "%02x", tail[i]);
+    }
+    LOG_ERR("ZIP",
+            "EOCD signature not found (fileSize=%u, scanned=%u from EOF, tail32=%s)",
+            static_cast<unsigned>(fileSize), static_cast<unsigned>(totalScanned), tailHex);
+    // Quick Zip64 sniff: EOCD64 locator sig is 0x07064b50 (bytes 50 4b 06 07);
+    // sits 20 bytes before the traditional EOCD or right at EOF for pure-Zip64.
+    // If we see it in the tail, that's the diagnosis.
+    for (size_t i = 0; i + 4 <= tailRead; ++i) {
+      if (tail[i] == 0x50 && tail[i + 1] == 0x4b && tail[i + 2] == 0x06 && tail[i + 3] == 0x07) {
+        LOG_ERR("ZIP", "Zip64 EOCD locator found at tail offset %u -- this file uses Zip64 (not yet supported)",
+                static_cast<unsigned>(i));
+        break;
+      }
+    }
     free(buffer);
     return false;
   }
 
-  // Now extract the values we need from the EOCD record
+  // Read the 22-byte EOCD record fresh via absolute seek+read. Simpler
+  // than tracking whether the signature landed near the top edge of the
+  // buffer where offset+22 would spill past what we captured.
+  file.seek(static_cast<size_t>(foundSigFileOffset));
+  const size_t eocdRead = file.read(buffer, 22);
+  if (eocdRead != 22) {
+    LOG_ERR("ZIP", "EOCD record short read at %d", static_cast<int>(foundSigFileOffset));
+    free(buffer);
+    return false;
+  }
   // Relative positions within EOCD:
-  // Offset 10: Total number of entries (2 bytes)
-  // Offset 16: Offset of start of central directory with respect to the starting disk number (4 bytes)
-  zipDetails.totalEntries = *reinterpret_cast<uint16_t*>(&buffer[foundOffset + 10]);
-  zipDetails.centralDirOffset = *reinterpret_cast<uint32_t*>(&buffer[foundOffset + 16]);
+  //   Offset 10: total number of entries (u16 LE)
+  //   Offset 16: offset of start of central directory (u32 LE)
+  zipDetails.totalEntries = static_cast<uint16_t>(buffer[10]) |
+                            (static_cast<uint16_t>(buffer[11]) << 8);
+  zipDetails.centralDirOffset = static_cast<uint32_t>(buffer[16]) |
+                                (static_cast<uint32_t>(buffer[17]) << 8) |
+                                (static_cast<uint32_t>(buffer[18]) << 16) |
+                                (static_cast<uint32_t>(buffer[19]) << 24);
   zipDetails.isSet = true;
-
   free(buffer);
   return true;
 }

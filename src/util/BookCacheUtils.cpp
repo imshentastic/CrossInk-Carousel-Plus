@@ -93,14 +93,46 @@ bool isBookCacheDirectoryName(const char* name) {
 }
 
 void clearBookCache(const std::string& path) {
-  if (FsHelpers::hasEpubExtension(path)) {
-    Epub(path, "/.crosspoint").clearCache();
-  } else if (FsHelpers::hasXtcExtension(path)) {
-    Xtc(path, "/.crosspoint").clearCache();
-  } else if (FsHelpers::hasTxtExtension(path)) {
-    Txt(path, "/.crosspoint").clearCache();
-  } else {
+  // 4.5.5+: extension check FIRST, before any logging or heap-gate work.
+  // The WS upload DONE handler calls clearBookCache on EVERY completed
+  // upload -- including the 700+ small prebake-cache files (.jpg/.pxc/
+  // .bin/.cache) pushed during a CJK book optimize. None of those have a
+  // book extension so the function would no-op anyway, but the prior
+  // version ran the heap-gate + LOG_INF per call. Across hundreds of
+  // sequential WS uploads under the AsyncWebServer's already-tight heap,
+  // the cumulative log-string and path-string churn fragmented heap to
+  // the 3 KB critical floor -- silent-restart loop in the middle of the
+  // prebake-cache push. Returning silently on non-book paths drops the
+  // per-upload overhead to zero.
+  const bool isEpub = FsHelpers::hasEpubExtension(path);
+  const bool isXtc = !isEpub && FsHelpers::hasXtcExtension(path);
+  const bool isTxt = !isEpub && !isXtc && FsHelpers::hasTxtExtension(path);
+  if (!isEpub && !isXtc && !isTxt) return;
+
+  // Heap-gate (book paths only): the cache-clear path walks
+  // .crosspoint/epub_<hash>/ via Storage.removeDir, which calls openNextFile
+  // per entry. Each iteration allocates a HalFile::Impl + FsFile. For a
+  // book re-uploaded multiple times (10MB HP CJK test), the cache dir
+  // accumulates 50-100 sections/markers/thumbs -- one per-iteration alloc
+  // bad_allocs under WS-DONE post-reclaim heap (free~17K, maxAlloc~14K),
+  // triggering std::terminate and silent-restart at the moment of upload
+  // success. Defer when heap is tight; the reader's onEnter fingerprint
+  // check invalidates stale cache lazily on next book open.
+  constexpr uint32_t kMinMaxAllocForClear = 20u * 1024u;
+  if (ESP.getMaxAllocHeap() < kMinMaxAllocForClear) {
+    LOG_INF("BookCache",
+            "Skipping clear under heap pressure (maxAlloc=%u < %u): %s -- "
+            "reader fingerprint check will invalidate on next open",
+            ESP.getMaxAllocHeap(), kMinMaxAllocForClear, path.c_str());
     return;
+  }
+
+  if (isEpub) {
+    Epub(path, "/.crosspoint").clearCache();
+  } else if (isXtc) {
+    Xtc(path, "/.crosspoint").clearCache();
+  } else {
+    Txt(path, "/.crosspoint").clearCache();
   }
   LOG_DBG("BookCache", "Done checking metadata cache for: %s", path.c_str());
 }

@@ -12,6 +12,7 @@
 #include <string>
 #include <utility>
 
+#include "BookReadingStats.h"
 #include "activities/Activity.h"
 
 class XtcReaderActivity final : public Activity {
@@ -21,6 +22,14 @@ class XtcReaderActivity final : public Activity {
   int pagesUntilFullRefresh = 0;
   bool longPowerPageTurnHandled = false;
   bool frontButtonLongPressHandled = false;
+
+  // v18.9.9.462 (P4b): XTC/XTCH stats parity with EpubReader.
+  // Session time is tracked from onEnter until onExit / sleep entry.
+  // Pages turned tracked via currentPage delta captured at onEnter.
+  BookReadingStats stats;
+  uint32_t stats_sessionStartMs = 0;
+  uint32_t stats_pageAtSessionStart = 0;
+  bool stats_sessionCounted = false;
 
   enum class StatusBarOverlayPosition { Bottom, Top };
   struct StatusBarInfo {

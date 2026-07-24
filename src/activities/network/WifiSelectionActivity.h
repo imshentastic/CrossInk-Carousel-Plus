@@ -79,6 +79,16 @@ class WifiSelectionActivity final : public Activity {
   int savePromptSelection = 0;
   int forgetPromptSelection = 0;
 
+  // CrumBLE 4.5.5+: silent-retry counter for transient AP failures. Bumped
+  // on every CONNECTION_FAILED that occurred during an auto-connect or
+  // saved-password attempt. If still under kMaxAutoRetries the activity
+  // re-attempts the same network without user input; on the (kMaxAutoRetries+1)th
+  // failure it falls back to the network list with the error visible.
+  // Reset to 0 on any successful connect or when the user manually picks a
+  // network from the list.
+  int autoConnectRetryCount = 0;
+  static constexpr int kMaxAutoRetries = 3;
+
   // Connection timeout
   static constexpr unsigned long CONNECTION_TIMEOUT_MS = 15000;
   static constexpr unsigned long CONNECTION_STATUS_LOG_INTERVAL_MS = 2000;

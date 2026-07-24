@@ -23,6 +23,7 @@
 #include "FileBrowserActionActivity.h"
 #include "LibraryIndex.h"
 #include "MappedInputManager.h"
+#include "SilentRestart.h"
 #include "activities/util/ConfirmationActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -167,10 +168,30 @@ void FileBrowserActivity::onExit() {
   files.clear();
 }
 
+// Minimum maxAlloc the in-place delete needs to safely run. clearFileMetadata
+// walks the book's prebake-cache + thumbs + bookmarks + collection store,
+// each pass touching FsFile + small string allocs; library index forgetPath
+// then rewrites the SD index. Sets the floor a bit above the FT pre-flight
+// safety net (~45 KB) so we defer *before* that net fires inappropriately.
+// Set conservatively -- the cost of a deferred-delete is just a 1-2s reboot,
+// while the cost of an inline delete failing partway is the user landing
+// in FT with their file half-cleaned-up.
+static constexpr uint32_t kDeleteHeapFloor = 50 * 1024;
+
 void FileBrowserActivity::promptDeleteFile(const std::string& fullPath, const std::string& entry) {
   auto handler = [this, fullPath](const ActivityResult& res) {
     if (res.isCancelled) {
       LOG_DBG("FileBrowser", "Delete cancelled by user");
+      return;
+    }
+
+    const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+    if (maxAlloc < kDeleteHeapFloor) {
+      LOG_INF("FileBrowser",
+              "Delete deferred via silent restart: maxAlloc=%u below floor=%u (path=%s)",
+              maxAlloc, kDeleteHeapFloor, fullPath.c_str());
+      setPendingDelete(fullPath.c_str(), false);
+      silentRestart();  // does not return
       return;
     }
 
@@ -206,6 +227,16 @@ void FileBrowserActivity::promptDeleteDirectory(const std::string& fullPath, con
     longPressConfirmHandled = false;
     if (res.isCancelled) {
       LOG_DBG("FileBrowser", "Delete cancelled by user");
+      return;
+    }
+
+    const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+    if (maxAlloc < kDeleteHeapFloor) {
+      LOG_INF("FileBrowser",
+              "Dir-delete deferred via silent restart: maxAlloc=%u below floor=%u (path=%s)",
+              maxAlloc, kDeleteHeapFloor, dirPath.c_str());
+      setPendingDelete(dirPath.c_str(), true);
+      silentRestart();  // does not return
       return;
     }
 
@@ -317,7 +348,23 @@ void FileBrowserActivity::showFileActionMenu(const std::string& entry, bool igno
           case FileBrowserAction::Delete:
             promptDeleteFile(fullPath, entry);
             return;
-          case FileBrowserAction::DeleteCache:
+          case FileBrowserAction::DeleteCache: {
+            // Mirror the file-delete path: clearBookCache walks the prebake-
+            // cache subdir recursively (hundreds of files for a CJK book),
+            // so under fragmented heap the inline walk OOMs and the FT
+            // safety net silently routes the user into File Transfer
+            // instead of clearing the cache. Pre-check heap; if too low,
+            // stash the path + action code in RTC and silent-restart -- the
+            // boot path executes clearBookCache on the fresh ~85 KB heap.
+            const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+            if (maxAlloc < kDeleteHeapFloor) {
+              LOG_INF("FileBrowser",
+                      "Clear-book-cache deferred via silent restart: maxAlloc=%u below floor=%u (path=%s)",
+                      maxAlloc, kDeleteHeapFloor, fullPath.c_str());
+              setPendingClearBookCache(fullPath.c_str());
+              silentRestart();  // does not return
+              return;
+            }
             if (!BookActions::clearBookCache(fullPath)) {
               LOG_ERR("FileBrowser", "Failed to clear book cache for: %s", fullPath.c_str());
               BookActions::drawToast(renderer, tr(STR_CACHE_DELETE_FAILED));
@@ -328,6 +375,7 @@ void FileBrowserActivity::showFileActionMenu(const std::string& entry, bool igno
             }
             requestUpdate();
             return;
+          }
           case FileBrowserAction::DeleteStats: {
             // CrumBLE 4.4 (ported from CrossInk v1.3.3): delete just this
             // book's stats.bin, leaving its cache + reading position intact.
@@ -335,6 +383,16 @@ void FileBrowserActivity::showFileActionMenu(const std::string& entry, bool igno
             const bool ok = BookReadingStats::remove(cachePath);
             BookActions::drawToast(renderer, ok ? tr(STR_BOOK_STATS_DELETED) : tr(STR_CACHE_DELETE_FAILED));
             delay(ok ? 1000 : 1500);
+            requestUpdate();
+            return;
+          }
+          case FileBrowserAction::ToggleSimpleRendering: {
+            // v18.9.6.2: flip the Simple Rendering sidecar. Toast confirms the
+            // new state so the user knows what to expect next book open.
+            const bool nowOn = BookActions::toggleSimpleRenderingSidecar(fullPath);
+            BookActions::drawToast(renderer, nowOn ? tr(STR_ENABLE_SIMPLE_RENDERING)
+                                                  : tr(STR_DISABLE_SIMPLE_RENDERING));
+            delay(1000);
             requestUpdate();
             return;
           }

@@ -243,10 +243,33 @@ class CollectionsStore {
   // IDs in `orderedIds` are ignored. Saves to collections.json on change.
   void setDisplayOrder(const std::vector<std::string>& orderedIds);
 
+  // v18.9.9.342: mirrors CrossPointSettings::hasDeferredSave /
+  // retryDeferredSaveIfNeeded. When saveToFile() defers because heap is
+  // too low (steady-state on Home while a CJK UI-fallback is resident),
+  // the in-memory mutation stays live but the JSON write is skipped.
+  // Without a retry the change dies at the next silentRestart(). The
+  // main loop calls retryDeferredSaveIfNeeded() every tick; Home also
+  // flushes right before its Cover heap-guard silentRestart() so the
+  // toggle survives the recover-heap reboot.
+  static bool hasDeferredSave();
+  void retryDeferredSaveIfNeeded() const;
+  // Last-chance flush that bypasses the heap pre-flight gate. Only for
+  // paths that are about to lose the in-memory copy (Home Cover
+  // heap-guard silentRestart, deep sleep entry) -- the mid-write
+  // downside is bounded because writeFileWithBackup does tmp+rename,
+  // so a crash mid-write leaves the primary intact. No-op if no save
+  // is pending.
+  void flushDeferredSaveNowBypassGate() const;
+
  private:
   CollectionsStore() = default;
   bool loadFromFile();
   bool saveToFile() const;
+  // Actual JSON build + write. Called by saveToFile() after the heap
+  // pre-flight; called directly by flushDeferredSaveNowBypassGate()
+  // when the caller has already accepted the mid-write risk (i.e.
+  // we're about to lose the in-memory state anyway).
+  bool writeToDiskNow_() const;
   // Ensures FAVORITES_ID exists in the collections vector. Used after load
   // when the file was missing/empty/corrupt, and on first boot.
   void seedDefaults();

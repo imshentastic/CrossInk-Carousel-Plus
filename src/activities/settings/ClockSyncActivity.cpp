@@ -10,7 +10,9 @@
 #include <cstdio>
 #include <vector>
 
+#include "../../SilentRestart.h"
 #include "CrossPointSettings.h"
+#include "../../ReadingStats.h"
 #include "MappedInputManager.h"
 #include "WifiCredentialStore.h"
 #include "components/UITheme.h"
@@ -18,6 +20,27 @@
 
 void ClockSyncActivity::onEnter() {
   Activity::onEnter();
+  SET_CHECKPOINT("clockSync:onEnter");
+  // v18.9.9.337: same silent-restart pre-flight as WifiSelectionActivity.
+  // ClockSync calls WiFi.begin() via runSync() to reach NTP; that fires the
+  // same wpa_supplicant/eloop.c null-deref on fragmented heap. Fresh-boot
+  // heap clears the ESP-IDF init path.
+  constexpr uint32_t kClockSyncMinFree = 55U * 1024U;
+  constexpr uint32_t kClockSyncMinMaxAlloc = 40U * 1024U;
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+  if (!g_postClockSyncSilentReboot &&
+      (freeHeap < kClockSyncMinFree || maxAlloc < kClockSyncMinMaxAlloc)) {
+    LOG_INF("CLK",
+            "ClockSync heap pre-flight tripped (free=%u<%u OR maxAlloc=%u<%u); "
+            "silent-restart-to-self to avoid wpa_supplicant crash",
+            freeHeap, static_cast<unsigned>(kClockSyncMinFree),
+            maxAlloc, static_cast<unsigned>(kClockSyncMinMaxAlloc));
+    silentRestartToClockSync();
+    return;  // never reached
+  }
+  g_postClockSyncSilentReboot = false;
+
   state = SYNCING;
   syncedTime[0] = '\0';
   requestUpdate();
@@ -45,6 +68,16 @@ void ClockSyncActivity::runSync() {
     // and the first credential may not be in range. Now iterate through
     // ALL saved credentials in priority order, short timeout per attempt
     // so the worst-case wait stays bounded.
+    // v18.9.9.305: WIFI_STORE lives in RAM and is only populated when
+    // WifiSelectionActivity's onEnter calls loadFromFile(). Fresh-boot X4
+    // users whose only path to a sync is Sync Time (or the Show Clock
+    // toggle-on hook) never opened WiFi Selection this boot, so the store
+    // is empty and this activity bailed as NO_WIFI even with saved
+    // networks on disk. Reload here if empty; cheap (small JSON parse) and
+    // idempotent.
+    if (WIFI_STORE.getCredentials().empty()) {
+      WIFI_STORE.loadFromFile();
+    }
     const auto& creds = WIFI_STORE.getCredentials();
     if (creds.empty()) {
       LOG_INF("CLK", "Manual sync requested but no saved WiFi networks");
@@ -116,6 +149,9 @@ void ClockSyncActivity::runSync() {
   // Mark as synced so the auto-sync hook stops firing on future WiFi connects.
   SETTINGS.clockHasBeenSynced = 1;
   SETTINGS.saveToFile();
+  // v18.9.9.292: kick the reading-stats module in case it was dormant
+  // (X4 device that hadn't synced yet).
+  ReadingStats::reevaluateClockStatus();
 
   // Read the freshly synced time back for the user-facing confirmation.
   char buf[9];
@@ -132,6 +168,19 @@ void ClockSyncActivity::loop() {
     // requestUpdateAndWait below forces the render before we block on WiFi.
     requestUpdateAndWait();
     runSync();
+    // v18.9.9.343: automatic boot-from-Home sync. After runSync completes,
+    // silent-restart straight back to Home instead of waiting for the
+    // user to press Back on a screen they didn't open. Short delay lets
+    // the SUCCESS/FAIL frame paint so users see the result of the auto
+    // sync, then boot back to Home with the correct time.
+    if (g_postHomeClockSyncSilentReboot) {
+      g_postHomeClockSyncSilentReboot = false;
+      requestUpdateAndWait();  // paint the SUCCESS/FAIL screen once
+      delay(1200);              // ~1.2 s so user sees the result
+      LOG_INF("CLK", "Auto boot sync complete (state=%d) -- silent-restart back to Home", (int)state);
+      silentRestart();  // target=HOME
+      return;           // never reached
+    }
     return;
   }
 

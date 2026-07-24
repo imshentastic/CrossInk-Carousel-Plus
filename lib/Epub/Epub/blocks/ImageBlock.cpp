@@ -78,7 +78,12 @@ bool renderFromCache(GfxRenderer& renderer, const std::string& cachePath, int x,
   const int bytesPerRow = (cachedWidth + 3) / 4;  // 2 bits per pixel, 4 pixels per byte
   uint8_t* rowBuffer = (uint8_t*)malloc(bytesPerRow);
   if (!rowBuffer) {
-    LOG_ERR("IMG", "Failed to allocate row buffer");
+    // v18.9.9.60: bump to visible level. This path was silently skipping
+    // images under tight BT heap because bytesPerRow (e.g. 117 B for a
+    // 464-wide image) can't fit into a fragmented maxAlloc. Renders as
+    // "images disappeared" from the user's perspective with no clue why.
+    LOG_ERR("IMG", "Failed to allocate row buffer: needed=%d bytes for %dx%d image at %s",
+            bytesPerRow, static_cast<int>(expectedWidth), static_cast<int>(expectedHeight), cachePath.c_str());
     cacheFile.close();
     return false;
   }
@@ -207,6 +212,18 @@ void ImageBlock::render(GfxRenderer& renderer, const int x, const int y) {
   }
 
   LOG_DBG("IMG", "Decode successful");
+}
+
+bool ImageBlock::renderIfCached(GfxRenderer& renderer, const int x, const int y) {
+  if (width <= 0 || height <= 0) return false;
+  const int screenWidth = renderer.getScreenWidth();
+  const int screenHeight = renderer.getScreenHeight();
+  if (x >= screenWidth || y >= screenHeight || x + width <= 0 || y + height <= 0) return false;
+  if (renderer.suppressImages()) {
+    renderer.drawRect(x, y, width, height, true);
+    return true;
+  }
+  return renderFromCache(renderer, getCachePath(imagePath), x, y, width, height);
 }
 
 bool ImageBlock::serialize(FsFile& file) {

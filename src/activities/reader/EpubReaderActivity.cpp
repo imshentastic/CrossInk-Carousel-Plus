@@ -10,11 +10,13 @@
 #include <FontCacheManager.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
+#include <HalGPIO.h>
 #include <HalStorage.h>
 #include <I18n.h>
 #include <Logging.h>
 #include <MemoryBudget.h>
 #include <SdCardFont.h>
+#include <Serialization.h>
 #include <esp_system.h>
 
 #include <algorithm>
@@ -22,6 +24,7 @@
 #include <limits>
 #include <memory>
 
+#include "../../ReadingStats.h"
 #include "../../SilentRestart.h"  // CrumBLE 4.4: silent-restart-before-BT pre-flight
 #include "../settings/BluetoothSettingsActivity.h"
 #include "../settings/KOReaderSettingsActivity.h"
@@ -64,6 +67,17 @@
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "util/ScreenshotUtil.h"
+
+// v18.9.9.2: post-BT diagnostic MEM snapshot at a named reader step. Fires
+// only while postBtDiagUntilMs_ is in the future (20s after BT link, armed
+// in loop() at the linkedNow transition). Bounded log volume: ~1 render per
+// second × ~7 steps × 20 s = ~140 lines per BT-linked session.
+#define POST_BT_STEP(name)                                                                                 \
+  do {                                                                                                     \
+    if (millis() < postBtDiagUntilMs_) {                                                                   \
+      LOG_INF("PBTD", "%s: free=%u maxAlloc=%u", name, ESP.getFreeHeap(), ESP.getMaxAllocHeap());          \
+    }                                                                                                      \
+  } while (0)
 
 namespace {
 // pagesPerRefresh now comes from SETTINGS.getRefreshFrequency()
@@ -186,6 +200,294 @@ constexpr char READ_FOLDER[] = "/Read";
 bool isInReadFolder(const std::string& path) {
   constexpr size_t n = sizeof(READ_FOLDER) - 1;  // excludes NUL
   return path.size() > n && path.compare(0, n, READ_FOLDER) == 0 && path[n] == '/';
+}
+
+// v18.9.9.70 (ported from crosspoint 05c1e9aa, adapted for our BluetoothHIDManager):
+// RAII helper that lends the ~40 KB framebuffer allocation to the section cold-
+// build for the duration of the loan. release() drops the framebuffer, restore()
+// re-allocates it (white contents). Requires our freeink-sdk backport of upstream
+// 059c1d1 which heap-allocates the framebuffer on non-PSRAM boards too. If
+// restore fails, we try dropping BT before giving up, and hard-restart on total
+// failure -- render state cannot proceed with a null framebuffer.
+class FrameBufferBuildLoan {
+ public:
+  explicit FrameBufferBuildLoan(GfxRenderer& renderer) : renderer_(renderer) {}
+  ~FrameBufferBuildLoan() {
+    if (active_ && !restore()) {
+      ESP.restart();
+    }
+  }
+
+  void release() {
+    if (active_ || !renderer_.hasFrameBuffer()) return;
+    renderer_.releaseFrameBufferForBuild();
+    active_ = true;
+    LOG_DBG("ERS", "Framebuffer lent for section build (bt=%u heap=%u maxAlloc=%u)",
+            BluetoothHIDManager::getInstance().isEnabled() ? 1 : 0,
+            (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+  }
+
+  bool restore() {
+    if (!active_) return true;
+    active_ = false;
+    if (renderer_.restoreFrameBufferAfterBuild()) {
+      LOG_DBG("ERS", "Framebuffer restored after section build");
+      return true;
+    }
+    if (BluetoothHIDManager::getInstance().isEnabled()) {
+      LOG_INF("ERS", "Framebuffer restore needs heap; freeing BT and retrying (heap=%u maxAlloc=%u)",
+              (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+      BluetoothHIDManager::getInstance().disable();
+      if (renderer_.restoreFrameBufferAfterBuild()) {
+        LOG_DBG("ERS", "Framebuffer restored after freeing BT");
+        return true;
+      }
+    }
+    LOG_ERR("ERS", "Framebuffer restore failed after section build");
+    return false;
+  }
+
+ private:
+  GfxRenderer& renderer_;
+  bool active_ = false;
+};
+
+// v18.9.6.1 / v18.9.9.58: Simple Rendering per-book sidecar, now split per
+// render path. Compat is a "this path OOM'd once" hint scoped to whichever
+// render path was active when the escalation fired:
+//   - compat_prepared.flag: book was on the prepared-layout path
+//   - compat_custom.flag:   book was on the user's own settings
+// A book whose prepared path renders fine can still legitimately need compat
+// under a settings drift the user hasn't cleaned up (or vice versa). Pre-v58
+// legacy simple_rendering.flag is deleted on first sight (see
+// clearLegacySimpleRenderingSidecar); a real OOM on either path re-writes
+// within a page.
+constexpr const char* kSimpleRenderingFlagLegacy = "/simple_rendering.flag";
+constexpr const char* kSimpleRenderingFlagPrepared = "/compat_prepared.flag";
+constexpr const char* kSimpleRenderingFlagCustom = "/compat_custom.flag";
+
+const char* simpleRenderingSidecarBasename(ReaderPath path) {
+  return path == ReaderPath::PreparedLayout
+             ? kSimpleRenderingFlagPrepared
+             : kSimpleRenderingFlagCustom;
+}
+
+bool simpleRenderingSidecarSet(const std::string& cachePath,
+                               ReaderPath path) {
+  const std::string full = cachePath + simpleRenderingSidecarBasename(path);
+  return Storage.exists(full.c_str());
+}
+
+void writeSimpleRenderingSidecar(const std::string& cachePath,
+                                 ReaderPath path) {
+  const std::string full = cachePath + simpleRenderingSidecarBasename(path);
+  if (Storage.exists(full.c_str())) return;
+  HalFile f;
+  if (Storage.openFileForWrite("ERS", full.c_str(), f)) {
+    f.close();
+    LOG_INF("ERS", "Simple Rendering sidecar written: %s", full.c_str());
+  } else {
+    LOG_ERR("ERS", "Failed to write Simple Rendering sidecar: %s", full.c_str());
+  }
+}
+
+void clearSimpleRenderingSidecar(const std::string& cachePath,
+                                 ReaderPath path) {
+  const std::string full = cachePath + simpleRenderingSidecarBasename(path);
+  if (Storage.exists(full.c_str())) {
+    Storage.remove(full.c_str());
+    LOG_INF("ERS", "Simple Rendering sidecar cleared: %s", full.c_str());
+  }
+}
+
+// One-shot cleanup of the pre-v58 path-agnostic sidecar. Called from
+// EpubReaderActivity::onEnter -- delete-if-present so books that had the
+// legacy flag set (from pre-v58 firmware) don't stay stuck in compat forever
+// once the reader switches to the split model. A real OOM will re-write the
+// correct-path sidecar within a page.
+void clearLegacySimpleRenderingSidecar(const std::string& cachePath) {
+  const std::string full = cachePath + kSimpleRenderingFlagLegacy;
+  if (Storage.exists(full.c_str())) {
+    Storage.remove(full.c_str());
+    LOG_INF("ERS", "Legacy simple_rendering.flag swept (v58 split): %s", full.c_str());
+  }
+}
+
+// v18.9.9.6 Level 2: per-book sidecar for the "tables suppressed, images
+// preserved" fallback. Written when Level 1 defrag didn't fit but full
+// Simple Rendering feels heavy-handed for a book whose only problem is
+// oversized table fragments. Images and embedded style stay on; only
+// PageTableFragments are collapsed to paragraphs at parse time.
+constexpr const char* kTablesSuppressedFlagFilename = "/tables_suppressed.flag";
+
+bool tablesSuppressedSidecarSet(const std::string& cachePath) {
+  const std::string path = cachePath + kTablesSuppressedFlagFilename;
+  return Storage.exists(path.c_str());
+}
+
+void writeTablesSuppressedSidecar(const std::string& cachePath) {
+  const std::string path = cachePath + kTablesSuppressedFlagFilename;
+  if (Storage.exists(path.c_str())) return;
+  HalFile f;
+  if (Storage.openFileForWrite("ERS", path.c_str(), f)) {
+    f.close();
+    LOG_INF("ERS", "Tables-suppressed sidecar written: %s", path.c_str());
+  } else {
+    LOG_ERR("ERS", "Failed to write tables-suppressed sidecar: %s", path.c_str());
+  }
+}
+
+void clearTablesSuppressedSidecar(const std::string& cachePath) {
+  const std::string path = cachePath + kTablesSuppressedFlagFilename;
+  if (Storage.exists(path.c_str())) {
+    Storage.remove(path.c_str());
+    LOG_INF("ERS", "Tables-suppressed sidecar cleared: %s", path.c_str());
+  }
+}
+
+// v18.9.9.35 (task #17) + v18.9.9.52 (task #37): per-book "user declined
+// the prebake prompt at these settings" state, moved from an SD sidecar
+// to RTC_NOINIT memory. The SD version persisted the decline across
+// cold boots, which hid the fact that every chapter was cold-building
+// and pushed image-heavy books past the "images suppressed under BT"
+// gate silently. Corrected behavior: the decline is scoped to a single
+// power-on session -- it survives silent-restart chains (which the
+// original v35 justification was really about) but resets on cold boot
+// so the next fresh open re-fires the prompt whenever current settings
+// still don't match the prebake.
+//
+// The old kPrebakeDeclinedFilename SD files are cleaned up on first
+// boot of the new firmware via clearLegacyPrebakeDeclinedSidecar().
+constexpr const char* kLegacyPrebakeDeclinedFilename = "/prebake-declined.dat";
+constexpr uint32_t kPrebakeDeclinedRtcMagic = 0x50444352;  // 'PDCR'
+
+// RTC_NOINIT is uninitialized on cold boot and preserved across
+// silent-restart / soft reset. We stamp a magic + book identity + a
+// settings fingerprint. If any field on read doesn't match, treat as
+// "no decline recorded" -- which for cold boot is exactly what we want.
+RTC_NOINIT_ATTR uint32_t g_prebakeDeclinedMagic;
+RTC_NOINIT_ATTR uint64_t g_prebakeDeclinedBookHash;
+RTC_NOINIT_ATTR uint32_t g_prebakeDeclinedSettingsHash;
+
+uint32_t hashPrebakeDeclineFingerprint() {
+  // FNV-1a over the same fields the SD sidecar used to compare. Order
+  // must be stable across firmware versions or the fingerprint check
+  // becomes flakey after upgrades. Any field added here needs an
+  // explicit migration story.
+  uint32_t h = 2166136261u;
+  auto mix = [&](uint32_t v) {
+    for (int i = 0; i < 4; ++i) {
+      h ^= (v >> (i * 8)) & 0xFF;
+      h *= 16777619u;
+    }
+  };
+  mix(SETTINGS.orientation);
+  mix(SETTINGS.screenMargin);
+  mix(SETTINGS.imageRendering);
+  mix(SETTINGS.fontFamily);
+  mix(SETTINGS.fontSize);
+  mix(SETTINGS.sdFontSizeRange);
+  for (size_t i = 0; i < sizeof(SETTINGS.sdFontFamilyName); ++i) {
+    mix(static_cast<uint8_t>(SETTINGS.sdFontFamilyName[i]));
+  }
+  mix(SETTINGS.lineSpacing);
+  mix(SETTINGS.paragraphAlignment);
+  mix(SETTINGS.extraParagraphSpacing);
+  mix(SETTINGS.forceParagraphIndents);
+  mix(SETTINGS.hyphenationEnabled);
+  mix(SETTINGS.embeddedStyle);
+  mix(SETTINGS.bionicReadingEnabled);
+  mix(SETTINGS.guideReadingEnabled);
+  return h;
+}
+
+uint64_t bookHashForCachePath(const std::string& cachePath) {
+  // FNV-1a 64. The cache path itself is derived from the book's file
+  // path hash (see Epub::cachePathForFilePath -- fnvHash64) so this is
+  // effectively a stable per-book identifier for the session.
+  uint64_t h = 14695981039346656037ULL;
+  for (char c : cachePath) {
+    h ^= static_cast<uint8_t>(c);
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+void writePrebakeDeclinedSidecar(const std::string& cachePath) {
+  g_prebakeDeclinedMagic = kPrebakeDeclinedRtcMagic;
+  g_prebakeDeclinedBookHash = bookHashForCachePath(cachePath);
+  g_prebakeDeclinedSettingsHash = hashPrebakeDeclineFingerprint();
+  LOG_INF("ERA", "Prebake decline recorded in RTC (bookHash=%08lx%08lx, settingsHash=%08x)",
+          static_cast<unsigned long>(g_prebakeDeclinedBookHash >> 32),
+          static_cast<unsigned long>(g_prebakeDeclinedBookHash & 0xFFFFFFFF), g_prebakeDeclinedSettingsHash);
+}
+
+void clearPrebakeDeclinedSidecar(const std::string& /*cachePath*/) {
+  g_prebakeDeclinedMagic = 0;
+  g_prebakeDeclinedBookHash = 0;
+  g_prebakeDeclinedSettingsHash = 0;
+  LOG_INF("ERA", "Prebake decline cleared from RTC");
+}
+
+// True only when the RTC slots (a) carry the magic sentinel, (b) match
+// the current book's hash, and (c) match the current settings
+// fingerprint. Any drift -> caller treats as "no decline" -> prompt
+// fires.
+bool prebakeDeclinedSidecarMatchesCurrent(const std::string& cachePath) {
+  if (g_prebakeDeclinedMagic != kPrebakeDeclinedRtcMagic) return false;
+  const uint64_t currentBookHash = bookHashForCachePath(cachePath);
+  if (g_prebakeDeclinedBookHash != currentBookHash) return false;
+  const uint32_t currentSettingsHash = hashPrebakeDeclineFingerprint();
+  if (g_prebakeDeclinedSettingsHash != currentSettingsHash) {
+    LOG_INF("ERA", "Prebake decline settings-hash drift (%08x -> %08x); clearing so prompt re-fires",
+            g_prebakeDeclinedSettingsHash, currentSettingsHash);
+    g_prebakeDeclinedMagic = 0;
+    g_prebakeDeclinedBookHash = 0;
+    g_prebakeDeclinedSettingsHash = 0;
+    return false;
+  }
+  return true;
+}
+
+// v18.9.9.187: per-book "user already answered the pxc-manifest / prepared-
+// layout prompt in this session" state, RTC-persisted so silent restarts
+// (defrag-with-EnableBt, low-heap section rebuilds) don't re-fire the prompt
+// on every boot's reader instance. Mirrors the prebake-declined RTC pattern
+// -- book hash + magic sentinel, no settings hash (any answer, keep or use-
+// prepared, means "don't ask again this session"). Cleared on user-exit so
+// re-opening the book gets a fresh chance to accept prepared.
+constexpr uint32_t kBtManifestAnsweredRtcMagic = 0x424D4152;  // 'BMAR'
+RTC_NOINIT_ATTR uint32_t g_btManifestAnsweredMagic;
+RTC_NOINIT_ATTR uint64_t g_btManifestAnsweredBookHash;
+
+void writeBtManifestAnsweredSidecar(const std::string& cachePath) {
+  g_btManifestAnsweredMagic = kBtManifestAnsweredRtcMagic;
+  g_btManifestAnsweredBookHash = bookHashForCachePath(cachePath);
+  LOG_INF("ERA", "BT manifest prompt answered recorded in RTC (bookHash=%08lx%08lx)",
+          static_cast<unsigned long>(g_btManifestAnsweredBookHash >> 32),
+          static_cast<unsigned long>(g_btManifestAnsweredBookHash & 0xFFFFFFFF));
+}
+
+void clearBtManifestAnsweredSidecar() {
+  g_btManifestAnsweredMagic = 0;
+  g_btManifestAnsweredBookHash = 0;
+  LOG_INF("ERA", "BT manifest answered cleared from RTC");
+}
+
+bool btManifestAnsweredSidecarMatchesCurrent(const std::string& cachePath) {
+  if (g_btManifestAnsweredMagic != kBtManifestAnsweredRtcMagic) return false;
+  return g_btManifestAnsweredBookHash == bookHashForCachePath(cachePath);
+}
+
+// One-shot cleanup of the pre-v52 SD sidecar. Called on the first
+// reader open per boot; a simple existence-based delete so we don't
+// keep old "declined forever" state around after users upgrade.
+void clearLegacyPrebakeDeclinedSidecar(const std::string& cachePath) {
+  const std::string path = cachePath + kLegacyPrebakeDeclinedFilename;
+  if (Storage.exists(path.c_str())) {
+    Storage.remove(path.c_str());
+    LOG_INF("ERA", "Removed legacy SD prebake-declined sidecar: %s", path.c_str());
+  }
 }
 
 // Pick a non-colliding destination path inside /Read/ for a finished book.
@@ -368,6 +670,38 @@ void EpubReaderActivity::onEnter() {
   CollectionsStore::getInstance().releaseMemory();
   SeriesIndex::getInstance().releaseMemory();
 
+  // CrumBLE 4.5.116: reader never needs the standalone UI glyph fallback
+  // family (~10 KB resident tax fragmentation-scattered through the
+  // reading session). Two paths:
+  //   (a) primary SD font is loaded -- alias it as the UI fallback.
+  //       Zero extra heap; any CJK glyph miss in reader UI (title,
+  //       chapter label, progress bar, drawer, menu) resolves through
+  //       the primary. Renders at primary's point size (typically
+  //       14-20pt) which will look visibly larger than the surrounding
+  //       10-12pt UI text but beats tofu boxes.
+  //   (b) no primary loaded (user hasn't picked an SD font, or
+  //       ReaderActivity's ensureLoaded hasn't run yet on this open
+  //       path) -- fall through to suppress + release, matching the
+  //       4.5.115 tofu-in-reader behavior.
+  // Un-suppressed in onExit so per-tick poll restores the user's real
+  // fallback on the return to home/settings.
+  if (!sdFontSystem.aliasPrimaryAsFallback(renderer)) {
+    sdFontSystem.setFallbackSuppressed(true);
+    sdFontSystem.releaseFallback(renderer);
+  }
+
+  // v18.9.9.194: drop the in-RAM cover-bitmap cache on reader entry.
+  // Reader has no use for cover thumbs, and v192's pinned-covers change
+  // (Home/RBGA covers held resident to keep shelf scroll snappy) means
+  // ~24 KB of pinned cover bytes now survive the Home-to-Reader transition
+  // and eat into the contiguous heap wrapDefinition + section CSS need.
+  // Field repro: post-RBGA reader entry -> dict lookup -> bad_alloc
+  // terminate at maxAlloc=6388. Unpin + clear here restores the invariant
+  // that the reader owns the full heap. Home rebuilds the cache lazily
+  // on the next lookupCachedBitmapPinned.
+  renderer.unpinAllCachedBitmaps();
+  renderer.clearImageCache();
+
   // BT No Images Quick Connect is session-scoped: always start a freshly opened
   // (or reopened-after-reboot) book with images enabled. If the user picked the
   // no-images connect last session, rebooting and re-entering the book brings the
@@ -390,6 +724,7 @@ void EpubReaderActivity::onEnter() {
   // where it's invisible.
   readerSettingsCache_.clear();
   pxcManifest_.reset();
+  bookVisibleCharCount_ = 0;
   prebakeManifest_.reset();
   prebakeLastSnapshot_ = {};
   prebakePromptShowing_ = false;
@@ -431,11 +766,155 @@ void EpubReaderActivity::onEnter() {
   // different manifest (or none), and any prior link tracking is stale.
   btWasLinked_ = false;
   btManifestPromptEarliestMs_ = 0UL;
-  btManifestPromptAnsweredThisSession_ = false;
+  // v18.9.9.187: rehydrate the "answered this session" flag from RTC. A
+  // silent-restart chain (defrag+EnableBt, low-heap section rebuild) tears
+  // down this reader and rebuilds it, defaulting the flag to false. Before
+  // v187 that caused the pxc-manifest prompt to re-fire on every boot in
+  // the chain, asking the user "use prepared layout?" 2-3 times per QC.
+  // RTC-persisted flag survives the restart; cleared in onExit so a fresh
+  // open reasks.
+  btManifestPromptAnsweredThisSession_ =
+      (epub && btManifestAnsweredSidecarMatchesCurrent(epub->getCachePath()));
+  if (btManifestPromptAnsweredThisSession_) {
+    LOG_INF("ERA", "BT manifest prompt: honoring RTC-recorded prior answer, suppressing this session");
+  }
   pendingBleQuickConnect_ = false;
   pendingBleQuickConnectNoImages_ = false;
   pendingBleQuickConnectSettingsChanged_ = false;
   pendingBleQuickConnectPromptStage_ = -1;
+  bleConnectingPopupPainted_ = false;
+
+  // v18.9.6: reset the per-session latches (BLE-drop retry, simple-retry
+  // one-shots). These bound how many times a session escalates -- fresh
+  // book, fresh attempts.
+  layoutBleRetryAttempted = false;
+  layoutSimpleRetryAttempted = false;
+  // v18.9.9.36 Phase C2: fresh book -> no incremental build in flight.
+  sectionBuildInProgress_ = false;
+  sectionBuildSpine_ = -1;
+  sectionBuildJustFailed_ = false;
+  sectionBuildLayoutAbortedForLowMemory_ = false;
+  sectionBuildImagesWereSuppressed_ = false;
+  sectionBuildBleWasDroppedForFail_ = false;
+  sectionBuildPopupLastMs_ = 0;
+  sectionBuildPopupDotPhase_ = 0;
+  // v18.9.9.58: sweep the pre-split legacy sidecar so any books stuck on
+  // it from earlier firmware get a fresh chance. If a real OOM is still
+  // reachable, the escalation cascade rewrites the correct-path flag
+  // within a page.
+  clearLegacySimpleRenderingSidecar(epub->getCachePath());
+
+  // v18.9.9.58: determine which render path this book open is on. Priority:
+  //   1. If continuing from silent-restart AND we stashed a path pre-restart,
+  //      honor that (user's prompt answer / manual toggle carries across).
+  //   2. Else if prebake manifest exists AND SETTINGS fully match its
+  //      fingerprint, assume PreparedLayout. The mismatch prompt would just
+  //      no-op here anyway.
+  //   3. Else default to CustomSettings. If prebake exists but mismatches,
+  //      the existing prebake prompt (checkAndShowPrebakePromptIfNeeded)
+  //      still runs and can flip the path.
+  {
+    uint8_t stashed = 0;
+    if (isContinuingFromSilentReboot() && consumePendingReaderActivePath(stashed) &&
+        stashed <= static_cast<uint8_t>(ReaderPath::CustomSettings)) {
+      readerActivePath_ = static_cast<ReaderPath>(stashed);
+    } else if (prebakeManifest_.has_value()) {
+      const auto& pm = *prebakeManifest_;
+      const int32_t curFontId = SETTINGS.getReaderFontId();
+      const uint16_t curW = renderer.getScreenWidth();
+      const uint16_t curH = renderer.getScreenHeight();
+      constexpr uint16_t kVpTolPx = 8;
+      const uint16_t vpWDelta = pm.viewportWidth > curW ? pm.viewportWidth - curW : curW - pm.viewportWidth;
+      const uint16_t vpHDelta = pm.viewportHeight > curH ? pm.viewportHeight - curH : curH - pm.viewportHeight;
+      const bool matches =
+          (pm.fontId == curFontId) &&
+          (pm.lineCompression == SETTINGS.getReaderLineCompression()) &&
+          (pm.extraParagraphSpacing == SETTINGS.extraParagraphSpacing) &&
+          (pm.forceParagraphIndents == SETTINGS.forceParagraphIndents) &&
+          (pm.paragraphAlignment == SETTINGS.paragraphAlignment) &&
+          (vpWDelta <= kVpTolPx) && (vpHDelta <= kVpTolPx) &&
+          (pm.hyphenationEnabled == SETTINGS.hyphenationEnabled) &&
+          (pm.embeddedStyle == SETTINGS.embeddedStyle) &&
+          (pm.imageRendering == SETTINGS.imageRendering) &&
+          (pm.bionicReadingEnabled == SETTINGS.bionicReadingEnabled) &&
+          (pm.guideReadingEnabled == SETTINGS.guideReadingEnabled);
+      readerActivePath_ = matches ? ReaderPath::PreparedLayout : ReaderPath::CustomSettings;
+    } else {
+      readerActivePath_ = ReaderPath::CustomSettings;
+    }
+    APP_STATE.readerActivePath = static_cast<uint8_t>(readerActivePath_);
+    stashReaderActivePathForNextBoot(APP_STATE.readerActivePath);
+    LOG_INF("ERS", "Book open: readerActivePath=%s",
+            readerActivePath_ == ReaderPath::PreparedLayout ? "PreparedLayout" : "CustomSettings");
+  }
+
+  // v18.9.9.59: consume the "compat auto-re-enabled" toast flag armed by
+  // the prior Layer 2 write-sidecar site. When set, we briefly show a
+  // popup explaining why compat is back on before dismissing to the
+  // normal render.
+  if (isContinuingFromSilentReboot() && consumePendingCompatReenabledToast()) {
+    LOG_INF("ERS", "Compat re-enabled toast: user had just manually disabled compat; showing popup");
+    GUI.drawPopup(renderer, "Compatibility Mode required", 0, false, HalDisplay::FAST_REFRESH);
+    delay(1600);
+  }
+  // v18.9.9.438: consume the chapter-heap-refuse toast armed by the v437
+  // escalation gate when a chapter jump refused on prebake+heap-tight.
+  // Explains to the user why they're not at the chapter they clicked.
+  if (isContinuingFromSilentReboot()) {
+    const int refusedSpine = consumePendingChapterHeapRefuseToast();
+    if (refusedSpine >= 0) {
+      char msg[80];
+      snprintf(msg, sizeof(msg),
+               "Chapter %d needs more memory\nStayed on chapter %d",
+               refusedSpine + 1, currentSpineIndex + 1);
+      LOG_INF("ERS", "Chapter-heap-refuse toast: requested=%d, staying=%d",
+              refusedSpine, currentSpineIndex);
+      GUI.drawPopup(renderer, msg, 0, false, HalDisplay::FAST_REFRESH);
+      delay(1800);
+    }
+  }
+  // v18.9.9.10: sidecar is a "needs compat mode WHEN BT is on" hint, not
+  // an always-on override. When BT is off (and no silent-restart is about
+  // to enable it), respect the user's prebake experience and render full
+  // even if the sidecar is set. When BT is on or being enabled via a
+  // silent-restart continuation, honor the compat marker.
+  // v18.9.9.58: sidecar is now path-scoped (compat_prepared / compat_custom).
+  const bool sidecarSet = simpleRenderingSidecarSet(epub->getCachePath(), readerActivePath_);
+  // v18.9.9.28: sidecar alone determines compat -- see the matching change
+  // at the loadSectionFile preamble in loop(). The old "sidecar && BT" gate
+  // meant a user toggling Compat On via ReaderOptions saw no effect until
+  // BT was engaged, which didn't match "on / off" semantics.
+  simpleRenderingActive_ = sidecarSet;
+  if (simpleRenderingActive_) {
+    LOG_INF("ERS", "Book opened with Simple Rendering active (sidecar set); compat mode ON");
+  }
+  // v18.9.9.23: broadcast compat state to Settings so the four compat-
+  // overridden settings show a "· Compat" suffix and refuse to toggle.
+  // Cleared on onExit.
+  APP_STATE.readerCompatModeActive = simpleRenderingActive_;
+  // v18.9.9.10: deprecated tables_suppressed.flag (v18.9.9.6-9). Sweep it
+  // if present so it doesn't linger. Reader no longer reads or writes.
+  clearTablesSuppressedSidecar(epub->getCachePath());
+  // v18.9.9.52 (task #37): one-shot cleanup of the pre-v52 SD prebake-
+  // declined sidecar. The state lives in RTC_NOINIT now (session-scoped);
+  // any lingering SD file would silently keep suppressing the prompt on
+  // cold boots. Cheap no-op after the first successful sweep per book.
+  clearLegacyPrebakeDeclinedSidecar(epub->getCachePath());
+  tableSuppressionActive_ = false;
+  // v18.9.9.5: consume the Layer 1 defrag continuation signal. If this
+  // boot is the result of a defrag silent-restart triggered by the same
+  // book's last render attempt, we've already spent our defrag budget
+  // for this book open -- the next failure jumps straight to Layer 2
+  // (compat mode), no more defrag hops.
+  if (isDefragRetryContinuation()) {
+    layoutDefragRetryAttempted_ = true;
+    // v18.9.9.168: seed the per-spine tracker so a cache-miss on the SAME
+    // spine we just defragged for correctly falls through to Layer 2,
+    // while a miss on a NEW spine is treated as a fresh defrag candidate.
+    layoutDefragRetryChapterSpine_ = currentSpineIndex;
+    LOG_INF("ERS", "Book opened continuing from Layer 1 defrag retry -- next failure -> compat mode");
+    clearDefragRetryContinuation();
+  }
 
   // Activate reader-specific front button mapping (if configured).
   mappedInput.setReaderMode(true);
@@ -480,6 +959,22 @@ void EpubReaderActivity::onEnter() {
           LOG_DBG("ERS", "Ignoring stale last-page sentinel from progress cache");
           nextPageNumber = 0;
         }
+        // v18.9.9.364: sanity-check the loaded spine index against the book's
+        // actual spine count. Field-observed pattern: corrupt progress.bin
+        // (mid-write crash, SD glitch) has spineIndex like 17237 while the
+        // book has ~30 spines. The clamp at line 5082 then set
+        // currentSpineIndex == spineCount → End of Book immediately on
+        // open. Reset to 0 (restart from beginning) if wildly out of range;
+        // preserves the "user genuinely finished" case where index equals
+        // exactly spineCount (still lands on End of Book screen).
+        const int spineCount = epub->getSpineItemsCount();
+        if (spineCount > 0 && currentSpineIndex > spineCount) {
+          LOG_ERR("ERS",
+                  "Corrupt progress.bin: spineIndex=%d exceeds book spineCount=%d -- resetting to 0",
+                  currentSpineIndex, spineCount);
+          currentSpineIndex = 0;
+          nextPageNumber = 0;
+        }
         cachedSpineIndex = currentSpineIndex;
         LOG_DBG("ERS", "Loaded cache: %d, %d", currentSpineIndex, nextPageNumber);
       }
@@ -496,6 +991,49 @@ void EpubReaderActivity::onEnter() {
       currentSpineIndex = textSpineIndex;
       LOG_DBG("ERS", "Opened for first time, navigating to text reference at index %d", textSpineIndex);
     }
+  }
+
+  // v18.9.9.66: apply resumeSpine from silent-restart. main.cpp captures the
+  // RTC-stashed target spine (silentRebootTargetSpine, set by
+  // silentRestartToReaderWithDefragRetryAtSpine and similar) into
+  // g_pendingResumeSpine at boot; without this consume the reader lands on
+  // progress.bin's last-committed spine instead of the one that triggered
+  // the silent-restart.
+  //
+  // v18.9.9.67: gate the apply. main.cpp:1943 resets silentRebootTargetSpine
+  // to 0 (v67 fix: to 0xFFFFFFFFu) after consuming, and
+  // silentRestartToReaderWithAction (used by e.g. BT pre-flight defrag)
+  // doesn't touch that slot. So a pre-v67 non-defrag silent-restart chain
+  // could leave stale value 0 in RTC, and v66 (unconditionally) applied it
+  // as spine 0 -- book jumped to cover/text-reference start and screen
+  // turned white when BT reconnected. The defrag-retry silent-restart is
+  // the ONLY path that sets silentRebootTargetSpine explicitly, so consuming
+  // it makes sense only when the boot is a defrag-retry continuation.
+  // Regular silent-restart-with-action continuations (drawer group, ROA,
+  // OpenBt pre-flight, etc.) resume from progress.bin.
+  //
+  // v18.9.9.68: use layoutDefragRetryAttempted_ (set at line ~766 above from
+  // isDefragRetryContinuation) instead of calling isDefragRetryContinuation
+  // directly -- v67 was checking the raw flag which had already been cleared
+  // by clearDefragRetryContinuation at line ~768. Net effect pre-68: the
+  // else branch always ran, resumeSpine was NEVER applied even on a genuine
+  // defrag-retry boot, so v64's chapter-boundary defrag-restart still landed
+  // on the wrong chapter. layoutDefragRetryAttempted_ is the reader's own
+  // copy of that state and stays true until book close.
+  if (layoutDefragRetryAttempted_) {
+    const int resumeSpine = consumePendingResumeSpine();
+    if (resumeSpine >= 0 && resumeSpine < epub->getSpineItemsCount()) {
+      LOG_INF("ERS", "Applying silent-restart resumeSpine=%d (was progress.bin=%d)",
+              resumeSpine, currentSpineIndex);
+      currentSpineIndex = resumeSpine;
+      nextPageNumber = 0;
+      cachedSpineIndex = currentSpineIndex;
+      pendingPercentJump = false;
+    }
+  } else {
+    // Drain the RTC slot so a later defrag-retry boot doesn't inherit
+    // a stale value from a non-defrag silent-restart.
+    (void)consumePendingResumeSpine();
   }
 
   // Load reading stats and record session start time.
@@ -527,7 +1065,20 @@ void EpubReaderActivity::onEnter() {
   APP_STATE.openEpubPath = epub->getPath();
   APP_STATE.saveToFile();
   RECENT_BOOKS.addOrUpdateBook(epub->getPath(), epub->getTitle(), epub->getAuthor(), epub->getThumbBmpPath());
+  // v18.9.9.290: start a reading-stats session. Cheap no-op on X4 or
+  // pre-clock-sync X3 (getStatus() != Ok inside noteBookOpened).
+  ReadingStats::noteBookOpened(epub->getPath().c_str());
   SleepCoverAssets::prepareEpub(*epub);
+
+  // v18.9.5 REVERTED in v18.9.5.4: previously skipped the initial page paint
+  // when EnableBt was queued (to avoid a flash before the QC popup). That
+  // caused a freeze -- the QC handler at line 1588 waits for `section` to
+  // be built, and `section` is only built inside render(). Without an
+  // initial render, section stayed null forever and the connect never
+  // fired. Restoring the normal first-render trigger; the extra flash on
+  // the defrag path is the cost of correctness. A follow-up (v18.9.5.5)
+  // can look at making the initial paint use FAST_REFRESH when a post-boot
+  // action is queued, to cut the visible impact.
 
   // Trigger first update
   requestUpdate();
@@ -667,29 +1218,26 @@ void EpubReaderActivity::runDeferredOnEnter() {
   // unfragmented (same window the prewarm depends on -- BLE not yet eating
   // 58 KB, no chapter decoded yet). The drawer references this cache instead
   // of rebuilding under BLE pressure, which used to OOM-crash on a fragmented
-  // heap. Skip if heap is already tight -- the drawer's own local gate will
-  // fall back to its actions-only list, same as before. Tracking BLE state
-  // too because mid-book Reader Activity re-entry (e.g. returning from a
-  // settings sub-activity) can hit this with BLE already connected; in that
-  // rare case we prefer the safe skip over a doomed build.
-  {
-    const auto heap = MemoryBudget::snapshot();
-    if (MemoryBudget::hasHeap(heap, 40u * 1024u, 20u * 1024u)) {
-      auto all = getSettingsList(&sdFontSystem.registry());
-      readerSettingsCache_.reserve(20);
-      for (auto& s : all) {
-        if (s.category == StrId::STR_CAT_READER) {
-          readerSettingsCache_.push_back(std::move(s));
-        }
-      }
-      readerSettingsCache_.shrink_to_fit();
-      LOG_INF("ERA", "Cached %u reader settings (heap free=%u maxAlloc=%u)",
-              static_cast<unsigned>(readerSettingsCache_.size()), heap.freeHeap, heap.maxAllocHeap);
-    } else {
-      LOG_INF("ERA", "Skipping reader-settings cache build; heap too tight (free=%u maxAlloc=%u)",
-              heap.freeHeap, heap.maxAllocHeap);
-    }
-  }
+  // heap.
+  //
+  // CrumBLE 4.5.5+: lowered the build threshold from (40 KB free / 20 KB
+  // maxAlloc) to (20 KB free / 10 KB maxAlloc). The actual cost of
+  // getSettingsList + the readerSettingsCache_ copy is ~6-10 KB depending on
+  // settings count -- the old 20 KB MaxAlloc gate was 2x over-cautious. On
+  // CJK books in particular, MaxAlloc spends most of the book lifetime in
+  // the 13-15 KB range from the streaming glyph atlas + per-page metadata,
+  // so the old gate was a hard miss every open and the drawer perpetually
+  // fell back to its Bluetooth-only emergency view (user pain: "I opened
+  // settings and got 3 BT items"). The new gate clears 99% of normal
+  // post-load heap states and only skips when heap is genuinely too tight
+  // for even the actual ~6 KB build.
+  // CrumBLE 4.5.6: eager readerSettingsCache_ build removed. It was ~6-10 KB
+  // permanently reserved every book open, whether or not the user ever visited
+  // the drawer. Field test: that heap was what pushed BT + SD-font reading
+  // over the floor on X4 English books -- post-BT free 504 B with cache built
+  // vs 3836 B without. The drawer now builds its own settings list lazily on
+  // first group expand (BookSettingsDrawerActivity::activateSelected), so
+  // users who tap "BT Quick Connect" as the first action never pay the cost.
 
   // CrumBLE: parse the optimizer's .pxc manifest if the book has one. Path is
   // META-INF/crumble-pxc.json (standard EPUB metadata directory). Contents
@@ -729,6 +1277,34 @@ void EpubReaderActivity::runDeferredOnEnter() {
           LOG_INF("ERA", "Failed to parse .pxc manifest: %s", err.c_str());
         }
         free(manifestBytes);
+      }
+    }
+  }
+
+  // v18.9.9.298: parse crumble-stats.json for real Stable Page Numbers.
+  // Written by the optimizer (v298+) with the total visible-text character
+  // count across all XHTML files. Reader uses this instead of the byte-size
+  // approximation from getBookSize(), which over-counts HTML markup.
+  // Missing manifest is fine -- byte-size fallback preserves v78 behavior
+  // for un-optimized books.
+  {
+    const std::string statsPath = "META-INF/crumble-stats.json";
+    size_t statsSize = 0;
+    if (epub->getItemSize(statsPath, &statsSize) && statsSize > 0 && statsSize < 512) {
+      uint8_t* statsBytes = epub->readItemContentsToBytes(statsPath, &statsSize);
+      if (statsBytes) {
+        JsonDocument sdoc;
+        const DeserializationError serr = deserializeJson(sdoc, statsBytes, statsSize);
+        if (!serr) {
+          const uint32_t chars = sdoc["totalChars"] | 0u;
+          if (chars > 0) {
+            bookVisibleCharCount_ = chars;
+            LOG_INF("ERA", "Loaded stats manifest: totalChars=%u", chars);
+          }
+        } else {
+          LOG_INF("ERA", "Failed to parse stats manifest: %s", serr.c_str());
+        }
+        free(statsBytes);
       }
     }
   }
@@ -822,7 +1398,24 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
       prebakeLastSnapshot_.bionicReadingEnabled != SETTINGS.bionicReadingEnabled ||
       prebakeLastSnapshot_.guideReadingEnabled != SETTINGS.guideReadingEnabled;
 
-  if (!prebakeLastSnapshot_.initialised) snapshotCurrent();
+  if (!prebakeLastSnapshot_.initialised) {
+    // v18.9.9.35 (task #17): if the user previously declined the prompt
+    // for this book at exactly these SETTINGS, honor that across silent
+    // restarts / power cycles. Populating the snapshot from current
+    // SETTINGS below is what the snapChanged gate uses to skip the
+    // prompt on the next tick; we short-circuit the fresh-open path here
+    // to reach that same steady state.
+    if (epub && prebakeDeclinedSidecarMatchesCurrent(epub->getCachePath())) {
+      LOG_INF("ERA", "Prebake prompt suppressed: user previously declined for this book at these settings");
+      snapshotCurrent();
+      prebakePromptDiagLogged_ = true;
+      // v18.9.9.455: also mark this book as skip-prebake-fallback so the
+      // section loader stops trying sections-prebake/N.bin per chapter.
+      prebakeDeclinedForThisBook_ = true;
+      return false;
+    }
+    snapshotCurrent();
+  }
   if (!snapChanged) {
     if (!prebakePromptDiagLogged_) {
       LOG_DBG("ERA", "Prebake prompt skipped: snapshot unchanged since last call (no settings drift)");
@@ -831,28 +1424,101 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
     return false;
   }
 
+  // CrumBLE 4.5.7: viewport tolerance matches Section::tryLoadFromPath.
+  // freeink-sdk migration shifted computed viewport by ~5px; don't nag
+  // users with a prompt they can't resolve (settings are already correct;
+  // only the theme metric moved).
+  constexpr uint16_t kViewportTolerancePx = 8;
+  const uint16_t vpWDelta = (pm.viewportWidth > curViewportW) ? (pm.viewportWidth - curViewportW)
+                                                              : (curViewportW - pm.viewportWidth);
+  const uint16_t vpHDelta = (pm.viewportHeight > curViewportH) ? (pm.viewportHeight - curViewportH)
+                                                               : (curViewportH - pm.viewportHeight);
+  // v18.9.9.308: cross-check the SECTION file's fontId against the manifest's
+  // claim. Field bug: some prebake pipelines (notably crosspointreader.com's
+  // browser optimizer) write manifest.json with the device's CURRENT fontId
+  // rather than the fontId actually used to bake the sections. Result: user
+  // baked with LXGWWenKai (fontId=-2037991310), manifest recorded Bitter
+  // (417158117) because the browser tab had Bitter selected at that moment,
+  // sections were correctly baked at -2037991310. Device compares
+  // manifest(417158117) vs device(417158117) at prompt-gate -> match -> no
+  // prompt -> loads section, sees section-level fingerprint mismatch, drops
+  // to indexing, EOCD errors under tight heap. Cross-checking section 0's
+  // fontId (the ground truth) catches manifests that lie.
+  int32_t sectionFontId = pm.fontId;  // fallback: trust the manifest
+  sectionFontIdFromPeek_ = 0;  // v18.9.9.311: reset per-check; populated below on successful peek
+  if (epub) {
+    // Mirror of SECTION_CACHE_MAGIC in Section.cpp (`0xFF C X S`). Kept
+    // as a local constexpr because Section's version is a compilation-unit
+    // static -- exposing it via Section.h just for one peek would grow the
+    // public surface of a hot header. If the on-disk format changes, the
+    // magic check below fails and we fall through to trusting the
+    // manifest, which is the correct conservative behaviour.
+    constexpr uint32_t kSectionCacheMagicMirror = 0x535843FF;
+    const std::string sectionPath = epub->getCachePath() + "/sections-prebake/0.bin";
+    FsFile sfile;
+    if (Storage.openFileForRead("ERA", sectionPath, sfile)) {
+      uint32_t magic = 0;
+      uint8_t version = 0;
+      int32_t peekFontId = 0;
+      // Section header layout: magic(4B) + version(1B) + fontId(4B int).
+      if (serialization::tryReadPod(sfile, magic) && magic == kSectionCacheMagicMirror &&
+          serialization::tryReadPod(sfile, version) && serialization::tryReadPod(sfile, peekFontId)) {
+        sectionFontId = peekFontId;
+        sectionFontIdFromPeek_ = peekFontId;  // v18.9.9.311: cached for rescue path
+        if (peekFontId != pm.fontId) {
+          LOG_INF("ERA",
+                  "Prebake fingerprint: manifest claims fontId=%ld but sections-prebake/0.bin says fontId=%ld -- "
+                  "trusting section (manifest is stale)",
+                  static_cast<long>(pm.fontId), static_cast<long>(peekFontId));
+        }
+      }
+      sfile.close();
+    }
+  }
+
   const bool mismatch =
-      (pm.fontId != curFontId) ||
+      (sectionFontId != curFontId) ||
       (pm.lineCompression != curLineComp) ||
       (pm.extraParagraphSpacing != SETTINGS.extraParagraphSpacing) ||
       (pm.forceParagraphIndents != SETTINGS.forceParagraphIndents) ||
       (pm.paragraphAlignment != SETTINGS.paragraphAlignment) ||
-      (pm.viewportWidth != curViewportW) ||
-      (pm.viewportHeight != curViewportH) ||
+      (vpWDelta > kViewportTolerancePx) ||
+      (vpHDelta > kViewportTolerancePx) ||
       (pm.hyphenationEnabled != SETTINGS.hyphenationEnabled) ||
       (pm.embeddedStyle != SETTINGS.embeddedStyle) ||
       (pm.imageRendering != SETTINGS.imageRendering) ||
       (pm.bionicReadingEnabled != SETTINGS.bionicReadingEnabled) ||
       (pm.guideReadingEnabled != SETTINGS.guideReadingEnabled);
+  // v18.9.9.58 gap: tableRendering is in the section-file fingerprint (v43)
+  // but not in the PrebakeManifest JSON, so the prompt can't preemptively
+  // catch a tables drift. Section load falls through the file-level
+  // fingerprint mismatch and rebuilds cold. Fix requires prebake CLI schema
+  // bump + tryLoadPrebakeManifest parse -- deferred out of v58 scope.
 
   if (!mismatch) {
     if (!prebakePromptDiagLogged_) {
       LOG_INF("ERA",
-              "Prebake prompt skipped: settings match prebake (fontId=%ld viewport=%ux%u) -- no prompt needed",
-              static_cast<long>(curFontId), static_cast<unsigned>(curViewportW), static_cast<unsigned>(curViewportH));
+              "Prebake prompt skipped: full fingerprint matches (fontId=%ld viewport=%ux%u lineComp=%.3f "
+              "ePS=%d fPI=%d pA=%u hyph=%d embed=%d imgR=%u bionic=%d guide=%d) -- no prompt needed",
+              static_cast<long>(curFontId), static_cast<unsigned>(curViewportW),
+              static_cast<unsigned>(curViewportH), static_cast<double>(curLineComp),
+              SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
+              static_cast<unsigned>(SETTINGS.paragraphAlignment),
+              SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle,
+              static_cast<unsigned>(SETTINGS.imageRendering),
+              SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled);
       prebakePromptDiagLogged_ = true;
     }
     snapshotCurrent();  // user-driven drift but still valid; accept silently
+    return false;
+  }
+
+  // v18.9.9.41 (task #26): mismatch confirmed and we're about to fire the
+  // prompt. Atomically claim the "showing" slot so a concurrent caller
+  // (loop() vs render() run on separate FreeRTOS tasks) can't also fall
+  // through and double-push. If someone beat us to it, silently no-op.
+  bool expected = false;
+  if (!prebakePromptShowing_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
     return false;
   }
 
@@ -911,7 +1577,7 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
            fontLabel(readerSettingsCache_, pm.fontFamily, pm.fontSize, pm.sdFontSizeRange,
                      std::string(pm.sdFontFamilyName)));
   }
-  if (pm.viewportWidth != curViewportW || pm.viewportHeight != curViewportH) {
+  if (vpWDelta > kViewportTolerancePx || vpHDelta > kViewportTolerancePx) {
     append("Viewport: " + std::to_string(curViewportW) + "x" + std::to_string(curViewportH) +
            " (device) vs " + std::to_string(pm.viewportWidth) + "x" + std::to_string(pm.viewportHeight) + " (prebake)");
   }
@@ -949,7 +1615,8 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
       "This book's chapter cache was prepared with different reader settings:\n\n" +
       diffLines +
       "\n\nKeep your current settings (rebuild chapters on demand), or restore the prepared layout (apply the book's prepared settings to your device)?";
-  prebakePromptShowing_ = true;
+  // prebakePromptShowing_ was atomically claimed above (task #26) before
+  // the LOG_INF fired; no need to set again here.
   startActivityForResult(
       std::make_unique<ChoicePromptActivity>(
           renderer, mappedInput, "Settings differ from prepared layout",
@@ -988,6 +1655,8 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
         // any residual fontId difference the BT prompt would still surface
         // comes from a missing SD font (BT prompt can't fix that either).
         btManifestPromptAnsweredThisSession_ = true;
+        // v18.9.9.187: RTC-persist so silent-restart chains honor the answer.
+        if (epub) writeBtManifestAnsweredSidecar(epub->getCachePath());
         const bool keepCurrent = chosen != 1;
         if (keepCurrent) {
           // User declined -- keep their current settings. Don't delete the
@@ -997,6 +1666,12 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
           // the snapshot to current SETTINGS so we don't keep firing the
           // prompt on every render tick.
           LOG_INF("ERA", "Prebake prompt: user declined, keeping current settings");
+          // v18.9.9.58: the user actively chose "keep my settings" -- lock
+          // in CustomSettings as the render path so per-path compat state
+          // routes to compat_custom.flag. Stash for silent-restart continuity.
+          readerActivePath_ = ReaderPath::CustomSettings;
+          APP_STATE.readerActivePath = static_cast<uint8_t>(readerActivePath_);
+          stashReaderActivePathForNextBoot(APP_STATE.readerActivePath);
           prebakeLastSnapshot_.orientation = SETTINGS.orientation;
           prebakeLastSnapshot_.screenMargin = SETTINGS.screenMargin;
           prebakeLastSnapshot_.imageRendering = SETTINGS.imageRendering;
@@ -1014,6 +1689,14 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
           prebakeLastSnapshot_.embeddedStyle = SETTINGS.embeddedStyle;
           prebakeLastSnapshot_.bionicReadingEnabled = SETTINGS.bionicReadingEnabled;
           prebakeLastSnapshot_.guideReadingEnabled = SETTINGS.guideReadingEnabled;
+          // v18.9.9.35 (task #17): persist the decision so the same
+          // fingerprint isn't asked about again on subsequent silent
+          // restarts or book reopens.
+          if (epub) writePrebakeDeclinedSidecar(epub->getCachePath());
+          // v18.9.9.455: session flag so the section loader skips prebake
+          // fallback for this book from here on. No more per-section
+          // fingerprint-mismatch SD reads.
+          prebakeDeclinedForThisBook_ = true;
           requestUpdate();
           return;
         }
@@ -1024,6 +1707,12 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
         if (!prebakeManifest_.has_value()) return;
         const PrebakeManifest& pm2 = *prebakeManifest_;
         LOG_INF("ERA", "Prebake prompt: user accepted, restoring prepared layout");
+        // v18.9.9.58: user accepted -- flip the render path so per-path
+        // compat routes to compat_prepared.flag from here on. Stash for
+        // silent-restart continuity.
+        readerActivePath_ = ReaderPath::PreparedLayout;
+        APP_STATE.readerActivePath = static_cast<uint8_t>(readerActivePath_);
+        stashReaderActivePathForNextBoot(APP_STATE.readerActivePath);
         SETTINGS.orientation = pm2.orientation;
         SETTINGS.screenMargin = pm2.screenMargin;
         SETTINGS.imageRendering = pm2.imageRendering;
@@ -1053,6 +1742,69 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
         // built-in-font path doesn't need this because its fontId is purely
         // a switch on (fontFamily, fontSize), no runtime side-state.
         sdFontSystem.ensureLoaded(renderer);
+
+        // v18.9.9.311: prebake-fontId rescue. If the manifest was baked by a
+        // broken pipeline (crosspointreader.com writes sdFontFamilyName=""
+        // + fontId=Bitter's even when sections were actually rendered with
+        // an SD font), the settings-restore above only recovered the LIE.
+        // Cross-check: after the reload, does SETTINGS.getReaderFontId()
+        // actually match the section-file fingerprint? If not, iterate
+        // installed SD fonts to find the one whose fontId matches the
+        // section, and swap SETTINGS to that. Then reload again. Costs
+        // 1 tiny SD read per installed .cpfont; only fires when the
+        // manifest is lying, so happy path pays nothing.
+        {
+          const int32_t restoredFontId = SETTINGS.getReaderFontId();
+          if (sectionFontIdFromPeek_ != 0 && restoredFontId != sectionFontIdFromPeek_) {
+            std::string rescuedFamily;
+            uint8_t rescuedPointSize = 0;
+            if (sdFontSystem.findFamilyByFontId(sectionFontIdFromPeek_, rescuedFamily, rescuedPointSize)) {
+              LOG_INF("ERA",
+                      "Prebake rescue: manifest restored to fontId=%ld but section wants %ld; "
+                      "found installed family '%s' @%upt with matching fontId -- swapping",
+                      static_cast<long>(restoredFontId), static_cast<long>(sectionFontIdFromPeek_),
+                      rescuedFamily.c_str(), rescuedPointSize);
+              strncpy(SETTINGS.sdFontFamilyName, rescuedFamily.c_str(),
+                      sizeof(SETTINGS.sdFontFamilyName) - 1);
+              SETTINGS.sdFontFamilyName[sizeof(SETTINGS.sdFontFamilyName) - 1] = '\0';
+              // ensureLoaded picks the file matching (family, sdFontSizeRange,
+              // fontSize) -- as long as the family has the target size, we get
+              // the same fontId back. If the point-size enum still doesn't
+              // resolve to rescuedPointSize (e.g. family has multiple sizes),
+              // reader will report a fresh mismatch and we accept the fall-
+              // through since we can't safely reverse-map pointSize -> enum.
+              SETTINGS.saveToFile();
+              sdFontSystem.ensureLoaded(renderer);
+            } else {
+              // v18.9.9.323: distinguish "family present but content differs"
+              // from "family not installed at all". The old pessimistic log
+              // claimed layout will fail regardless -- but if the manifest's
+              // sdFontFamilyName IS installed (just a different build/version
+              // with different content bytes hashing differently), the cold
+              // rebuild path will succeed using the currently-installed font.
+              // The user's on-screen layout may drift slightly from what was
+              // originally baked (glyph metrics can differ across builds of
+              // the same family) but the book renders. Only genuinely
+              // uninstalled family names hit the hard failure.
+              const bool familyInstalled =
+                  SETTINGS.sdFontFamilyName[0] != '\0' &&
+                  sdFontSystem.registry().findFamily(SETTINGS.sdFontFamilyName) != nullptr;
+              if (familyInstalled) {
+                LOG_INF("ERA",
+                        "Prebake rescue: family '%s' installed but content hash %ld (device) != %ld (baked); "
+                        "sections will be rebuilt cold from EPUB using currently-installed font. Layout "
+                        "may drift slightly if glyph metrics differ across font builds.",
+                        SETTINGS.sdFontFamilyName, static_cast<long>(restoredFontId),
+                        static_cast<long>(sectionFontIdFromPeek_));
+              } else {
+                LOG_ERR("ERA",
+                        "Prebake rescue: family '%s' NOT installed AND no font with matching fontId=%ld -- "
+                        "prebake layout unusable. Install the original bake font on SD card.",
+                        SETTINGS.sdFontFamilyName, static_cast<long>(sectionFontIdFromPeek_));
+              }
+            }
+          }
+        }
         // Snapshot the now-reverted SETTINGS as the new baseline.
         prebakeLastSnapshot_.orientation = SETTINGS.orientation;
         prebakeLastSnapshot_.screenMargin = SETTINGS.screenMargin;
@@ -1071,6 +1823,10 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
         prebakeLastSnapshot_.embeddedStyle = SETTINGS.embeddedStyle;
         prebakeLastSnapshot_.bionicReadingEnabled = SETTINGS.bionicReadingEnabled;
         prebakeLastSnapshot_.guideReadingEnabled = SETTINGS.guideReadingEnabled;
+        // v18.9.9.35 (task #17): user aligned with prebake; drop any
+        // stale "declined" record so a future settings drift asks fresh
+        // instead of comparing against the pre-accept snapshot.
+        if (epub) clearPrebakeDeclinedSidecar(epub->getCachePath());
         if (section) section.reset();
         requestUpdate();
       });
@@ -1079,6 +1835,52 @@ bool EpubReaderActivity::checkAndFirePrebakePromptIfNeeded() {
 
 void EpubReaderActivity::onExit() {
   Activity::onExit();
+
+  // CrumBLE 4.5.116: tear down the reader's fallback state (either the
+  // primary-alias or the suppression flag, depending on which onEnter
+  // branch fired). releaseFallback covers both -- it clears the alias
+  // flag AND the fallback pointer, so the per-tick poll's next tick
+  // sees a clean slate and loads the user's real fallback family.
+  // Silent-restart bypasses onExit; the flag resets on the fresh boot.
+  sdFontSystem.releaseFallback(renderer);
+  sdFontSystem.setFallbackSuppressed(false);
+
+  // v18.9.9.290: flush the reading-stats session. Silent-restart bypasses
+  // onExit; ReadingStats::tick() also flushes every 5 min so at most that
+  // window is lost across an unclean exit.
+  ReadingStats::onBookClose();
+
+  // v18.9.9.54 (task #39): clear the RTC-scoped prebake decline. Silent
+  // restart goes through ESP.restart() which bypasses onExit entirely,
+  // so this only fires on user-initiated exit (Back to home). Matches
+  // the user's mental model: closing the book and reopening it is a
+  // "fresh chance" to accept the prepared layout; only silent-restart
+  // chains within the same session keep the decline active.
+  if (epub) clearPrebakeDeclinedSidecar(epub->getCachePath());
+  // v18.9.9.187: same user-exit reset for the BT manifest answered flag.
+  // Silent-restart bypasses onExit; only real book-close reaches here.
+  clearBtManifestAnsweredSidecar();
+
+  // v18.9.9.23: clear the Settings-visible compat state -- the user is
+  // leaving the reader, and Settings shouldn't keep locking values on the
+  // book they just closed.
+  APP_STATE.readerCompatModeActive = false;
+  // v18.9.9.174: signal HomeActivity to force a full refresh if the last
+  // rendered page had images. Prevents cover/illustration ghosting on the
+  // shelf paint that immediately follows this exit.
+  // v18.9.9.191: widened to include pages with highlights. Field report
+  // (v188): exiting from a highlighted-but-image-free page produced a
+  // 2/3-black, 1/3-white split ghost on the Home paint at tight heap.
+  // prevPageHadHighlights is set by renderSavedHighlightsOverlay after
+  // each render, so it accurately reflects the last-rendered state.
+  APP_STATE.readerExitedFromImagePage = lastRenderedPageHadImages_ || prevPageHadHighlights;
+  // v18.9.9.25: reset the drawer's silent-restart one-shot latch so the next
+  // book open gets a fresh budget.
+  APP_STATE.drawerHeapRestartTriedThisBook = false;
+  // v18.9.9.59: clear the manual-off marker on book close. A subsequent
+  // book open starts fresh -- Layer 2 auto-writes in the new session
+  // aren't credited to a disable done in a previous book.
+  APP_STATE.compatUserDisabledThisSession = false;
 
   // NOTE: the deep-sleep cycle cache (last_reader_page.bin) is no longer
   // snapshotted here. onExit runs AFTER the "Going home..." popup
@@ -1117,23 +1919,46 @@ void EpubReaderActivity::onExit() {
   // Here at onExit the heap is usually cleaner (page DOM released,
   // BT teardown queued), so one more attempt with a heap pre-flight
   // catches the common case at near-zero cost.
-  if (epub && section && pendingSyncSaveError) {
+  // v18.9.9.471: always save at onExit (previously gated behind
+  // pendingSyncSaveError). Progress is now debounced during page turns,
+  // so unsaved deltas can exist even on a healthy SD — need to flush
+  // them here. Cheap when it's a no-op re-save; guaranteed on-exit
+  // freshness when it's not.
+  if (epub && section) {
     constexpr uint32_t kExitSaveMinMaxAlloc = 4 * 1024;
     const uint32_t exitMaxAlloc = ESP.getMaxAllocHeap();
     if (exitMaxAlloc >= kExitSaveMinMaxAlloc) {
       if (saveProgress(currentSpineIndex, section->currentPage, section->pageCount)) {
-        LOG_INF("ERS", "Defensive save-on-exit recovered progress (maxAlloc=%u)", exitMaxAlloc);
+        pagesSinceProgressSave_ = 0;
         pendingSyncSaveError = false;
       } else {
-        LOG_INF("ERS", "Defensive save-on-exit still failed (maxAlloc=%u)", exitMaxAlloc);
+        LOG_INF("ERS", "Save-on-exit failed (maxAlloc=%u) — SD may need repair", exitMaxAlloc);
       }
     } else {
-      LOG_INF("ERS", "Defensive save-on-exit skipped: heap too low (maxAlloc=%u < %u)",
+      LOG_INF("ERS", "Save-on-exit skipped: heap too low (maxAlloc=%u < %u)",
               exitMaxAlloc, kExitSaveMinMaxAlloc);
     }
   }
 
+  // v18.9.9.202: persist the current chapter title so Home's Dashboard
+  // theme can show it under the book title without loading the EPUB.
+  writeChapterTitleSidecar();
+
   BOOKMARKS.unload();
+
+  // The renderer holds raw pointers into section->glyphAtlasSlots_[*].fontData
+  // (and into the embedded-subset slots) that were handed over via the
+  // per-page setEmbeddedGlyphData() call. Once section.reset() runs below,
+  // those vectors are freed and the renderer's stored pointers dangle. The
+  // GfxRenderer.h contract on setEmbeddedGlyphData explicitly puts the burden
+  // of clearing on the reader. Skipping this step had been benign until the
+  // CrumBLE 4.5.5 streaming-atlas changes started leaving more state inside
+  // slot.fontData (glyphBitmapCtx = section_ptr) -- now any post-reset render
+  // (home transition popup, screensaver redraw, idle repaint) dereferences
+  // the freed Section and reads heap-poison bytes (0xabba1234), crashing with
+  // load access fault. Clearing here closes the window.
+  renderer.clearEmbeddedGlyphData(SETTINGS.getReaderFontId());
+
   section.reset();
 
   if (pendingReadFolderMove && epub) {
@@ -1177,6 +2002,36 @@ void EpubReaderActivity::commitReadingSession() {
   if (elapsedSecs > 0) {
     stats.totalReadingSeconds += elapsedSecs;
     globalStats.totalReadingSeconds += elapsedSecs;
+
+    // v18.9.9.441 (CrossInk parity): fold segment into 730-day streak
+    // bitfield + ToD/DoW buckets. localStart = now - elapsed. Safe
+    // no-op when clock is invalid (returns false, span not recorded).
+    // v18.9.9.443 also folds into per-book ToD/DoW and updates pace.
+    ReadingStatsDateTime nowLocal;
+    const bool clockValid = getCurrentLocalReadingStatsDateTime(nowLocal);
+    ReadingStatsDateTime localStart = nowLocal;
+    if (clockValid) {
+      int32_t sodSigned = static_cast<int32_t>(localStart.hour) * 3600 +
+                          static_cast<int32_t>(localStart.minute) * 60 +
+                          static_cast<int32_t>(localStart.second) - static_cast<int32_t>(elapsedSecs);
+      while (sodSigned < 0) {
+        addDaysToReadingStatsDate(localStart.date, -1);
+        sodSigned += 24 * 3600;
+      }
+      localStart.hour = static_cast<uint8_t>(sodSigned / 3600);
+      localStart.minute = static_cast<uint8_t>((sodSigned % 3600) / 60);
+      localStart.second = static_cast<uint8_t>(sodSigned % 60);
+      globalStats.recordReadingSpan(localStart, elapsedSecs);
+
+      // v18.9.9.443: auto-populate startDate on first-seen session,
+      // unless user has manually set it.
+      if (!stats.startDate.isValid() && !(stats.flags & BookReadingStats::FLAG_START_DATE_MANUAL)) {
+        stats.startDate = nowLocal.date;
+      }
+    }
+    // Per-book pace / bucket recorder (pace runs even without clock).
+    stats.recordReadingSpan(clockValid ? localStart : ReadingStatsDateTime{}, elapsedSecs,
+                            /*pagesTurnedForward=*/0);
   }
 
   stats.save(epub->getCachePath());
@@ -1189,12 +2044,235 @@ void EpubReaderActivity::onBeforeDeepSleep() {
   // session-resume continues from the saved progress.bin position
   // and a fresh session segment begins.
   commitReadingSession();
+  // v18.9.9.471: also flush progress.bin unconditionally. Page-turn saves
+  // are debounced (every 3rd render), so a deep-sleep entry with 1-2
+  // unsaved page turns would otherwise reopen on the older page. Cheap
+  // when it's a no-op re-save.
+  if (epub && section) {
+    if (saveProgress(currentSpineIndex, section->currentPage, section->pageCount)) {
+      pagesSinceProgressSave_ = 0;
+      pendingSyncSaveError = false;
+    }
+  }
+  // v18.9.9.202: Home may render next (wake-to-home); keep its Dashboard
+  // chapter line fresh.
+  writeChapterTitleSidecar();
+}
+
+void EpubReaderActivity::writeChapterTitleSidecar() {
+  if (!epub) return;
+  const int tocIdx = epub->getTocIndexForSpineIndex(currentSpineIndex);
+  const std::string title = tocIdx >= 0 ? epub->getTocItem(tocIdx).title : std::string();
+  const std::string path = epub->getCachePath() + "/chapter_title.txt";
+  FsFile f;
+  if (!Storage.openFileForWrite("ERS", path, f)) return;
+  // Cap defensively — Dashboard truncates to two lines anyway.
+  f.write(reinterpret_cast<const uint8_t*>(title.c_str()), std::min<size_t>(title.size(), 120));
+  f.close();
 }
 
 void EpubReaderActivity::loop() {
   if (!epub) {
     // Should never happen
     finish();
+    return;
+  }
+
+  // v18.9.6c: BT tryEnableIfRequested has burned its retry budget without
+  // fitting NimBLE into heap. If we entered Simple Rendering earlier this
+  // session because of a page-load conflict, the section is still holding
+  // the trimmed layout that BT can't recover behind -- fire a silent-restart
+  // with EnableBt to reset both the section cache (fingerprint mismatch
+  // will fall back to prebake) AND get a fresh heap for NimBLE. Matches
+  // the manual "drawer BT quick-connect" recovery a user would try anyway.
+  //
+  // v18.9.9.33 (task #16): also fire when BT gave up outside Simple
+  // Rendering -- the common case is post-rebuild fragmentation. After a
+  // chapter cache miss the reader drops BLE, builds the section, then
+  // asks BT back on. Free heap is fine (~65 KB) but maxAlloc is scattered
+  // to ~30 KB while NimBLE controller_init needs ~40 KB contiguous, so
+  // the 6 s refuse-loop bails and the user is left with a silently-off
+  // BLE. Silent-restart-to-defrag-with-EnableBt lands on a clean ~90 KB
+  // contiguous heap and reconnects the bonded remote automatically. Gated
+  // on the same layoutDefragRetryAttempted_ one-shot so a genuinely
+  // NimBLE-incompatible book doesn't loop. currentSpineIndex resumes the
+  // user on the chapter they were reading.
+  if (BluetoothHIDManager::getInstance().takeEnableGaveUpAlert()) {
+    if (simpleRenderingActive_) {
+      LOG_INF("ERS",
+              "BT enable gave up after Simple Rendering was active; silent-restart-with-EnableBt "
+              "to reset section cache and reclaim heap for NimBLE");
+      silentRestartToReaderWithAction(ReaderPostBootAction::EnableBt);
+      // never returns
+    }
+    if (!layoutDefragRetryAttempted_) {
+      LOG_INF("ERS",
+              "BT enable gave up (likely post-rebuild fragmentation); silent-restart-to-defrag "
+              "with EnableBt to reclaim contiguous heap and reconnect bonded remote (spine=%d)",
+              currentSpineIndex);
+      layoutDefragRetryAttempted_ = true;
+      silentRestartToReaderWithDefragRetryAtSpine(ReaderPostBootAction::EnableBt, currentSpineIndex);
+      // never returns
+    }
+    // Budget spent -- give up quietly; the takeEnableGaveUpAlert has
+    // already cleared, and the user can hit BT quick-connect manually
+    // from the drawer once they notice.
+  }
+
+  // CrumBLE 4.5.6: BT-cycle recovery (atlas / page load) sits idle waiting
+  // for the deferred BT disable to actually drain. render() won't re-fire
+  // without requestUpdate(). Kick one the tick after BT flips off so the
+  // retry render runs on the freed heap.
+  if ((atlasRetryPendingBtDrop_ || pageLoadRetryPendingBtDrop_) &&
+      !BluetoothHIDManager::getInstance().isEnabled()) {
+    requestUpdate();
+  }
+
+  // v18.9.9.36 Phase C2: drive the incremental Section build one chunk
+  // per tick. Runs entirely outside the RenderLock so input polling,
+  // sleep timer, battery snapshots, BT drain all continue during the
+  // multi-second parse. Cancel semantics: if the section pointer went
+  // null (chapter-nav, book exit) or currentSpineIndex changed
+  // (user tapped prev/next mid-build), we abandon the tmp build and let
+  // the next render construct + build for the new spine.
+  if (sectionBuildInProgress_) {
+    if (!section) {
+      LOG_INF("ERS", "Section build cancelled: section pointer released mid-build");
+      sectionBuildInProgress_ = false;
+      return;
+    }
+    if (currentSpineIndex != sectionBuildSpine_) {
+      LOG_INF("ERS", "Section build cancelled: user navigated from spine=%d to %d mid-build",
+              sectionBuildSpine_, currentSpineIndex);
+      section->abandonBuild();
+      section.reset();
+      sectionBuildInProgress_ = false;
+      requestUpdate();
+      return;
+    }
+    // Animate the popup on wall-clock (250 ms cadence). Painted under a
+    // brief RenderLock so we don't collide with the render task.
+    const unsigned long nowMs = millis();
+    if (sectionBuildPopupLastMs_ != 0 && (nowMs - sectionBuildPopupLastMs_) >= 250) {
+      sectionBuildPopupLastMs_ = nowMs;
+      sectionBuildPopupDotPhase_ = (sectionBuildPopupDotPhase_ + 1) % 4;
+      static constexpr const char* kDots[4] = {"", ".", "..", "..."};
+      char buf[64];
+      // v18.9.9.76: show "Indexing… page X of ~Y" once the byte-ratio estimate
+      // has enough signal to be meaningful (pageCount > 0 AND estimate > pageCount).
+      // Early ticks with no estimate fall back to the classic animated-dots form.
+      const uint16_t pc = section ? section->pageCount : 0;
+      const uint16_t est = section ? section->estimatedTotalPages() : 0;
+      if (SETTINGS.showIndexingPageCount && pc > 0 && est > pc) {
+        snprintf(buf, sizeof(buf), "%s page %u of ~%u", tr(STR_INDEXING), pc, est);
+      } else {
+        snprintf(buf, sizeof(buf), "%s%s", tr(STR_INDEXING), kDots[sectionBuildPopupDotPhase_]);
+      }
+      RenderLock lock(*this);
+      GUI.drawPopup(renderer, buf, sectionBuildPopupMinWidth_, /*leftAlignText=*/true);
+    }
+    // v18.9.9.262: pre-flight heap-floor gate ported from CrossPoint
+    // feat-bluetooth 74a0969c. Layout allocations inside parseStep abort()
+    // on OOM under -fno-exceptions, so a section build entered on tight
+    // heap can wipe the panel with a hard restart. If free heap is below
+    // the floor, drop BT (if resident) BEFORE starting the tick so the
+    // next iteration runs with NimBLE's ~58 KB reclaimed. bleAutoReEnable
+    // brings it back after the build completes.
+    constexpr uint32_t kBuildMinFreeHeap = 40u * 1024u;
+    if (ESP.getFreeHeap() < kBuildMinFreeHeap && BluetoothHIDManager::getInstance().isEnabled()) {
+      LOG_INF("ERS",
+              "buildSomeMore: pre-flight below floor (free=%u < %u) with BT resident; requesting BT drop",
+              ESP.getFreeHeap(), (unsigned)kBuildMinFreeHeap);
+      BluetoothHIDManager::getInstance().requestDisableLater();
+      bleAutoReEnableAfterReindex = true;
+      // Skip this tick; next tick after BT drain runs with reclaimed heap.
+      return;
+    }
+    // Drive a small chunk of build work. kBuildPagesPerTick is small so
+    // each loop tick stays well under the ~250 ms window BT input
+    // polling needs -- individual parseStep is ~10-30 ms for pure-ASCII
+    // pages, but jumps to seconds-per-glyph on CJK+SD-fallback pages.
+    // v18.9.9.70: lend the framebuffer's ~40 KB for the build chunk. Restored
+    // at end-of-tick so subsequent renders see a valid buffer.
+    // v18.9.9.451: 4 -> 1 for the animation cadence win. Field feedback:
+    // on CJK books using an SD fallback the 4-page tick meant the
+    // "Indexing..." dots updated every 20-40 s, reading as a frozen
+    // device. 1 page per tick lets the popup animation fire every
+    // ~5-10 s worst case, giving the user a clear "still working"
+    // signal without changing total wall-clock build time.
+    constexpr int kBuildPagesPerTick = 1;
+    FrameBufferBuildLoan buildLoan(renderer);
+    buildLoan.release();
+    const bool ok = section->buildSomeMore(kBuildPagesPerTick);
+    if (!buildLoan.restore()) { ESP.restart(); }
+    if (!ok) {
+      sectionBuildLayoutAbortedForLowMemory_ = section->lastBuildLayoutAbortedForLowMemory();
+      sectionBuildImagesWereSuppressed_ = section->lastBuildImagesWereSuppressed();
+      sectionBuildBleWasDroppedForFail_ = bleAutoReEnableAfterReindex;
+      sectionBuildInProgress_ = false;
+      sectionBuildJustFailed_ = true;
+      // Do NOT reset section here -- the render() failure block does
+      // section.reset() itself; leave the mid-build object alive so
+      // getters (already snapshotted above) stay valid until the tail.
+      // Actually snapshotted above so we can safely reset.
+      section.reset();
+      requestUpdate();
+      return;
+    }
+    if (section->isBuildComplete()) {
+      const bool imagesWereSuppressed = section->lastBuildImagesWereSuppressed();
+      LOG_DBG("ERS", "Cache build complete (C2): pages=%u free=%u maxAlloc=%u",
+              section->pageCount, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      // Post-build bookkeeping that used to live inline after the
+      // createSectionFile call in render().
+      layoutBleRetryAttempted = false;
+      if (bleAutoReEnableAfterReindex) {
+        bleAutoReEnableAfterReindex = false;
+        bleReEnableHeldForImagePage = true;
+        LOG_INF("ERS", "Section build done; holding BLE re-enable until a clean image-free render");
+      }
+      // v18.9.9.38 (task #23): if the build succeeded but had to suppress
+      // images on the way (heap couldn't fit the ~57 KB decode window
+      // for the largest inline image), silent-restart-to-defrag once so
+      // the rebuild lands on the clean boot heap and images fit. Same
+      // one-shot gate as the build-failure defrag path; if the retry
+      // build ALSO suppresses images, we've hit a real ceiling and the
+      // pending alert below (BT_IMAGES_HIDDEN / LOW_MEMORY_IMAGES title+body)
+      // tells the user honestly. Only fires when at least one image was
+      // dropped -- clean builds don't burn the budget.
+      if (imagesWereSuppressed && !layoutDefragRetryAttempted_) {
+        LOG_INF("ERS",
+                "Build completed with images suppressed; silent-restart-to-defrag at spine=%d "
+                "so images fit on the retry (one-shot per book)",
+                currentSpineIndex);
+        layoutDefragRetryAttempted_ = true;
+        // Preserve BT if it was up; None otherwise. bleAutoReEnableAfterReindex
+        // was already cleared above so read the manager directly.
+        const bool bleUp = BluetoothHIDManager::getInstance().isEnabled();
+        silentRestartToReaderWithDefragRetryAtSpine(
+            bleUp ? ReaderPostBootAction::EnableBt : ReaderPostBootAction::None,
+            currentSpineIndex);
+        // never returns
+      }
+      if (imagesWereSuppressed) {
+        const bool bleConnected = BluetoothHIDManager::getInstance().isEnabled();
+        const StrId titleId = bleConnected ? StrId::STR_BT_IMAGES_HIDDEN_TITLE : StrId::STR_LOW_MEMORY_IMAGES_TITLE;
+        const StrId bodyId = bleConnected ? StrId::STR_BT_IMAGES_HIDDEN_BODY : StrId::STR_LOW_MEMORY_IMAGES_BODY;
+        snprintf(APP_STATE.pendingAlertTitle, sizeof(APP_STATE.pendingAlertTitle), "%s",
+                 I18n::getInstance().get(titleId));
+        snprintf(APP_STATE.pendingAlertBody, sizeof(APP_STATE.pendingAlertBody), "%s",
+                 I18n::getInstance().get(bodyId));
+        APP_STATE.pendingAlertGoHomeOnBack.store(false, std::memory_order_relaxed);
+        APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
+      }
+      sectionBuildInProgress_ = false;
+      // Drop the section so the next render() reconstructs a fresh one
+      // and loadSectionFile picks up the just-committed .bin.
+      section.reset();
+      requestUpdate();
+      return;
+    }
+    // Still building; loop() will tick again on its natural cadence.
     return;
   }
 
@@ -1224,10 +2302,72 @@ void EpubReaderActivity::loop() {
         LOG_INF("ERA", "post-boot dispatch: EnableBt -> pendingBleQuickConnect_ (free=%u maxAlloc=%u)",
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap());
         pendingBleQuickConnect_ = true;
+        // v18.1: mark this QC as coming from the defrag boot dispatch so the
+        // pre-flight knows to trust the fresh heap and skip its check. QCs
+        // from other origins (drawer, reader menu) get the normal heap check.
+        pendingBleQuickConnectFromBootDispatch_ = true;
         pendingBleQuickConnectNoImages_ = false;
         pendingBleQuickConnectSettingsChanged_ = false;
         pendingBleQuickConnectPromptStage_ = -1;
-        requestUpdate();
+
+        // v18.9.9.81: paint the "Connecting Bluetooth..." popup NOW and kick
+        // off BleHid.begin() so NimBLE controller init runs during the panel-
+        // refresh window that the popup HALF_REFRESH is about to trigger. The
+        // QC handler on the next loop tick sees btMgr.isEnabled() == true and
+        // skips straight to connectToDevice — user sees the popup ~2 s earlier
+        // and BleHid.begin's ~40 ms is fully hidden behind the panel refresh.
+        //
+        // Also release the page heap reserve here (mirrors what the QC handler
+        // would do at line ~2486) so NimBLE's controller_init has ~20 KB more
+        // contiguous heap. Safe to release early: the reader's initial page
+        // render is already complete or completing behind this popup.
+        if (Section::pageHeapReserveHeld()) {
+          const uint32_t freeBefore = ESP.getFreeHeap();
+          Section::releasePageHeapReserveForBtEnable();
+          LOG_INF("ERA", "Boot-dispatch early: released page heap reserve (free %u->%u)",
+                  freeBefore, ESP.getFreeHeap());
+        }
+        // v18.9.9.138: mirror the caches that the pendingBleQuickConnect_
+        // handler (line ~2469) drops before its BT enable. On boot dispatch
+        // the first reader render has already run, so cachedRenderPage_ holds
+        // ~30 KB of DOM that NimBLE's controller_init would otherwise fight
+        // for contiguous heap. Field repro: NimBLE malloc failed silently
+        // during enable, connect timed out, disable crashed on null-deref.
+        // Dropping cachedRenderPage_ costs ~100 ms on the next post-BT
+        // render (one-time re-deserialize) -- imperceptible next to the
+        // 3 sec BT connect window. storedBwBuffer + readerSettingsCache_
+        // are typically empty on boot dispatch (drawer never opened), so
+        // those calls are safe no-ops when empty.
+        const uint32_t freePreCacheFlush = ESP.getFreeHeap();
+        cachedRenderPage_.reset();
+        cachedRenderSection_ = nullptr;
+        cachedRenderSpine_ = -1;
+        cachedRenderPageIndex_ = -1;
+        if (renderer.hasStoredBwBuffer()) {
+          renderer.discardStoredBwBuffer();
+        }
+        readerSettingsCache_.clear();
+        readerSettingsCache_.shrink_to_fit();
+        if (ESP.getFreeHeap() > freePreCacheFlush + 1024) {
+          LOG_INF("ERA", "Boot-dispatch early: flushed reader caches (free %u->%u)",
+                  freePreCacheFlush, ESP.getFreeHeap());
+        }
+        {
+          RenderLock lock(*this);
+          GUI.drawPopup(renderer, tr(STR_BT_CONNECTING), 0, false, HalDisplay::HALF_REFRESH);
+        }
+        // v18.9.9.145: pre-BT reserve REMOVED. Field test showed NimBLE
+        // truly needs the full ~73 KB budget for enable + connect. The
+        // 5 KB reserve starved NimBLE at 68 KB -- enable succeeded but
+        // connect timed out because late-stage GATT allocations failed.
+        // Rely instead on v141's raised streamed-render floor (1600) +
+        // the "drop BT for render, retry" path at line ~5410 when
+        // post-BT renders can't fit.
+        // BT enable is synchronous and takes ~40 ms; kick it off now so the
+        // ~1.7 s panel refresh (triggered by the popup above) overlaps with
+        // NimBLE init. Panel refresh is SPI-idle; CPU is free for NimBLE.
+        auto& btMgrEarly = BluetoothHIDManager::getInstance();
+        if (!btMgrEarly.isEnabled()) btMgrEarly.enable();
       } else if (action == ReaderPostBootAction::OpenLookup) {
         LOG_INF("ERA", "post-boot dispatch: OpenLookup (free=%u maxAlloc=%u)",
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap());
@@ -1238,9 +2378,14 @@ void EpubReaderActivity::loop() {
         onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::ADD_HIGHLIGHT);
       } else if (action == ReaderPostBootAction::OpenDefinition) {
         const char* word = consumePendingDefinitionWord();
+        // v18.9.9.249: also consume a paired chunk-start offset. Non-zero
+        // means the restart was armed by the chunked reader's boundary
+        // refuse path -- open the definition at that chunk directly
+        // instead of chunk 0.
+        const uint32_t chunkStart = consumePendingDefinitionChunkStart();
         if (word && word[0] != '\0' && epub) {
-          LOG_INF("ERA", "post-boot dispatch: OpenDefinition('%s') (free=%u maxAlloc=%u)",
-                  word, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+          LOG_INF("ERA", "post-boot dispatch: OpenDefinition('%s') chunkStart=%u (free=%u maxAlloc=%u)",
+                  word, chunkStart, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
           // CrumBLE 4.4 post-bisect: thread the word into the LOOKUP flow
           // so the word-select activity opens with cursor on the word AND
           // auto-opens the definition overlay. Replaces the prior
@@ -1249,6 +2394,7 @@ void EpubReaderActivity::loop() {
           // routes through LOOKUP regardless of where the user was when
           // the silent-restart fired.
           pendingLookupDefinitionWord_ = word;
+          pendingLookupDefinitionChunkStart_ = chunkStart;
           onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::LOOKUP);
         } else {
           LOG_INF("ERA", "post-boot dispatch: OpenDefinition but no word queued; falling back to OpenLookup");
@@ -1262,6 +2408,14 @@ void EpubReaderActivity::loop() {
         LOG_INF("ERA", "post-boot dispatch: OpenKoSync (free=%u maxAlloc=%u)",
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap());
         onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::SYNC);
+      } else if (action == ReaderPostBootAction::OpenReaderOptions) {
+        LOG_INF("ERA", "post-boot dispatch: OpenReaderOptions (free=%u maxAlloc=%u)",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::READER_OPTIONS);
+      } else if (action == ReaderPostBootAction::OpenLookedUpWords) {
+        LOG_INF("ERA", "post-boot dispatch: OpenLookedUpWords (free=%u maxAlloc=%u)",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::LOOKED_UP_WORDS);
       } else if (action == ReaderPostBootAction::OpenLookupAtWord) {
         const char* word = consumePendingDefinitionWord();
         if (word && word[0] != '\0' && epub) {
@@ -1274,6 +2428,30 @@ void EpubReaderActivity::loop() {
           LOG_INF("ERA", "post-boot dispatch: OpenLookupAtWord but no word queued; falling back to OpenLookup");
           onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction::LOOKUP);
         }
+      }
+      // v18.9.9.26: ReaderPostBootAction::OpenBookSettingsDrawer removed.
+      // v18.9.9.25's silent-restart-on-refuse path was reverted because BT
+      // can't cleanly reconnect while the drawer is on the activity stack.
+      // Compat mode now hides settings groups from the drawer entirely
+      // (see BookSettingsDrawerActivity::rebuildDrawerItems), so the tight-
+      // heap refuse the silent-restart was meant to work around doesn't
+      // trigger anymore.
+      //
+      // v18.9.9.55 (task #40): dispatch restored. The drawer's view-mode
+      // (v55) fires this action when the user taps to edit while in
+      // view-only mode; post-boot heap is clean (~90 KB), BT is cold,
+      // and the drawer opens editable with the previously-expanded
+      // group pre-selected via consumePendingDrawerExpandGroup().
+      // The 4.5.6 BT-can't-reconnect concern doesn't apply here: BT is
+      // still off post-boot, and requestEnableLater on drawer close
+      // schedules the reconnect for after the drawer teardown finishes.
+      else if (action == ReaderPostBootAction::OpenBookSettingsDrawer) {
+        const int group = consumePendingDrawerExpandGroup();
+        LOG_INF("ERA", "post-boot dispatch: OpenBookSettingsDrawer (group=%d free=%u maxAlloc=%u)", group,
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        startActivityForResult(std::make_unique<BookSettingsDrawerActivity>(
+                                   renderer, mappedInput, &readerSettingsCache_, &pxcManifest_, group),
+                               [this](const ActivityResult&) { requestUpdate(); });
       }
     }
   }
@@ -1345,6 +2523,14 @@ void EpubReaderActivity::loop() {
     if (linkedNow && !btWasLinked_) {
       // Fresh link. Arm the prompt; we'll fire once the stability window passes.
       btManifestPromptEarliestMs_ = millis() + kManifestPromptStabilityMs;
+      // v18.9.9.2: arm 20s of dense MEM instrumentation to catch the
+      // post-connect throw seen in the field log (Free 6944 -> terminate
+      // in 30ms after "Successfully connected"). Log at named steps of
+      // loop()/render() so the sub-alloc that swallows the last ~6.8KB
+      // is nameable in the next repro.
+      postBtDiagUntilMs_ = millis() + 20000UL;
+      LOG_INF("PBTD", "post-BT diag ARMED for 20s (link established, free=%u maxAlloc=%u)",
+              ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     } else if (!linkedNow && btWasLinked_) {
       // Link dropped. Don't clear btManifestPromptAnsweredThisSession_ here --
       // if the user already answered, brief controller drops shouldn't re-prompt.
@@ -1361,6 +2547,7 @@ void EpubReaderActivity::loop() {
                             (m.screenMargin != SETTINGS.screenMargin) ||
                             (m.imageRendering != SETTINGS.imageRendering);
       btManifestPromptAnsweredThisSession_ = true;  // one-shot per book, regardless of branch below
+      if (epub) writeBtManifestAnsweredSidecar(epub->getCachePath());  // v187
       if (mismatch) {
         LOG_INF("ERA",
                 ".pxc manifest mismatch on BLE connect: cur fontId=%ld ori=%u marg=%u img=%u vs mfst fontId=%ld ori=%u marg=%u img=%u",
@@ -1468,6 +2655,7 @@ void EpubReaderActivity::loop() {
             const int pick = cr ? cr->choice : 0;
             pendingBleQuickConnectPromptStage_ = pick;
             btManifestPromptAnsweredThisSession_ = true;  // suppress edge-detect prompt later
+            if (epub) writeBtManifestAnsweredSidecar(epub->getCachePath());  // v187: survive silent-restart
             if (pick == 1 && pxcManifest_.has_value()) {
               // Use prepared: revert SETTINGS to manifest values. If those
               // already match the section's built layout (e.g. user toggled
@@ -1530,7 +2718,15 @@ void EpubReaderActivity::loop() {
     }
     // If section is still null (mid re-layout), wait. Loop will re-enter
     // next tick once the render task has built the new section.
-    if (!section) {
+    //
+    // v18.9.9.64: also wait when the section is constructed but has no
+    // pages yet (Phase C2 build in progress, or pending first-load).
+    // Under a defrag-restart-with-EnableBt sequence, we boot on a fresh
+    // ~85 KB heap; if BT enables NOW, NimBLE takes ~70 KB of that before
+    // the section's cold build has run -- the build then attempts at 12 KB
+    // maxAlloc and fails, defeating the purpose of the defrag hop. Waiting
+    // for pageCount>0 keeps the fresh heap available for the build first.
+    if (!section || sectionBuildInProgress_ || section->pageCount <= 0) {
       return;
     }
 
@@ -1566,24 +2762,121 @@ void EpubReaderActivity::loop() {
     {
       const uint32_t preBtFree = ESP.getFreeHeap();
       const uint32_t preBtMaxAlloc = ESP.getMaxAllocHeap();
-      constexpr uint32_t kPreBtFreshMaxAllocThreshold = 55 * 1024;
-      if (isContinuingFromSilentReboot()) {
+      // v18.9.9.281: was 55 KB. The 55 KB floor assumed pre-v280 NimBLE
+      // consumed ~66 KB of free heap + left MaxAlloc at ~10-15 KB. With
+      // the v280 shrink (BT_CTRL_BLE_MAX_ACT 6->1, MSYS/ACL/EVT/PREP
+      // pools all trimmed), post-NimBLE MaxAlloc is roughly +20 KB
+      // better -- a 35 KB pre-BT MaxAlloc now leaves ~15 KB post-connect,
+      // which was the safety target. Symptom of a too-high floor: the
+      // reader silent-restart-loops here trying to reach a MaxAlloc it
+      // will never see because the SD-font + settings baseline itself
+      // sits below the old threshold.
+      constexpr uint32_t kPreBtFreshMaxAllocThreshold = 35 * 1024;
+      // v18.9.9.252: BLE controller memory was released this boot by the
+      // v245 BT-off boot branch (or the FT-enter release). enable() would
+      // load-fault inside NimBLEDevice::init on the freed controller
+      // memory (see v251 crash class). Silent-restart-with-EnableBt so
+      // the boot lands with bluetoothEnabled=1 and the v245 release
+      // skipped, giving NimBLE a fresh controller to init.
+      extern bool g_bleControllerMemReleased;
+      if (g_bleControllerMemReleased) {
         LOG_INF("ERA",
-                "BT enable pre-flight: skipped (post-recovery dispatch; this enable is the result of "
-                "a prior silent restart, free=%u maxAlloc=%u)",
+                "BT enable requested but BLE controller mem was released this boot -- "
+                "silent-restart-with-EnableBt (free=%u maxAlloc=%u)",
                 preBtFree, preBtMaxAlloc);
+        {
+          RenderLock lock(*this);
+          silentRestartToReaderWithAction(ReaderPostBootAction::EnableBt);
+        }
+        return;
+      }
+      // v18.9.9.163: BleHid port reverted. v48 skip-deinit path is live again --
+      // if the previous disable() skipped NimBLE deinit (crash mitigation),
+      // NimBLE stack state is stale in RAM. Force a silent-restart-with-EnableBt
+      // so the boot lands on a clean NimBLE state.
+      if (BluetoothHIDManager::getInstance().nimbleStateSkippedTeardown()) {
+        LOG_INF("ERA",
+                "BT enable requested but a prior disable() skipped NimBLE deinit -- silent-restart-with-EnableBt "
+                "to re-initialise on clean stack (free=%u maxAlloc=%u)",
+                preBtFree, preBtMaxAlloc);
+        {
+          RenderLock lock(*this);
+          silentRestartToReaderWithAction(ReaderPostBootAction::EnableBt);
+        }
+        return;
+      }
+      // v18.1: only skip the pre-flight when the QC actually came from a
+      // ReaderPostBootAction::EnableBt dispatch (defrag path just brought us
+      // here with a fresh heap). Skipping for ANY silent-restart continuation
+      // was too broad -- e.g. a cover-heap-guard restart-to-home followed by
+      // the user opening a book and tapping BT connect was letting BT enable
+      // proceed at ~24 KB maxAlloc, crashing after connect.
+      if (isContinuingFromSilentReboot() && pendingBleQuickConnectFromBootDispatch_) {
+        LOG_INF("ERA",
+                "BT enable pre-flight: skipped (defrag boot dispatch; this enable is the result of "
+                "a prior silent-restart-with-EnableBt, free=%u maxAlloc=%u)",
+                preBtFree, preBtMaxAlloc);
+        // v18.9.9.159: DO NOT pre-alloc failsafe here. This branch runs AFTER
+        // BleHid.begin (NimBLE controller already grabbed ~70 KB) and BEFORE
+        // BleHid.connect (needs another few KB for connection state). The
+        // 4 KB failsafe alloc here starved connect -> BLE_INIT malloc failed
+        // -> inconsistent NimBLE state -> disable() panic. Boot-dispatch keeps
+        // slow pass 2 as trade-off; safer than crashing.
+        // v18.9.5.1: DON'T clear pendingBleQuickConnectFromBootDispatch_ here.
+        // The popup draw at line 1687 checks this flag to decide NO_REFRESH
+        // vs HALF_REFRESH; clearing here made every boot-dispatch QC still
+        // HALF-flash the popup a second time. Clear happens after the popup
+        // draw instead.
         clearSilentRebootContinuationFlag();
       } else if (preBtMaxAlloc < kPreBtFreshMaxAllocThreshold) {
+        // CrumBLE 4.5.7 v17: revert to v12's defrag path. The v15.3 detour
+        // through bt-settings + returnToReaderAfterBtMagic added a second
+        // silent-restart hop and made the reader re-enable BT while its
+        // render loop was still running, which races NimBLE init and lets
+        // it consume ~9 KB more than a lean-boot enable (76 KB vs 67 KB).
+        // The reader-with-EnableBt path lets reader load state fully FIRST,
+        // then a queued post-boot EnableBt fires against a settled render
+        // loop -- historically the "BT and page turns work" flow.
         LOG_INF("ERA",
                 "BT enable pre-flight: pre-BT heap is degraded "
                 "(free=%u maxAlloc=%u < %u); triggering silent restart with EnableBt to defrag heap",
                 preBtFree, preBtMaxAlloc, kPreBtFreshMaxAllocThreshold);
-        silentRestartToReaderWithAction(ReaderPostBootAction::EnableBt);
+        // v18.9.4 opt#1: take RenderLock and paint the "Connecting..." popup
+        // to the framebuffer BEFORE calling silent-restart. Inside the
+        // silent-restart, snapshotFrameBufferForSilentRestart sees
+        // heldByCurrentTask() and takes the fast path -- no 300 ms
+        // tryLockFor timeout, no "skipping sleep-frame snapshot" bailout.
+        // Result: the popup pixels survive the reboot via the sleep-frame,
+        // so the user sees "Connecting Bluetooth..." continuously through
+        // the defrag restart instead of a blank period + double flash.
+        // v18.9.9.45 (task #30): don't composite a "Connecting..." popup
+        // into the framebuffer before the silent-restart. The old design
+        // captured the popup pixels in the snapshot so the boot-restore
+        // repainted them ("continuous UI through the reboot"), but that
+        // produces a visible cascade: boot restore paints the POPUP
+        // (flash 1), reader loads and repaints the actual page erasing
+        // the popup (flash 2), then the post-BT-connect refresh paints
+        // the page again (flash 3). Three flashes total, reported in
+        // field logs.
+        //
+        // Skipping the popup composite means the snapshot captures the
+        // reader page as-is. Post-boot restore paints the same pixels
+        // the user was already looking at -- no perceived flash. Only
+        // the reader's post-BT-connect refresh remains, so the whole
+        // silent-restart collapses to one visible transition.
+        {
+          RenderLock lock(*this);
+          silentRestartToReaderWithAction(ReaderPostBootAction::EnableBt);
+        }
         return;
       } else {
         LOG_INF("ERA",
                 "BT enable pre-flight: heap acceptable (free=%u maxAlloc=%u); proceeding",
                 preBtFree, preBtMaxAlloc);
+        // v18.9.9.161: SDCF failsafe pre-alloc reverted. Even at 3400 B it
+        // starved NimBLE during BT connect and triggered std::terminate
+        // (v160 log: pre-BT maxAlloc=61428 healthy -> post-connect
+        // free=136 maxAlloc=16). BT reliability wins over prewarm speed.
       }
     }
     // Persistent "Connecting Bluetooth..." popup spanning the blocking
@@ -1602,7 +2895,25 @@ void EpubReaderActivity::loop() {
     // paint the page back on top once the connect is done.
     {
       RenderLock lock(*this);
-      GUI.drawPopup(renderer, tr(STR_BT_CONNECTING));
+      // CrumBLE 4.5.7 v17: HALF_REFRESH instead of FAST_REFRESH. On
+      // freeink-sdk, FAST_REFRESH is a visible whole-panel flash (worse
+      // than open-x4-sdk's old custom-LUT path). HALF_REFRESH is subtler
+      // and completes within the ~2-3 s BT init window anyway, so the
+      // user still sees the "Connecting Bluetooth..." popup without a
+      // jarring flash on top of a page they were just reading.
+      //
+      // v18.9.9.132: skip the second HALF_REFRESH when boot-dispatch already
+      // painted the popup at line ~1958.
+      // v18.9.9.164: also skip when drawer-close painted at :4287. Prior fix
+      // only covered the boot-dispatch flag, so the drawer-tap path still
+      // double-flashed the same popup here.
+      const HalDisplay::RefreshMode refresh =
+          (pendingBleQuickConnectFromBootDispatch_ || bleConnectingPopupPainted_)
+              ? HalDisplay::NO_REFRESH
+              : HalDisplay::HALF_REFRESH;
+      GUI.drawPopup(renderer, tr(STR_BT_CONNECTING), 0, false, refresh);
+      pendingBleQuickConnectFromBootDispatch_ = false;
+      bleConnectingPopupPainted_ = false;
       // CrumBLE Phase 1 fast-open: pre-grow the glyph buffer NOW, before
       // NimBLE eats heap. Cost (~20 ms) hides inside the Connecting
       // popup window we just drew.
@@ -1621,6 +2932,18 @@ void EpubReaderActivity::loop() {
       cachedRenderSection_ = nullptr;
       cachedRenderSpine_ = -1;
       cachedRenderPageIndex_ = -1;
+      // CrumBLE 4.5.7 v18.7: drop the stored BW compressed backup. This is
+      // the drawer's onEnter snapshot (up to ~32 KB for dense pages, ~2-5
+      // KB for text). Owned by the renderer, not the drawer -- so it
+      // survives drawer close and stays pinned through BT enable if we
+      // don't explicitly discard. Field observation: user opens drawer +
+      // clicks BT Quick Connect -> ~20-30 KB of dead snapshot was
+      // competing with NimBLE's ~75 KB budget. Discarding here saves that
+      // for the reader's post-connect deserialization budget.
+      if (renderer.hasStoredBwBuffer()) {
+        LOG_INF("ERA", "BT connect: discarding stored BW buffer to free heap for NimBLE");
+        renderer.discardStoredBwBuffer();
+      }
       // Also release the reader-settings cache (~25 KB of SettingInfo
       // entries the drawer reads). It's rebuilt lazily the next time the
       // user opens the drawer; the rebuild is ~50-100 ms inline at drawer
@@ -1655,10 +2978,12 @@ void EpubReaderActivity::loop() {
       // margin; chapter transitions still require BT disconnect because
       // installing the next chapter's subset (another 5 KB) won't fit
       // under post-NimBLE MaxAlloc.
+      // v18.9.9.145: pre-BT reserve REMOVED. See boot-dispatch comment.
       if (!btMgr.isEnabled()) btMgr.enable();
       btMgr.connectToDevice(SETTINGS.bleBondedDeviceAddr);
     }
     btManifestPromptAnsweredThisSession_ = true;  // we handled the manifest decision
+    if (epub) writeBtManifestAnsweredSidecar(epub->getCachePath());  // v187: survive silent-restart
     requestUpdate();
     return;
   }
@@ -1878,9 +3203,13 @@ void EpubReaderActivity::loop() {
                              const uint32_t maxAlloc = ESP.getMaxAllocHeap();
                              if (maxAlloc < POST_MENU_MIN_MAX_ALLOC) {
                                LOG_INF("ERA",
-                                       "Post-menu heap pre-flight: maxAlloc=%u below %u; silent-restart to reader",
+                                       "Post-menu heap pre-flight: maxAlloc=%u below %u; silent-restart to reader with OpenLookup",
                                        maxAlloc, POST_MENU_MIN_MAX_ALLOC);
-                               silentRestartToReader();
+                               // v18.9.9.176: carry OpenLookup postAction so the book reopens
+                               // in Lookup mode. Without this, silent-restart drops the user
+                               // back into normal reading mode and they'd have to re-open the
+                               // menu and click Lookup again -- confusing UX.
+                               silentRestartToReaderWithAction(ReaderPostBootAction::OpenLookup);
                              }
                            });
   }
@@ -2169,10 +3498,28 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
           std::make_unique<EpubReaderChapterSelectionActivity>(renderer, mappedInput, epub, path, spineIdx),
           [this](const ActivityResult& result) {
             if (!result.isCancelled && currentSpineIndex != std::get<ChapterResult>(result.data).spineIndex) {
-              RenderLock lock(*this);
-              currentSpineIndex = std::get<ChapterResult>(result.data).spineIndex;
-              nextPageNumber = 0;
-              section.reset();
+              const int targetSpine = std::get<ChapterResult>(result.data).spineIndex;
+              // v18.9.9.397: chapter jump ALWAYS silent-restarts to the target
+              // spine. Prior heap gate (v360 / v365 at 55K/40K) tried to run
+              // inline when heap looked healthy, but field logs showed cases
+              // just above the threshold that still crashed (page deserialize
+              // + streaming atlas install + glyph queue eat 40-70 KB peak
+              // together, and a jump right after a heavy render starts from
+              // whatever the reader left behind). Simpler + always-reliable:
+              // silent-restart every time. Cost is ~2 s of boot; win is a
+              // guaranteed fresh ~85 KB heap for the target section load. Works
+              // identically with or without prebake -- the boot reopens the
+              // book, which uses the prebake if present. RTC-preserved EPUB
+              // path (v397 in main.cpp) means even a corrupt CPS post-restart
+              // still lands us back in the book at the target spine.
+              LOG_INF("ERS",
+                      "Chapter jump: silent-restart-to-reader at spine=%d for fresh-heap section load",
+                      targetSpine);
+              const bool bleUp = BluetoothHIDManager::getInstance().isEnabled();
+              silentRestartToReaderWithDefragRetryAtSpine(
+                  bleUp ? ReaderPostBootAction::EnableBt : ReaderPostBootAction::None,
+                  targetSpine);
+              // never returns
             }
           });
       break;
@@ -2228,12 +3575,18 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       // silent-restart with OpenLookup so the post-boot flow runs with a
       // cold ~115 KB heap and BT already off (so the disable inside the
       // restarted LOOKUP path is a safe no-op).
+      // v18.9.9.74 Phase 4: was v51's "widened gate" that pre-emptively
+      // silent-restarted whenever BT was on, because pre-port disable() was
+      // a no-op for heap purposes. Under BleHid, disable() truly reclaims
+      // ~50 KB, so the fall-through to btMgr.disable() below is real. Only
+      // silent-restart in the residual case: BT is OFF but the heap is
+      // already too fragmented to lookup safely. That's the actual crash
+      // guard — the BT-on case is now handled by disable + check.
       constexpr uint32_t LOOKUP_PRE_DISABLE_MIN_MAX_ALLOC = 12000;
-      if (bleWasOnForLookup && ESP.getMaxAllocHeap() < LOOKUP_PRE_DISABLE_MIN_MAX_ALLOC &&
+      if (!bleWasOnForLookup && ESP.getMaxAllocHeap() < LOOKUP_PRE_DISABLE_MIN_MAX_ALLOC &&
           !isContinuingFromSilentReboot()) {
         LOG_INF("ERS",
-                "Lookup: pre-BT-disable maxAlloc=%u below %u; silent-restart with OpenLookup "
-                "to avoid NimBLE-teardown heap corruption",
+                "Lookup: BT off + maxAlloc=%u below %u; silent-restart with OpenLookup to defrag",
                 ESP.getMaxAllocHeap(), LOOKUP_PRE_DISABLE_MIN_MAX_ALLOC);
         silentRestartToReaderWithAction(ReaderPostBootAction::OpenLookup);
         break;
@@ -2253,7 +3606,11 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       // the alert catches that second-attempt case before extractWords
       // bad_allocs. Cost: a few more "low memory" alerts in edge cases,
       // each of which is correct (better than a reboot).
-      constexpr uint32_t LOOKUP_MIN_MAX_ALLOC = 32000;
+      // CrumBLE 4.5.5: matched the highlight floor (32K -> 16K) since
+      // WordInfo::lookupText is gone and both modes now share the same
+      // ~16 KB vector footprint. See HIGHLIGHT_MIN_MAX_ALLOC comment for
+      // the breakdown.
+      constexpr uint32_t LOOKUP_MIN_MAX_ALLOC = 16000;
       if (ESP.getMaxAllocHeap() < LOOKUP_MIN_MAX_ALLOC) {
         // CrumBLE 4.4 post-bisect: silent-restart with OpenLookup queued
         // instead of the "low memory" dead-end. Post-boot dispatch
@@ -2374,8 +3731,16 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
         if (!pendingLookupDefinitionWord_.empty()) {
           activity->setPendingDefinitionWord(std::move(pendingLookupDefinitionWord_),
                                               /*openOverlay=*/!pendingLookupCursorOnly_);
+          // v18.9.9.249: forward the chunk-start offset if the post-boot
+          // dispatch queued one. Word-select uses it as the initial
+          // chunkStart in performDefinitionLookup so the definition
+          // opens on the chunk the user was trying to page into.
+          if (pendingLookupDefinitionChunkStart_ != 0) {
+            activity->setPendingDefinitionChunkStart(pendingLookupDefinitionChunkStart_);
+          }
           pendingLookupDefinitionWord_.clear();
           pendingLookupCursorOnly_ = false;
+          pendingLookupDefinitionChunkStart_ = 0;
         }
         startActivityForResult(
             std::move(activity),
@@ -2385,42 +3750,114 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
             });
       };
 
-      if (Dictionary::isIndexReady()) {
-        launchWordSelect();
-      } else if (Dictionary::loadCachedIndex()) {
-        // Cache present AND loaded cleanly (~50ms). If the file existed
-        // but was truncated/corrupt, loadCachedIndex returns false here
-        // and we fall through to the prompt -- we'd rather ask the user
-        // to consent to a rebuild than silently freeze inside the first
-        // lookup() call (which is what happens if we proceed assuming
-        // the cache loaded when it didn't).
-        launchWordSelect();
+      // v18.9.9.259: multi-dict entry. Discover all available dicts
+      // (walks /, /dict/, /dictionary/). Path:
+      //   0 dicts  -> Dictionary::exists() falls through, word-select
+      //                shows "no dictionary found" as before.
+      //   1 dict   -> auto-select it. Same UX as pre-v259 single-dict.
+      //   2+ dicts -> if last-picked matches one, use it silently. Else
+      //                push ChoicePromptActivity with dict display
+      //                names. On pick: setActive + continue. On cancel:
+      //                cleanup + return without word-select.
+      // After the dict is chosen, the existing three-path index gate
+      // (in-RAM / cached / build-needed) runs against THAT dict's
+      // per-dict .qidx cache.
+      auto proceedAfterDictChosen = [this, launchWordSelect, reEnableBleIfNeeded]() {
+        if (Dictionary::isIndexReady()) {
+          launchWordSelect();
+        } else if (Dictionary::loadCachedIndex()) {
+          launchWordSelect();
+        } else {
+          startActivityForResult(
+              std::make_unique<ChoicePromptActivity>(
+                  renderer, mappedInput, tr(STR_DICT_INDEX_PROMPT_TITLE), tr(STR_DICT_INDEX_PROMPT_BODY),
+                  std::vector<std::string>{tr(STR_DICT_INDEX_PROMPT_BUILD), tr(STR_DICT_INDEX_PROMPT_CANCEL)},
+                  /*ignoreInitialConfirmRelease=*/true),
+              [this, launchWordSelect, reEnableBleIfNeeded](const ActivityResult& promptResult) {
+                int chosen = -1;
+                if (const auto* cp = std::get_if<ChoicePromptResult>(&promptResult.data)) {
+                  chosen = cp->choice;
+                }
+                if (promptResult.isCancelled || chosen != 0) {
+                  reEnableBleIfNeeded();
+                  requestUpdate();
+                  return;
+                }
+                startActivityForResult(std::make_unique<DictionaryIndexBuildActivity>(renderer, mappedInput),
+                                        [this, launchWordSelect, reEnableBleIfNeeded](const ActivityResult& buildResult) {
+                                          if (buildResult.isCancelled) {
+                                            reEnableBleIfNeeded();
+                                            requestUpdate();
+                                            return;
+                                          }
+                                          launchWordSelect();
+                                        });
+              });
+        }
+      };
+
+      const auto dicts = Dictionary::discoverAll();
+      // v18.9.9.295: post-silent-restart continuation path -- if the
+      // user already picked a dict before the restart (Dictionary::getActive
+      // returns something in the discovered set), skip the picker entirely
+      // and reuse that choice. The silent-restart is a heap-recovery
+      // hop the user didn't ask for, so re-prompting them for the same
+      // dict they were literally just using is bad UX. Only applies to
+      // the OpenLookupAtWord continuation (pendingLookupCursorOnly_ is
+      // the reliable signal for "we came from silent-restart"); the
+      // normal fresh-lookup path still shows the picker for multi-dict
+      // users to switch between dicts.
+      bool skipPickerReusingActive = false;
+      if (pendingLookupCursorOnly_ && dicts.size() >= 2) {
+        const auto active = Dictionary::getActive();
+        for (const auto& d : dicts) {
+          if (d.dictPath == active.dictPath) { skipPickerReusingActive = true; break; }
+        }
+      }
+      if (dicts.size() <= 1 || skipPickerReusingActive) {
+        // Zero or one dict: no picker needed. If one, setActive it so
+        // the per-dict cache path is derived correctly. If skipping
+        // via reuse-active, Dictionary::getActive is already valid so
+        // no setActive call needed.
+        if (dicts.size() == 1) Dictionary::setActive(dicts[0]);
+        proceedAfterDictChosen();
       } else {
-        startActivityForResult(
-            std::make_unique<ChoicePromptActivity>(
-                renderer, mappedInput, tr(STR_DICT_INDEX_PROMPT_TITLE), tr(STR_DICT_INDEX_PROMPT_BODY),
-                std::vector<std::string>{tr(STR_DICT_INDEX_PROMPT_BUILD), tr(STR_DICT_INDEX_PROMPT_CANCEL)},
-                /*ignoreInitialConfirmRelease=*/true),
-            [this, launchWordSelect, reEnableBleIfNeeded](const ActivityResult& promptResult) {
-              int chosen = -1;
-              if (const auto* cp = std::get_if<ChoicePromptResult>(&promptResult.data)) {
-                chosen = cp->choice;
-              }
-              if (promptResult.isCancelled || chosen != 0) {
-                reEnableBleIfNeeded();
-                requestUpdate();
-                return;
-              }
-              startActivityForResult(std::make_unique<DictionaryIndexBuildActivity>(renderer, mappedInput),
-                                     [this, launchWordSelect, reEnableBleIfNeeded](const ActivityResult& buildResult) {
-                                       if (buildResult.isCancelled) {
-                                         reEnableBleIfNeeded();
-                                         requestUpdate();
-                                         return;
-                                       }
-                                       launchWordSelect();
-                                     });
-            });
+        // v18.9.9.268: ALWAYS show picker when 2+ dicts (previously we
+        // silently reused the last-picked). User feedback: "how do I
+        // switch dicts?" -- this is the answer.
+        // v18.9.9.270: cursor defaults to the last-picked dict when
+        // it still exists in the discovered set, so the "keep using
+        // same dict" flow is one tap (Confirm on the pre-selected
+        // row). Only ~1-3 rows so arrow-nav is minor when switching.
+        {
+          std::vector<std::string> choices;
+          choices.reserve(dicts.size());
+          for (const auto& d : dicts) choices.push_back(d.displayName);
+          const auto active = Dictionary::getActive();
+          int defaultIdx = 0;
+          for (size_t i = 0; i < dicts.size(); ++i) {
+            if (dicts[i].dictPath == active.dictPath) { defaultIdx = static_cast<int>(i); break; }
+          }
+          startActivityForResult(
+              std::make_unique<ChoicePromptActivity>(
+                  renderer, mappedInput, tr(STR_DICT_PICKER_TITLE), tr(STR_DICT_PICKER_BODY),
+                  std::move(choices),
+                  /*ignoreInitialConfirmRelease=*/true,
+                  /*defaultSelectedIndex=*/defaultIdx),
+              [this, dicts, proceedAfterDictChosen, reEnableBleIfNeeded](const ActivityResult& r) {
+                int chosen = -1;
+                if (const auto* cp = std::get_if<ChoicePromptResult>(&r.data)) {
+                  chosen = cp->choice;
+                }
+                if (r.isCancelled || chosen < 0 || chosen >= static_cast<int>(dicts.size())) {
+                  reEnableBleIfNeeded();
+                  requestUpdate();
+                  return;
+                }
+                Dictionary::setActive(dicts[chosen]);
+                proceedAfterDictChosen();
+              });
+        }
       }
       break;
     }
@@ -2443,11 +3880,27 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       // Pre-flight heap check: tapping an entry will eventually call
       // Dictionary::lookup and (if the user opens word select later from
       // there) hit the same WordInfo allocation pressure as LOOKUP. Same
-      // 32 KB threshold + same alert path.
+      // 32 KB threshold.
+      //
+      // v18.9.9.268: on low heap, silent-restart-to-reader instead of
+      // showing a dead-end "low memory" alert. Post-boot dispatch
+      // re-fires the LOOKED_UP_WORDS menu action on a fresh ~90 KB heap
+      // so the user lands exactly where they were trying to go.
+      // v18.9.9.270: uses OpenLookedUpWords (new enum) instead of
+      // OpenLookup so post-boot lands on the History screen directly,
+      // not on Word Select. Loop-safety: isContinuingFromSilentReboot
+      // check mirrors the LOOKUP pre-flight pattern.
       constexpr uint32_t LOOKED_UP_MIN_MAX_ALLOC = 32000;
       if (ESP.getMaxAllocHeap() < LOOKED_UP_MIN_MAX_ALLOC) {
-        LOG_INF("ERS", "LookedUpWords pre-flight: maxAlloc=%u below %u, raising alert",
-                ESP.getMaxAllocHeap(), LOOKED_UP_MIN_MAX_ALLOC);
+        if (!isContinuingFromSilentReboot()) {
+          LOG_INF("ERS",
+                  "LookedUpWords pre-flight: maxAlloc=%u < %u -- silent-restart-to-reader-with-OpenLookedUpWords",
+                  ESP.getMaxAllocHeap(), LOOKED_UP_MIN_MAX_ALLOC);
+          silentRestartToReaderWithAction(ReaderPostBootAction::OpenLookedUpWords);
+          // never returns
+        }
+        LOG_INF("ERS", "LookedUpWords pre-flight: post-restart maxAlloc=%u still below floor -- alert",
+                ESP.getMaxAllocHeap());
         if (bleWasOnForHistory) btMgr.requestEnableLater();
         strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_LOOKUP_TITLE),
                 sizeof(APP_STATE.pendingAlertTitle) - 1);
@@ -2472,21 +3925,31 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       // is the same; bad_alloc here would still reboot the device.
       auto& btMgrH = BluetoothHIDManager::getInstance();
       const bool bleWasOnForHighlight = btMgrH.isEnabled();
+      // v18.9.9.74 Phase 4: mirrors the LOOKUP simplification. Under BleHid
+      // disable() truly frees, so we don't need to pre-empt when BT is on —
+      // the disable below actually gets us the heap back. Only silent-restart
+      // when BT is already off and heap is still too fragmented for the
+      // WordInfo vector build.
+      constexpr uint32_t HIGHLIGHT_MIN_MAX_ALLOC = 16000;
+      if (!bleWasOnForHighlight && ESP.getMaxAllocHeap() < HIGHLIGHT_MIN_MAX_ALLOC &&
+          !isContinuingFromSilentReboot()) {
+        LOG_INF("ERS",
+                "AddHighlight pre-flight: BT off + maxAlloc=%u below %u; silent-restart with OpenHighlight",
+                ESP.getMaxAllocHeap(), HIGHLIGHT_MIN_MAX_ALLOC);
+        silentRestartToReaderWithAction(ReaderPostBootAction::OpenHighlight);
+        break;
+      }
       if (bleWasOnForHighlight) {
         LOG_INF("ERS", "AddHighlight: disabling BT (re-enabling on exit)");
         btMgrH.disable();
         LOG_INF("ERS", "AddHighlight: heap after BT disable: free=%u maxAlloc=%u",
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap());
       }
-      constexpr uint32_t HIGHLIGHT_MIN_MAX_ALLOC = 32000;
+      // Post-silent-restart safety net: if we DID restart and heap is
+      // still critically fragmented (rare -- means the boot itself is
+      // struggling), show the alert path instead of pushing WordSelect
+      // and blowing up mid-alloc.
       if (ESP.getMaxAllocHeap() < HIGHLIGHT_MIN_MAX_ALLOC) {
-        if (!isContinuingFromSilentReboot()) {
-          LOG_INF("ERS",
-                  "AddHighlight pre-flight: maxAlloc=%u below %u; triggering silent restart with OpenHighlight",
-                  ESP.getMaxAllocHeap(), HIGHLIGHT_MIN_MAX_ALLOC);
-          silentRestartToReaderWithAction(ReaderPostBootAction::OpenHighlight);
-          break;
-        }
         LOG_INF("ERS", "AddHighlight pre-flight: maxAlloc=%u below %u even after silent restart, showing alert",
                 ESP.getMaxAllocHeap(), HIGHLIGHT_MIN_MAX_ALLOC);
         clearSilentRebootContinuationFlag();
@@ -3045,7 +4508,15 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
         // if free heap is below the TLS floor AND we're not already in
         // a post-restart attempt, silent-restart with OpenKoSync so the
         // sync runs against the fresh ~115 KB post-boot heap (BT cold).
-        constexpr uint32_t KOSYNC_TLS_HEAP_FLOOR = 60u * 1024u;
+        //
+        // CrumBLE 4.5.4: raised 60 KB -> 95 KB. Field report showed TLS
+        // failing at 18 KB free even though the pre-flight had passed --
+        // wifi.connect + mbedtls cert-chain load + initial scratch
+        // allocations consume ~40 KB BETWEEN the pre-flight click and
+        // the actual TLS handshake. 95 KB at pre-flight leaves ~55 KB
+        // for TLS after that intermediate consumption, matching
+        // MIN_HEAP_FOR_TLS in KOReaderSyncClient.cpp.
+        constexpr uint32_t KOSYNC_TLS_HEAP_FLOOR = 95u * 1024u;
         if (ESP.getFreeHeap() < KOSYNC_TLS_HEAP_FLOOR && !isContinuingFromSilentReboot()) {
           LOG_INF("KOSync",
                   "SYNC pre-flight: free=%u below %u; silent-restart with OpenKoSync",
@@ -3155,9 +4626,28 @@ void EpubReaderActivity::onReaderMenuConfirm(EpubReaderMenuActivity::MenuAction 
       openAutoPageTurnIntervalPicker();
       break;
     case EpubReaderMenuActivity::MenuAction::ROTATE_SCREEN:
-    case EpubReaderMenuActivity::MenuAction::READER_OPTIONS:
     case EpubReaderMenuActivity::MenuAction::CONTROLS_OPTIONS:
       break;
+    case EpubReaderMenuActivity::MenuAction::READER_OPTIONS: {
+      // v18.9.9.49 + v18.9.9.50: post-boot dispatch after
+      // silent-restart-with-OpenReaderOptions lands here. The menu-side
+      // handler is bypassed on the post-boot path so we open the ROA
+      // directly. Fresh boot heap; no BT to consider. Minimal callback:
+      // on close, mark settings dirty so the section rebuilds if any
+      // layout-affecting toggle changed, and requestUpdate for the next
+      // paint. If a user came to Reader Options intending to just view,
+      // they hit Back with no settings edits -- rebuild is a cheap no-op
+      // in that case because the section-fingerprint check will find
+      // everything matches.
+      startActivityForResult(std::make_unique<ReaderOptionsActivity>(renderer, mappedInput),
+                             [this](const ActivityResult&) {
+                               if (APP_STATE.compatModeChanged) {
+                                 APP_STATE.compatModeChanged = false;
+                               }
+                               requestUpdate();
+                             });
+      break;
+    }
   }
 }
 
@@ -3303,6 +4793,35 @@ void EpubReaderActivity::executeReaderQuickAction(CrossPointSettings::LONG_PRESS
                                  pendingBleQuickConnectNoImages_ = menu->bleConnectNoImages;
                                  pendingBleQuickConnectSettingsChanged_ = menu->settingsChanged;
                                  pendingBleQuickConnectPromptStage_ = -1;  // not yet shown
+                                 // CrumBLE 4.5.5: draw "Connecting Bluetooth..." here, the moment
+                                 // QC is dispatched, instead of waiting until Step 3 (the existing
+                                 // popup at ~line 1605 only renders AFTER section-reset settles and
+                                 // AFTER any heap-recovery silent-restart cycle). Without this early
+                                 // draw the user sees 3-10 s of normal page refreshes between the
+                                 // drawer-close and the first popup, and the QC tap reads as "did
+                                 // anything happen?" The popup will get clobbered by the next render
+                                 // pass (drawer pop animation, section transition, etc.) -- the
+                                 // existing late popup re-asserts it once we reach Step 3 -- but
+                                 // even the brief flash on close gives the click immediate feedback.
+                                 //
+                                 // v18.9.5.1: skip this popup when the imminent BT enable pre-flight
+                                 // will trip the silent-restart defrag path -- the pre-flight's own
+                                 // popup (NO_REFRESH) + sleep-frame restore already gives the user
+                                 // continuous feedback across the reboot. Flashing HERE would add a
+                                 // wasted HALF_REFRESH (~1.7 s) right before we blank the panel for
+                                 // the reboot. Match the pre-flight's 55 KB maxAlloc floor so we
+                                 // only skip when a restart is genuinely coming.
+                                 constexpr uint32_t kSkipDrawerPopupMaxAllocFloor = 55u * 1024u;
+                                 if (ESP.getMaxAllocHeap() >= kSkipDrawerPopupMaxAllocFloor) {
+                                   RenderLock lock(*this);
+                                   GUI.drawPopup(renderer, tr(STR_BT_CONNECTING), 0, false, HalDisplay::HALF_REFRESH);
+                                   bleConnectingPopupPainted_ = true;
+                                 } else {
+                                   LOG_INF("ERA",
+                                           "Skipping drawer-close QC popup: maxAlloc=%u below pre-flight "
+                                           "floor -- silent-restart will carry the popup across reboot",
+                                           ESP.getMaxAllocHeap());
+                                 }
                                }
 
                                // If the drawer's Bluetooth entry asked us to launch BT settings
@@ -3314,7 +4833,8 @@ void EpubReaderActivity::executeReaderQuickAction(CrossPointSettings::LONG_PRESS
                                  startActivityForResult(
                                      std::make_unique<BluetoothSettingsActivity>(
                                          renderer, mappedInput, [] { activityManager.popActivity(); },
-                                         /*exitOnSuccessfulConnect=*/true),
+                                         /*exitOnSuccessfulConnect=*/true,
+                                         /*disableOnExit=*/false),
                                      [this](const ActivityResult&) { requestUpdate(); });
                                  return;
                                }
@@ -3469,6 +4989,14 @@ void EpubReaderActivity::setBookCompleted(bool isCompleted) {
     if (SETTINGS.moveFinishedToReadFolder && !isInReadFolder(epub->getPath())) {
       pendingReadFolderMove = true;
     }
+    // v18.9.9.443 (CrossInk parity): auto-populate finishDate on
+    // completion unless user has manually set it. Only when clock valid.
+    if (!(stats.flags & BookReadingStats::FLAG_FINISH_DATE_MANUAL)) {
+      ReadingStatsDateTime nowLocal;
+      if (getCurrentLocalReadingStatsDateTime(nowLocal)) {
+        stats.finishDate = nowLocal.date;
+      }
+    }
   } else {
     pendingReadFolderMove = false;
   }
@@ -3565,6 +5093,10 @@ void EpubReaderActivity::setAutoPageTurnIntervalSeconds(uint16_t seconds) {
 
 void EpubReaderActivity::pageTurn(bool isForwardTurn) {
   pageLoadRetryCount = 0;
+  // v18.9.9.290: count every forward AND backward turn towards the day's
+  // page total. Overcounts a bit for user backtracks but stays intuitive
+  // ("total pages read today" includes re-reads).
+  ReadingStats::notePageTurn();
   if (isForwardTurn) {
     if (section->currentPage < section->pageCount - 1) {
       section->currentPage++;
@@ -3608,9 +5140,23 @@ void EpubReaderActivity::pageTurn(bool isForwardTurn) {
 
 // TODO: Failure handling
 void EpubReaderActivity::render(RenderLock&& lock) {
+  POST_BT_STEP("render enter");
   if (!epub) {
     return;
   }
+
+  // v18.9.9.266 emergency BLE shed REVERTED in v18.9.9.269. Upstream's
+  // 613371b7 shed calls bleinput::stop() which fully tears down NimBLE
+  // and reclaims ~50 KB. CrumBLE's BluetoothHIDManager::disable() is
+  // deliberately skip-deinit (v18.9.9.48 crash mitigation) -- it drops
+  // the BT link but leaves NimBLE state in memory until the next
+  // silent-restart. The shed therefore FAILED to recover heap in field
+  // testing: BT link dropped 2 ms after connect, heap stayed stuck at
+  // ~7 KB for 40 s, subsequent alloc failed -> terminate/crash. Without
+  // a clean NimBLE deinit path the shed is counterproductive here.
+  // Revisit if CrumBLE ever ports a safe deinit sequence.
+  // v18.9.9.145: reserve release removed -- the reserve was starving
+  // NimBLE. See boot-dispatch comment for full explanation.
 
   // CrumBLE: settings-drift check at the START of render -- before any
   // section.load / chapter parse runs. Tick()'s call to the same helper
@@ -3623,10 +5169,45 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     return;
   }
 
+  // v18.9.9.36 Phase C2 + v18.9.9.39 Phase C3: if loop() is driving an
+  // incremental Section build, the section pointer is non-null but
+  // holds a mid-build state. C3 lets render() proceed AS SOON AS the
+  // target page (nextPageNumber) has been laid out -- Section's
+  // loadPageFromSectionFile detects build_ and reads the page from the
+  // tmp file via the in-memory LUT. Only paint the indexing popup when
+  // the target page hasn't landed yet, or when we're briefly between
+  // ticks (section null). Skipping the loadSectionFile / build-init
+  // block below still applies (section is non-null so `if (!section)`
+  // is false).
+  if (sectionBuildInProgress_) {
+    const int c3Target = nextPageNumber >= 0 ? nextPageNumber : 0;
+    if (!section || c3Target >= section->pageCount) {
+      static constexpr const char* kDots[4] = {"", ".", "..", "..."};
+      char buf[64];
+      // v18.9.9.76: same page-of-estimate treatment as the loop() animation path.
+      const uint16_t pc = section ? section->pageCount : 0;
+      const uint16_t est = section ? section->estimatedTotalPages() : 0;
+      if (SETTINGS.showIndexingPageCount && pc > 0 && est > pc) {
+        snprintf(buf, sizeof(buf), "%s page %u of ~%u", tr(STR_INDEXING), pc, est);
+      } else {
+        snprintf(buf, sizeof(buf), "%s%s", tr(STR_INDEXING), kDots[sectionBuildPopupDotPhase_ % 4]);
+      }
+      GUI.drawPopup(renderer, buf, sectionBuildPopupMinWidth_, /*leftAlignText=*/true);
+      return;
+    }
+    // else: fall through -- read the just-laid-out page from the tmp file.
+  }
+
   const auto showPendingSyncSaveError = [this]() {
+    // v18.9.9.471: popup suppressed. Transient FAT-write hiccups happened
+    // every page turn on affected users and drowned out the actual reading
+    // experience with an unactionable toast. onExit and onBeforeDeepSleep
+    // save unconditionally so at most 2 pages of drift can be lost even
+    // on hard power-off — persistent SD failures still get diagnosed via
+    // serial LOG_ERR from EpubReaderUtils::saveProgress. Kept the flag
+    // reset so retry loops upstream still terminate.
     if (!pendingSyncSaveError) return;
     pendingSyncSaveError = false;
-    GUI.drawPopup(renderer, tr(STR_SAVE_PROGRESS_FAILED));
   };
 
   const auto showLowMemoryLayoutError = [this]() {
@@ -3685,18 +5266,78 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   const uint16_t viewportWidth = renderer.getScreenWidth() - orientedMarginLeft - orientedMarginRight;
   const uint16_t viewportHeight = renderer.getScreenHeight() - orientedMarginTop - orientedMarginBottom;
 
+  // v18.9.9.439: X3-vs-X4 layout-overflow diagnostic. User reported same
+  // book/prebake renders clean on X4 but shows overlapping Chinese text on
+  // X3, with thousands of "[GFX] !! Outside range (528+, ...)" errors on
+  // X3 (x=528 == X3's rotated logical panel width). This log dumps the
+  // per-render geometry once per section load so X3 vs X4 numbers can be
+  // compared side by side to nail whether the delta is in screenWidth,
+  // margin-computation, or the SETTINGS.screenMargin add-on. One-shot per
+  // section (guarded by !section below) so we don't flood the log.
+  if (!section) {
+    LOG_INF("ERS",
+            "GEOM-DIAG device=%s panel=%ux%u screen=%ux%u marginLTRB=%d,%d,%d,%d "
+            "screenMargin=%u viewport=%ux%u",
+            gpio.deviceIsX3() ? "X3" : "X4",
+            static_cast<unsigned>(renderer.getDisplayWidth()),
+            static_cast<unsigned>(renderer.getDisplayHeight()),
+            static_cast<unsigned>(renderer.getScreenWidth()),
+            static_cast<unsigned>(renderer.getScreenHeight()),
+            orientedMarginLeft, orientedMarginTop, orientedMarginRight, orientedMarginBottom,
+            static_cast<unsigned>(SETTINGS.screenMargin),
+            static_cast<unsigned>(viewportWidth),
+            static_cast<unsigned>(viewportHeight));
+  }
+
   if (!section) {
     const auto filepath = epub->getSpineItem(currentSpineIndex).href;
     LOG_DBG("ERS", "Loading file: %s, index: %d (free=%u, maxAlloc=%u)", filepath.c_str(), currentSpineIndex,
             ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     section = std::unique_ptr<Section>(new Section(epub, currentSpineIndex, renderer));
 
+    // v18.9.9.27: resync simpleRenderingActive_ from the sidecar so a mid-
+    // session toggle in ReaderOptionsActivity takes effect on the next load.
+    // v18.9.9.28: dropped the BT-on gate that was here originally. Auto-
+    // escalation still works (Layer 2 OOM writes the sidecar, next rebuild
+    // sees it), and the user-facing toggle now means "compat: on/off" the
+    // way the user expects, not "compat when BT is on." Sidecar is the sole
+    // source of truth for user intent.
+    const bool sidecarNow = simpleRenderingSidecarSet(epub->getCachePath(), readerActivePath_);
+    simpleRenderingActive_ = sidecarNow;
+    APP_STATE.readerCompatModeActive = simpleRenderingActive_;
+
+    // v18.9.9.18: reverted v18.9.9.17's "compat mode serves from prebake"
+    // change. The runtime table/image skip on the streamed render path only
+    // skips *drawing* -- the PageTableFragment still fully deserializes,
+    // which allocates every cell TextBlock in one peak. Prebake bytes have
+    // full-fat fragments (unlike a compat-mode cold rebuild which collapses
+    // tables to paragraphs) so the deserialize peak blows the post-BT
+    // maxAlloc ceiling on the first page turn under BT. Back to the safe
+    // cold-rebuild path -- the v18.9.9.16 rename retry catches transient
+    // SD glitches during that rebuild.
+    //
+    // Original v18.9.6a rationale for the gate: prebake artifact was built
+    // with the user's real settings (tables + images + style) and re-loading
+    // it would crash us again at PageTableFragment::deserialize -- still
+    // true today because runtime-skip doesn't unwind the deserialize peak.
+    // v18.9.9.455 REVERTED in v18.9.9.457: keeping the decline flag around
+    // as a signal but NOT using it to force useprebakeFallback=false. Field
+    // regression: books with prebake ONLY (no ever-built sections/) went
+    // straight to live build after decline, which tries to write
+    // sections/N.bin.tmp and fails with "book file couldn't be read". The
+    // prebake fallback loading the mismatched file (then rejecting on
+    // fingerprint) is wasteful but keeps sections/ dir seed logic alive
+    // via a code path that IS correctly wired. Accept ~30-60 ms/section
+    // of wasted SD I/O in exchange for books actually opening.
+    const bool useprebakeFallback = SETTINGS.optimizeChapterIndexing != 0 && !simpleRenderingActive_;
+    (void)prebakeDeclinedForThisBook_;  // flag intentionally unused post-revert
     if (!section->loadSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
                                   SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
                                   SETTINGS.paragraphAlignment, viewportWidth, viewportHeight,
                                   SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle, SETTINGS.imageRendering,
                                   SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled,
-                                  SETTINGS.optimizeChapterIndexing != 0)) {
+                                  SETTINGS.tableRendering, useprebakeFallback,
+                                  /*forceSimpleRendering=*/simpleRenderingActive_)) {
       // Cache miss with BLE up: NimBLE's ~58 KB share has historically
       // made the parser either return layoutAbortedForLowMemory (good —
       // the reactive retry path below handles it) or simply hang
@@ -3728,7 +5369,46 @@ void EpubReaderActivity::render(RenderLock&& lock) {
         // net, just reached on demand instead of pre-emptively.
         const bool chapterStored = epub->isItemStored(epub->getSpineItem(currentSpineIndex).href);
         if (!chapterStored) {
-          LOG_INF("ERS", "Cache miss with BLE up (DEFLATE chapter); dropping BLE and deferring build to next render");
+          // v18.9.9.64: v48's skip-deinit means bt.disable() doesn't actually
+          // free the ~58 KB NimBLE holds. requestDisableLater()'s deferred
+          // build then runs at ~6-8 KB maxAlloc and fails; Layer 2 also
+          // fails (same heap state) and the user dead-ends at "not enough
+          // memory". Silent-restart-to-defrag with EnableBt is the only way
+          // to actually reclaim that ~58 KB. Post-boot: clean ~90 KB heap
+          // -> section build succeeds -> boot dispatch re-enables BT.
+          //
+          // Gated on layoutDefragRetryAttempted_ (isDefragRetryContinuation()
+          // seeds it true on the boot after this restart), so if the fresh-
+          // heap build ALSO fails we fall through to the pre-v64 defer-and-
+          // retry path + Layer 2 escalation. Prevents boot-loops on genuinely
+          // too-heavy chapters that even a clean boot can't parse.
+          //
+          // v18.9.9.69: this whole hack should go away once the crosspoint
+          // NimBLE shrink (custom_sdkconfig in platformio.ini) can be
+          // enabled -- it drops NimBLE from ~68 KB to ~52 KB, at which point
+          // the pre-v64 requestDisableLater path just works. See the
+          // platformio.ini comment for the path-move requirement.
+          // v18.9.9.168: allow one defrag-restart per unique spine. A
+          // session-wide one-shot was too aggressive under v48 skip-deinit --
+          // requestDisableLater alone can't free NimBLE's ~58 KB, so the
+          // fallback path crashed at framebuffer realloc on the second
+          // boundary. Per-spine tracking gives us N defrags per session
+          // while still bounding loops (the same spine failing twice
+          // escalates as before).
+          if (layoutDefragRetryChapterSpine_ != currentSpineIndex) {
+            LOG_INF("ERS",
+                    "Cache miss with BLE up (DEFLATE chapter); silent-restart-to-defrag with EnableBt "
+                    "for spine %d (v48 skip-deinit means requestDisableLater alone can't free NimBLE's ~58 KB)",
+                    currentSpineIndex);
+            layoutDefragRetryAttempted_ = true;
+            layoutDefragRetryChapterSpine_ = currentSpineIndex;
+            silentRestartToReaderWithDefragRetryAtSpine(ReaderPostBootAction::EnableBt, currentSpineIndex);
+            // never returns
+          }
+          LOG_INF("ERS",
+                  "Cache miss with BLE up (DEFLATE chapter); already defragged for spine %d, "
+                  "falling back to requestDisableLater + deferred build",
+                  currentSpineIndex);
           btMgr.requestDisableLater();
           bleAutoReEnableAfterReindex = true;
           // Reset section back to null. We constructed it above (line ~1495)
@@ -3747,44 +5427,90 @@ void EpubReaderActivity::render(RenderLock&& lock) {
 
       LOG_DBG("ERS", "Cache not found, building... (free=%u, maxAlloc=%u)", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
-      // Animated indexing popup. The parser ticks the callback every
-      // ~250 ms; we cycle the trailing dots so the user sees the system
-      // is alive during the multi-second chapter build instead of
-      // staring at a frozen popup.
-      //
-      // Pre-measure the widest frame ("Indexing...") and pass that as
-      // minTextWidth to every drawPopup call. The box sizes itself once
-      // off the widest frame and stays anchored on the same pixels for
-      // every subsequent tick — without this floor, period vs space
-      // glyph widths differ enough in Inter that the box visibly pulses
-      // wider on the 3-dot frame.
+      // v18.9.9.36 Phase C2: pre-measure the widest popup frame
+      // ("Indexing...") so the box stays anchored to the same pixels
+      // when loop() animates the trailing dots.
       char widestBuf[40];
       snprintf(widestBuf, sizeof(widestBuf), "%s...", tr(STR_INDEXING));
       const int popupMinTextWidth =
           renderer.getTextWidth(UI_12_FONT_ID, widestBuf, EpdFontFamily::BOLD);
 
-      // Left-anchor the text so "Indexing" stays pinned at a fixed
-      // position and the trailing dots cycle to its right without
-      // visibly shifting the word.
-      GUI.drawPopup(renderer, tr(STR_INDEXING), popupMinTextWidth, /*leftAlignText=*/true);
-
-      const auto popupFn = [this, popupMinTextWidth]() {
-        static uint8_t dotPhase = 0;
-        static constexpr const char* kDots[4] = {"", ".", "..", "..."};
-        dotPhase = (dotPhase + 1) % 4;
-        char buf[40];
-        snprintf(buf, sizeof(buf), "%s%s", tr(STR_INDEXING), kDots[dotPhase]);
-        GUI.drawPopup(renderer, buf, popupMinTextWidth, /*leftAlignText=*/true);
-      };
-
       bool imagesWereSuppressed = false;
       bool layoutAbortedForLowMemory = false;
-      if (!section->createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
-                                      SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
-                                      SETTINGS.paragraphAlignment, viewportWidth, viewportHeight,
-                                      SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle, SETTINGS.imageRendering,
-                                      SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled, popupFn,
-                                      &imagesWereSuppressed, &layoutAbortedForLowMemory)) {
+      // v18.9.9.36 Phase C2: the section build is now driven from loop()
+      // one buildSomeMore chunk at a time so render() doesn't hold the
+      // RenderLock for the full multi-second parse. Two entry paths land
+      // in this block:
+      //   1. Kickoff -- loadSectionFile just missed, and sectionBuildJustFailed_
+      //      is false. Call startBuild, seed the C2 state, draw the initial
+      //      popup, return. loop() takes over next tick.
+      //   2. Failure resume -- loop()'s buildSomeMore returned false last
+      //      tick and set sectionBuildJustFailed_. Snapshot the outcome
+      //      flags back into locals and fall through to the failure
+      //      block below. Section was already reset by loop() before
+      //      requesting this render; the branch below is safe with a
+      //      null section (each branch either returns or resets again).
+      if (sectionBuildJustFailed_) {
+        sectionBuildJustFailed_ = false;
+        imagesWereSuppressed = sectionBuildImagesWereSuppressed_;
+        layoutAbortedForLowMemory = sectionBuildLayoutAbortedForLowMemory_;
+        bleAutoReEnableAfterReindex = sectionBuildBleWasDroppedForFail_;
+        // Fall through to the failure block below.
+      } else {
+        // Left-anchor so "Indexing" stays pinned at a fixed position
+        // and the trailing dots cycle to its right without shifting.
+        GUI.drawPopup(renderer, tr(STR_INDEXING), popupMinTextWidth, /*leftAlignText=*/true);
+        // v18.9.9.70: lend the framebuffer's ~40 KB for the initial startBuild
+        // (parser construction + first-page allocations). Restored before
+        // return -- subsequent buildSomeMore ticks in loop() will lend/restore.
+        FrameBufferBuildLoan startBuildLoan(renderer);
+        startBuildLoan.release();
+        const bool startedOk = section->startBuild(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
+                                  SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
+                                  SETTINGS.paragraphAlignment, viewportWidth, viewportHeight,
+                                  SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle, SETTINGS.imageRendering,
+                                  SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled,
+                                  SETTINGS.tableRendering, /*popupFn=*/nullptr,
+                                  /*imagesWereSuppressed=*/nullptr,
+                                  /*layoutAbortedForLowMemory=*/nullptr,
+                                  /*forceSimpleRendering=*/simpleRenderingActive_,
+                                  /*suppressTablesOnly=*/false);
+        if (!startBuildLoan.restore()) { ESP.restart(); }
+        if (!startedOk) {
+          // v18.9.9.318: was `showPendingSyncSaveError()` no-op that left the
+          // screen frozen. v18.9.9.322: replaced the "low memory" popup with
+          // "book file couldn't be read" -- startBuild failing at initialise
+          // (before any layout work) is essentially always a ZIP-side
+          // problem, not memory: EOCD not found (truncated / Zip64 /
+          // unsupported), inflate init failure (compressed stream broken),
+          // or the section stream returned empty (missing spine file).
+          // v320's streaming EOCD scan removed the fragmented-heap class of
+          // failure so the message is now accurate. Genuine low-memory hits
+          // the async cascade below, which shows the real low-memory error.
+          LOG_ERR("ERS", "Section startBuild failed to initialise; showing book-file-unreadable error");
+          section.reset();
+          snprintf(APP_STATE.pendingAlertTitle, sizeof(APP_STATE.pendingAlertTitle), "%s",
+                   tr(STR_EPUB_BOOK_FILE_UNREADABLE_TITLE));
+          snprintf(APP_STATE.pendingAlertBody, sizeof(APP_STATE.pendingAlertBody), "%s",
+                   tr(STR_EPUB_BOOK_FILE_UNREADABLE_BODY));
+          APP_STATE.pendingAlertGoHomeOnBack.store(true, std::memory_order_relaxed);
+          APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
+          GUI.drawPopup(renderer, tr(STR_EPUB_BOOK_FILE_UNREADABLE_TITLE));
+          return;
+        }
+        sectionBuildInProgress_ = true;
+        sectionBuildSpine_ = currentSpineIndex;
+        sectionBuildPopupMinWidth_ = popupMinTextWidth;
+        sectionBuildPopupLastMs_ = millis();
+        sectionBuildPopupDotPhase_ = 0;
+        // v18.9.9.454: reset the "title-shown" flag so the first render
+        // after this build completes leaves title empty (avoids blocking
+        // first-page paint on title-glyph SD reads).
+        postBuildFirstRenderShown_ = false;
+        return;  // loop() drives buildSomeMore from here.
+      }
+      // Failure branch reachable only from the resume path above.
+      {
         if (layoutAbortedForLowMemory) {
           LOG_ERR("ERS", "EPUB section layout aborted for low heap; chapter exceeds safe layout memory");
         }
@@ -3792,6 +5518,49 @@ void EpubReaderActivity::render(RenderLock&& lock) {
           LOG_ERR("ERS", "Failed to persist page data to SD");
         }
         section.reset();
+        // v18.9.9.20 (task #6): if the failure was inflate-init-class (not a
+        // parser abort) AND we already dropped BLE for this build AND we
+        // haven't burned the defrag budget yet, silent-restart the reader to
+        // reset the fragmented heap. Even with BLE dropped, mid-session heap
+        // can leave the largest contiguous slot around 30 KB while the
+        // DEFLATE window needs ~90 KB -- clean boot heap has ~90 KB contiguous
+        // naturally. The alternative (returning here) leaves the user stuck
+        // at "Failed to persist page data" and only the home-screen cover
+        // heap-guard eventually recovers via its own silent-restart -- ugly
+        // multi-hop path. Gated one-shot per book open via
+        // layoutDefragRetryAttempted_ (isDefragRetryContinuation() seeds it
+        // to true on the boot after this restart, so we never loop).
+        // EnableBt as the post-boot action preserves the user's BLE session
+        // -- the boot rebuilds first, then dispatches BT enable.
+        // v18.9.9.22: also fire the defrag restart when BLE was never on but
+        // maxAlloc is well below what the inflate window needs. Same class of
+        // failure -- fragmented heap can't fit the ~90 KB contiguous slot --
+        // just reached without a BLE-drop step. Threshold picked well below
+        // the ~90 KB DEFLATE window need so we don't over-trigger; a clean
+        // boot recovers with ~90 KB naturally.
+        constexpr uint32_t COLD_INFLATE_DEFRAG_MAX_ALLOC_FLOOR = 60 * 1024;
+        const bool droppedBleThisAttempt = bleAutoReEnableAfterReindex;
+        const bool likelyFragmentationFailure =
+            !droppedBleThisAttempt && ESP.getMaxAllocHeap() < COLD_INFLATE_DEFRAG_MAX_ALLOC_FLOOR;
+        if (!layoutAbortedForLowMemory && !layoutDefragRetryAttempted_ &&
+            (droppedBleThisAttempt || likelyFragmentationFailure)) {
+          LOG_INF("ERS",
+                  "Section build failed on inflate init (%s, maxAlloc=%u); "
+                  "silent-restart-to-defrag with %s to retry on clean heap",
+                  droppedBleThisAttempt ? "post-BLE-drop" : "no BLE this session",
+                  ESP.getMaxAllocHeap(),
+                  droppedBleThisAttempt ? "EnableBt" : "None");
+          layoutDefragRetryAttempted_ = true;
+          // v18.9.9.32: pass currentSpineIndex so post-boot resume lands
+          // on the chapter the user was trying to open (e.g. a fresh
+          // chapter clicked from ChapterSelect) rather than progress.bin's
+          // last-committed position. If the user was already on this
+          // spine, resuming at it is a no-op.
+          silentRestartToReaderWithDefragRetryAtSpine(
+              droppedBleThisAttempt ? ReaderPostBootAction::EnableBt : ReaderPostBootAction::None,
+              currentSpineIndex);
+          // never returns
+        }
         // CrumBLE: if the layout aborted on heap pressure and BLE is still
         // hogging ~58 KB, drop BLE and retry once. requestDisableLater()
         // sets a flag that the next main-loop tick drains via
@@ -3817,6 +5586,25 @@ void EpubReaderActivity::render(RenderLock&& lock) {
           // pendingLayoutRetryAfterBleOff), giving the chapter one genuine
           // full-heap build attempt before we'd show the low-memory error.
           pendingLayoutRetryAfterBleOff = true;
+          return;
+        }
+        // v18.9.6: second-tier fallback. BLE-drop retry has already run (or
+        // BLE wasn't the culprit) and the parse is still failing. Flip on
+        // Simple Rendering (images off, style off, tables collapsed, bionic
+        // + guide off) and retry once. Set the flag so subsequent chapters
+        // in this session also render in simple mode -- prevents the same
+        // crash on every chapter turn.
+        if (layoutAbortedForLowMemory && !layoutSimpleRetryAttempted) {
+          LOG_INF("ERS",
+                  "Layout aborted after BLE-drop retry; escalating to Simple Rendering "
+                  "(force images off, style off, tables collapsed, bionic+guide off) and retrying");
+          layoutSimpleRetryAttempted = true;
+          simpleRenderingActive_ = true; APP_STATE.readerCompatModeActive = true;
+          // v18.9.6.1: persist so next open skips the crash-then-retry cycle.
+          writeSimpleRenderingSidecar(epub->getCachePath(), readerActivePath_);
+          if (APP_STATE.compatUserDisabledThisSession) { armCompatReenabledToast(); APP_STATE.compatUserDisabledThisSession = false; }
+          section.reset();
+          requestUpdate();
           return;
         }
         // Build failed and we already retried (or BLE wasn't the culprit).
@@ -3934,11 +5722,77 @@ void EpubReaderActivity::render(RenderLock&& lock) {
         if (!SETTINGS.glyphAtlasEnabled && section->hasGlyphAtlas()) {
           LOG_INF("SCT", "EGS gate: atlas available but glyphAtlasEnabled=0, falling back to v39 subset");
         }
-        const bool atlasOk = SETTINGS.glyphAtlasEnabled && section->hasGlyphAtlas() &&
-                              section->tryInstallGlyphAtlas(it->second->contentHash(),
-                                                       /*preferLowBitDepth=*/BluetoothHIDManager::getInstance().isEnabled());
+        // v18.9.9.436: lend the ~52 KB framebuffer to the atlas install for
+        // its transient contiguous allocations. Chapter-jump into a CJK
+        // section (1067+ glyphs) previously left maxAlloc ~10 KB
+        // post-install because entries+synthesizedGlyphs+intervals pit the
+        // heap around the framebuffer block; a fresh 52 KB hole for the
+        // allocator to work in dramatically lowers post-install fragmen-
+        // tation. Restored right after so the ensuing loadPageFromSection
+        // File + render finds a valid framebuffer. Only applied when we
+        // actually intend to install (atlas enabled + section has one).
+        bool atlasOk = false;
+        if (SETTINGS.glyphAtlasEnabled && section->hasGlyphAtlas()) {
+          const uint32_t maxBefore = ESP.getMaxAllocHeap();
+          FrameBufferBuildLoan atlasLoan(renderer);
+          atlasLoan.release();
+          LOG_INF("SCT",
+                  "Atlas install: framebuffer lent (maxAlloc %u -> %u)",
+                  maxBefore, ESP.getMaxAllocHeap());
+          atlasOk = section->tryInstallGlyphAtlas(
+              it->second->contentHash(),
+              /*preferLowBitDepth=*/BluetoothHIDManager::getInstance().isEnabled());
+          if (!atlasLoan.restore()) {
+            LOG_ERR("SCT", "Atlas install: framebuffer restore failed; hard restart");
+            ESP.restart();
+          }
+          LOG_INF("SCT",
+                  "Atlas install: framebuffer restored (maxAlloc now=%u, atlasOk=%d)",
+                  ESP.getMaxAllocHeap(), atlasOk ? 1 : 0);
+        }
+        // CrumBLE 4.5.6: CrossPoint-style pause/resume pattern
+        // (crosspoint-reader@6305777b). If atlas refuses with BT enabled,
+        // cycle NimBLE off, retry on next tick with ~15 KB freed, then
+        // requestEnableLater so bonded remote auto-reconnects. In-process;
+        // no reboot. Loop() drives the retry once BT actually drains.
+        auto& btMgrForAtlas = BluetoothHIDManager::getInstance();
+        const bool btEnabledAtlas = btMgrForAtlas.isEnabled();
+        if (!atlasOk && SETTINGS.glyphAtlasEnabled && section->hasGlyphAtlas() &&
+            btEnabledAtlas && !atlasRetryPendingBtDrop_) {
+          LOG_INF("ERA",
+                  "Atlas install refused (free=%u maxAlloc=%u); cycling BT off for retry",
+                  ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+          atlasRetryPendingBtDrop_ = true;
+          btMgrForAtlas.requestDisableLater();
+          // CrumBLE 4.5.7 v17: HALF_REFRESH avoids the freeink-sdk
+          // FAST_REFRESH whole-panel flash while waiting for BT to drain.
+          GUI.drawPopup(renderer, tr(STR_BT_CONNECTING), 0, false, HalDisplay::HALF_REFRESH);
+          return;  // loop() will requestUpdate once BT drains
+        }
+        if (atlasOk && atlasRetryPendingBtDrop_) {
+          LOG_INF("ERA",
+                  "Atlas installed after BT cycle (free=%u); re-enabling BT",
+                  ESP.getFreeHeap());
+          btMgrForAtlas.requestEnableLater();
+          atlasRetryPendingBtDrop_ = false;
+        }
         if (!atlasOk) {
-          section->tryInstallEmbeddedGlyphSubset(it->second->contentHash());
+          // If BT was cycled + atlas still failed, subset install would also
+          // fail (comment on skipSubset path: subset is often bigger than
+          // atlas). Restore BT + rely on SD-font streaming.
+          if (atlasRetryPendingBtDrop_) {
+            LOG_INF("ERA",
+                    "Atlas still refused after BT drop (free=%u); restoring BT, streaming glyphs",
+                    ESP.getFreeHeap());
+            btMgrForAtlas.requestEnableLater();
+            atlasRetryPendingBtDrop_ = false;
+          } else if (btEnabledAtlas) {
+            LOG_INF("ERA",
+                    "Atlas install refused (free=%u); streaming to preserve BT",
+                    ESP.getFreeHeap());
+          } else {
+            section->tryInstallEmbeddedGlyphSubset(it->second->contentHash());
+          }
         }
         // CrumBLE 4.4: one-time backward-compat write of prebake-cpfont.marker
         // for books that were re-uploaded with the optimizer.js atlas-emit
@@ -4079,8 +5933,87 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     // pattern around BT enable. Re-loading per render is the v3.7.3 behavior
     // and ~50-80 ms per call -- imperceptible compared to e-ink's 400 ms
     // refresh cycle.
-    const bool cacheHit = false;
-    {
+    //
+    // v18.9.9.4 (experiment): re-enable the cache scoped to BT-linked
+    // sessions on !simpleRenderingActive_ books. Rationale: under BT the
+    // per-tick deserialize churns 5-40 KB against a heap that also holds
+    // NimBLE's 58 KB, and post-turn re-renders (BT connect popup, focus
+    // change, header refresh) shouldn't re-pay the deserialize cost when
+    // the DOM is already in RAM. Trade-off: the 4.3 fragmentation regression
+    // may briefly reappear during the cache-hold window, but at post-BT
+    // MaxAlloc of 2-8 KB the current unfragmented ceiling is already the
+    // bottleneck. Simple Rendering books stay on the no-cache path -- their
+    // per-page DOMs are already trimmed so the caching value is smaller
+    // and the 4.3 regression cost is proportionally worse.
+    const bool btLinkedNow = BluetoothHIDManager::getInstance().isEnabled() &&
+                             SETTINGS.bleBondedDeviceAddr[0] != '\0' &&
+                             BluetoothHIDManager::getInstance().isConnected(SETTINGS.bleBondedDeviceAddr);
+
+    // v18.9.9.10 + v18.9.9.11: streamed line-by-line render whenever BT
+    // is linked. Peak heap ~500 bytes vs ~10 KB for the whole-DOM path.
+    // Under BT, images skip render and tables render via
+    // renderContentOnly (cell text without borders) -- so the streamed
+    // path is the "always fits" compat render for any BT session,
+    // regardless of the sidecar / simpleRenderingActive_ state.
+    // simpleRenderingActive_ is now a hint to the parser at section
+    // rebuild time, not a runtime toggle.
+    //
+    // v18.9.9.17: also route through the streamed path when
+    // simpleRenderingActive_ is on but BT isn't (rare: Layer 2 OOM
+    // escalation on a heavy non-BT book). Compat-mode-without-BT would
+    // otherwise use the whole-DOM path and re-OOM on the same content
+    // that just escalated. Passing btLinked=true is a slight misnomer
+    // here -- the flag really means "runtime-skip tables and images"
+    // -- but that's exactly what compat mode wants regardless of BT.
+    //
+    // v18.9.9.57: revert v56's whole-DOM re-route. The whole-DOM path holds
+    // ~10 KB Page DOM (one TextBlock per line) which -- combined with
+    // NimBLE's ~58 KB -- drops post-render maxAlloc below the 4000 floor
+    // and cascades into Layer 1 defrag -> Layer 2 compat mode. Instead,
+    // stay on the streamed path under BT (peak ~500 B per element) but
+    // pass a pxcImagesSafe flag so Section can blit images from the .pxc
+    // cache when it's safe to do so. Cache blit peaks at ~64 B row buffer,
+    // preserves the 4000 floor headroom, and unlocks images under BT.
+    const bool pxcImagesSafe =
+        pxcManifest_.has_value() && section && section->wasLoadedFromPrebake();
+    const bool useReducedRender = btLinkedNow || simpleRenderingActive_;
+    if (useReducedRender) {
+      POST_BT_STEP("pre streamed render");
+      const bool streamedOk = section->renderPageStreamed(
+          renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop,
+          ReaderUtils::readerForegroundBlack(), /*btLinked=*/true,
+          /*pxcImagesSafe=*/pxcImagesSafe);
+      POST_BT_STEP("post streamed render");
+      if (streamedOk) {
+        postRenderDrainedMaxAlloc_ = ESP.getMaxAllocHeap();
+        // v18.9.9.11: renderStatusBar + displayBuffer here -- the streamed
+        // path skips renderContents which normally does both, so without
+        // this the framebuffer contents never get pushed to the panel
+        // (bug in v18.9.9.10).
+        // v18.9.9.12: use ReaderUtils::displayWithRefreshCycle instead of
+        // a fixed HALF_REFRESH. HALF flashes the panel black/white every
+        // page (~1.7 s) which is visually jarring on every turn. The
+        // shared cycle helper picks FAST_REFRESH (~500 ms, no flash) for
+        // most turns and HALF only every N pages to clear ghosting --
+        // matching the whole-DOM path's cadence. Also honours the
+        // continuation-from-silent-restart FAST-only rule.
+        renderStatusBar();
+        ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
+        // Skip the whole-DOM cache/load/renderContents path below.
+        goto streamedRenderDone;
+      }
+      LOG_ERR("ERS", "Streamed render refused; falling back to whole-DOM path (may OOM)");
+    }
+
+    const bool cachedPageStillValid =
+        cachedRenderPage_ != nullptr && cachedRenderSection_ == static_cast<void*>(section.get()) &&
+        cachedRenderSpine_ == currentSpineIndex && cachedRenderPageIndex_ == section->currentPage;
+    const bool cacheHit = btLinkedNow && !simpleRenderingActive_ && cachedPageStillValid;
+    if (cacheHit) {
+      LOG_DBG("ERS", "Page DOM cache HIT: spine=%d page=%d (skip deserialize, BT linked)",
+              currentSpineIndex, section->currentPage);
+    }
+    if (!cacheHit) {
       // CrumBLE 4.3: free-old-before-build-new. See warmPageCacheForBtTransition's
       // matching block for the full explanation. Briefly: unique_ptr::operator=
       // builds the RHS (a complete fresh Page DOM) before deleting the LHS, so
@@ -4102,7 +6035,9 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       // neither the lazy subset reinstall nor the SD-font fallback could
       // re-allocate after the page DOM ate the freed bytes. Permanent
       // fix is the page-DOM arena (task #24).
+      POST_BT_STEP("pre loadPageFromSectionFile");
       cachedRenderPage_ = section->loadPageFromSectionFile();
+      POST_BT_STEP("post loadPageFromSectionFile");
       if (cachedRenderPage_) {
         cachedRenderSection_ = static_cast<void*>(section.get());
         cachedRenderSpine_ = currentSpineIndex;
@@ -4110,6 +6045,13 @@ void EpubReaderActivity::render(RenderLock&& lock) {
         // Footnotes are owned by the page; copy (not move) so the cache
         // still has them on subsequent re-renders that read them.
         currentPageFootnotes = cachedRenderPage_->footnotes;
+        POST_BT_STEP("post footnotes copy");
+        // CrumBLE 4.5.6: page loaded after BT cycle → bring BT back.
+        if (pageLoadRetryPendingBtDrop_) {
+          BluetoothHIDManager::getInstance().requestEnableLater();
+          pageLoadRetryPendingBtDrop_ = false;
+          LOG_INF("ERS", "Page loaded after BT cycle; re-enabling BT (auto-reconnect follows)");
+        }
       } else {
         cachedRenderSection_ = nullptr;
         cachedRenderSpine_ = -1;
@@ -4118,6 +6060,139 @@ void EpubReaderActivity::render(RenderLock&& lock) {
     }
 
     if (!cachedRenderPage_) {
+      // CrumBLE 4.5.6: CrossPoint-style pause/resume for page-load refuse.
+      // Page::deserialize needs ~10-15 KB contiguous heap. With BT
+      // connected, cycle NimBLE off (freeing ~15 KB + defragmenting),
+      // retry on next tick, then requestEnableLater.
+      auto& btMgrForPage = BluetoothHIDManager::getInstance();
+      const bool btEnabledForPage = btMgrForPage.isEnabled();
+      // Waiting for the deferred BT disable to drain? Don't clear cache or
+      // bump retry -- just wait. loop() requestUpdate once BT is off.
+      if (pageLoadRetryPendingBtDrop_ && btEnabledForPage) {
+        return;
+      }
+      if (btEnabledForPage && !pageLoadRetryPendingBtDrop_) {
+        LOG_INF("ERS", "Page load refused with BT on (free=%u maxAlloc=%u); cycling BT for retry",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        // v18.9.9.5 Level 1: before content escalation, spend a one-shot
+        // silent-restart-with-EnableBt to defrag the heap while keeping
+        // full render (tables + images) intact. This replicates the
+        // "manual retry works" pattern users hit on heavy books: a fresh
+        // ~110 KB boot heap fits the deserialize that a fragmented
+        // mid-session heap couldn't. Gated so we don't loop: budget is
+        // spent for the current book open, and boot 2's reader seeds
+        // layoutDefragRetryAttempted_ from isDefragRetryContinuation()
+        // so the NEXT failure escalates content (Level 2 or 3).
+        if (!layoutDefragRetryAttempted_ && !layoutSimpleRetryAttempted && !simpleRenderingActive_) {
+          LOG_INF("ERS",
+                  "Level 1 defrag retry -- silent-restart-with-EnableBt to reset heap "
+                  "fragmentation while keeping full render (one-shot per book open)");
+          layoutDefragRetryAttempted_ = true;
+          // v18.9.9.32: resume at currentSpineIndex so a defrag triggered
+          // from a fresh-chapter navigation lands the user there, not on
+          // progress.bin's stale spine.
+          silentRestartToReaderWithDefragRetryAtSpine(ReaderPostBootAction::EnableBt, currentSpineIndex);
+          // never returns
+        }
+        // v18.9.9.10 Layer 2: Layer 1 defrag already spent -- jump straight
+        // to compat mode. No intermediate tables-only middle ground; the
+        // streamed line-render path in Simple Rendering has a peak
+        // footprint of ~500 bytes per page, guaranteed to fit any post-BT
+        // heap state.
+        if (!layoutSimpleRetryAttempted && !simpleRenderingActive_) {
+          LOG_INF("ERS", "Layer 2 escalation -- Simple Rendering compat mode after defrag budget spent");
+          layoutSimpleRetryAttempted = true;
+          simpleRenderingActive_ = true; APP_STATE.readerCompatModeActive = true;
+          writeSimpleRenderingSidecar(epub->getCachePath(), readerActivePath_);
+          if (APP_STATE.compatUserDisabledThisSession) { armCompatReenabledToast(); APP_STATE.compatUserDisabledThisSession = false; }
+          section->clearCache();
+          section.reset();
+        }
+        pageLoadRetryPendingBtDrop_ = true;
+        // v18.9.9.148: v137's guard REMOVED entirely. It was designed to
+        // prevent a null-deref during NimBLE.disable() when the controller
+        // partial-init'd (which happened only when we were starving NimBLE
+        // via v142's reserve). With v145's reserve removal, NimBLE always
+        // completes init cleanly when connect succeeds, so disable is safe.
+        btMgrForPage.requestDisableLater();
+        // CrumBLE 4.5.7 v17: HALF_REFRESH avoids the freeink-sdk FAST_REFRESH
+        // whole-panel flash while cycling BT for the page-load retry.
+        GUI.drawPopup(renderer, tr(STR_BT_CONNECTING), 0, false, HalDisplay::HALF_REFRESH);
+        return;
+      }
+      if (pageLoadRetryPendingBtDrop_ && !btEnabledForPage) {
+        // BT off, retry STILL failed. Restore BT + fall through to existing
+        // clear-cache retry so the user isn't stranded with BT off.
+        LOG_ERR("ERS", "Page load still refused after BT drop (free=%u); restoring BT + clearing section cache",
+                ESP.getFreeHeap());
+        btMgrForPage.requestEnableLater();
+        pageLoadRetryPendingBtDrop_ = false;
+      }
+
+      // v18.9.6a: runtime deserialization crashes on prebaked books (the
+      // parse-time escalation in v18.9.6 doesn't help because the parse
+      // never runs -- Section loads sections-prebake/N.bin directly and
+      // hits PageTableFragment::deserialize under low heap). Escalate to
+      // Simple Rendering here BEFORE burning a normal clear-cache retry:
+      // the next createSectionFile writes a fresh section.bin with tables
+      // collapsed to paragraphs, so the failing fragment doesn't exist to
+      // deserialize.
+      //
+      // v18.9.9.437: gate the escalation on WHY the load failed. The
+      // v18.9.6a comment assumed the failure was a deserialize crash, but
+      // loadPageFromSectionFile also returns nullptr when its pre-flight
+      // refuses under maxAlloc < 12 KB -- a heap-budget refusal, NOT a
+      // content problem. In that case the section is fine, we just don't
+      // have room to allocate the Page struct on this pass. Escalating to
+      // Simple Rendering here is actively harmful: Simple Rendering
+      // abandons the prebake path and re-parses XHTML from the ZIP each
+      // time, which cascades into the ZIP-read failure we saw with the
+      // Harry Potter EPUB (bad SD cluster made every subsequent chapter
+      // open fail as "book unreadable"). When we know the section loaded
+      // cleanly from prebake AND maxAlloc is what refused the page load,
+      // preserve the prebake path and surface an honest error instead.
+      // The user can back out to a lighter chapter or retry after some
+      // heap recovers.
+      const bool sectionWasPrebakeLoad = section && section->wasLoadedFromPrebake();
+      const bool pageLoadRefusedForHeap = section && ESP.getMaxAllocHeap() < 14u * 1024u;
+      if (!layoutSimpleRetryAttempted && !simpleRenderingActive_ &&
+          !(sectionWasPrebakeLoad && pageLoadRefusedForHeap)) {
+        LOG_INF("ERS",
+                "Page load still failing; escalating to Simple Rendering (free=%u maxAlloc=%u)",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        layoutSimpleRetryAttempted = true;
+        simpleRenderingActive_ = true; APP_STATE.readerCompatModeActive = true;
+        // v18.9.6.1: persist for future opens.
+        writeSimpleRenderingSidecar(epub->getCachePath(), readerActivePath_);
+          if (APP_STATE.compatUserDisabledThisSession) { armCompatReenabledToast(); APP_STATE.compatUserDisabledThisSession = false; }
+        section->clearCache();
+        section.reset();
+        requestUpdate();
+        automaticPageTurnActive = false;
+        return;
+      }
+      if (sectionWasPrebakeLoad && pageLoadRefusedForHeap) {
+        LOG_INF("ERS",
+                "Page load failed on prebake path under heap pressure (free=%u maxAlloc=%u); "
+                "NOT escalating to Simple Rendering. Silent-restart-to-reader dropping "
+                "resumeSpine=%d, will fall back to progress.bin's last-committed spine "
+                "and show a toast on arrival explaining why.",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap(), currentSpineIndex);
+        // Arm the toast for the next boot's onEnter, then silent-restart.
+        // silentRestartToReader() (no *Resuming* variant) doesn't set
+        // silentRebootTargetSpine, so the boot-side consumer sees the
+        // 0xFFFFFFFF sentinel and progress.bin's spine is used unchanged.
+        // Every FT/heap-refuse path here already went through the Layer 1
+        // defrag continuation once (that's WHY we're on the second attempt
+        // that failed); using the plain restart avoids re-entering the
+        // defrag-retry loop.
+        armChapterHeapRefuseToast(currentSpineIndex);
+        section->clearCache();
+        section.reset();
+        silentRestartToReader();  // never returns
+        return;
+      }
+
       pageLoadRetryCount++;
       if (pageLoadRetryCount < MAX_PAGE_LOAD_RETRIES) {
         LOG_ERR("ERS", "Failed to load page from SD (retry %d) - clearing section cache", pageLoadRetryCount);
@@ -4210,20 +6285,71 @@ void EpubReaderActivity::render(RenderLock&& lock) {
       }
     }
 
+    POST_BT_STEP("pre renderContents");
     const auto start = millis();
     renderContents(*cachedRenderPage_, orientedMarginTop, orientedMarginRight, orientedMarginBottom,
                    orientedMarginLeft);
+    POST_BT_STEP("post renderContents");
     LOG_DBG("ERS", "Rendered page in %dms (cache %s)", millis() - start, cacheHit ? "hit" : "miss");
+    // v18.9.9.9: capture the drained MaxAlloc BEFORE the cache-drop path
+    // frees ~10 KB of page DOM back to the allocator. Without this snapshot,
+    // the post-render escalation check further down sees the RECOVERED
+    // heap and never fires, even though the just-run deserialize proved
+    // the session heap can't fit another page-turn deserialize.
+    postRenderDrainedMaxAlloc_ = ESP.getMaxAllocHeap();
     // CrumBLE 4.3 heap-regression revert: release the page DOM immediately
     // after render so it doesn't fragment the heap around BT events.
-    cachedRenderPage_.reset();
-    cachedRenderSection_ = nullptr;
-    cachedRenderSpine_ = -1;
-    cachedRenderPageIndex_ = -1;
+    // v18.9.9.4: keep the DOM alive when BT is linked on a non-simple book
+    // so subsequent re-renders (BT popup, focus change, header refresh)
+    // reuse it instead of re-deserializing under tight post-BT MaxAlloc.
+    // Dropped on next page turn (cache-miss branch above) or on BT drop
+    // (next render sees btLinkedNow=false, refreshes into no-cache mode).
+    if (!btLinkedNow || simpleRenderingActive_) {
+      cachedRenderPage_.reset();
+      cachedRenderSection_ = nullptr;
+      cachedRenderSpine_ = -1;
+      cachedRenderPageIndex_ = -1;
+    }
+  }
+streamedRenderDone:;
+  // v18.9.9.134: BT re-enable path for BOTH streamed and DOM render paths.
+  // My v132 fix put this check inside renderContents(), which the streamed
+  // render path skips via `goto streamedRenderDone`. Result: force-simple
+  // books (which ALWAYS take streamed) never fired the gate -- BT stayed
+  // off after chapter-boundary section rebuild until user paged forward
+  // several times. Now the check lives here at the shared join point.
+  // Streamed render has no image blocks that could partial-decode, so we
+  // don't need the imageRepaintUnsafeNow check for that path.
+  if (bleReEnableHeldForImagePage &&
+      (simpleRenderingActive_ || renderer.suppressImages())) {
+    bleReEnableHeldForImagePage = false;
+    LOG_INF("ERS", "Clean BLE-safe streamed render after rebuild (images suppressed); "
+                   "re-enabling BLE for bonded remote reconnect");
+    if (Section::pageHeapReserveHeld()) {
+      const uint32_t freeBefore = ESP.getFreeHeap();
+      Section::releasePageHeapReserveForBtEnable();
+      LOG_INF("ERS", "Post-rebuild re-enable: released page heap reserve (free %u->%u)",
+              freeBefore, ESP.getFreeHeap());
+    }
+    prewarmReaderTextBuffer(renderer);
+    BluetoothHIDManager::getInstance().requestEnableLater();
   }
   silentIndexNextChapterIfNeeded(viewportWidth, viewportHeight);
-  if (!saveProgress(currentSpineIndex, section->currentPage, section->pageCount)) {
-    pendingSyncSaveError = true;
+  // v18.9.9.471: debounce to every 3rd page turn. onExit and onBeforeDeepSleep
+  // always save unconditionally, so a hard power-off can lose at most 2
+  // pages. 3× fewer SD writes = 3× less FAT stress and correspondingly less
+  // "Could not save progress" exposure. If a prior save is pending recovery
+  // (pendingSyncSaveError set), force a save this turn to catch up.
+  constexpr int kProgressSaveEveryNPages = 3;
+  ++pagesSinceProgressSave_;
+  const bool forceSave = pendingSyncSaveError || pagesSinceProgressSave_ >= kProgressSaveEveryNPages;
+  if (forceSave) {
+    if (saveProgress(currentSpineIndex, section->currentPage, section->pageCount)) {
+      pagesSinceProgressSave_ = 0;
+      pendingSyncSaveError = false;
+    } else {
+      pendingSyncSaveError = true;
+    }
   }
   queueCompletionPromptIfNeeded();
 
@@ -4238,6 +6364,70 @@ void EpubReaderActivity::render(RenderLock&& lock) {
   // deferred init on the next tick. Only the FIRST render needs to set
   // this -- subsequent re-renders idempotently keep it true.
   firstRenderCompleted_ = true;
+
+  // v18.9.9.8: post-render heap-floor escalation. If we're BT-linked and
+  // the render just drained MaxAlloc below the sustainable-session floor,
+  // any subsequent operation (BT re-subscribe on link blip, next page turn
+  // deserialize, drawer open) will fail and the reader loop() will grind
+  // to a halt with buttons registering but no response. Detect this here
+  // and trigger Level 1 defrag (or Level 2/3 if defrag budget spent),
+  // BEFORE the user tries to page-turn into a wall.
+  //
+  // Threshold sized to survive one more page deserialize on this book's
+  // 7-8 KB heap-consumption profile: MaxAlloc 4000 leaves headroom for a
+  // small page + BT event allocs. Books with lighter pages will rarely
+  // trip this; books with heavy tables will escalate through the
+  // graduated levels the same as page-load-refuse triggers.
+  constexpr uint32_t POST_RENDER_MIN_MAX_ALLOC = 4000;
+  const bool btLinkedForFloorCheck = BluetoothHIDManager::getInstance().isEnabled() &&
+                                     SETTINGS.bleBondedDeviceAddr[0] != '\0' &&
+                                     BluetoothHIDManager::getInstance().isConnected(SETTINGS.bleBondedDeviceAddr);
+  // v18.9.9.9: use the maxAlloc captured immediately after renderContents
+  // returned, BEFORE the cache-drop path freed the page DOM. That's the
+  // ACTUAL drained heap floor; post-cache-drop value is misleadingly high.
+  const uint32_t postRenderMaxAlloc =
+      postRenderDrainedMaxAlloc_ != 0 ? postRenderDrainedMaxAlloc_ : ESP.getMaxAllocHeap();
+  postRenderDrainedMaxAlloc_ = 0;
+  if (btLinkedForFloorCheck && postRenderMaxAlloc < POST_RENDER_MIN_MAX_ALLOC) {
+    if (!layoutDefragRetryAttempted_ && !layoutSimpleRetryAttempted && !simpleRenderingActive_) {
+      LOG_INF("ERS",
+              "Post-render floor breach (BT linked, drained maxAlloc=%u < %u); Layer 1 defrag "
+              "silent-restart before next page-turn fails",
+              postRenderMaxAlloc, POST_RENDER_MIN_MAX_ALLOC);
+      layoutDefragRetryAttempted_ = true;
+      // v18.9.9.32: resume where user is currently reading (which is
+      // currentSpineIndex, already reflected in progress.bin because the
+      // just-completed render committed it -- but pass explicitly for
+      // consistency with the pre-render defrag sites).
+      silentRestartToReaderWithDefragRetryAtSpine(ReaderPostBootAction::EnableBt, currentSpineIndex);
+      // never returns
+    } else if (!simpleRenderingActive_) {
+      LOG_INF("ERS",
+              "Post-render floor breach (BT linked, drained maxAlloc=%u); Layer 2 Simple Rendering "
+              "compat mode + silent-restart (defrag budget already spent)",
+              postRenderMaxAlloc);
+      writeSimpleRenderingSidecar(epub->getCachePath(), readerActivePath_);
+          if (APP_STATE.compatUserDisabledThisSession) { armCompatReenabledToast(); APP_STATE.compatUserDisabledThisSession = false; }
+      section->clearCache();
+      // v18.9.9.32: resume on the same chapter -- the user was mid-read
+      // when the post-render heap floor breached, so landing them back
+      // where they are is the right default.
+      silentRestartToReaderWithDefragRetryAtSpine(ReaderPostBootAction::EnableBt, currentSpineIndex);
+      // never returns
+    }
+    // else: Simple Rendering already active. The streamed render path
+    // (Section::renderPageStreamed under simpleRenderingActive_ && BT
+    // linked) has a peak footprint of ~500 bytes per page, so we should
+    // never reach here with simpleRenderingActive_ = true. If we do, it's
+    // a diagnostic edge case -- log and continue; the terminate handler
+    // still catches a bad_alloc if one somehow slips through.
+    else {
+      LOG_ERR("ERS",
+              "Post-render floor breach with Simple Rendering already active (drained maxAlloc=%u). "
+              "Streamed render should have prevented this. Continuing without escalation.",
+              postRenderMaxAlloc);
+    }
+  }
 }
 
 void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportWidth, const uint16_t viewportHeight) {
@@ -4261,7 +6451,10 @@ void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportW
                                   SETTINGS.paragraphAlignment, viewportWidth, viewportHeight,
                                   SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle, SETTINGS.imageRendering,
                                   SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled,
-                                  SETTINGS.optimizeChapterIndexing != 0)) {
+                                  SETTINGS.tableRendering,
+                                  // v18.9.9.455 REVERTED in v457: see main useprebakeFallback comment.
+                                  SETTINGS.optimizeChapterIndexing != 0 && !simpleRenderingActive_,
+                                  /*forceSimpleRendering=*/simpleRenderingActive_)) {
     return;
   }
 
@@ -4275,7 +6468,10 @@ void EpubReaderActivity::silentIndexNextChapterIfNeeded(const uint16_t viewportW
                                      SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
                                      SETTINGS.paragraphAlignment, viewportWidth, viewportHeight,
                                      SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle, SETTINGS.imageRendering,
-                                     SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled)) {
+                                     SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled,
+                                     SETTINGS.tableRendering, nullptr, nullptr, nullptr,
+                                     /*forceSimpleRendering=*/simpleRenderingActive_,
+                                     /*suppressTablesOnly=*/false)) {
     LOG_ERR("ERS", "Failed silent indexing for chapter: %d", nextSpineIndex);
   } else {
     LOG_DBG("ERS", "Silent indexing complete: chapter=%d pages=%u free=%u maxAlloc=%u", nextSpineIndex,
@@ -4289,6 +6485,7 @@ bool EpubReaderActivity::saveProgress(int spineIndex, int currentPage, int pageC
 void EpubReaderActivity::renderContents(const Page& page, const int orientedMarginTop,
                                         const int orientedMarginRight, const int orientedMarginBottom,
                                         const int orientedMarginLeft) {
+  POST_BT_STEP("renderContents enter");
   const auto t0 = millis();
 
   // Font prewarm: scan pass accumulates text, then prewarm, then real render
@@ -4296,8 +6493,11 @@ void EpubReaderActivity::renderContents(const Page& page, const int orientedMarg
   fcm->resetStats();
   const uint32_t heapBefore = esp_get_free_heap_size();
   auto scope = fcm->createPrewarmScope();
+  POST_BT_STEP("renderContents pre scan-pass");
   page.renderText(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);  // scan pass
+  POST_BT_STEP("renderContents post scan-pass");
   scope.endScanAndPrewarm();
+  POST_BT_STEP("renderContents post prewarm");
   const uint32_t heapAfter = esp_get_free_heap_size();
   fcm->logStats("prewarm");
   const auto tPrewarm = millis();
@@ -4308,6 +6508,7 @@ void EpubReaderActivity::renderContents(const Page& page, const int orientedMarg
   (void)heapAfter;
 
   const bool pageHasImages = page.hasImages();
+  lastRenderedPageHadImages_ = pageHasImages;
   // CrumBLE: NimBLE holds ~90 KB while the remote is up, leaving ~24 KB
   // contiguous -- not enough for the grayscale re-render pass (it would starve
   // glyphs, the "5% of characters" bug). Gate the AA re-render on the remote
@@ -4328,8 +6529,24 @@ void EpubReaderActivity::renderContents(const Page& page, const int orientedMarg
 
   renderer.takeRenderStarved();        // clear stale; capture only this render's failures
   renderer.takeImageRepaintUnsafe();   // clear stale; capture only this render's uncached images
+
+  // 4.5.5+: highlight rendering moved from underline (solid 2-px bar) to
+  // faux-bold via per-word overprint in renderSavedHighlightsOverlay. No
+  // ghost-clear refresh strategy is needed for the bold path -- the dark
+  // pixels in faux-bold are glyph shapes, not a continuous bar, and ghost
+  // the same way regular text does (which is to say: handled cleanly by
+  // FAST_REFRESH between pages). The old prevPageHadHighlights /
+  // ghostClearOnNextRender_ machinery is now dead code; renderSavedHighlightsOverlay
+  // leaves prevPageHadHighlights false so no special path ever fires.
+
   page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop,
               ReaderUtils::readerForegroundBlack());
+
+  // 4.5.5: layer persistent highlights on top of the rendered text. Runs
+  // after page.render so the solid underline draws beneath the glyphs (no
+  // z-order conflict with the text raster). Also updates
+  // prevPageHadHighlights so the NEXT render knows to promote refresh.
+  renderSavedHighlightsOverlay(page, orientedMarginLeft, orientedMarginTop);
 
   // Note when the BLE remote came up. The connect handshake makes NimBLE grab
   // its ~58 KB and churn temporary buffers, which briefly spikes heap pressure
@@ -4393,9 +6610,32 @@ void EpubReaderActivity::renderContents(const Page& page, const int orientedMarg
   // could NOT cache (partial/off-screen), since that one would re-decode and drop
   // BLE again. requestEnableLater() defers to the loop so NimBLE init doesn't
   // fight the next render; checkAutoReconnect() then relinks on the next press.
-  if (bleReEnableHeldForImagePage && !imageRepaintUnsafeNow) {
+  // v18.9.9.132: when Simple Rendering is active (or suppressImages is on),
+  // the section has no image blocks that could partial-decode -- the "unsafe
+  // repaint" flag has nothing to gate against, and holding BT off just
+  // strands the bonded remote until the user pages forward again. Field
+  // repro: user crossed chapter boundary on force-simple book, BT dropped
+  // to build section, section done, but bleReEnableHeldForImagePage stayed
+  // true across renders (unclear why -- possibly a stale flag from before
+  // Simple Rendering was set), and BT never came back.
+  const bool imageSafeAlways = simpleRenderingActive_ || renderer.suppressImages();
+  if (bleReEnableHeldForImagePage && (imageSafeAlways || !imageRepaintUnsafeNow)) {
     bleReEnableHeldForImagePage = false;
-    LOG_INF("ERS", "Clean BLE-safe render after rebuild (images cached); re-enabling BLE for bonded remote reconnect");
+    LOG_INF("ERS", "Clean BLE-safe render after rebuild (images %s); re-enabling BLE for bonded remote reconnect",
+            imageSafeAlways ? "suppressed" : "cached");
+    // v18.9.9.74 Phase 4: release the page heap reserve BEFORE the deferred
+    // enable drains. Post-rebuild heap sits ~3-8 KB below our free-heap floor
+    // even after Phase 4's threshold drop; the reserve gives ~20 KB. Field
+    // repro: chapter 15 build finished at free=63 KB, enable refused for 6 s
+    // (crosspoint's 56 KB floor helps but pre-rebuild fragmentation kept us
+    // just under). Releasing the reserve here mirrors the same call the
+    // boot-dispatch EnableBt path does at line ~2477.
+    if (Section::pageHeapReserveHeld()) {
+      const uint32_t freeBefore = ESP.getFreeHeap();
+      Section::releasePageHeapReserveForBtEnable();
+      LOG_INF("ERS", "Post-rebuild re-enable: released page heap reserve (free %u->%u)",
+              freeBefore, ESP.getFreeHeap());
+    }
     // CrumBLE Phase 1 fast-open: pre-grow the glyph buffer before the
     // queued enable drains. NimBLE starts initializing on the next loop
     // tick; the buffer needs to be at high-water by then.
@@ -4449,36 +6689,76 @@ void EpubReaderActivity::renderContents(const Page& page, const int orientedMarg
   toastShownLastRender = toastShownThisRender;
 
   if (pageHasImages) {
-    // Double FAST_REFRESH with selective image blanking (pablohc's technique):
-    // HALF_REFRESH sets particles too firmly for the grayscale LUT to adjust.
-    // Instead, blank only the image area and do two fast refreshes.
-    // Step 1: Display page with image area blanked (text appears, image area white)
-    // Step 2: Re-render with images and display again (images appear clean)
+    // Double FAST_REFRESH with selective image blanking (pablohc's technique).
+    // v18.9.9.167: also preclear the status-bar band when dynamic content is
+    // shown, and re-renderStatusBar on step 2 so the page counter refreshes.
+    // v18.9.9.411 REVERTED in v18.9.9.412: image-page singlePass with a single
+    // HALF_REFRESH was worse than the original double-FAST -- HALF triggers
+    // a full-panel wipe/repaint on image transitions on this X4 driver
+    // (whereas on text-only content the wipe is subtle). Users reported a
+    // pronounced full-page flash. Fell back to the ORIGINAL image-page flow
+    // for both singlePass on and off; only text pages benefit from the toggle.
     int16_t imgX, imgY, imgW, imgH;
     if (page.getImageBoundingBox(imgX, imgY, imgW, imgH)) {
-      renderer.fillRect(imgX + orientedMarginLeft, imgY + orientedMarginTop, imgW, imgH, false);
+      // v18.9.9.207: back to re-render between the two flushes (v205's
+      // snapshot/restore experiment spliced an extra store/restore cycle
+      // into the BW-buffer machinery the grayscale AA pass also uses, and
+      // image grays came out washed out). With clearStatusBarBand now
+      // positioned off the BASE margins (it used to start a full text
+      // reserve too high), the late-arriving region is just the thin
+      // status row + the image rects themselves.
+      //
+      // v18.9.9.203: blank each image's own rect, not the union bounding
+      // box. The union of two images far apart (or one tall figure)
+      // swallowed a band of TEXT into the second flush.
+      if (ReaderUtils::hasDynamicStatusBarContent()) {
+        ReaderUtils::clearStatusBarBand(renderer, orientedMarginBottom);
+      }
+      page.blankImageRects(renderer, orientedMarginLeft, orientedMarginTop);
       const auto tImageBlankDisplay = millis();
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
       const uint32_t imageBlankDisplayMs = millis() - tImageBlankDisplay;
 
-      // Re-render page content to restore images into the blanked area
-      // Status bar is not re-rendered here to avoid reading stale dynamic values (e.g. battery %)
       const auto tImageRestoreRender = millis();
       page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop,
                   ReaderUtils::readerForegroundBlack());
+      renderStatusBar();
       const uint32_t imageRestoreRenderMs = millis() - tImageRestoreRender;
       const auto tImageFinalDisplay = millis();
       renderer.displayBuffer(HalDisplay::FAST_REFRESH);
       const uint32_t imageFinalDisplayMs = millis() - tImageFinalDisplay;
       logImagePageProfile(imageBlankDisplayMs, imageRestoreRenderMs, imageFinalDisplayMs);
     } else {
+      POST_BT_STEP("renderContents pre displayBuffer HALF");
       renderer.displayBuffer(HalDisplay::HALF_REFRESH);
     }
     // Double FAST_REFRESH handles ghosting for image pages; don't count toward full refresh cadence
+  } else if (ReaderUtils::shouldPreclearStatusBarBeforeFastRefresh(pagesUntilFullRefresh)) {
+    // v18.9.9.167: double-FAST with status-bar preclear for text pages carrying
+    // dynamic status-bar content. Kills counter ghosting under normal FAST_REFRESH.
+    // v18.9.9.414: v413's skip-displayBuffer attempt made displayGrayBuffer
+    // paint against stale panel state -> severe ghosting + slow-mo transitions.
+    // Reverted to always running the FAST_REFRESH double-tap. singlePass now
+    // relies solely on v412's restoreBwBuffer-before-displayGrayBuffer for
+    // the status bar fix. Net effect for the user: same visual as baseline
+    // (per user testing on v410), status bar no longer blanks for 500ms.
+    POST_BT_STEP("renderContents pre displayBuffer status-preclear FAST");
+    ReaderUtils::clearStatusBarBand(renderer, orientedMarginBottom);
+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+    page.render(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop,
+                ReaderUtils::readerForegroundBlack());
+    renderStatusBar();
+    renderer.displayBuffer(HalDisplay::FAST_REFRESH);
+    pagesUntilFullRefresh--;
   } else {
+    POST_BT_STEP("renderContents pre displayWithRefreshCycle");
+    // v18.9.9.414: reverted v413's skip-displayBuffer attempt. Always
+    // display via displayWithRefreshCycle. singlePass now relies on
+    // v412's restoreBwBuffer-before-displayGrayBuffer status bar fix.
     ReaderUtils::displayWithRefreshCycle(renderer, pagesUntilFullRefresh);
   }
   const auto tDisplay = millis();
+  POST_BT_STEP("renderContents post displayBuffer");
 
   // Save bw buffer to reset buffer state after grayscale data sync
   const uint32_t bwStoreHeapBefore = esp_get_free_heap_size();
@@ -4507,6 +6787,12 @@ void EpubReaderActivity::renderContents(const Page& page, const int orientedMarg
   // the remote render cleanly without AA instead of starving.
   const bool reRenderSafe = !bleConnected;
   const bool canApplyGrayscale = needsAnyGrayscale && (storedBwBuffer || reRenderSafe);
+  // v18.9.9.346: publish for SleepActivity so a sleep overlay entering
+  // from a text-only / highlight-only page skips the redundant
+  // grayscale-plane rebuild passes that caused the triple-flash on
+  // highlighted pages. canApplyGrayscale is the truest signal (accounts
+  // for AA-off, heap-restricted images, etc.).
+  APP_STATE.lastReaderPageNeededGrayscale = canApplyGrayscale;
   const bool grayscaleNeedsReRender = canApplyGrayscale && !storedBwBuffer;
   // Per-page AA status for diagnosis. DBG level (compiled out of the
   // production build). mode=re-render means we drew the page twice to avoid
@@ -4522,6 +6808,13 @@ void EpubReaderActivity::renderContents(const Page& page, const int orientedMarg
     // 0x00 (their "no glyph here" state), separate from dark mode. The actual
     // foreground/background colour comes from the text draw paths below, so
     // pass readerForegroundBlack into page.render the same as the BW path.
+    // v18.9.9.452: ALSO draw status bar into each grayscale plane. Without
+    // this, displayGrayBuffer paints text but the status-bar band is empty,
+    // so the bottom of the page reads as white until the follow-up
+    // restoreBwBuffer + next refresh puts the status bar back. Field
+    // symptom: bottom bar visibly "fills in" ~500 ms after each page turn.
+    // (This was v410's fix which appears to have been reverted alongside
+    // v415's singlePass rollback.)
     const bool fg = ReaderUtils::readerForegroundBlack();
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
@@ -4530,6 +6823,7 @@ void EpubReaderActivity::renderContents(const Page& page, const int orientedMarg
     } else {
       page.renderImages(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
     }
+    renderStatusBar();
     renderer.copyGrayscaleLsbBuffers();
     const auto tGrayLsb = millis();
 
@@ -4541,6 +6835,7 @@ void EpubReaderActivity::renderContents(const Page& page, const int orientedMarg
     } else {
       page.renderImages(renderer, SETTINGS.getReaderFontId(), orientedMarginLeft, orientedMarginTop);
     }
+    renderStatusBar();
     renderer.copyGrayscaleMsbBuffers();
     const auto tGrayMsb = millis();
 
@@ -4596,14 +6891,200 @@ void EpubReaderActivity::renderContents(const Page& page, const int orientedMarg
   }
 }
 
+void EpubReaderActivity::renderSavedHighlightsOverlay(const Page& page, int marginLeft, int marginTop) {
+  // Track whether THIS render drew anything; used at the end to set
+  // prevPageHadHighlights for the next render's refresh-mode decision.
+  bool drewAny = false;
+
+  // 4.5.5: heap gate lowered 4 KB -> 1 KB. fillRect + zero-allocation
+  // vector iteration here doesn't touch heap; the original 4K floor was
+  // over-defensive. Field report: under BT-on heap pressure (maxAlloc
+  // ~12-20 KB but periodic dips into single-digit KB during connect
+  // grace windows) the 4K gate was tripping and the underline visually
+  // disappeared. 1 KB is below anything fillRect's call-chain might
+  // need and matches the existing api-files bailout-floor convention.
+  if (ESP.getMaxAllocHeap() < 1024) { prevPageHadHighlights = false; return; }
+  if (!section || section->pageCount <= 0) { prevPageHadHighlights = false; return; }
+
+  const auto& bookmarks = BOOKMARKS.getBookmarks();
+  if (bookmarks.empty()) { prevPageHadHighlights = false; return; }
+
+  // Current page's progress slice [pageStart, pageEnd). Saved bookmarks
+  // anchor on (spineIndex, progress) where progress is the page's start.
+  // Matching a highlight to the current page means progress falls within
+  // this half-open interval.
+  const float pageStart = static_cast<float>(section->currentPage) / static_cast<float>(section->pageCount);
+  const float pageSlice = 1.0f / static_cast<float>(section->pageCount);
+  const float pageEnd = pageStart + pageSlice;
+
+  const int fontId = SETTINGS.getReaderFontId();
+  const int lineHeight = renderer.getLineHeight(fontId);
+
+  for (const auto& bm : bookmarks) {
+    // Plain point bookmark (the bookmark icon, not a highlight). Identified
+    // by an empty preview AND zero-length word range AND single-page-anchor.
+    // We don't draw an underline for those -- the bookmark icon in the
+    // status bar handles them.
+    const bool hasWordRange = (bm.endWord > bm.startWord) || !bm.preview.empty();
+    if (!hasWordRange) continue;
+
+    // Which slice of the highlight lives on the current page? A single-page
+    // highlight has both anchors on this page. Cross-page highlights are
+    // rare today (HighlightRange is single-page; HighlightSingleWord is
+    // start==end) but we handle them defensively: if the start anchors on
+    // this page, highlight from startWord onward; if the end anchors here,
+    // highlight up to endWord; else (full mid-range page) highlight all
+    // words. INT16_MAX as a sentinel means "no upper bound on this page".
+    const bool startOnPage = (bm.spineIndex == static_cast<uint16_t>(currentSpineIndex)) &&
+                             (bm.progress >= pageStart) && (bm.progress < pageEnd);
+    const bool endOnPage = (bm.endSpineIndex == static_cast<uint16_t>(currentSpineIndex)) &&
+                           (bm.endProgress >= pageStart) && (bm.endProgress < pageEnd);
+    if (!startOnPage && !endOnPage) {
+      // Could still be a fully-spanning highlight (start before, end after
+      // current page). Detect that: same-spine, start before this page,
+      // end after. Treat as "underline every word on the page."
+      const bool spansPage = (bm.spineIndex == static_cast<uint16_t>(currentSpineIndex)) &&
+                             (bm.endSpineIndex == static_cast<uint16_t>(currentSpineIndex)) &&
+                             (bm.progress < pageStart) && (bm.endProgress >= pageEnd);
+      if (!spansPage) continue;
+    }
+
+    const int firstWord = startOnPage ? static_cast<int>(bm.startWord) : 0;
+    const int lastWord = endOnPage ? static_cast<int>(bm.endWord) : INT16_MAX;
+
+    // Walk page elements; count word index as we go (matches the
+    // DictionaryWordSelectActivity::extractWords assignment). Note: that
+    // function further splits a lineWords entry on internal em-dashes,
+    // which we don't replicate here -- 1:1 with TextBlock::getWords() is
+    // accurate for >99% of real text. Worst-case visual is one word off
+    // for em-dash-containing lines; acceptable.
+    int wordIdx = 0;
+    for (const auto& element : page.elements) {
+      if (!element || element->getTag() != TAG_PageLine) continue;
+      const auto& line = static_cast<const PageLine&>(*element);
+      const auto& block = line.getBlock();
+      if (!block) continue;
+      const auto words = block->getWords();
+      const auto wordXpos = block->getWordXpos();
+      const auto wordStyles = block->getWordStyles();
+
+      // CrumBLE 4.5.6 (ported from INX): highlight rendering pivoted from
+      // faux-bold overprint to a sparse-ink lattice (every 2nd pixel on
+      // every 2nd row painted black) drawn as an ADDITIVE overlay under
+      // the word. Eye reads it as ~25% grey on the 1-bit panel. Wins over
+      // the faux-bold path:
+      //   1. Dot pattern (not contiguous mass) doesn't ghost on FAST
+      //      refresh -- same anti-ghost property faux-bold had.
+      //   2. Visually distinct from "this word is bold for emphasis" --
+      //      bold is now back to meaning source-bold, not "highlighted."
+      //      Faux-bold on LXGWWenKai (single-weight CJK) produced a
+      //      false-bold reading.
+      //   3. Reads as a single contiguous wash across multi-word
+      //      highlights once we group adjacent in-range words on the
+      //      same baseline into one rect.
+      // The lattice is byte-aligned + ADDITIVE (pixels ANDed to black
+      // rather than overwritten to a dither pattern), so text glyphs
+      // underneath the highlight remain visible. Speed matches the
+      // existing byte-aligned fillRect (~10x per-pixel drawPixel loop).
+      const int lineBaseX = marginLeft + line.xPos;
+      const int textY = marginTop + line.yPos;
+      int runStartX = -1;
+      int runEndX = -1;
+      auto flushRun = [&]() {
+        if (runStartX < 0) return;
+        renderer.fillSparseInkLatticeInRect(runStartX, textY, runEndX - runStartX, lineHeight,
+                                            /*step=*/2, /*state=*/true);
+        drewAny = true;
+        runStartX = -1;
+        runEndX = -1;
+      };
+      for (size_t i = 0; i < words.size(); ++i) {
+        const bool inRange = (wordIdx >= firstWord && wordIdx <= lastWord);
+        if (inRange) {
+          const auto wordView = words[i];
+          const int baseX = lineBaseX + wordXpos[i];
+          const int wordW = renderer.getTextWidth(fontId, wordView.c_str(), wordStyles[i]);
+          if (runStartX < 0) {
+            runStartX = baseX;
+            runEndX = baseX + wordW;
+          } else {
+            runEndX = std::max(runEndX, baseX + wordW);
+          }
+        } else {
+          flushRun();
+        }
+        ++wordIdx;
+      }
+      flushRun();
+    }
+  }
+
+  // 4.5.5+: flag retained for any callers / tests that read it, but
+  // intentionally set to false now -- bold-by-overprint doesn't leave a
+  // ghost trail, so the post-highlight FULL_REFRESH dispatch (see
+  // renderContents) is no longer needed.
+  prevPageHadHighlights = false;
+  (void)drewAny;
+  (void)lineHeight;
+}
+
 void EpubReaderActivity::renderStatusBar() const {
-  const int currentPage = section->currentPage + 1;
-  const float pageCount = section->pageCount;
+  int currentPage = section->currentPage + 1;
+  // v18.9.9.43 (task #28): during an in-progress build (C3 read-during-build),
+  // section->pageCount is a partial-and-growing count. Sending it as-is would
+  // paint "5/8" then "5/47" and read as if the book got longer between page
+  // turns. Pass -1 as a sentinel so drawStatusBar renders "5/..." until
+  // finalizeBuild commits the real total.
+  float pageCount = section->isBuilding() ? -1.0f : static_cast<float>(section->pageCount);
   const float bookProgress = getCurrentBookProgressPercent();
+
+  // v18.9.9.78: Stable Page Numbers (CrossInk parity, KOReader-style). When on,
+  // the section-local "Page N of M" is replaced with a book-wide "Stable page X
+  // of Y" derived from byte position + a configurable char-count divisor. Byte
+  // position is what Epub::calculateProgress already computes; we reuse it so
+  // there's no per-page char-offset table needed. Held stable across font /
+  // margin changes because it's tied to source EPUB byte position, not the
+  // rendered layout — that's the whole point of the mode.
+  if (SETTINGS.showStablePageNumbers && epub && epub->getBookSize() > 0 && !section->isBuilding()) {
+    const uint16_t divisor = SETTINGS.stablePageChars > 0 ? SETTINGS.stablePageChars : 1500;
+    // v18.9.9.298: prefer the optimizer-provided visible-char count when
+    // the book has a META-INF/crumble-stats.json manifest -- accurate to
+    // actual text length. Fall back to getBookSize() for books not run
+    // through the v298+ optimizer (which counts inflated HTML bytes and
+    // over-reports for image-heavy or markup-heavy books).
+    const size_t bookSize =
+        (bookVisibleCharCount_ > 0) ? static_cast<size_t>(bookVisibleCharCount_) : epub->getBookSize();
+    const int stableTotal = std::max(1, static_cast<int>((bookSize + divisor - 1) / divisor));
+    // bookProgress is 0-100; convert to 0-1 for the multiplier.
+    const float bookProgress01 = bookProgress / 100.0f;
+    // v18.9.9.293: FLOOR + 1 (was ROUND). Old rounding jumped in both
+    // directions -- sometimes two consecutive page turns rounded to the
+    // same stable page (visual stall), sometimes one turn double-jumped
+    // (5, 5, 7 instead of 5, 6, 7). Floor gives a monotonic sequence
+    // where a single page-turn always shows the same or the next stable
+    // page. Occasional stall is intentional -- it means "still on that
+    // stable chunk"; user's real-page-turn feedback is still there.
+    int stableCurrent = static_cast<int>(bookProgress01 * static_cast<float>(stableTotal)) + 1;
+    if (stableCurrent < 1) stableCurrent = 1;
+    if (stableCurrent > stableTotal) stableCurrent = stableTotal;
+    currentPage = stableCurrent;
+    pageCount = static_cast<float>(stableTotal);
+  }
 
   std::string title;
 
   int textYOffset = 0;
+
+  // v18.9.9.454: on the FIRST render after a section build completes, leave
+  // the title empty so glyph loads for non-Latin titles don't block the
+  // first-page paint. Title fills in from the second render onward
+  // (typically the user's first page turn) — by then any needed SD reads
+  // don't compete with the page-load critical path. Section-in-progress
+  // renders are always title-less (Indexing popup covers the status bar
+  // anyway; keeps the flag pattern simple). Automatic-turn banner is
+  // exempt — it's user-triggered state, not book content.
+  const bool suppressTitleForFirstRender =
+      !automaticPageTurnActive && (section->isBuilding() || !postBuildFirstRenderShown_);
 
   if (automaticPageTurnActive) {
     title = tr(STR_AUTO_TURN_ENABLED) + std::to_string(pageTurnDuration / 1000);
@@ -4616,6 +7097,8 @@ void EpubReaderActivity::renderStatusBar() const {
       textYOffset += UITheme::getInstance().getMetrics().statusBarVerticalMargin;
     }
 
+  } else if (suppressTitleForFirstRender) {
+    // title stays empty this render; drawStatusBar's pre-clear covers the band.
   } else if (SETTINGS.statusBarTitle == CrossPointSettings::STATUS_BAR_TITLE::CHAPTER_TITLE) {
     title = tr(STR_UNNAMED);
     const int tocIndex = epub->getTocIndexForSpineIndex(currentSpineIndex);
@@ -4628,11 +7111,63 @@ void EpubReaderActivity::renderStatusBar() const {
     title = epub->getTitle();
   }
 
+  // v18.9.9.454: mark the post-build first render as done so subsequent
+  // renders include the title. Only flip once the build has actually
+  // completed (isBuilding false) so the first non-Indexing render is the
+  // one that pays the deferral cost.
+  if (!section->isBuilding()) {
+    postBuildFirstRenderShown_ = true;
+  }
+
   const float rawProgress = (pageCount > 0) ? (static_cast<float>(section->currentPage) / pageCount) : 0.0f;
   const bool bookmarked = BOOKMARKS.hasBookmarkForPage(static_cast<uint16_t>(currentSpineIndex), rawProgress,
                                                        section->pageCount > 0 ? section->pageCount : 1);
+  // v18.9.9.15 / v18.9.9.53 (task #38): reader-mode icon.
+  //   - Compat mode (Simple Rendering) -> Reduced (flipped gauge). Takes
+  //     precedence because prebake is deliberately bypassed under compat.
+  //   - Prebake available AND user's current settings match the prebake
+  //     fingerprint -> Prebake bolt. Sections load directly from
+  //     sections-prebake/N.bin, no cold builds.
+  //   - Prebake available AND user's settings DON'T match the prebake
+  //     fingerprint (either drift since decline, or a fresh open where
+  //     the user hasn't seen the prompt yet this session) -> PrebakeDeclined
+  //     (bolt with slash). Every chapter is being cold-built. Signal to
+  //     the user that they can visit the prompt or align settings to
+  //     switch to the fast path.
+  //   - No prebake manifest OR optimizeChapterIndexing disabled -> no
+  //     icon; normal reader.
+  BaseTheme::ReaderStatusIcon readerIcon = BaseTheme::ReaderStatusIcon::None;
+  if (simpleRenderingActive_) {
+    readerIcon = BaseTheme::ReaderStatusIcon::Reduced;
+  } else if (prebakeManifest_.has_value() && SETTINGS.optimizeChapterIndexing != 0) {
+    const PrebakeManifest& pm = *prebakeManifest_;
+    const int32_t curFontId = SETTINGS.getReaderFontId();
+    const float curLineComp = SETTINGS.getReaderLineCompression();
+    const bool fingerprintMatch = pm.fontId == curFontId && pm.lineCompression == curLineComp &&
+                                  pm.extraParagraphSpacing == SETTINGS.extraParagraphSpacing &&
+                                  pm.forceParagraphIndents == SETTINGS.forceParagraphIndents &&
+                                  pm.paragraphAlignment == SETTINGS.paragraphAlignment &&
+                                  pm.hyphenationEnabled == SETTINGS.hyphenationEnabled &&
+                                  pm.embeddedStyle == SETTINGS.embeddedStyle &&
+                                  pm.imageRendering == SETTINGS.imageRendering &&
+                                  pm.bionicReadingEnabled == SETTINGS.bionicReadingEnabled &&
+                                  pm.guideReadingEnabled == SETTINGS.guideReadingEnabled;
+    readerIcon = fingerprintMatch ? BaseTheme::ReaderStatusIcon::Prebake
+                                  : BaseTheme::ReaderStatusIcon::PrebakeDeclined;
+  }
+  // v18.9.9.463: compute time-left from per-book pace × chapter-pages-remaining.
+  // Simple within-chapter estimate — accurate when the user's pace is roughly
+  // constant across chapters. 0 = insufficient pace data OR at chapter end,
+  // in which case drawStatusBar suppresses the field.
+  uint32_t timeLeftSeconds = 0;
+  if (SETTINGS.statusBarTimeLeft && stats.avgSecondsPerForwardPage > 0 && !section->isBuilding() &&
+      section->pageCount > 0 && section->currentPage < section->pageCount) {
+    const uint32_t pagesRemaining =
+        static_cast<uint32_t>(section->pageCount) - static_cast<uint32_t>(section->currentPage);
+    timeLeftSeconds = pagesRemaining * static_cast<uint32_t>(stats.avgSecondsPerForwardPage);
+  }
   GUI.drawStatusBar(renderer, bookProgress, currentPage, pageCount, title, 0, textYOffset, bookmarked,
-                    ReaderUtils::readerDarkModeEnabled());
+                    ReaderUtils::readerDarkModeEnabled(), readerIcon, timeLeftSeconds);
 }
 
 void EpubReaderActivity::navigateToHref(const std::string& hrefStr, const bool savePosition) {
@@ -4737,22 +7272,35 @@ bool EpubReaderActivity::drawCurrentPageToBuffer(const std::string& filePath, Gf
   // Load or rebuild the section cache. Rebuilding is needed when the cache is missing or stale
   // (e.g. after a firmware update). A no-op popup callback avoids any UI during sleep preparation.
   auto section = std::make_unique<Section>(epub, spineIndex, renderer);
+  // v18.9.9.455: this call site is static (sleep-page cache rebuild) and has
+  // no instance flag access. Leaves per-book decline unenforced here — the
+  // path is a rare sleep-time rebuild, not the hot in-book reading path, so
+  // the perf impact is negligible.
   if (!section->loadSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
                                 SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
                                 SETTINGS.paragraphAlignment, viewportWidth, viewportHeight, SETTINGS.hyphenationEnabled,
                                 SETTINGS.embeddedStyle, SETTINGS.imageRendering, SETTINGS.bionicReadingEnabled,
-                                SETTINGS.guideReadingEnabled, SETTINGS.optimizeChapterIndexing != 0)) {
+                                SETTINGS.guideReadingEnabled, SETTINGS.tableRendering,
+                                SETTINGS.optimizeChapterIndexing != 0)) {
     if (!MemoryBudget::hasHeapForOptionalEpubRebuild("SLP", "EPUB sleep-page cache rebuild", spineIndex)) {
       return false;
     }
 
     LOG_DBG("SLP", "EPUB: section cache not found for spine %d, rebuilding (free=%u, maxAlloc=%u)", spineIndex,
             ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    // v18.9.6: static method has no access to member simpleRenderingActive_;
+    // sleep-frame regeneration is a cold path (called by SleepActivity, not
+    // during active reading), safe to fall back to normal rendering. If the
+    // parse aborts here, the sleep cover just won't refresh -- the reader's
+    // own path will hit the retry cycle on the user's next book-open.
     if (!section->createSectionFile(SETTINGS.getReaderFontId(), SETTINGS.getReaderLineCompression(),
                                     SETTINGS.extraParagraphSpacing, SETTINGS.forceParagraphIndents,
                                     SETTINGS.paragraphAlignment, viewportWidth, viewportHeight,
                                     SETTINGS.hyphenationEnabled, SETTINGS.embeddedStyle, SETTINGS.imageRendering,
-                                    SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled, []() {})) {
+                                    SETTINGS.bionicReadingEnabled, SETTINGS.guideReadingEnabled,
+                                    SETTINGS.tableRendering, []() {},
+                                    nullptr, nullptr,
+                                    /*forceSimpleRendering=*/false)) {
       LOG_ERR("SLP", "EPUB: failed to rebuild section cache for spine %d", spineIndex);
       return false;
     }

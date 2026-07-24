@@ -7,7 +7,11 @@
 #include <OpdsStream.h>
 #include <WiFi.h>
 
+#include "CollectionsStore.h"
+#include "LibraryIndex.h"
 #include "MappedInputManager.h"
+#include "SdCardFontSystem.h"
+#include "SeriesIndex.h"
 #include "SilentRestart.h"
 #include "activities/network/WifiSelectionActivity.h"
 #include "activities/util/KeyboardEntryActivity.h"
@@ -26,6 +30,30 @@ constexpr size_t OPDS_BROWSER_ENTRY_CAPACITY = MAX_OPDS_FEED_ENTRIES + 2;
 void OpdsBookBrowserActivity::onEnter() {
   Activity::onEnter();
 
+  // v18.9.9.474: arm terminate-recovery to OPDS Browser (target=7) so
+  // a mid-load OOM (TLS handshake, XML parse, entry buffer alloc)
+  // lands back in OPDS on the fresh boot heap instead of Home carousel.
+  armSilentRestartTarget(/*SILENT_REBOOT_TARGET_OPDS_BROWSER=*/7);
+
+  // v18.9.9.371: aggressive teardown BEFORE the pre-flight, so the check
+  // measures post-reclaim heap. See KOReaderAuthActivity for the same
+  // pattern -- WiFi.begin + mbedTLS handshake want ~110 KB together, but
+  // lean-boot dispatch starts at ~85 KB with sdFont+LibraryIndex+series+
+  // collections loaded. Releasing those non-essentials frees ~20 KB, which
+  // is the difference between TLS handshake succeeding and failing.
+  {
+    const uint32_t freeBefore = ESP.getFreeHeap();
+    LibraryIndex::getInstance().releaseMemory();
+    SeriesIndex::getInstance().releaseMemory();
+    CollectionsStore::getInstance().releaseMemory();
+    renderer.clearImageCache();
+    sdFontSystem.releaseLoadedFont(renderer);
+    sdFontSystem.setFallbackSuppressed(true);
+    sdFontSystem.releaseFallback(renderer);
+    LOG_INF("OPDS", "Pre-network teardown: free %u -> %u bytes (maxAlloc=%u)",
+            freeBefore, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  }
+
   // CrumBLE 4.5.4: heap pre-flight before WiFi + OPDS-feed parse. WiFi
   // begin = ~58 KB, HTTPS handshake = ~40-50 KB contiguous, plus the
   // streaming OPDS XML parser eats ~10-15 KB through its chunk buffer
@@ -33,7 +61,13 @@ void OpdsBookBrowserActivity::onEnter() {
   // the silent-restart the user used to hit ERROR with no recovery
   // path. Pattern mirrors KOReader auth + BT scan: bail to a clean
   // ~150 KB heap, then continue. g_postOpdsSilentReboot guards loop.
-  constexpr uint32_t kOpdsMinFreeHeap = 66u * 1024u;
+  //
+  // v18.9.9.305: raised 66 KB -> 95 KB matching KOReaderAuthActivity
+  // (which was raised to match the reader-side SYNC pre-flight after
+  // field reports of the pre-flight passing but TLS handshake starving
+  // ~40 KB later inside the wifi.connect + mbedtls cert-chain drain).
+  // OPDS HTTPS uses the same handshake path, so the same floor applies.
+  constexpr uint32_t kOpdsMinFreeHeap = 95u * 1024u;
   constexpr uint32_t kOpdsMinMaxAlloc = 48u * 1024u;
   const uint32_t freeHeapPre = ESP.getFreeHeap();
   const uint32_t maxAllocPre = ESP.getMaxAllocHeap();
@@ -69,6 +103,8 @@ void OpdsBookBrowserActivity::onEnter() {
 
 void OpdsBookBrowserActivity::onExit() {
   Activity::onExit();
+  // v18.9.9.474: clear our terminate-recovery arming before we tear down.
+  clearArmedSilentRestartTarget();
   clearEntries();
   entries.reset();
   navigationHistory.clear();

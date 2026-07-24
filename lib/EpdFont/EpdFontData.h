@@ -141,6 +141,19 @@ typedef struct {
   /// Context pointer for glyphMissHandler (typically SdCardFont*).  Also used by
   /// GfxRenderer::getGlyphBitmap() to retrieve overflow bitmaps via SdCardFont.
   void* glyphMissCtx;
+
+  /// Streaming glyph-bitmap fetch (CrumBLE 4.5.5: hybrid streaming atlas).
+  /// When non-null, GfxRenderer::getGlyphBitmap() routes through this callback
+  /// instead of dereferencing `bitmap[dataOffset]`.  The glyph is present in
+  /// the interval table (findGlyph hits), but the bitmap bytes are not
+  /// resident -- the callback reads them on demand into a small scratch
+  /// owned by the ctx (typically Section*).  Same valid-until-next-fetch
+  /// contract as glyphMissHandler: caller must consume (draw/measure) the
+  /// returned pointer before requesting another glyph.
+  const uint8_t* (*glyphBitmapFetch)(void* ctx, const EpdGlyph* glyph);
+
+  /// Context for glyphBitmapFetch (typically Section* in streaming-atlas mode).
+  void* glyphBitmapCtx;
 } EpdFontData;
 
 namespace syntheticGlyph {

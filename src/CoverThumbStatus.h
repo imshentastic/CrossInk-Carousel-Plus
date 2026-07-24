@@ -61,4 +61,11 @@ int sweepAllMarkers();
 // since they'd otherwise block regen. Returns count of thumbs removed.
 int regenerateAllCovers();
 
+// v18.9.9.170: single-book variant of regenerateAllCovers. Deletes every
+// thumb_<W>x<H>.bmp under `cacheDir` and clears any thumb_failed_*.marker
+// files in the same dir so the next render regenerates fresh. Cache dir is
+// the value returned by Epub::cachePathForFilePath (e.g. /.crosspoint/xtc_...).
+// Returns count of thumb bmps removed. Cheap no-op if the dir doesn't exist.
+int regenerateThumbsForBook(const std::string& cacheDir);
+
 }  // namespace CoverThumbStatus

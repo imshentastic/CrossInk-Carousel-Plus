@@ -1,0 +1,10 @@
+{
+  "name": "InputManager",
+  "version": "2.0.0",
+  "description": "FreeInk input abstraction: ADC ladder / digital / confirm-hold / five-key button styles plus scaffolded capacitive touch, selected from BoardConfig.",
+  "keywords": "input, buttons, touch, adc",
+  "authors": [{"name": "FreeInk SDK Contributors"}],
+  "dependencies": {},
+  "platforms": "espressif32",
+  "frameworks": ["arduino"]
+}

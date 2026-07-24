@@ -162,7 +162,9 @@ bool decodeToBuffer(GfxRenderer& renderer, const std::string& filename, int page
     return false;
   }
 
-  constexpr size_t MIN_FREE_HEAP = 60 * 1024;  // PNG decoder ~42 KB + overhead
+  // v18.9.9.294: same rationale as SleepActivity::decodeSleepPngToBuffer -- old
+  // 60 KB gate was conservative pre-v285 shrink; actual usage is ~42 KB.
+  constexpr size_t MIN_FREE_HEAP = 48 * 1024;
   if (ESP.getFreeHeap() < MIN_FREE_HEAP) {
     LOG_ERR("PNG", "Not enough heap for PNG decoder: %u free, need %u for %s", ESP.getFreeHeap(),
             static_cast<unsigned>(MIN_FREE_HEAP), filename.c_str());

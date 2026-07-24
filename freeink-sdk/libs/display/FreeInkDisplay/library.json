@@ -1,0 +1,13 @@
+{
+  "name": "EInkDisplay",
+  "version": "2.0.0",
+  "description": "FreeInk e-paper display driver. Hardware-independent facade with one standalone driver per controller (SSD1677, UC8253, ED2208). Grayscale, anti-aliased, full/half/fast refresh. Drop-in compatible with the EInkDisplay API.",
+  "keywords": "epaper, eink, ssd1677, uc8253, display",
+  "authors": [
+    {"name": "FreeInk SDK Contributors"},
+    {"name": "CidVonHighwind", "url": "https://github.com/CidVonHighwind", "maintainer": false}
+  ],
+  "dependencies": {},
+  "platforms": "espressif32",
+  "frameworks": ["arduino"]
+}

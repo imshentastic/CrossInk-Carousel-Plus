@@ -221,6 +221,17 @@ void RecentBooksActivity::showBookActionMenu(const size_t bookIndex, const bool 
                              case FileBrowserAction::RemoveFromRecents:
                                promptRemoveBook(book.path, book.title);
                                return;
+                             case FileBrowserAction::ToggleSimpleRendering: {
+                               // v18.9.6.2: manual toggle for the Simple Rendering
+                               // sidecar. Toast shows the new state so the user
+                               // knows what to expect on the next book open.
+                               const bool nowOn = BookActions::toggleSimpleRenderingSidecar(book.path);
+                               BookActions::drawToast(renderer, nowOn ? tr(STR_ENABLE_SIMPLE_RENDERING)
+                                                                     : tr(STR_DISABLE_SIMPLE_RENDERING));
+                               delay(1000);
+                               reloadAfterBookAction();
+                               return;
+                             }
                              case FileBrowserAction::ViewOptimizedDetails: {
                                // CrumBLE 4.2: user picked the Optimized header
                                // (long-pressed UP from item 0). Load the .json

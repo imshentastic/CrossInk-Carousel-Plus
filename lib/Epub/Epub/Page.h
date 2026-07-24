@@ -51,6 +51,10 @@ class PageImage final : public PageElement {
   PageImage(std::shared_ptr<ImageBlock> block, const int16_t xPos, const int16_t yPos)
       : PageElement(xPos, yPos), imageBlock(std::move(block)) {}
   void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset, bool foregroundBlack = true) override;
+  // v18.9.9.57: cache-only render used by Section::renderPageStreamed under
+  // BT when the caller has verified prebake fingerprint + .pxc manifest are
+  // safe. Delegates to ImageBlock::renderIfCached (no decoder fallback).
+  void renderIfCached(GfxRenderer& renderer, int xOffset, int yOffset);
   bool serialize(FsFile& file) override;
   PageElementTag getTag() const override { return TAG_PageImage; }
   static std::unique_ptr<PageImage> deserialize(FsFile& file);
@@ -112,6 +116,15 @@ class PageTableFragment final : public PageElement {
         rows(std::move(rows)) {}
 
   void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset, bool foregroundBlack = true) override;
+  // v18.9.9.11: text-only render for BT-linked sessions. Iterates each cell
+  // and renders its TextBlocks at the cell's approximate top-left, but
+  // skips the table rect, column dividers, and row separators. Result
+  // is "content, no structure" -- readable text where a table used to
+  // be, minus the visual borders that don't fit the tighter BT budget
+  // and often obscure content on books that shouldn't have been parsed
+  // as tables in the first place.
+  void renderContentOnly(GfxRenderer& renderer, int fontId, int xOffset, int yOffset,
+                         bool foregroundBlack = true);
   bool serialize(FsFile& file) override;
   PageElementTag getTag() const override { return TAG_PageTableFragment; }
   static std::unique_ptr<PageTableFragment> deserialize(FsFile& file);
@@ -143,14 +156,27 @@ class Page {
   void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset, bool foregroundBlack = true) const;
   void renderText(GfxRenderer& renderer, int fontId, int xOffset, int yOffset, bool foregroundBlack = true) const;
   void renderImages(GfxRenderer& renderer, int fontId, int xOffset, int yOffset) const;
-  bool serialize(FsFile& file) const;
-  static std::unique_ptr<Page> deserialize(FsFile& file);
+  // v18.9.9.19: fileVersion drives the on-disk envelope for TAG_PageTableFragment.
+  // v42+ prepends the fragment payload with a uint32_t payloadSize so the
+  // streamed reader can cheap-skip the whole fragment (v18.9.9.20 lands the
+  // skip). v41 and earlier files stay unchanged -- readers must gate the
+  // size read on the file's version. Writers always pass SECTION_FILE_VERSION.
+  bool serialize(FsFile& file, uint8_t fileVersion) const;
+  static std::unique_ptr<Page> deserialize(FsFile& file, uint8_t fileVersion);
 
   // Check if page contains any images (used to force full refresh)
   bool hasImages() const {
     return std::any_of(elements.begin(), elements.end(),
                        [](const std::unique_ptr<PageElement>& el) { return el->getTag() == TAG_PageImage; });
   }
+
+  // v18.9.9.203: blank each image's own rect (to white) instead of the
+  // union bounding box. The reader's anti-ghosting double-flash blanks
+  // image areas before the first flush; with the union, two images far
+  // apart (or one tall figure) swallowed a band of pure text into the
+  // second flush — the "bottom of the page loads half a second late"
+  // effect. Per-rect blanking keeps interleaved text in flush one.
+  void blankImageRects(GfxRenderer& renderer, int xOffset, int yOffset) const;
 
   // Get bounding box of all images on the page (union of image rects)
   // Returns false if no images. Coordinates are relative to page origin.

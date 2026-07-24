@@ -131,6 +131,16 @@ READING_FONT_SIZES=(8 9 10 12 14 16 18 20)
 READING_FONT_STYLES=("Regular" "Bold" "Italic" "BoldItalic")
 READING_FONT_RENDER_ARGS=(--2bit --compress --pnum --darken-aa)
 
+# v18.9.9.295: IPA Extensions (0x0250-0x02AF) + Spacing Modifier Letters
+# (0x02B0-0x02FF). Needed for dictionary pronunciation glyphs (schwa /ə/,
+# primary stress mark /ˈ/, long-vowel /ː/, etc.); without them, dict
+# entries render those characters as tofu boxes. Applied to every
+# reading-font variant since dict + reader share this font.
+IPA_INTERVALS=(
+  --additional-intervals 0x0250,0x02AF
+  --additional-intervals 0x02B0,0x02FF
+)
+
 font_include_args() {
   local face_index="$1"
   shift
@@ -156,7 +166,7 @@ generate_family() {
       local font_path="../builtinFonts/source/${source_dir}/${source_prefix}-${style}.ttf"
       local output_path="${output_dir}/${font_name}.h"
       local font_stack=("$font_path")
-      local interval_args=()
+      local interval_args=("${IPA_INTERVALS[@]}")
       local include_args=()
 
       if [[ "$include_emoji" == "yes" ]]; then

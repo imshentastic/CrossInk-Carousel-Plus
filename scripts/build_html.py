@@ -246,9 +246,14 @@ for root, _, files in os.walk(SRC_DIR):
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            # Only minify HTML files; JS files are typically pre-minified (e.g., jszip.min.js)
+            # Only minify HTML files; JS files are typically pre-minified (e.g., jszip.min.js).
+            # Exception: files-app.js -- extracted from FilesPage.html in v18.9.9.97 and
+            # therefore heavily commented; run it through minify_js so the served payload
+            # matches what would have been produced by minify_html's inline-script pass.
             if file.endswith(".html"):
                 processed = minify_html(content)
+            elif file == "files-app.js":
+                processed = minify_js(content)
             else:
                 processed = content
 

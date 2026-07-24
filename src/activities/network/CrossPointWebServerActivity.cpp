@@ -23,6 +23,7 @@
 #include "network/CrossPointWebServer.h"
 #include "network/FirmwareFlasher.h"
 #include <HalStorage.h>
+#include <HalGPIO.h>  // v18.9.9.117: for gpio.deviceIsX3() in pre-flight
 #include "WifiSelectionActivity.h"
 #include "activities/network/CalibreConnectActivity.h"
 #include "components/UITheme.h"
@@ -56,6 +57,11 @@ int barsForRssi(int rssi, int currentBars) {
 
 void CrossPointWebServerActivity::onEnter() {
   Activity::onEnter();
+
+  // v18.9.9.373: mark the entry time so the heap watchdog can enforce
+  // a minimum cooldown between silent-restart-to-FT attempts.
+  activityEnteredAtMs_ = millis();
+  heapLowStreakStartMs_ = 0;
 
   LOG_INF("WEBACT", "Free heap at onEnter: %d bytes (maxAlloc %d)", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
@@ -92,10 +98,14 @@ void CrossPointWebServerActivity::onEnter() {
     if (btStatus != ESP_BT_CONTROLLER_STATUS_IDLE) {
       esp_bt_controller_deinit();
     }
-    // mem_release returns the controller's static buffers permanently.
-    // After this call, esp_bt_controller_init() will fail until reboot --
-    // exactly what we want since onExit triggers a silentRestart anyway.
+    // v18.9.9.110: BT memory reservation is now released at BOOT (not here)
+    // via our strong btInUse() override in main.cpp. If the previous session
+    // silent-restarted into FT (silentRebootTarget == FT), Arduino releases
+    // the ~25 KB of BT static memory before app_main. So this runtime call
+    // is now a small ~1.6 KB extra cleanup that mostly no-ops.
     esp_bt_mem_release(ESP_BT_MODE_BLE);
+    extern bool g_bleControllerMemReleased;
+    g_bleControllerMemReleased = true;
     LOG_INF("WEBACT", "Free heap after BT controller release: %d bytes (maxAlloc %d)",
             ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   }
@@ -147,6 +157,40 @@ void CrossPointWebServerActivity::onEnter() {
   LOG_INF("WEBACT", "Free heap after series/collections release: %d bytes (maxAlloc %d)",
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
+  // CrumBLE 4.5.4: also dump the renderer's image cache. On a device
+  // that's been showing the home screen with shelf covers loaded, the
+  // image cache can hold ~30-50 KB of cover bitmaps that the FT mode
+  // doesn't need. Field log showed maxAlloc=6900 at WEBACT entry on a
+  // device that booted clean, meaning the cover decode churn during
+  // shelf paint had fragmented the heap beyond what BT/index/series
+  // release could recover. Wiping the image cache is the last reclaim
+  // that targets the cover-decode residue specifically.
+  renderer.clearImageCache();
+  LOG_INF("WEBACT", "Free heap after image-cache clear: %d bytes (maxAlloc %d)",
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
+  // CrumBLE 4.5.4: also release the SD card fonts. The primary SD font +
+  // UI fallback together hold ~30-40 KB resident (headers, intervals,
+  // mini bitmap caches), scattered through the heap. None of it is
+  // needed in FT mode: the web server uses small UI strings drawn with
+  // the always-loaded built-in fonts. On exit, ensureLoaded() + ensure
+  // FallbackLoaded() are called from main.cpp's per-tick poll and the
+  // fonts re-resident before the user's next home render. Field log:
+  // WEBACT entered with maxAlloc=14324 (well below the 45 KB pre-flight
+  // floor), and even after BT/index/series/cache clears the maxAlloc
+  // stayed at 14324 -- the SD-font fragmentation was the dominant
+  // residue.
+  sdFontSystem.releaseLoadedFont(renderer);
+  // CrumBLE 4.5.4: also release the UI fallback. The fallback was the
+  // dominant fragmentation contributor -- a permanently-resident
+  // LXGW @14pt in the carousel/UI path. Suppression flag prevents the
+  // per-tick poll from immediately reloading it. ALWAYS clear the flag
+  // on FT exit (see exitToOrigin / silent restart paths).
+  sdFontSystem.setFallbackSuppressed(true);
+  sdFontSystem.releaseFallback(renderer);
+  LOG_INF("WEBACT", "Free heap after SD font + fallback release: %d bytes (maxAlloc %d)",
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
   // CrumBLE: pre-flight heap check AFTER all reclamations.
   //
   // Threshold history:
@@ -184,37 +228,44 @@ void CrossPointWebServerActivity::onEnter() {
   //       sees a real error instead of an infinite restart.
   constexpr uint32_t SILENT_REBOOT_LOWHEAP_RECOVERY_HINT = 99;
   const uint32_t modeHint = consumeSilentRebootFtModeHint();
-  const bool justLowHeapRestarted = (modeHint == SILENT_REBOOT_LOWHEAP_RECOVERY_HINT);
+  // v18.9.9.86: also latch on the html-serve low-heap flag (see main.cpp
+  // g_ftHtmlServeLowHeapRestart). One-shot: read-and-clear so a subsequent
+  // fresh FT entry doesn't inherit "we just recovered."
+  extern uint32_t g_ftHtmlServeLowHeapRestart;
+  const bool htmlServeLowHeapPrev = (g_ftHtmlServeLowHeapRestart == 1);
+  g_ftHtmlServeLowHeapRestart = 0;
+  // v18.9.9.117: modeHint 1 or 2 also implies "we just restarted with the
+  // user's mode preserved" so the pre-flight in onNetworkModeSelected must
+  // not fire again (loop protection). Any silent-restart into FT (whether
+  // for html-serve low heap or for the new post-mode-selection pre-flight)
+  // sets this so a second failure falls through to alert + exit.
+  const bool justLowHeapRestarted = (modeHint == SILENT_REBOOT_LOWHEAP_RECOVERY_HINT) ||
+                                    (modeHint == 1) || (modeHint == 2) || htmlServeLowHeapPrev;
+  justLowHeapRestarted_ = justLowHeapRestarted;  // v18.9.9.83: latch for mid-serve check
 
-  const uint32_t FT_MIN_MAX_ALLOC = gpio.deviceIsX3() ? 32000U : 45000U;
-  if (ESP.getMaxAllocHeap() < FT_MIN_MAX_ALLOC) {
-    if (!justLowHeapRestarted) {
-      // CrumBLE 4.2: convert the "Reboot the device" alert into an
-      // automatic silent-restart to FT. Symptom we're fixing: user was
-      // in a heap-tight state (e.g. just connected BT on an SD-font
-      // book), exited to FT, the NimBLE/controller/SD-font/index/series
-      // releases above weren't enough to defragment the heap, pre-flight
-      // failed, and the user had to physically reboot. With the silent
-      // restart they instead see a brief loading popup (~3-5 s) and
-      // land in a fresh-boot FT with a clean heap -- same total wait,
-      // zero user action required.
-      LOG_ERR("WEBACT", "FT pre-flight: maxAlloc=%u below %u, silent-restarting to recover",
-              ESP.getMaxAllocHeap(), FT_MIN_MAX_ALLOC);
-      setSilentRebootFtModeHint(SILENT_REBOOT_LOWHEAP_RECOVERY_HINT);
-      silentRestartToFileTransfer();
-      return;  // ESP.restart() in silentRestartToFileTransfer doesn't return
-    }
-    // Already silent-restarted once and still failing -- something is
-    // genuinely wrong (corrupt SD, hardware issue, etc.). Don't loop.
-    // Fall back to the original alert + exit.
-    LOG_ERR("WEBACT", "FT pre-flight: maxAlloc=%u below %u after recovery restart, falling back to alert",
-            ESP.getMaxAllocHeap(), FT_MIN_MAX_ALLOC);
-    strncpy(APP_STATE.pendingAlertTitle, tr(STR_LOW_MEMORY_FT_TITLE), sizeof(APP_STATE.pendingAlertTitle) - 1);
-    strncpy(APP_STATE.pendingAlertBody, tr(STR_LOW_MEMORY_FT_BODY), sizeof(APP_STATE.pendingAlertBody) - 1);
-    APP_STATE.hasPendingAlert.store(true, std::memory_order_release);
-    exitToOrigin();
-    return;
-  }
+  // CrumBLE 4.5.4: REVERTED to 45000/32000. An earlier lowering to
+  // 25000/20000/16000 was based on observed steady-state heap, but
+  // didn't account for WiFi.begin's allocation need: esp_wifi_init
+  // consumes ~50 KB contiguous, so a 20 KB pre-flight pass lets the
+  // device proceed to WiFi.begin which then OOMs and produces the
+  // ASSOC_EXPIRE storm (field log: heap dropped 56548 -> 2572 over
+  // WiFi.begin, then connection timed out). The 45 KB floor really
+  // is the minimum that lets WiFi succeed -- the lower thresholds
+  // for HTML serve / API guard (in CrossPointWebServer.cpp) are fine
+  // because those run POST-WiFi when heap has already recovered.
+  // v18.9.9.116: REVERT v115's threshold lowering. The pre-flight silent-
+  // restart IS beneficial: it wipes cover-buffer/carousel/framebuffer state
+  // that isn't otherwise released at FT-enter, and the post-restart boot
+  // reaches 60+K maxAlloc vs the cold-path 38K. v115's log proved skipping
+  // the restart left us at 12K/10K Post-webServer-begin vs 15K/13K WITH
+  // the restart. Restore 45000 for X4 -- the "unnecessary" restart is
+  // actually the difference between FT working and stalling.
+  // v18.9.9.117: pre-flight moved to onNetworkModeSelected(). Firing here
+  // (at onEnter, BEFORE the user has committed to a mode) wasted a ~3 s
+  // reboot cycle even when the user just wanted to see the mode picker
+  // before backing out. Now the check fires ONLY after the user picks
+  // Join Network / Hotspot -- at which point the ~3 s wait is meaningful
+  // (they're committing to WiFi.begin's ~50 KB alloc anyway).
 
   // Reset state
   state = WebServerActivityState::MODE_SELECTION;
@@ -267,6 +318,12 @@ void CrossPointWebServerActivity::onExit() {
   // the next FT session.
   setFtUploadInProgress(false);
 
+  // CrumBLE 4.5.4: lift the UI-fallback suppression so the per-tick
+  // poll restores the fallback before the user's next home render.
+  // No-op on silent-restart exits (they reboot, suppression flag
+  // resets to default false anyway).
+  sdFontSystem.setFallbackSuppressed(false);
+
   // CrumBLE: books may have just been uploaded over the file-transfer
   // web UI (USB or hotspot). Mark the LibraryIndex stale so the next
   // visit to Recently Added / All Books re-walks SD and discovers them.
@@ -312,6 +369,29 @@ void CrossPointWebServerActivity::onNetworkModeSelected(const NetworkMode mode) 
   networkMode = mode;
   isApMode = (mode == NetworkMode::CREATE_HOTSPOT);
 
+  // v18.9.9.120: UNCONDITIONAL silent-restart on FT mode commit (Pattern 1
+  // from user's arch discussion). Rationale: Home page optimizations
+  // (shelf-strip snapshot, LyraFlowTheme side-tile cache ~24 KB, carousel
+  // frame cache) fragment the heap during a Home session. Even after the
+  // Home::onExit release, fragmentation persists and FT serves at a
+  // constrained heap that struggles with api-files + follow-up XHRs
+  // (/api/settings-page, /api/wifi-networks). Silent-restarting on mode
+  // commit gives FT a truly fresh heap identical to boot-into-FT state,
+  // matching v55's post-cover-guard-restart baseline that shipped fast
+  // FT loads. Home optimizations kept 100%. Cost: ~3s "Loading FT..."
+  // popup once per FT session at a natural user-commit point.
+  // Skip only when we came via boot dispatch (post-restart) to avoid
+  // an infinite loop; the mode hint mechanism carries the picked mode
+  // across the reboot so the user picks once.
+  if (mode != NetworkMode::CONNECT_CALIBRE && !justLowHeapRestarted_) {
+    LOG_INF("WEBACT",
+            "onNetworkModeSelected: unconditional silent-restart to FT for fresh heap (mode hint=%u)",
+            (unsigned)(mode == NetworkMode::CREATE_HOTSPOT ? 2u : 1u));
+    setSilentRebootFtModeHint(mode == NetworkMode::CREATE_HOTSPOT ? 2u : 1u);
+    silentRestartToFileTransfer();
+    return;  // ESP.restart() doesn't return
+  }
+
   if (mode == NetworkMode::CONNECT_CALIBRE) {
     startActivityForResult(
         std::make_unique<CalibreConnectActivity>(renderer, mappedInput), [this](const ActivityResult& result) {
@@ -330,10 +410,27 @@ void CrossPointWebServerActivity::onNetworkModeSelected(const NetworkMode mode) 
   }
 
   if (mode == NetworkMode::JOIN_NETWORK) {
+    // v18.9.9.265: stop BLE BEFORE WiFi init. ESP32-C3 shares one radio
+    // between BLE + WiFi. When WiFi driver init runs with NimBLE
+    // resident (~52 KB heap), the WiFi RX/TX pool sizes get clamped to
+    // fit the remaining budget -- and stay clamped for this WiFi
+    // session even if we drop BLE later. Ported from CrossPoint
+    // feat-bluetooth c1a396c1. Match action: synchronous disable so
+    // WiFi.mode() runs with BLE memory already released.
+    if (BluetoothHIDManager::getInstance().isEnabled()) {
+      LOG_INF("WEBACT", "Disabling BT before WiFi STA init to free radio+heap");
+      BluetoothHIDManager::getInstance().disable();
+    }
     // STA mode - launch WiFi selection
-    LOG_DBG("WEBACT", "Turning on WiFi (STA mode)...");
-    WiFi.mode(WIFI_STA);
-
+    // v18.9.9.355: DROPPED the pre-emptive WiFi.mode(WIFI_STA) call.
+    // WifiSelectionActivity's connect path already sets WIFI_STA before
+    // WiFi.begin(). Doing it HERE ate ~50 KB of driver-init heap
+    // BEFORE WifiSelection ran, and WifiSelection then had only ~30 KB
+    // free -- which trickled through onWifiSelectionComplete leaving
+    // startWebServer at ~15 KB (needs 40 KB+ for routes). Result:
+    // /api/files rendered zero rows, all requests soft-503'd. Letting
+    // WifiSelection own the WiFi.mode call keeps FT's heap ~50 KB
+    // higher for startWebServer.
     state = WebServerActivityState::WIFI_SELECTION;
     LOG_DBG("WEBACT", "Launching WifiSelectionActivity...");
     startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
@@ -360,10 +457,21 @@ void CrossPointWebServerActivity::onWifiSelectionComplete(const bool connected) 
     // Get connection info before exiting subactivity
     isApMode = false;
 
-    // Start mDNS for hostname resolution
-    if (MDNS.begin(AP_HOSTNAME)) {
-      LOG_DBG("WEBACT", "mDNS started: http://%s.local/", AP_HOSTNAME);
-    }
+    // v18.9.9.82: instrument the post-connect path to identify which
+    // allocation is bad_alloc'ing on marginal heap. Field repro: WiFi
+    // connects at ~25 KB free, then 17 ms later std::terminate at
+    // free=2608. Somewhere in [mDNS begin, webServer new, webServer->begin]
+    // ~22 KB got consumed.
+    LOG_INF("WEBACT", "Post-connect diag: free=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
+    // v18.9.9.92: mDNS SKIPPED on STA path. It costs ~5.5 KB free / ~4 KB
+    // maxAlloc, which on X4 is exactly the headroom that separates
+    // "TCP accept can serve HTTP" from "silent connection reset at
+    // maxAlloc=4852". Device is reachable at the raw IP shown on the
+    // mode-status panel, so .local access is a nicety users can trade
+    // for FT actually working. Bookmarked `.local` URLs will need to
+    // be updated to the IP once (or resolved via router DHCP hostname).
+    LOG_INF("WEBACT", "mDNS skipped on STA path (v91: heap-headroom trade); IP-only access");
 
     // Start the web server
     startWebServer();
@@ -386,6 +494,13 @@ void CrossPointWebServerActivity::startAccessPoint() {
   LOG_DBG("WEBACT", "Starting Access Point mode...");
   LOG_DBG("WEBACT", "Free heap before AP start: %d bytes", ESP.getFreeHeap());
 
+  // v18.9.9.265: same rationale as the STA branch above -- stop BLE
+  // BEFORE WiFi init so the WiFi RX/TX pool sizing runs against fresh
+  // heap. Ported from CrossPoint feat-bluetooth c1a396c1.
+  if (BluetoothHIDManager::getInstance().isEnabled()) {
+    LOG_INF("WEBACT", "Disabling BT before WiFi AP init to free radio+heap");
+    BluetoothHIDManager::getInstance().disable();
+  }
   // Configure and start the AP
   WiFi.mode(WIFI_AP);
   delay(100);
@@ -439,10 +554,13 @@ void CrossPointWebServerActivity::startAccessPoint() {
 }
 
 void CrossPointWebServerActivity::startWebServer() {
-  LOG_DBG("WEBACT", "Starting web server...");
+  LOG_INF("WEBACT", "startWebServer entry: free=%u maxAlloc=%u",
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   // Create the web server instance
   webServer.reset(new CrossPointWebServer());
+  LOG_INF("WEBACT", "Post-webServer-new diag: free=%u maxAlloc=%u",
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   // Give it the renderer so /api/reader-render-info can compute the reader's
   // viewport + emSize for the optimizer's .pxc baking.
   webServer->setRenderer(&renderer);
@@ -451,11 +569,30 @@ void CrossPointWebServerActivity::startWebServer() {
   // returns 503 in this build (the device-side Settings UI is the canonical
   // path); /api/wifi, /api/opds, /api/files all work normally.
   webServer->begin();
+  LOG_INF("WEBACT", "Post-webServer-begin diag: free=%u maxAlloc=%u",
+          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
   if (webServer->isRunning()) {
     state = WebServerActivityState::SERVER_RUNNING;
     LOG_DBG("WEBACT", "Web server started successfully");
-    lastWifiBars = isApMode ? 0 : barsForRssi(WiFi.RSSI(), 0);
+    lastWifiRssi = isApMode ? 0 : WiFi.RSSI();
+    lastWifiBars = isApMode ? 0 : barsForRssi(lastWifiRssi, 0);
+
+    // v18.9.9.432: reclaim the ~52 KB framebuffer secondary. FT's UI is a
+    // static QR/IP screen: no differential AA rendering, only occasional
+    // RSSI/bars cosmetic repaints (already suppressed during active WS
+    // uploads by the loop() gate below). swapBuffers() and displayBuffer()
+    // handle a null secondary correctly (no swap; driver re-seeds RAM
+    // planes). onExit always reboots via silentRestart(), which re-allocs
+    // both buffers on next boot, so no matching realloc is needed here.
+    const uint32_t freeBefore = ESP.getFreeHeap();
+    const uint32_t maxBefore = ESP.getMaxAllocHeap();
+    display.releaseSecondaryFrameBuffer();
+    LOG_INF("WEBACT",
+            "Released framebuffer secondary: free %u -> %u (+%d), maxAlloc %u -> %u",
+            freeBefore, ESP.getFreeHeap(),
+            static_cast<int>(ESP.getFreeHeap()) - static_cast<int>(freeBefore),
+            maxBefore, ESP.getMaxAllocHeap());
 
     // Force an immediate render since we're transitioning from a subactivity
     // that had its own rendering task. We need to make sure our display is shown.
@@ -500,6 +637,17 @@ void CrossPointWebServerActivity::loop() {
       if (millis() - lastWifiCheck > 2000) {  // Check every 2 seconds
         lastWifiCheck = millis();
         const wl_status_t wifiStatus = WiFi.status();
+        // v18.9.9.421: skip cosmetic repaints during an active WS upload.
+        // Each requestUpdate() drives the activity's render() and a panel
+        // refresh (X3_DRF ~380-930 ms on X3), which pauses the WS loop
+        // and eats maxAlloc for the framebuffer flush. Over a 10 MB
+        // upload the RSSI/bars flap can trigger 15-30 repaints, adding
+        // ~10-15 s of dead time AND transiently starving the heap the
+        // WS BIN handler needs. WiFi loss handling (consecutive-
+        // disconnect abandonment via onGoHome) still runs -- only the
+        // "bars changed" cosmetic repaint is suppressed while uploading.
+        const bool uploadActiveForRepaintGate =
+            webServer && webServer->getWsUploadStatus().inProgress;
         // Driver auto-reconnect handles retries; abandon (via onGoHome) only
         // after WIFI_ABANDON_MS, otherwise the activity freezes on a blip.
         bool repaint = false;
@@ -530,12 +678,20 @@ void CrossPointWebServerActivity::loop() {
             LOG_DBG("WEBACT", "Warning: Weak WiFi signal: %d dBm", rssi);
           }
           const int bars = barsForRssi(rssi, lastWifiBars);
-          if (bars != lastWifiBars) {
+          // v18.9.9.300: cache RSSI so render() can show a weak-signal
+          // warning. Repaint on either bars change OR when we cross the
+          // weak-signal threshold in either direction.
+          const bool wasWeak = lastWifiRssi < 0 && lastWifiRssi > -100 && lastWifiRssi < -70;
+          const bool nowWeak = rssi < 0 && rssi > -100 && rssi < -70;
+          if (bars != lastWifiBars || wasWeak != nowWeak) {
             lastWifiBars = bars;
+            lastWifiRssi = rssi;
             repaint = true;
+          } else {
+            lastWifiRssi = rssi;
           }
         }
-        if (repaint) requestUpdate();
+        if (repaint && !uploadActiveForRepaintGate) requestUpdate();
       }
     }
 
@@ -550,6 +706,36 @@ void CrossPointWebServerActivity::loop() {
 
       // Reset watchdog BEFORE processing - HTTP header parsing can be slow
       esp_task_wdt_reset();
+
+      // CrumBLE 4.5.5: critical-heap watchdog. Field log: an HP CJK upload
+      // finished cleanly, then the post-upload phase (font stream + library
+      // re-walk attempts + browser probing .crosspoint cache state) drained
+      // heap to free=5864 maxAlloc=1780. The NEXT incoming HTTP request
+      // entered WebServer::_parseForm, which allocates a std::unordered_map
+      // for headers, hit std::bad_alloc, and -- because the Arduino runtime
+      // is built without exception handling for application code paths --
+      // landed in std::terminate -> abort(). Device panic'd, reboot, the
+      // freshly-uploaded EPUB wasn't visible in FT.
+      //
+      // We can't intercept inside _parseForm (it's library code). But we
+      // CAN refuse to call handleClient when heap is already below the
+      // floor parseForm needs. If we hit that floor, trigger a clean
+      // silent-restart back to FT instead of letting the next request
+      // crash the process. The user re-enters FT on a fresh heap; in-
+      // flight uploads are lost but the device stays alive.
+      //
+      // v18.9.9.90: pre-emptive heap-floor + silent-restart-to-FT removed.
+      // History: v83 added a 3072-byte floor to prevent bad_alloc in
+      // _parseForm; v88 lowered it to 1500 after v87's chunked serve; v90
+      // field logs showed maxAlloc dipping below 1500 mid-session and
+      // silent-restarting even when the next request would have parsed
+      // fine, breaking the browser's WS session and open pages every
+      // time. Real bad_allocs are caught by std::terminate ->
+      // hard-restart with panel resync (v18.9.9.84), which is one clean
+      // reboot per actual failure vs. dozens of unnecessary reboots
+      // under the pre-emptive floor. If _parseForm turns out to
+      // bad_alloc under some workload, reintroduce a narrower guard
+      // (e.g. floor + hasClient() check + multi-poll persistence).
 
       // Process HTTP requests in tight loop for maximum throughput
       // More iterations = more data processed per main loop cycle
@@ -582,6 +768,251 @@ void CrossPointWebServerActivity::loop() {
       lastHandleClientTime = millis();
     }
 
+    // v18.9.9.372: passive critical-heap watchdog. sendBufferGzip's per-
+    // serve guard only fires when a PROGMEM page is being served -- if
+    // the heap collapses AFTER a serve (WS state pinning, post-upload
+    // library walk, browser polling /api/heap while device chokes), the
+    // device sits at ~3 KB free indefinitely. Browser sees "reconnecting"
+    // because every new HTTP conn needs ~2 KB for the TCP socket.
+    //
+    // Poll free heap once per loop tick; if it stays under a critical
+    // floor for kHeapLowConsecutiveTicks in a row, silent-restart to FT
+    // to give the browser a natural recovery point (same flow the
+    // per-serve guard uses -- mode hint preserves the network mode so
+    // the reload lands on FilesPage automatically).
+    //
+    // Consecutive-tick requirement avoids restarting on transient dips
+    // (e.g. mid-request allocation spike that resolves in <1 second).
+    // Never fires during an active WS upload -- restarting mid-upload
+    // aborts the browser's upload state and loses whatever bytes were
+    // in flight. Never fires when a request handler already scheduled
+    // a per-serve restart (peekFtRestartRequest).
+    // v18.9.9.373: raised threshold from 6 KB -> 10 KB, added time-based
+    // cooldown that lets the watchdog fire again 30 s after a prior
+    // silent-restart. Field log: 40 seconds of low-heap thrash with the
+    // old code refusing to restart because `justLowHeapRestarted_` was
+    // still latched and no "large serve" had counted since restart --
+    // browser only polls small API endpoints, none of which trigger the
+    // progress counter. Time-based cooldown handles that flow.
+    // v18.9.9.374: DROP the justLowHeapRestarted_ gate. It's set true on
+    // EVERY post-mode-select boot (modeHint 1 or 2), not just after a
+    // real heap-recovery restart -- so the 30 s cooldown was applying
+    // even on the first FT session after user picked Join Network. That
+    // meant the browser sat at 6 KB free for 30 seconds every time.
+    // Replace with a simpler "minimum time since entry" gate: give the
+    // page 12 s to load + settle, then any 2 s low-heap streak triggers
+    // restart. Worst-case restart-every-14s loop is preferable to
+    // 30-second browser stalls on every FT session.
+    {
+      // v18.9.9.426: cut floor 10 KB -> 5 KB. Field bug: watchdog kept
+      // tripping during normal Optimize activity -- after optimizer.js
+      // serve + WS pad grab + api-reader-render-info request, free heap
+      // legitimately dips to 7-9 KB for several seconds, well under the
+      // old 10 KB floor. The watchdog then restarted the WS server
+      // mid-optimize, browser saw "cannot fetch". 5 KB is genuinely
+      // stuck-territory; normal serve activity should recover above it.
+      constexpr uint32_t kHeapLowFloor = 5u * 1024u;
+      constexpr uint32_t kHeapLowStreakMs = 2000;   // sustained-low duration
+      constexpr uint32_t kMinTimeSinceEntryMs = 12000;  // let page load + settle first
+      const uint32_t nowMs = millis();
+      const uint32_t freeNow = ESP.getFreeHeap();
+      const bool uploadActive = webServer && webServer->getWsUploadStatus().inProgress;
+      const bool peerPending = peekFtRestartRequest();
+      if (!uploadActive && !peerPending && freeNow < kHeapLowFloor) {
+        if (heapLowStreakStartMs_ == 0) {
+          heapLowStreakStartMs_ = nowMs;
+        }
+        const uint32_t streakMs = nowMs - heapLowStreakStartMs_;
+        const bool minEntryElapsed = (activityEnteredAtMs_ != 0 &&
+                                      (nowMs - activityEnteredAtMs_) >= kMinTimeSinceEntryMs);
+        if (streakMs >= kHeapLowStreakMs) {
+          if (!minEntryElapsed) {
+            LOG_DBG("WEBACT",
+                    "Heap watchdog: free=%u < %u for %u ms; skipping (min time since entry not elapsed)",
+                    freeNow, kHeapLowFloor, streakMs);
+          } else {
+            LOG_INF("WEBACT",
+                    "Heap watchdog tripped: free=%u < %u for %u ms -- silent-restart to FT",
+                    freeNow, kHeapLowFloor, streakMs);
+            setSilentRebootFtModeHint(isApMode ? 2u : 1u);
+            extern uint32_t g_ftHtmlServeLowHeapRestart;
+            g_ftHtmlServeLowHeapRestart = 1;
+            stopWebServer();
+            MDNS.end();
+            if (dnsServer) {
+              dnsServer->stop();
+              delete dnsServer;
+              dnsServer = nullptr;
+            }
+            delay(50);
+            silentRestartToFileTransfer();  // never returns
+            return;
+          }
+        }
+      } else {
+        heapLowStreakStartMs_ = 0;  // heap recovered
+      }
+    }
+
+    // v18.9.9.417: fragmentation-during-upload watchdog. The heap-low block
+    // above deliberately gates out `uploadActive` because we don't want to
+    // interrupt a healthy in-progress upload. But that leaves a gap: an
+    // upload can be alive (WS accepting connections, free heap fine) while
+    // maxAlloc is chronically fragmented -- every BIN frame dips below
+    // v402's 6 KB hard floor and gets refused, so the browser retries
+    // forever at ~10-20 s per file. Field-observed: uploading Harry Potter
+    // CJK, ~700 small files, ~85% of them got 3-10 retries each, taking
+    // hours instead of minutes. maxAlloc sat at 11764 for 1000+ seconds
+    // with no automatic recovery.
+    // Fix: if maxAlloc stays below 15 KB for 60+ seconds during an active
+    // upload, silent-restart to FT. Browser's WS retry + server RESUME:N
+    // continues from the fsync'd offset on the fresh boot's clean heap.
+    // Threshold 15 KB is chosen so the trigger doesn't fire under normal
+    // upload heap use (v417 field data showed 17-22 KB maxAlloc in a
+    // healthy CJK upload run); a sustained dip below indicates true
+    // fragmentation, not transient allocation.
+    {
+      // v18.9.9.421: tightened from 15 KB / 60 s to 18 KB / 30 s. Field
+      // observation: maxAlloc drifted at 10-17 KB for the entire upload
+      // and never recovered -- 60 s of "wait for recovery" was pure
+      // wasted time before we finally silent-restarted. At 18 KB / 30 s
+      // we catch chronic fragmentation twice as fast, and the 18 KB
+      // threshold sits between the WS BIN floor (20 KB, v421) and the
+      // observed crash zone (17 KB) so we defrag BEFORE the floor
+      // starts refusing frames.
+      constexpr uint32_t kUploadFragMaxAllocFloor = 18u * 1024u;
+      constexpr uint32_t kUploadFragStreakMs = 30u * 1000u;
+      const uint32_t nowMs = millis();
+      const bool uploadActive = webServer && webServer->getWsUploadStatus().inProgress;
+      if (uploadActive) {
+        const uint32_t maxAllocNow = ESP.getMaxAllocHeap();
+        if (maxAllocNow < kUploadFragMaxAllocFloor) {
+          if (uploadFragStreakStartMs_ == 0) {
+            uploadFragStreakStartMs_ = nowMs;
+          }
+          const uint32_t streakMs = nowMs - uploadFragStreakStartMs_;
+          if (streakMs >= kUploadFragStreakMs) {
+            LOG_INF("WEBACT",
+                    "Upload-fragmentation watchdog tripped: maxAlloc=%u < %u for %u ms during upload -- silent-restart to FT for defrag",
+                    maxAllocNow, kUploadFragMaxAllocFloor, streakMs);
+            setSilentRebootFtModeHint(isApMode ? 2u : 1u);
+            extern uint32_t g_ftHtmlServeLowHeapRestart;
+            g_ftHtmlServeLowHeapRestart = 1;
+            stopWebServer();
+            MDNS.end();
+            if (dnsServer) {
+              dnsServer->stop();
+              delete dnsServer;
+              dnsServer = nullptr;
+            }
+            delay(50);
+            silentRestartToFileTransfer();  // never returns
+            return;
+          }
+        } else {
+          uploadFragStreakStartMs_ = 0;
+        }
+      } else {
+        uploadFragStreakStartMs_ = 0;
+      }
+    }
+
+    // v18.9.9.384: post-large-upload defrag restart. WS DONE handler arms
+    // this after a >= 1 MB upload finishes and heap is fragmented. Uses
+    // the same silent-restart-to-FT path as the low-heap watchdog above,
+    // but timed to fire AFTER the DONE TXT frame has flushed to the browser
+    // (1500ms delay armed in the handler). Browser's post-upload workflow
+    // reconnects via its retry loop and lands on the fresh boot's clean heap.
+    // v18.9.9.394: idle-restart. If no HTTP request or WS event has arrived
+    // for kFtIdleRestartMs while an upload is NOT in progress, silent-restart
+    // to FT. Catches states the passive low-heap watchdog can't see:
+    //   - WS accept path wedged (stale client slot from a prior restart) but
+    //     HTTP still healthy, so heap is fine and the watchdog never trips.
+    //   - Slow heap creep from cumulative HTTP asset serves that never dips
+    //     below the critical floor but leaves us with maxAlloc ~16 KB.
+    //   - Browser tab closed silently -- next entry lands on a clean boot.
+    // Gates: skip during upload (wsUploadInProgress), and require the user
+    // to have been in FT long enough that a restart doesn't just re-loop
+    // (kMinTimeSinceEntryMs already enforced by the heap watchdog block above
+    // -- reuse activityEnteredAtMs_ here so the two share the same floor).
+    {
+      constexpr uint32_t kFtIdleRestartMs = 15u * 60u * 1000u;  // 15 min
+      constexpr uint32_t kFtWsWedgeRestartMs = 3u * 60u * 1000u;  // 3 min
+      constexpr uint32_t kMinUptimeForIdleRestart = 60u * 1000u;
+      extern uint32_t g_ftLastActivityAtMs;
+      extern uint32_t g_ftLastWsEventAtMs;
+      const uint32_t now = millis();
+      // v18.9.9.398: WS-wedge detector. Fires when the browser is actively
+      // hitting HTTP endpoints (g_ftLastActivityAtMs is recent) but no WS
+      // event has landed in 3 min. Real-world case: browser has stale
+      // pre-v395 JS + probes /api/status on every WS retry (keeping the
+      // 15-min idle timer forever reset), while every WS handshake times
+      // out at 30 s. Silent-restart-to-FT clears whatever wedge is blocking
+      // the WS accept (stale client slot / LWIP state / anything similar).
+      const bool httpRecent = (g_ftLastActivityAtMs != 0 &&
+                               (now - g_ftLastActivityAtMs) < 60u * 1000u);
+      if (!isFtUploadInProgress() &&
+          activityEnteredAtMs_ != 0 &&
+          (now - activityEnteredAtMs_) >= kMinUptimeForIdleRestart &&
+          httpRecent &&
+          g_ftLastWsEventAtMs != 0 &&
+          (now - g_ftLastWsEventAtMs) >= kFtWsWedgeRestartMs) {
+        LOG_INF("WEBACT",
+                "WS-wedge detected: HTTP active but no WS event for %u ms; silent-restart to FT",
+                now - g_ftLastWsEventAtMs);
+        setSilentRebootFtModeHint(isApMode ? 2u : 1u);
+        stopWebServer();
+        MDNS.end();
+        if (dnsServer) {
+          dnsServer->stop();
+          delete dnsServer;
+          dnsServer = nullptr;
+        }
+        delay(50);
+        silentRestartToFileTransfer();  // never returns
+        return;
+      }
+      if (!isFtUploadInProgress() &&
+          activityEnteredAtMs_ != 0 &&
+          (now - activityEnteredAtMs_) >= kMinUptimeForIdleRestart &&
+          g_ftLastActivityAtMs != 0 &&
+          (now - g_ftLastActivityAtMs) >= kFtIdleRestartMs) {
+        LOG_INF("WEBACT",
+                "Idle-restart firing: no FT activity for %u ms (>= %u); silent-restart to FT to refresh heap",
+                now - g_ftLastActivityAtMs, static_cast<unsigned>(kFtIdleRestartMs));
+        setSilentRebootFtModeHint(isApMode ? 2u : 1u);
+        stopWebServer();
+        MDNS.end();
+        if (dnsServer) {
+          dnsServer->stop();
+          delete dnsServer;
+          dnsServer = nullptr;
+        }
+        delay(50);
+        silentRestartToFileTransfer();  // never returns
+        return;
+      }
+    }
+
+    if (consumeFtDefragRestartIfDue()) {
+      LOG_INF("WEBACT",
+              "Post-upload defrag restart firing: free=%u maxAlloc=%u -- silent-restart to FT",
+              ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      setSilentRebootFtModeHint(isApMode ? 2u : 1u);
+      extern uint32_t g_ftHtmlServeLowHeapRestart;
+      g_ftHtmlServeLowHeapRestart = 1;
+      stopWebServer();
+      MDNS.end();
+      if (dnsServer) {
+        dnsServer->stop();
+        delete dnsServer;
+        dnsServer = nullptr;
+      }
+      delay(50);
+      silentRestartToFileTransfer();  // never returns
+      return;
+    }
+
     // CrumBLE 4.5.2: WS upload DONE flagged the library as needing a
     // refresh. Wait until no upload is in progress (so an N-book upload
     // burst triggers ONE walk, not N), then markStale + ensureWalked.
@@ -598,9 +1029,60 @@ void CrossPointWebServerActivity::loop() {
       // file too (incremental SD scan) and the next upload's DONE re-sets
       // the flag, which we'll consume again next iteration. Safe to run
       // the walk unconditionally.
-      LOG_INF("WEBACT", "Upload settled -- re-walking library to refresh author keys");
-      LibraryIndex::getInstance().markStale();
-      LibraryIndex::getInstance().ensureWalked();
+      //
+      // CrumBLE 4.5.4: heap-aware gating. After a sequence of WS upload +
+      // SD font fetch + chapter prebake, heap is typically heavily
+      // fragmented with maxAlloc in the 12-22 KB range. populateAuthorKeys
+      // (which the walk drives) opens each EPUB's ZIP + parses content.opf
+      // -- the ZIP open alone needs ~30 KB contiguous for the inflate
+      // dictionary. Under-heap, that throws std::bad_alloc and crashes
+      // the whole device (field log: PANIC right after 'Upload settled'
+      // following a 4.3 MB SD font fetch). Skip the walk and re-set the
+      // pending flag so the NEXT loop iteration retries. Heap recovers
+      // as transient WS / WiFi state drains, usually within seconds.
+      // CrumBLE 4.5.4: heap-aware deferring + attempts cap.
+      //   - Threshold: 30 KB (was 35 KB). The original 35 KB was set without
+      //     evidence; field log shows the post-upload heap pinned at 5-8 KB
+      //     maxAlloc for minutes, never crossing 35 KB. 30 KB is the actual
+      //     ZIP-inflate dictionary need + 2 KB safety.
+      //   - Cap: after kMaxDeferAttempts retries (~30 s wall clock at 1 Hz),
+      //     just give up. The walk will run on next boot's natural startup
+      //     instead. New book stays at the bottom of Sort-by-Author until
+      //     then -- a minor UX miss, far better than the field log spam.
+      //   - Self-debounce: only one deferred-log line per second (instead
+      //     of the 2 Hz tick rate) so the serial log stays readable.
+      constexpr uint32_t kMinMaxAllocForWalk = 30 * 1024;
+      constexpr uint32_t kMaxDeferAttempts = 60;
+      constexpr uint32_t kDeferLogIntervalMs = 1000;
+      static uint32_t deferAttempts = 0;
+      static uint32_t lastDeferLogMs = 0;
+      const uint32_t curMaxAlloc = ESP.getMaxAllocHeap();
+      if (curMaxAlloc < kMinMaxAllocForWalk) {
+        deferAttempts++;
+        if (deferAttempts > kMaxDeferAttempts) {
+          LOG_INF("WEBACT",
+                  "Upload settled -- GIVING UP on library re-walk after %u attempts (maxAlloc still %u); "
+                  "new book will pick up author keys on next boot",
+                  static_cast<unsigned>(kMaxDeferAttempts), curMaxAlloc);
+          deferAttempts = 0;
+          // Do NOT re-request: caller has accepted the loss.
+        } else {
+          if (millis() - lastDeferLogMs >= kDeferLogIntervalMs) {
+            LOG_INF("WEBACT",
+                    "Upload settled -- DEFERRING library re-walk (maxAlloc=%u < %u, attempt %u/%u)",
+                    curMaxAlloc, static_cast<unsigned>(kMinMaxAllocForWalk), static_cast<unsigned>(deferAttempts),
+                    static_cast<unsigned>(kMaxDeferAttempts));
+            lastDeferLogMs = millis();
+          }
+          requestLibraryRefresh();
+        }
+      } else {
+        LOG_INF("WEBACT", "Upload settled -- re-walking library to refresh author keys (maxAlloc=%u, attempts=%u)",
+                curMaxAlloc, static_cast<unsigned>(deferAttempts));
+        deferAttempts = 0;
+        LibraryIndex::getInstance().markStale();
+        LibraryIndex::getInstance().ensureWalked();
+      }
     }
 
     // CrumBLE 4.6 LAN-OTA: WS handler queued an install. The pending
@@ -670,13 +1152,39 @@ void CrossPointWebServerActivity::loop() {
     // refresh). silentRestart to FT now so the device comes back with
     // a fresh heap before the phone's next refresh fires.
     if (consumeFtRestartRequest()) {
+      // v18.9.9.86: loop-break if we already silent-restarted this cycle and
+      // are still failing -- restarting again just loops if we can't make ANY
+      // progress. v18.9.9.169 refinement: allow the restart when we HAVE made
+      // progress since the last restart (>= 1 large serve completed). That's
+      // the prebake-WASM-after-serving-optimizer.js case -- the "loop" heuristic
+      // was too coarse and blocked recovery when the heap was legitimately
+      // fresh enough to serve intermediate assets but couldn't sustain the
+      // 1.3 MB WASM. If NO large serve completed, we ARE stuck and should stop.
+      extern uint32_t g_ftLargeServesSinceRestart;
+      const uint32_t progress = g_ftLargeServesSinceRestart;
+      if (justLowHeapRestarted_ && progress == 0) {
+        LOG_ERR("WEBACT",
+                "html-serve low-heap AFTER a prior silent-restart AND no progress since (free=%u maxAlloc=%u); "
+                "not restarting again to avoid loop -- user should back out to Home",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        return;
+      }
+      if (justLowHeapRestarted_) {
+        LOG_INF("WEBACT",
+                "html-serve low-heap AFTER a prior silent-restart but %u large serve(s) completed since -- "
+                "restart allowed (heap can recover post-boot)",
+                progress);
+      }
       LOG_INF("WEBACT", "Auto-recovery: silentRestart to FT (free=%u maxAlloc=%u)",
               ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-      // Stash the current mode so the next boot's FT onEnter skips the
-      // mode picker and goes straight back to the same flow (auto-
-      // connect to last SSID for JOIN, or just restart softAP for
-      // HOTSPOT). 1 = JOIN_NETWORK, 2 = CREATE_HOTSPOT.
+      // v18.9.9.86: preserve the mode hint so post-boot still auto-connects
+      // to WiFi (user doesn't have to re-select JOIN_NETWORK). Latching the
+      // low-heap-recovery state uses g_ftHtmlServeLowHeapRestart (below), a
+      // separate RTC_NOINIT flag consulted in onEnter — that way this second
+      // hit path can bail without stomping the auto-restore behavior.
       setSilentRebootFtModeHint(isApMode ? 2u : 1u);
+      extern uint32_t g_ftHtmlServeLowHeapRestart;
+      g_ftHtmlServeLowHeapRestart = 1;  // consumed in onEnter (v18.9.9.86 loop-break)
       // Mirror onExit cleanup that matters before restart: stop our own
       // services so WiFi isn't holding sockets mid-restart.
       stopWebServer();
@@ -739,6 +1247,20 @@ void CrossPointWebServerActivity::renderServerRunning() const {
 
   int startY = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight + metrics.verticalSpacing * 2;
   int height10 = renderer.getLineHeight(UI_10_FONT_ID);
+
+  // v18.9.9.300: on-device weak-WiFi warning. Matches the web UI banner
+  // that fires below -70 dBm. Without this the device UI silently shows
+  // "connected" while file uploads stall or truncate mid-transfer.
+  // Threshold -70 dBm matches the browser-side banner threshold so
+  // users get consistent signal from both the phone and the device.
+  if (!isApMode && lastWifiRssi < 0 && lastWifiRssi > -100 && lastWifiRssi < -70) {
+    char warning[80];
+    snprintf(warning, sizeof(warning),
+             "Weak WiFi (%d dBm). Move closer to router.", lastWifiRssi);
+    renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, startY, warning,
+                       true, EpdFontFamily::BOLD);
+    startY += height10 + metrics.verticalSpacing;
+  }
   if (isApMode) {
     // AP mode display
     renderer.drawText(UI_10_FONT_ID, metrics.contentSidePadding, startY, tr(STR_CONNECT_WIFI_HINT), true,

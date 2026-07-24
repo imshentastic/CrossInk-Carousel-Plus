@@ -20,13 +20,15 @@ class DictionaryIndexBuildActivity final : public Activity {
  private:
   void buildIndex();
 
-  // CrumBLE 4.2: animated progress beacon for the one-time index scan.
-  // dotCount_ cycles 1..4 each time the throttle in onProgress fires;
-  // render() paints that many '.' on a row below the hint so the user
-  // sees the device is still alive during the 10-30 s scan. lastRedrawMs_
-  // throttles redraws because each requestUpdateAndWait blocks the scan
-  // for one eink refresh (~500 ms) -- without the throttle, the
-  // animation would noticeably extend the scan duration.
-  uint8_t dotCount_ = 1;
+  // v18.9.9.237: replaced 1-4 dot cycle with a real % progress bar so the
+  // user can tell the device isn't frozen during long scans (a 181 MB
+  // dict took 3.5 minutes in field testing; the dot animation was too
+  // static to signal aliveness at that duration). percent_ mirrors the
+  // onProgress callback's value directly (Dictionary::loadIndex computes
+  // it as bytes-scanned/total * 100). lastRedrawMs_ throttles redraws
+  // because each requestUpdateAndWait blocks the scan for one eink
+  // refresh (~500 ms) -- without the throttle, the redraws would
+  // noticeably extend the scan duration.
+  int percent_ = 0;
   uint32_t lastRedrawMs_ = 0;
 };

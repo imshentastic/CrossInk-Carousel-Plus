@@ -3,8 +3,10 @@
 #include <I18n.h>
 
 #include "DictionaryDefinitionActivity.h"
+#include "activities/util/ChoicePromptActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "util/Dictionary.h"
 #include "util/LookupHistory.h"
 
 LookedUpWordsActivity::LookedUpWordsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
@@ -108,9 +110,48 @@ void LookedUpWordsActivity::loop() {
   }
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    startActivityForResult(std::make_unique<DictionaryDefinitionActivity>(renderer, mappedInput, words[selectedIndex],
-                                                                          cachePath, UI_12_FONT_ID),
-                           [this](const ActivityResult& result) { requestUpdate(); });
+    // v18.9.9.293: mirror the dict picker flow from EpubReaderActivity's
+    // Lookup path. Without this, opening a historical word before any
+    // Lookup this session leaves Dictionary::getActive() empty ->
+    // DictionaryDefinitionActivity::lookup() falls back to the legacy
+    // hardcoded name path, which typically shows "word not found."
+    const std::string wordCopy = words[selectedIndex];
+    const std::string cachePathCopy = cachePath;
+    auto openDefinition = [this, wordCopy, cachePathCopy]() {
+      startActivityForResult(
+          std::make_unique<DictionaryDefinitionActivity>(
+              renderer, mappedInput, wordCopy, cachePathCopy, UI_12_FONT_ID),
+          [this](const ActivityResult& /*result*/) { requestUpdate(); });
+    };
+    const auto dicts = Dictionary::discoverAll();
+    if (dicts.size() <= 1) {
+      if (dicts.size() == 1) Dictionary::setActive(dicts[0]);
+      openDefinition();
+    } else {
+      std::vector<std::string> choices;
+      choices.reserve(dicts.size());
+      for (const auto& d : dicts) choices.push_back(d.displayName);
+      const auto active = Dictionary::getActive();
+      int defaultIdx = 0;
+      for (size_t i = 0; i < dicts.size(); ++i) {
+        if (dicts[i].dictPath == active.dictPath) { defaultIdx = static_cast<int>(i); break; }
+      }
+      startActivityForResult(
+          std::make_unique<ChoicePromptActivity>(
+              renderer, mappedInput, tr(STR_DICT_PICKER_TITLE), tr(STR_DICT_PICKER_BODY),
+              std::move(choices), /*ignoreInitialConfirmRelease=*/true,
+              /*defaultSelectedIndex=*/defaultIdx),
+          [this, dicts, openDefinition](const ActivityResult& r) {
+            int chosen = -1;
+            if (const auto* cp = std::get_if<ChoicePromptResult>(&r.data)) chosen = cp->choice;
+            if (r.isCancelled || chosen < 0 || chosen >= static_cast<int>(dicts.size())) {
+              requestUpdate();
+              return;
+            }
+            Dictionary::setActive(dicts[chosen]);
+            openDefinition();
+          });
+    }
   }
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {

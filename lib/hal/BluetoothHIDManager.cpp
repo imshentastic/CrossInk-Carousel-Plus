@@ -27,6 +27,22 @@ static const char* HID_PROTOCOL_MODE_UUID = "2A4E";
 static constexpr uint8_t GAMEBRICK_ACTION_A_CODE = 0xF1;
 static constexpr uint8_t GAMEBRICK_ACTION_B_CODE = 0xF2;
 
+// v18.9.9.195: NimBLE bond-store diagnostic. Reason-520 MIC-failure on first
+// connect per session is masked by v21's one-shot reconnect. To identify the
+// real cause we need to see what NimBLE has persisted at each boot/enable and
+// whether the bond record changes across a fail-then-succeed reconnect pair.
+// CONFIG_BT_NIMBLE_NVS_PERSIST=1 in nimconfig.h is on by default, so bonds
+// SHOULD survive a cold boot -- this log tells us whether they actually do.
+static void logBondStoreDiag(const char* tag) {
+  const int n = NimBLEDevice::getNumBonds();
+  LOG_INF("BTBOND", "%s: %d bond(s) persisted", tag, n);
+  for (int i = 0; i < n; ++i) {
+    NimBLEAddress addr = NimBLEDevice::getBondedAddress(i);
+    LOG_INF("BTBOND", "  [%d] addr=%s type=%u", i,
+            addr.toString().c_str(), (unsigned)addr.getType());
+  }
+}
+
 namespace {
 // BLE intervals are in 1.25ms units and timeout is in 10ms units.
 // Keep latency at 0 for low input lag while allowing a longer supervision timeout
@@ -207,9 +223,26 @@ void BluetoothHIDManager::cleanup() {
 }
 
 bool BluetoothHIDManager::enable() {
+  SET_CHECKPOINT("bt:enable-entry");
   if (_enabled) {
     LOG_DBG("BT", "Already enabled");
     return true;
+  }
+
+  // v18.9.9.252: refuse if the boot BT-off release (main.cpp v245 branch,
+  // or the FT-enter release) already released the BLE controller memory
+  // this boot. esp_bt_mem_release is one-way per boot -- once fired, no
+  // path in this boot can esp_bt_controller_init() again without
+  // load-faulting inside bt_controller_deinit_internal's queue walk (the
+  // v251 QC-crash class). Setting lastError here routes callers through
+  // their normal enable-failure fallback, which silent-restarts to a
+  // fresh boot with bluetoothEnabled=1 -- the v245 branch skips the
+  // release, and enable() succeeds naturally on that boot.
+  extern bool g_bleControllerMemReleased;
+  if (g_bleControllerMemReleased) {
+    LOG_ERR("BT", "Refusing to enable Bluetooth: BLE controller memory released this boot -- restart needed");
+    lastError = "BT released this boot; restart needed";
+    return false;
   }
 
   // Refuse to bring NimBLE up without enough free heap for it (controller + host
@@ -223,12 +256,48 @@ bool BluetoothHIDManager::enable() {
   // needs MORE than 60 KB at the controller-init step (device hangs at
   // "Enabling Bluetooth..." with no further output), so the floor stays
   // at 66 KB. The warm-before-enable path is reverted accordingly.
-  constexpr uint32_t kMinFreeHeapForEnable = 66 * 1024;
+  // v18.9.9.202: restored to 66 KB after reverting v199's dictionary picker
+  // (which cost ~150 B static + settings-view cache growth on X3 and forced
+  // v201's 65 KB stopgap). With the picker gone, X3 is back within the
+  // documented safe range.
+  // v18.9.9.281: was 66 KB, tuned to pre-v280 NimBLE that consumed ~55 KB
+  // at init. v280's controller + host pool trims (BT_CTRL_BLE_MAX_ACT
+  // 6->1, MSYS 12/24 -> 3/6, ACL 24->2, EVT 30->4, MAX_CONNECTIONS 3->1,
+  // HOST_TASK_STACK 5120->2560, ATT_MAX_PREP 64->2) cut init cost to
+  // ~20 KB. 30 KB gives ~10 KB safety margin. Symptom of an over-
+  // aggressive floor: quick-connect refused with "free heap X < Y" while
+  // X is comfortably above the actual runtime cost (v280 user report:
+  // refused at 67216 free vs 67584 gate -- 368 bytes short of a value
+  // that was overkill by 35 KB post-shrink).
+  constexpr uint32_t kMinFreeHeapForEnable = 30 * 1024;
+  // CrumBLE 4.5.5: contiguous-heap floor for the ESP-IDF BT controller init.
+  // History: a 4.5.5 dev build set this at 50 KB after a one-off crash with
+  // free=76900 / maxAlloc=45044 (controller_init failed + rollback double-
+  // freed a semaphore, esp-idf bug). Field testing showed 50 KB refused on
+  // a perfectly normal in-book quick-connect at maxAlloc=47092 -- a state
+  // CrumBLE 4.5.4 and earlier handled fine without any floor. Lowered to
+  // 40 KB which still gives controller_init the contiguous space it
+  // typically needs while not blocking the steady-state reader case.
+  // Trade-off: ~5 KB closer to the documented crash point. If we see a
+  // recurrence, raise back toward 45-48 KB or pair with a defrag step.
+  // v18.9.9.281: was 40 KB. Same reasoning as kMinFreeHeapForEnable --
+  // controller_init's biggest contiguous chunk was the BLE_MAX_ACT
+  // slot table (~15 KB at MAX_ACT=6). v280 shrunk MAX_ACT to 1, so
+  // the largest contiguous demand is now the NimBLE host task stack
+  // (2560 B) or ACL pool blocks; 22 KB stays well above either.
+  constexpr uint32_t kMinMaxAllocForEnable = 22 * 1024;
   const uint32_t freeHeap = esp_get_free_heap_size();
+  const uint32_t maxAlloc = ESP.getMaxAllocHeap();
   if (freeHeap < kMinFreeHeapForEnable) {
     LOG_ERR("BT", "Refusing to enable Bluetooth: free heap %u < %u needed for NimBLE", freeHeap,
             static_cast<unsigned>(kMinFreeHeapForEnable));
     lastError = "Not enough memory to enable Bluetooth";
+    return false;
+  }
+  if (maxAlloc < kMinMaxAllocForEnable) {
+    LOG_ERR("BT", "Refusing to enable Bluetooth: maxAlloc %u < %u needed for controller_init", maxAlloc,
+            static_cast<unsigned>(kMinMaxAllocForEnable));
+    lastError = "Memory fragmented; restart needed";
     return false;
   }
 
@@ -246,15 +315,32 @@ bool BluetoothHIDManager::enable() {
     delay(100);  // Brief delay to ensure WiFi is fully powered down
   }
   
-  // Initialize NimBLE stack
-  NimBLEDevice::init("CrossPoint");
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9); // +9dBm
-  NimBLEDevice::setDefaultPhy(BLE_GAP_LE_PHY_1M_MASK, BLE_GAP_LE_PHY_1M_MASK);
-  NimBLEDevice::setSecurityAuth(true, false, true);
-  
+  // CrumBLE 4.5.5: clamp CPU to normal speed across NimBLE init. The
+  // controller-init step takes the interrupt-WDT path that hangs at the
+  // 10 MHz low-power frequency -- field reports (and upstream CrossPoint's
+  // feat-bluetooth investigation) trace one class of "device freezes when
+  // turning on Bluetooth" to this. The Lock scopes itself off as soon as
+  // init returns; if power-saving was the active mode before, it resumes
+  // on the next loop tick.
+  {
+    HalPowerManager::Lock powerLock;
+    NimBLEDevice::init("CrossPoint");
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9); // +9dBm
+    NimBLEDevice::setDefaultPhy(BLE_GAP_LE_PHY_1M_MASK, BLE_GAP_LE_PHY_1M_MASK);
+    NimBLEDevice::setSecurityAuth(true, false, true);
+    // v18.9.9.195: dump bond store immediately after init so we can see what
+    // survived the previous power-off. Expected pattern: cold boot after a
+    // successful bond => 1 entry (the Free3-R remote). If 0 shows up here on
+    // a cold boot, NVS bond persistence is broken (root cause of reason 520).
+    logBondStoreDiag("post-NimBLE-init");
+  }
+
   _enabled = true;
+  // v18.9.9.48: successful init clears the skip-teardown flag so callers
+  // don't keep silent-restarting after we've re-entered a clean state.
+  _nimbleStateSkippedTeardown = false;
   lastError = "";
-  
+
   LOG_INF("BT", "Bluetooth enabled successfully");
   loadState();
   return true;
@@ -262,22 +348,54 @@ bool BluetoothHIDManager::enable() {
 
 bool BluetoothHIDManager::tryEnableIfRequested() {
   if (!_enableLaterRequested) return false;
+  SET_CHECKPOINT("bt:tryEnableIfRequested");
   if (_enabled) {
     _enableLaterRequested = false;  // someone else already brought it back up
+    _enableLaterFirstAttemptMs = 0;
+    _enableLaterLastAttemptMs = 0;
     return false;
   }
 
-  if (!enable()) {
-    // enable() refused -- typically free heap is just below the NimBLE threshold
-    // right after a heap-heavy chapter build. KEEP _enableLaterRequested set so we
-    // retry on a later tick once the heap recovers (it usually does within a
-    // second as the build's transient memory frees). Clearing it here -- as we
-    // used to -- left the bonded remote permanently off after a borderline miss,
-    // so the user appeared unable to reconnect.
-    LOG_DBG("BT", "tryEnableIfRequested: enable() deferred (%s); will retry when heap recovers", lastError.c_str());
+  // CrumBLE 4.5.6: rate-limit + give-up. Main loop calls this every tick.
+  // Without the rate limit, a refused enable() spammed the log at ~10 ms
+  // intervals. Without a give-up, a book whose steady-state heap can't fit
+  // NimBLE (37 KB free vs 67 KB needed) would spin forever after the reader
+  // fell to streaming glyphs post-BT-cycle.
+  constexpr unsigned long kMinRetryIntervalMs = 500;
+  constexpr unsigned long kGiveUpAfterMs = 6000;
+  const unsigned long now = millis();
+  if (_enableLaterLastAttemptMs != 0 && (now - _enableLaterLastAttemptMs) < kMinRetryIntervalMs) {
     return false;
   }
-  _enableLaterRequested = false;  // enabled successfully
+  if (_enableLaterFirstAttemptMs == 0) {
+    _enableLaterFirstAttemptMs = now;
+  }
+  _enableLaterLastAttemptMs = now;
+
+  if (!enable()) {
+    // Rate-limited retry so a borderline miss (heap recovers in ~1 s) still
+    // reconnects, but a hopeless case (post-heavy-book render) gives up cleanly.
+    if ((now - _enableLaterFirstAttemptMs) >= kGiveUpAfterMs) {
+      LOG_INF("BT",
+              "tryEnableIfRequested: giving up after %lu ms of refused enable() -- heap can't fit NimBLE"
+              " (user can re-enable manually from BT menu)",
+              now - _enableLaterFirstAttemptMs);
+      _enableLaterRequested = false;
+      _enableLaterFirstAttemptMs = 0;
+      _enableLaterLastAttemptMs = 0;
+      // v18.9.6c: signal give-up so callers (reader) can escalate to a
+      // silent-restart-with-EnableBt. One-shot; cleared on takeEnableGaveUpAlert.
+      _enableGaveUpAlertPending = true;
+    } else {
+      LOG_DBG("BT",
+              "tryEnableIfRequested: enable() deferred (%s); will retry (elapsed=%lu ms)",
+              lastError.c_str(), now - _enableLaterFirstAttemptMs);
+    }
+    return false;
+  }
+  _enableLaterRequested = false;
+  _enableLaterFirstAttemptMs = 0;
+  _enableLaterLastAttemptMs = 0;
 
   // checkAutoReconnect() gates on a local button press because in its usual
   // "remote got out of range / disconnected on its own" scenario the
@@ -318,7 +436,35 @@ bool BluetoothHIDManager::disable() {
     stopScan();
   }
 
-  // Disconnect all devices
+  // v18.9.9.293: user-initiated disable also cancels any pending auto-
+  // reconnect and clears the connection-lost alert flag. Previously an
+  // async link drop (e.g. remote fell asleep) could queue the alert
+  // between the last render and the disable click, so the user would
+  // press "Turn off BT" in settings and STILL see "Bluetooth couldn't
+  // stay connected" pop up on the way back to Home. The alert is only
+  // meaningful when BT is still enabled and trying to hold the link.
+  _autoReconnectPending = false;
+  _connectionLostAlertPending = false;
+
+  // CrumBLE 4.5.5: REVERTED to the pre-4.5.5 disable path. Two earlier
+  // attempts in this version (the wait-for-DISCONNECTED + explicit
+  // deleteClient, then the wait-without-deleteClient) both crashed in
+  // NimBLEClient::~NimBLEClient -> std::vector dtor -> heap_caps_free assert
+  // when called against the user's actively-connected Free3-R/M remote.
+  // The simple disconnect loop + deinit(true) was the proven-working pattern
+  // (shipped through 4.5.4) and the user reports field-stable behavior on it.
+  // The hypothetical m_pClients slot leak the 4.3 comment described is the
+  // lesser evil vs an actual crash on every BT-menu Back press.
+  // v18.9.9.47 (task #32): capture whether we needed to actively drop a
+  // live connection or whether _connectedDevices was already empty. The
+  // "already empty" case happens when the remote (or our own idle-timeout
+  // logic) had disconnected earlier and the deferred async cleanup didn't
+  // finish before disable() ran. That's the scenario where NimBLE's
+  // internal registry still holds stale client state that deinit(true)
+  // then tries to free -- crashing in heap_caps_free on a scrambled
+  // pointer. The mitigation below uses deinit(false) for that path so
+  // stale objects aren't touched.
+  const bool hadActiveConnection = !_connectedDevices.empty();
   while (!_connectedDevices.empty()) {
     disconnectFromDevice(_connectedDevices[0].address);
   }
@@ -342,7 +488,50 @@ bool BluetoothHIDManager::disable() {
   // single enable (e.g. lost-link auto-recovery without a disable in
   // between), it just never sees a stale client carried across an
   // explicit disable boundary.
-  NimBLEDevice::deinit(true);
+  //
+  // CrumBLE 4.5.5: same power lock as enable(). NimBLE deinit hits the
+  // same controller path that hangs the interrupt WDT at 10 MHz, so
+  // clamp to normal CPU around it. RAII releases as soon as deinit
+  // returns; power-saving resumes on the next loop tick.
+  //
+  // Also ported from upstream: retry deinit once if isInitialized() is
+  // still true after the first call. Stop/scan races can leave the host
+  // partially initialised, and a no-op enable() afterwards is then
+  // running on a half-torn-down stack.
+  {
+    // v18.9.9.285: try deinit(false) -- the ONE deinit path that skips the
+    // client std::vector destruction that crashed EVERY previous attempt
+    // (v18.9.9.34/44/46/47/282 with deinit(true), and CrumBLE 4.5.5's two
+    // deleteClient variants which invoke the same ~NimBLEClient destructor).
+    // deinit(false) tears down the NimBLE host stack + controller but leaves
+    // NimBLEClient objects allocated on the C++ heap. Cost: ~2 KB per
+    // enable/disable cycle leaks (accumulates until reboot). Benefit: we
+    // recover ~30 KB of host-stack RAM instead of holding it hostage until
+    // silent-restart. If this ALSO crashes in heap_caps_free, revert to
+    // skip-deinit in the block below (currently commented out) and update
+    // project-crumble-nimble-deinit-crash memory to strike this approach.
+    const uint32_t freeBefore = ESP.getFreeHeap();
+    const uint32_t maxAllocBefore = ESP.getMaxAllocHeap();
+    LOG_INF("BT", "disable: attempting NimBLEDevice::deinit(false) (hadActiveConn=%d free=%u maxAlloc=%u)",
+            hadActiveConnection ? 1 : 0, freeBefore, maxAllocBefore);
+
+    const bool ok = NimBLEDevice::deinit(false);
+    LOG_INF("BT", "disable: deinit(false) returned %d, isInitialized=%d",
+            ok ? 1 : 0, NimBLEDevice::isInitialized() ? 1 : 0);
+
+    _nimbleStateSkippedTeardown = false;
+    const uint32_t freeAfter = ESP.getFreeHeap();
+    const uint32_t maxAllocAfter = ESP.getMaxAllocHeap();
+    LOG_INF("BT", "disable: post-deinit(false) free=%u (+%d) maxAlloc=%u (+%d)",
+            freeAfter, static_cast<int>(freeAfter) - static_cast<int>(freeBefore),
+            maxAllocAfter, static_cast<int>(maxAllocAfter) - static_cast<int>(maxAllocBefore));
+
+    // Fallback path if the above ever regresses -- keep the code around
+    // so a single-line revert restores the v283 skip-deinit behavior.
+    // (void)hadActiveConnection;
+    // _nimbleStateSkippedTeardown = true;
+    // LOG_INF("BT", "disable: SKIPPED NimBLEDevice::deinit (fallback path)");
+  }
 
   _enabled = false;
   lastError = "";
@@ -404,19 +593,29 @@ void BluetoothHIDManager::stopScan() {
 
 void BluetoothHIDManager::onScanResult(NimBLEAdvertisedDevice* advertisedDevice) {
   if (!advertisedDevice) return;
-  
+
+  // Check if device advertises HID service
+  bool isHID = advertisedDevice->isAdvertisingService(NimBLEUUID(HID_SERVICE_UUID));
+
+  // CrumBLE 4.5.5: HID-only scan filter (ported from upstream feat-bluetooth /
+  // freeink-sdk BleKeyboardHost). The scan callback used to add every BLE
+  // advertiser (phones, headphones, smart bulbs, AirTags...) to
+  // _discoveredDevices with HID devices merely getting eviction priority.
+  // The list still showed everything to the user, and finding the actual
+  // page-turner among 8 noise entries was the consistent UX complaint. Now
+  // non-HID advertisements are dropped at the callback boundary -- the
+  // settings list only ever sees pairable remotes/keyboards.
+  if (!isHID) return;
+
   std::string address = advertisedDevice->getAddress().toString();
   std::string name = advertisedDevice->getName();
   int rssi = advertisedDevice->getRSSI();
-  
-  // Check if device advertises HID service
-  bool isHID = advertisedDevice->isAdvertisingService(NimBLEUUID(HID_SERVICE_UUID));
-  
+
   // Check if we already have this device
   for (auto& dev : _discoveredDevices) {
     if (dev.address == address) {
       dev.rssi = rssi; // Update RSSI
-      if (isHID) dev.isHID = true;
+      dev.isHID = true;
       return;
     }
   }
@@ -427,7 +626,9 @@ void BluetoothHIDManager::onScanResult(NimBLEAdvertisedDevice* advertisedDevice)
   // squeezed heap (NimBLE eats ~58 KB), even 20 entries hit the picker's
   // grow-on-build with MaxAlloc < entry size and abort(). Cap at 12 so the
   // picker fits comfortably; weakest-RSSI entry is evicted to keep the most
-  // promising ones. HID devices (remotes) get eviction priority over non-HID.
+  // promising ones. (4.5.5: now that non-HID is filtered out at the top, the
+  // requireNonHid eviction-priority pass below is a no-op -- every retained
+  // entry is HID. Kept as a safety net in case the filter is ever relaxed.)
   constexpr size_t MAX_SCAN_RESULTS = 12;
   if (_discoveredDevices.size() >= MAX_SCAN_RESULTS) {
     // Find weakest entry to evict. Prefer evicting non-HID over HID so a real
@@ -548,26 +749,30 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
       // actually races RF noise rather than peripheral state. NimBLE
       // controller event loop keeps ticking through delay().
       delay(300);
-      NimBLEClient* freshClient = NimBLEDevice::createClient(bleAddress);
-      if (freshClient) {
-        if (hadExistingClient) {
-          LOG_INF("BT", "Reconnect with existing client failed; using fresh client");
-        }
-        pClient = freshClient;
-        pClient->setSelfDelete(false, false);
-        pClient->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
-        pClient->setConnectionParams(BLE_CONN_MIN_INTERVAL, BLE_CONN_MAX_INTERVAL, BLE_CONN_LATENCY,
-                                     BLE_CONN_TIMEOUT, BLE_CONN_SCAN_INTERVAL, BLE_CONN_SCAN_WINDOW);
-        pClient->setClientCallbacks(&clientCallbacks);
-      }
-
+      // v18.9.9.34 (task #20): retry on the SAME pClient rather than
+      // creating a fresh one. The previous fresh-client fallback swapped
+      // pClient without disposing the old object; since the old client
+      // still had setSelfDelete(false, false) it stayed in NimBLE's
+      // internal registry with dangling references to our static
+      // ClientCallbacks. Later disable() -> NimBLEDevice::deinit(true)
+      // walked the registry to tear down all clients and hit
+      // heap_caps_free with a stale/scrambled pointer -- the crash we saw
+      // in the v18.9.9.33 field log (assert "free() target pointer is
+      // outside heap areas" during NimBLE ble_hs_stop). The 4.5.5 comment
+      // above ("attempts to explicitly deleteClient crashed") means we
+      // can't paper over the leak with a manual disposal either -- the
+      // safe path is to never leak in the first place. The Free3-R
+      // remote in test reliably reconnects on the second attempt with
+      // the same client after the 300 ms settle, so this doesn't cost
+      // us the retry success we were getting from the fresh client.
       if (!pClient->connect(bleAddress)) {
         lastError = "Connection failed";
         LOG_ERR("BT", "Failed to connect to %s (after retry)", address.c_str());
         return false;
       }
-      LOG_INF("BT", "Connect succeeded on retry for %s", address.c_str());
+      LOG_INF("BT", "Connect succeeded on retry for %s (same client)", address.c_str());
     }
+    (void)hadExistingClient;  // preserved for future diagnostic use
 
     const bool connParamsUpdated =
         pClient->updateConnParams(BLE_CONN_MIN_INTERVAL, BLE_CONN_MAX_INTERVAL, BLE_CONN_LATENCY, BLE_CONN_TIMEOUT);
@@ -644,11 +849,19 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
       return false;
     }
     
-    // Subscribe to ALL Report characteristics with notify capability
+    // v15.4 tried capping to 2 Report chars for ~500B heap + fragmentation
+    // savings. REVERTED in v18.9: field test on Free3-R "volume icon mode"
+    // showed only the leftmost button (0x07, sent on Report char #1) was
+    // received. Middle (0x08) and right (0x09) buttons use OTHER Report
+    // characteristics (typically consumer control on chars #3+) that we
+    // stopped listening to. Real functional regression. Reverting to all
+    // notify-capable chars means we hear every button on the remote.
+    // ~500B heap trade is nothing vs "your remote only half works."
     LOG_INF("BT", "Subscribing to %d Report characteristics...", reportChars.size());
+    const size_t subscribeCount = reportChars.size();
     size_t successfulSubscriptions = 0;
-    
-    for (size_t i = 0; i < reportChars.size(); i++) {
+
+    for (size_t i = 0; i < subscribeCount; i++) {
       auto* pChar = reportChars[i];
       
       // Clear stale CCCD state on reused clients where possible.
@@ -782,11 +995,24 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
     }
     
     LOG_INF("BT", "Successfully connected to %s", address.c_str());
+    // v18.9.9.195: bond snapshot right after Successfully connected. If a
+    // NEW bond was written during this connect, we'll see the count grow.
+    logBondStoreDiag("post-Successfully-connected");
     lastError = "Connected";
     return true;
 }
 
 void BluetoothHIDManager::noteClientDisconnect(int reason) {
+  // v18.9.9.195: log bond state on every disconnect (before the intentional-
+  // latch consume) so a reason-520 followed by a successful reconnect leaves
+  // three snapshots in the log: post-init, disconnect-520, post-reconnect.
+  // If the count/address changes between snapshots, NimBLE re-negotiated the
+  // LTK on the second connect -- explaining why reconnect works.
+  {
+    char tag[48];
+    snprintf(tag, sizeof(tag), "onDisconnect reason=%d", reason);
+    logBondStoreDiag(tag);
+  }
   // A disconnect we triggered ourselves: consume the latch, no alert.
   if (_intentionalDisconnect) {
     _intentionalDisconnect = false;
@@ -811,7 +1037,20 @@ void BluetoothHIDManager::noteClientDisconnect(int reason) {
   // A drop in [SETTLE_MS, EARLY_DISCONNECT_MS] is the real "controller timed the
   // link out under heap pressure" case (HCI 0x08 / reason 520). Surface it so the
   // user isn't left wondering why Bluetooth silently went away.
-  if (since < EARLY_DISCONNECT_MS) {
+  //
+  // v18.9.9.21: reason 520 (supervision timeout under CPU/heap pressure) is
+  // treated as auto-reconnectable regardless of session age. The EARLY_
+  // DISCONNECT_MS window was designed to distinguish a supervision timeout
+  // (retryable) from a walk-away (permanent), but a mid-session
+  // long-parse-blocking-BT case (heavy chapter transition, prebake miss,
+  // compat mode cold rebuild) can starve the BLE stack past the 10 s window
+  // -- the drop is still under pressure, not a walk-away. Field log with a
+  // reader that dropped ~6 minutes in during a chapter build showed exactly
+  // this pattern. The one-shot _autoReconnectConsumedThisCycle latch caps
+  // retries so we don't loop on a real walk-away that keeps re-dropping.
+  const bool retryableWindow = since < EARLY_DISCONNECT_MS;
+  const bool retryableReason520 = reason == 520;
+  if (retryableWindow || retryableReason520) {
     // CrumBLE 4.4 post-bisect: an early reason-520 drop is the
     // "supervision timeout during post-connect render" race. Fire a
     // one-shot auto-reconnect (reader polls takeAutoReconnectRequest()
@@ -938,6 +1177,21 @@ bool BluetoothHIDManager::hasRecentActivity() const {
     }
   }
   return false;
+}
+
+// v18.9.4: returns millis since the newest input across all connected
+// devices, or ULONG_MAX when nothing is connected (or no input yet). Used
+// by main.cpp to drive the user-set BT auto-disconnect timeout.
+unsigned long BluetoothHIDManager::getMillisSinceLastActivity() const {
+  if (_connectedDevices.empty()) return ULONG_MAX;
+  unsigned long now = millis();
+  unsigned long minGap = ULONG_MAX;
+  for (const auto& device : _connectedDevices) {
+    if (device.lastActivityTime == 0) continue;
+    unsigned long gap = now - device.lastActivityTime;
+    if (gap < minGap) minGap = gap;
+  }
+  return minGap;
 }
 
 bool BluetoothHIDManager::hadRecentFree2Input(unsigned long windowMs) const {
@@ -1340,16 +1594,37 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
         keycode == DeviceProfiles::FREE2_BACK_A || keycode == DeviceProfiles::FREE2_BACK_B ||
         keycode == DeviceProfiles::FREE2_BACK_C || keycode == DeviceProfiles::FREE2_BACK_D;
 
-    if (device->profile == nullptr && likelyFree2Press && isPressed) {
-      // Free 2 may not emit a clean initial release frame; arm on first valid press.
+    // CrumBLE 4.5.6: matched-profile arming that ALSO injects this first press
+    // (rather than swallowing it). Free3-R and similar remotes emit the same
+    // keycode on press AND release frames (byte[4] = 0x70 on both), so the
+    // normal `!isPressed` -> hasSeenRelease arming path at the top of this
+    // function never fires -- and the Free2 escape below only helps unknown
+    // profiles. For Free3-R the profile IS matched (via bonded name lookup)
+    // but hasSeenRelease stays false and the first tap gets swallowed here,
+    // then every subsequent tap does too. Skip the gate entirely when the
+    // profile is trusted: matched profile means startup noise is rare vs a
+    // genuine tap, and the user reports first tap always fails on Free3-R.
+    if (device->profile != nullptr && isPressed) {
       device->hasSeenRelease = true;
-      LOG_DBG("BT", "Arming auto-detect on first valid Free2 code: 0x%02X", keycode);
-    }
+      LOG_DBG("BT", "Arming injection on first press with matched profile '%s' (key=0x%02X)",
+              device->profile->name, keycode);
+      // Fall through so this first press actually injects instead of being
+      // swallowed by the return below.
+    } else {
+      if (device->profile == nullptr && likelyFree2Press && isPressed) {
+        // Free 2 auto-detect: no profile yet, but this looks like a Free2 code.
+        // Arm hasSeenRelease so the NEXT press injects (profile detection runs
+        // between here and then). First press is still swallowed to avoid
+        // treating startup noise as input during auto-detect.
+        device->hasSeenRelease = true;
+        LOG_DBG("BT", "Arming auto-detect on first valid Free2 code: 0x%02X", keycode);
+      }
 
-    releaseInjectedButton();
-    device->lastButtonState = isPressed;
-    device->lastHIDKeycode = keycode;
-    return;
+      releaseInjectedButton();
+      device->lastButtonState = isPressed;
+      device->lastHIDKeycode = keycode;
+      return;
+    }
   }
 
   const uint8_t free2Direction = free2Profile ? classifyFree2Direction(keycode) : 0xFF;
@@ -1396,6 +1671,32 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
       }
       LOG_DBG("BT", "Game Brick: promoting same-key re-press after %lu ms idle (key=0x%02X)",
               nowMs - device->lastNormalizedEventMs, keycode);
+    }
+  }
+
+  // CrumBLE 4.5.5: generalised stuck-state release for any device whose
+  // release frame doesn't decode to keycode==0 under its profile.
+  // Field log (Free3-R / Custom BLE Remote profile, byte[4] reads the same
+  // 0x70 on press AND release frames) showed activeInjectedButton sticking
+  // after the first press because no synthetic release ever fired -- second
+  // and third presses passed BUTTON PRESSED detection but were silently
+  // swallowed by the `activeInjectedButton == 0xFF` gate at the injector.
+  // A 2-second idle window is comfortably above any realistic held-button
+  // duration (key repeats arrive every ~30 ms) and below the smallest
+  // human "tap, wait, tap again" interval. Apply only when activeInjected
+  // Button is still set on the same keycode -- i.e. we're stuck.
+  if (isPressed && device->activeInjectedButton != 0xFF && keycode == device->lastInjectedKeycode &&
+      device->lastInjectionTime > 0) {
+    constexpr unsigned long GENERIC_STUCK_RELEASE_IDLE_MS = 2000;
+    if ((nowMs - device->lastInjectionTime) > GENERIC_STUCK_RELEASE_IDLE_MS) {
+      if (g_instance->_buttonInjector) {
+        g_instance->_buttonInjector(device->activeInjectedButton, false);
+      }
+      device->activeInjectedButton = 0xFF;
+      device->lastNormalizedPressed = false;
+      isNewPressEvent = true;
+      LOG_INF("BT", "Generic stuck-release: clearing latched injection key=0x%02X idle=%lums",
+              keycode, nowMs - device->lastInjectionTime);
     }
   }
 
@@ -1620,6 +1921,19 @@ uint8_t BluetoothHIDManager::mapKeycodeToButton(uint8_t keycode, ConnectedDevice
   // Log keycode for debugging
   if (keycode != 0x00) {
     LOG_DBG("BT", "mapKeycodeToButton() called with keycode: 0x%02X", keycode);
+  }
+
+  // CrumBLE 4.5.5: rich BLE button map override. The application wires a
+  // resolver at boot that consults SETTINGS.bleKeyMap and returns the
+  // mapped HalGPIO::BTN_* for a (kind, value) pair (or 0xFF if not mapped).
+  // Lives in the app layer because the HAL must not depend on
+  // CrossPointSettings (src/). kind == 1 == HID usage code (the only kind
+  // CrumBLE currently captures via its onReport hook).
+  if (_bleKeyMapResolver) {
+    const uint8_t mapped = _bleKeyMapResolver(1, keycode);
+    if (mapped != 0xFF) {
+      return mapped;
+    }
   }
   
   // If we have a device profile, ONLY map keycodes specific to that profile

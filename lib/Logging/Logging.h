@@ -57,6 +57,25 @@ void logPrintf(const char* level, const char* origin, const char* format, ...);
 
 std::string getLastLogs();
 void clearLastLogs();
+
+// v18.9.9.332: lightweight "last known operation" beacon for crash reports.
+// Call SET_CHECKPOINT("some-short-name") at the top of any code path we
+// want to correlate with terminate/panic events. The std::set_terminate
+// handler in main.cpp reads this and logs it alongside heap-at-terminate,
+// so a "bad_alloc during BT enable" or "bad_alloc during section load"
+// becomes distinguishable from a "bad_alloc during Home render" in the
+// crash log. Storage is a single 48-byte static buffer -- cheap, no
+// alloc. Overwrites on every call; only the LATEST checkpoint is
+// preserved, which is exactly what we want ("what was in flight when
+// we died"). Safe to call from any task.
+void setLastCheckpoint(const char* name);
+const char* getLastCheckpoint();
+// v18.9.9.334: read + clear the RTC-persisted checkpoint from the previous
+// boot. Returns nullptr on cold boot / already-consumed / empty. Call once
+// early in setup() to surface the last-known operation across ANY reboot
+// cause (std::terminate, ESP-IDF panic_abort, Guru Meditation, watchdog).
+const char* consumeCheckpointFromPrevBoot();
+#define SET_CHECKPOINT(name) setLastCheckpoint(name)
 // Validates the RTC log state (magic word + logHead range). Returns true if
 // corruption was detected (magic mismatch or logHead out of range), meaning
 // logMessages is untrusted garbage. Callers should call clearLastLogs() when

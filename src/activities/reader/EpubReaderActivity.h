@@ -6,6 +6,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <atomic>
 #include <optional>
 #include <string>
 #include <vector>
@@ -19,7 +20,16 @@
 #include "activities/Activity.h"
 #include "activities/settings/SettingsActivity.h"  // for SettingInfo (drawer cache)
 
+// v18.9.9.58: which render path this book open is on. Hoisted to file scope
+// so the anonymous-namespace sidecar helpers in EpubReaderActivity.cpp (and
+// ReaderOptionsActivity.cpp's compat toggle) can reference it without
+// crossing a class private boundary.
+enum class ReaderPath : uint8_t { PreparedLayout = 0, CustomSettings = 1 };
+
 class EpubReaderActivity final : public Activity {
+ public:
+  using ReaderPath = ::ReaderPath;
+ private:
   std::shared_ptr<Epub> epub;
   std::unique_ptr<Section> section = nullptr;
   int currentSpineIndex = 0;
@@ -29,8 +39,40 @@ class EpubReaderActivity final : public Activity {
   // Cleared on the next render after the new section loads and resolves it to a page.
   std::string pendingAnchor;
   int pagesUntilFullRefresh = 0;
+  // 4.5.5: tracks whether the LAST rendered page had any saved-highlight
+  // underlines drawn into the framebuffer. e-ink FAST_REFRESH doesn't fully
+  // erase dark pixels that become light -- a solid horizontal bar (the
+  // underline) leaves a faint ghost on the next page at the same Y. When
+  // this flag is set going into the next render, we promote that render to
+  // HALF_REFRESH which uses a different waveform that DOES cleanly erase
+  // the ghost. Cost is a slightly slower page turn on the page AFTER a
+  // highlighted one, but the visual artifact goes away.
+  bool prevPageHadHighlights = false;
+  // (Removed: ghostClearOnNextRender_ field. Highlight rendering switched
+  // from solid underline to faux-bold overprint, which doesn't leave a
+  // continuous-line ghost, so the post-highlight FULL_REFRESH path is
+  // no longer needed. See renderSavedHighlightsOverlay.)
   int cachedSpineIndex = 0;
   int cachedChapterTotalPageCount = 0;
+  // v18.9.9.454: defer status-bar title on the FIRST render after a section
+  // build completes. Title glyphs on non-Latin books (Chinese title, Bitter
+  // primary + LXGW SD fallback) trigger a per-glyph SD read that delays the
+  // first-page paint by 100-500 ms. Skipping the title on the first render
+  // pushes those reads off the critical path — user sees the page appear,
+  // then the title fills in on the next page turn. Reset false on each new
+  // section build; set true after one post-build render has completed.
+  // mutable so renderStatusBar() const can flip it — the flag is
+  // presentation-cache state, not observable book state.
+  mutable bool postBuildFirstRenderShown_ = false;
+
+  // v18.9.9.455: session flag — user has actively declined prebake for this
+  // book (either from the prompt this session, or a persisted decline
+  // sidecar from a prior session with matching settings). When true, the
+  // section loader skips sections-prebake/N.bin fallback entirely rather
+  // than opening + fingerprint-checking + rejecting each. Field cost of
+  // NOT having this: 30-60 ms of wasted SD I/O per section on declined
+  // books. Set at book-open (from sidecar) and on decline (from prompt).
+  bool prebakeDeclinedForThisBook_ = false;
   unsigned long lastPageTurnTime = 0UL;
   unsigned long pageTurnDuration = 0UL;
   BookReadingStats stats;
@@ -57,6 +99,13 @@ class EpubReaderActivity final : public Activity {
   float pendingSpineProgress = 0.0f;
   bool pendingScreenshot = false;
   bool pendingSyncSaveError = false;
+  // v18.9.9.471: page-turn count since the last progress.bin save. Debounces
+  // the per-render save site so we hit the SD 3× less often — reduces FAT
+  // stress that manifested as the "Could not save progress" popup. Reset
+  // whenever a save succeeds (render, onExit, onBeforeDeepSleep, chapter
+  // jump, or KOR sync). onExit + onBeforeDeepSleep always save, so a
+  // debounced page never loses more than 2 turns even on hard power-off.
+  int pagesSinceProgressSave_ = 0;
   bool skipNextButtonCheck = false;  // Skip button processing for one frame after subactivity exit
   bool automaticPageTurnActive = false;
   bool longPressMenuHandled = false;
@@ -69,6 +118,49 @@ class EpubReaderActivity final : public Activity {
   // disabled. Flag gates the retry so we don't loop forever if the
   // chapter genuinely can't be parsed.
   bool layoutBleRetryAttempted = false;
+  // v18.9.6: second-tier fallback. When a chapter still aborts after the
+  // BLE-drop retry (or BLE wasn't involved), retry ONCE more with all
+  // memory-frugal guards forced on: images suppressed, embedded style off,
+  // bionic+guide reading off, tables collapsed to paragraphs. If that
+  // succeeds, simpleRenderingActive_ stays true for the rest of the book
+  // so subsequent chapters skip straight to the simple path (no crash-
+  // then-retry). Reset on book close (in onEnter). Phase 2 will persist
+  // this to a sidecar so a re-open skips the first-chapter crash too.
+  bool layoutSimpleRetryAttempted = false;
+  bool simpleRenderingActive_ = false;
+  // v18.9.9.58: which render path this book open is on.
+  //   0 = PreparedLayout: prebake manifest present AND user's SETTINGS match
+  //       the prebake fingerprint (or the user just answered "Restore prepared
+  //       layout" at the mismatch prompt). Sections load from
+  //       sections-prebake/ when the live fingerprint drifts; images blit
+  //       from .pxc cache under BT.
+  //   1 = CustomSettings: no prebake manifest, or the user answered "Keep my
+  //       current settings" at the mismatch prompt. Sections build cold on
+  //       demand; images use the JPEG-decoder path (heap-hungry, subject to
+  //       compat escalation under BT).
+  // Compat is now scoped per-path via compat_prepared.flag / compat_custom.flag
+  // sidecars. A book whose PreparedLayout works fine can still legitimately
+  // need compat under CustomSettings (or vice versa). Enum declared at file
+  // scope above the class body so private-namespace helpers can reference it.
+  ReaderPath readerActivePath_ = ReaderPath::CustomSettings;
+  // v18.9.9.6 Level 2: parallel to simpleRenderingActive_ but narrower --
+  // only tables get collapsed to paragraphs, images/embedded style/bionic/
+  // guide stay on. Seeded at book open from tables_suppressed.flag sidecar,
+  // set true by the Level 2 escalation branch when Level 1 defrag didn't
+  // fit but full Simple Rendering feels heavy-handed for a book whose
+  // only failing page-load culprit is oversized PageTableFragments.
+  bool tableSuppressionActive_ = false;
+  // v18.9.9.9: MaxAlloc captured immediately after renderContents returns,
+  // BEFORE the cache-drop path frees ~10 KB of page DOM. Used by the
+  // post-render heap-floor check to decide escalation against the ACTUAL
+  // drained heap rather than the post-cache-drop misleadingly-high value.
+  // Reset to 0 after each check consumes it.
+  uint32_t postRenderDrainedMaxAlloc_ = 0;
+  // v18.9.9.9 Level 4: one-shot. Set true when the post-render floor check
+  // determines this book can't fit even Simple Rendering under BT and drops
+  // BT to reclaim NimBLE's ~58 KB share. Prevents a Level 4 loop if the
+  // book still fails post-BT-drop for some other reason.
+  bool layoutDroppedBtForBook_ = false;
   // CrumBLE: when we proactively drop BLE around a heavy re-layout (drawer
   // settings change, or the reactive chapter-abort retry), set this so the
   // next successful section build re-enables BLE via requestEnableLater().
@@ -84,6 +176,14 @@ class EpubReaderActivity final : public Activity {
   // renderContents() once a page renders cleanly AND has no images, so the
   // bonded remote reconnects only after we're past the un-decodable page(s).
   bool bleReEnableHeldForImagePage = false;
+  // v18.9.9.145: field REMOVED. The pre-BT reserve strategy starved
+  // NimBLE (NimBLE needs the full ~73 KB budget for enable + connect;
+  // any reserve took heap from NimBLE's connect step and caused link-up
+  // timeout). Kept as a dead unique_ptr for ABI stability during the
+  // build; the alloc/release code paths in EpubReaderActivity.cpp are
+  // no-ops now.
+  std::unique_ptr<uint8_t[]> btConnectedReadReserve_;
+  static constexpr size_t kBtConnectedReadReserveSize = 0;
   // CrumBLE: a chapter layout aborted under BLE pressure; we requested a BLE
   // disable and must retry the build only AFTER it's actually off. Set here and
   // drained in loop() once !isEnabled(), instead of requestUpdate()'ing inline --
@@ -192,6 +292,13 @@ class EpubReaderActivity final : public Activity {
   // the prepared layout when they connect a remote.
   std::optional<PxcManifest> pxcManifest_;
 
+  // v18.9.9.298: total visible-text character count for the open book,
+  // read from META-INF/crumble-stats.json (written by the optimizer).
+  // 0 = manifest absent -> Stable Page Numbers falls back to the
+  // inflated-byte-size approximation from getBookSize(). Populated once
+  // at book open, held until close.
+  uint32_t bookVisibleCharCount_ = 0;
+
   // CrumBLE: parsed prebake manifest -- the 12-field fingerprint baked into
   // section 0's header by the off-device prebake CLI. Optional (only books
   // the user ran through /optimizer with Pre-bake on have this). On book
@@ -232,7 +339,22 @@ class EpubReaderActivity final : public Activity {
     uint8_t guideReadingEnabled = 0;
     bool initialised = false;
   } prebakeLastSnapshot_;
-  bool prebakePromptShowing_ = false;  // suppress re-fire while dialog is open
+  // v18.9.9.41 (task #26): atomic so the "already showing?" check-and-set
+  // in checkAndFirePrebakePromptIfNeeded races safely between the loop()
+  // and render() call sites (main task vs render task). Prior plain-bool
+  // version could see both callers pass the initial guard, both log a
+  // "Prebake fingerprint mismatch", and both call startActivityForResult,
+  // which triggered "pendingActivity while pushActivity is not expected"
+  // in the activity manager.
+  std::atomic<bool> prebakePromptShowing_{false};
+
+  // v18.9.9.311: fontId peeked from sections-prebake/0.bin at fingerprint-
+  // check time. Kept across the prompt callback so the accept path can
+  // trigger the auto-match-installed-font rescue when the manifest's
+  // restored settings still don't produce a matching fontId. Zero means
+  // "not peeked yet / unknown" (0 is also the "not found" sentinel of
+  // SdCardFontManager::computeFontId so it's safely non-matching).
+  int32_t sectionFontIdFromPeek_ = 0;
 
   // CrumBLE: evaluates the prebake-cache mismatch state and fires the
   // settings-change prompt if needed. Returns true when a prompt has been
@@ -305,6 +427,54 @@ class EpubReaderActivity final : public Activity {
   // that one tracks the stack, this one tracks whether a remote is paired
   // up RIGHT NOW.
   bool btWasLinked_ = false;
+  // v18.9.9.5: session-scoped Level 1 defrag budget. False on fresh open;
+  // set to true when we fire a silent-restart-with-EnableBt in response to
+  // a page-load-refuse. Seeded true at book open when isDefragRetryContinuation()
+  // returns true (this boot IS the Level 1 continuation), so a second
+  // failure escalates content instead of hopping through another restart.
+  bool layoutDefragRetryAttempted_ = false;
+  // v18.9.9.168: per-spine chapter-boundary defrag tracker. -1 means no
+  // chapter-boundary defrag has fired yet. Set to the spine we last
+  // silent-restarted for; a cache-miss on a DIFFERENT spine is allowed
+  // another defrag attempt. Prevents infinite loops on a genuinely
+  // unbuildable spine while still letting the user traverse N chapters
+  // per session (the session-wide layoutDefragRetryAttempted_ was too
+  // aggressive -- v163's revert to v48 skip-deinit means requestDisableLater
+  // fallback can't free NimBLE's ~58 KB, so subsequent boundaries crashed
+  // at framebuffer realloc).
+  int16_t layoutDefragRetryChapterSpine_ = -1;
+  // v18.9.9.174: latched by renderContents to whatever page.hasImages()
+  // returned. Read in onExit to signal HomeActivity that the transition
+  // needs pendingFullRefresh so the cover doesn't ghost through the shelf.
+  bool lastRenderedPageHadImages_ = false;
+  // v18.9.9.36 (v20 Phase C2): incremental Section build driven from
+  // loop() rather than blocking inside render(). Kickoff still happens
+  // in render() when loadSectionFile misses, but the buildSomeMore
+  // loop, popup animation, and success/failure dispatch move to loop()
+  // so the render lock isn't held for the multi-second parse -- input
+  // polling, sleep timer, BT drain all tick during indexing. User can
+  // hit Back / prev / next mid-index to cancel (section.reset() on the
+  // navigation path fires abandonBuild via the destructor). Cleared on
+  // book open, on build complete, on build failure resume, on cancel.
+  bool sectionBuildInProgress_ = false;
+  int sectionBuildSpine_ = -1;
+  int sectionBuildPopupMinWidth_ = 0;
+  unsigned long sectionBuildPopupLastMs_ = 0;
+  uint8_t sectionBuildPopupDotPhase_ = 0;
+  // Set true by loop() when buildSomeMore returns false; render() sees
+  // the flag on the next tick and dispatches the failure branches
+  // (defrag restart, BLE-drop retry, Simple Rendering escalation) using
+  // the snapshotted outcome flags. Consumed on entry to that block.
+  bool sectionBuildJustFailed_ = false;
+  bool sectionBuildLayoutAbortedForLowMemory_ = false;
+  bool sectionBuildImagesWereSuppressed_ = false;
+  bool sectionBuildBleWasDroppedForFail_ = false;
+  // v18.9.9.2: post-BT-link MEM instrumentation window. Set to the target
+  // millis() when btWasLinked_ transitions to true. While millis() < this
+  // value, logPostBtStep() fires MEM snapshots at named steps of loop()
+  // and render() so we can pinpoint the throwing alloc between BT connect
+  // and the terminate that follows ~86ms later.
+  unsigned long postBtDiagUntilMs_ = 0UL;
   // Earliest ms timestamp at which we may fire the manifest mismatch prompt
   // after observing a fresh link. NimBLE's connect handshake briefly toggles
   // the linked state and we'd rather not race that; gating on a few seconds
@@ -340,8 +510,36 @@ class EpubReaderActivity final : public Activity {
   // auto-opening the definition popup -- user resumes on the same word
   // they were just reading, free to dismiss or pick a different word.
   bool pendingLookupCursorOnly_ = false;
+  // v18.9.9.249: parallel to pendingLookupDefinitionWord_ but carries the
+  // byte offset within the target entry we want the definition to open
+  // on. Non-zero only when the post-boot dispatch consumed a value from
+  // silentRestartToReaderWithDefinitionAtChunk (chunk-transition refuse
+  // path). Forwarded to the word-select activity via
+  // setPendingDefinitionChunk; 0 means start-of-entry as usual.
+  uint32_t pendingLookupDefinitionChunkStart_ = 0;
+  // CrumBLE 4.5.6: CrossPoint-style pause/resume BT recovery for atlas +
+  // page load failures. When atlas install or page load refuses under
+  // post-BT heap pressure, requestDisableLater to free NimBLE's ~15 KB,
+  // retry on next render tick, then requestEnableLater so bonded remote
+  // auto-reconnects. Deferred drains run in main loop (safe from render
+  // lock). Cleared on success OR on second failure with BT already down.
+  bool atlasRetryPendingBtDrop_ = false;
+  bool pageLoadRetryPendingBtDrop_ = false;
   bool pendingBleQuickConnect_ = false;
   bool pendingBleQuickConnectNoImages_ = false;
+  // CrumBLE 4.5.7 v18.1: true when this QC came from a silent-restart's
+  // ReaderPostBootAction::EnableBt dispatch (defrag-then-enable path). The
+  // pre-flight uses this to skip its heap check ONLY for that specific case,
+  // not for QCs that happen to fire after ANY silent restart (e.g. a cover-
+  // heap-guard restart-to-home whose reader entry then hits the BT-connect
+  // menu). Without this distinction, the pre-flight was skipping heap checks
+  // it should have run, letting BT enable proceed at ~24 KB maxAlloc and
+  // crashing after connect.
+  bool pendingBleQuickConnectFromBootDispatch_ = false;
+  // v18.9.9.164: true after drawer-close painted the "Connecting Bluetooth..."
+  // popup (:4287). Loop Step 3 checks this to downgrade its own paint from
+  // HALF_REFRESH to NO_REFRESH, avoiding the visible double-flicker.
+  bool bleConnectingPopupPainted_ = false;
   // True when the drawer reported settingsChanged alongside the QC request.
   // The reader's result handler defers the section.reset() until the user
   // answers the manifest prompt (if any), so the prompt fires BEFORE the
@@ -369,6 +567,9 @@ class EpubReaderActivity final : public Activity {
   // double-count. Idempotent: a 0-ms segment is a no-op. Called from
   // onExit, onBeforeDeepSleep, and the incremental save tick.
   void commitReadingSession();
+  // v18.9.9.202: writes <cache>/chapter_title.txt (current ToC entry) so
+  // Home's Dashboard theme can show the chapter without loading the EPUB.
+  void writeChapterTitleSidecar();
 
   // CrumBLE 4.2: page DOM cache. The render path used to drop and
   // re-allocate the Page (~25-40 KB of vector<string> for words +
@@ -394,6 +595,20 @@ class EpubReaderActivity final : public Activity {
 
   void renderContents(const Page& page, int orientedMarginTop, int orientedMarginRight,
                       int orientedMarginBottom, int orientedMarginLeft);
+
+  // CrumBLE 4.5.5: persistent highlight rendering. Walks the current page's
+  // PageLine/TextBlock elements counting word index, and draws a dotted
+  // underline for words within any saved highlight's [startWord, endWord]
+  // range. Same walk pattern as DictionaryWordSelectActivity::extractWords
+  // (1:1 with TextBlock::getWords() entries; em-dashes that split a word
+  // into multiple WordInfo entries cause a worst-case one-word visual
+  // miscount in rare cases -- acceptable tradeoff vs the cost of mirroring
+  // the full split logic at every render). Cheap: no allocations, just
+  // pixel writes for each highlighted word. Heap-gated: skips at maxAlloc
+  // < 4 KB so it never contributes to the reader's heap pressure floor.
+  // 4.5.5: const removed -- the overlay now sets prevPageHadHighlights so
+  // the next render can promote to HALF_REFRESH and clear the e-ink ghost.
+  void renderSavedHighlightsOverlay(const Page& page, int marginLeft, int marginTop);
   void renderStatusBar() const;
   void silentIndexNextChapterIfNeeded(uint16_t viewportWidth, uint16_t viewportHeight);
   bool saveProgress(int spineIndex, int currentPage, int pageCount);
@@ -437,7 +652,22 @@ class EpubReaderActivity final : public Activity {
   void render(RenderLock&& lock) override;
   bool preventAutoSleep() override { return automaticPageTurnActive; }
   bool isReaderActivity() const override { return true; }
-  bool canSnapshotForSleepOverlay() const override { return true; }
+  // v18.9.9.418: narrow the gate. Snapshot is used as the background behind
+  // transparent sleep PNGs; modes that fill the screen with their own content
+  // (DARK/LIGHT/BLANK/READING_STATS/MINIMAL_SLEEP/QUICK_RESUME) never sample
+  // it. Skipping the snapshot for those users kills a visible requestUpdate-
+  // AndWait re-render (~500 ms of "the book image reloads first, then Home"
+  // that they explicitly noticed on reader exit) with no functional change.
+  bool canSnapshotForSleepOverlay() const override {
+    switch (SETTINGS.sleepScreen) {
+      case CrossPointSettings::COVER:
+      case CrossPointSettings::COVER_CUSTOM:
+      case CrossPointSettings::OVERLAY:
+        return true;
+      default:
+        return false;
+    }
+  }
   std::string getCurrentBookPath() const override { return epub ? epub->getPath() : std::string{}; }
   void setAutoPageTurnIntervalSeconds(uint16_t seconds);
   uint16_t getAutoPageTurnIntervalSeconds() const;

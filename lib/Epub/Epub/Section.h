@@ -12,6 +12,12 @@
 
 class Page;
 class GfxRenderer;
+// v18.9.9.29 (v20 Phase C1): forward-declared so BuildContext can hold a
+// unique_ptr without pulling the parser + CSS headers into every Section
+// consumer. Full definitions live in the .cpp where startBuild constructs
+// the parser and finalizeBuild tears it down.
+class ChapterHtmlSlimParser;
+class CssParser;
 
 class Section {
   std::shared_ptr<Epub> epub;
@@ -132,6 +138,24 @@ class Section {
   uint8_t glyphAtlasBitDepth_ = 0;
   bool glyphAtlasInstalled_ = false;
 
+  // CrumBLE 4.5.5: hybrid streaming atlas. When the full atlas bitmap won't
+  // fit contiguously in heap (e.g. CJK section with ~90 KB bitmap on a heap
+  // fragmented to maxAlloc < 30 KB), tryInstallGlyphAtlas falls back to a
+  // streaming install: all metadata stays resident (StyleHeaders + GlyphEntry
+  // tables, ~3-6 KB total), and per-glyph bitmap bytes are read on demand
+  // from the section file at render time. glyphAtlasStreaming_ flags this
+  // mode; glyphAtlasStreamBitmapBase_ records the absolute file offset of
+  // the bitmap payload (start of the shared blob after the last style's
+  // entry table); glyphAtlasStreamScratch_ holds the most-recently-read
+  // glyph's bytes, valid until the next streamingAtlasFetch() call.
+  bool glyphAtlasStreaming_ = false;
+  uint32_t glyphAtlasStreamBitmapBase_ = 0;
+  std::vector<uint8_t> glyphAtlasStreamScratch_;
+  // Callback wired into EpdFontData::glyphBitmapFetch for streamed slots.
+  // Casts ctx back to Section* and dispatches to the instance method.
+  static const uint8_t* streamingAtlasFetch(void* ctx, const EpdGlyph* glyph);
+  const uint8_t* streamingAtlasFetchImpl(const EpdGlyph* glyph);
+
   // CrumBLE 4.3: parsed in-memory representation of one style's slice of the
   // embedded glyph subset block. Populated by tryInstallEmbeddedGlyphSubset()
   // when the block is present AND its cpfontHash matches the active
@@ -184,7 +208,8 @@ class Section {
   bool writeSectionFileHeader(int fontId, float lineCompression, uint8_t extraParagraphSpacing, bool forceParagraphIndents,
                               uint8_t paragraphAlignment, uint16_t viewportWidth, uint16_t viewportHeight,
                               bool hyphenationEnabled, bool embeddedStyle, uint8_t imageRendering,
-                              bool bionicReadingEnabled, bool guideReadingEnabled);
+                              bool bionicReadingEnabled, bool guideReadingEnabled,
+                              uint8_t tableRendering);
   uint32_t onPageComplete(std::unique_ptr<Page> page);
   // CrumBLE: shared implementation of loadSectionFile that works for either
   // the live filePath or the prebakeFilePath. Returns true on a clean load
@@ -195,20 +220,124 @@ class Section {
   bool tryLoadFromPath(const std::string& path, int fontId, float lineCompression, uint8_t extraParagraphSpacing,
                        bool forceParagraphIndents, uint8_t paragraphAlignment, uint16_t viewportWidth,
                        uint16_t viewportHeight, bool hyphenationEnabled, bool embeddedStyle, uint8_t imageRendering,
-                       bool bionicReadingEnabled, bool guideReadingEnabled);
+                       bool bionicReadingEnabled, bool guideReadingEnabled, uint8_t tableRendering,
+                       bool forceSimpleRendering = false);
+
+  // v18.9.9.29 (v20 Phase C1): page-offset table entry held in RAM while an
+  // incremental build is running so already-emitted pages can be located in
+  // the partially-written .bin. Also used by the one-shot createSectionFile
+  // wrapper (populated by onPageComplete, drained by finalizeBuild).
+  struct PageLutEntry {
+    uint32_t fileOffset;
+    uint16_t paragraphIndex;
+    uint16_t listItemIndex;
+  };
+  // Held only while an incremental build is in progress (see startBuild).
+  // Carries every piece of state that has to survive across buildSomeMore
+  // ticks: the parser (holds internal expat state), the strings it
+  // references by pointer, the in-RAM LUT, the effective parse settings
+  // (after force-simple / suppressTables overrides), and the CrumBLE-
+  // specific out-params. When the build ends -- Done, Error, or abandoned
+  // via the destructor -- finalizeBuild / abandonBuild release build_ and
+  // disarm the tables-suppress parser guard.
+  struct BuildContext {
+    std::unique_ptr<ChapterHtmlSlimParser> parser;
+    std::vector<PageLutEntry> lut;
+
+    // Parse settings the parser was constructed with. Kept so we can patch
+    // them into the section header at finalizeBuild time. "Effective"
+    // means: after forceSimpleRendering / suppressTablesOnly overrides.
+    int fontId = 0;
+    float lineCompression = 0.0f;
+    uint8_t extraParagraphSpacing = 0;
+    bool forceParagraphIndents = false;
+    uint8_t paragraphAlignment = 0;
+    uint16_t viewportWidth = 0;
+    uint16_t viewportHeight = 0;
+    bool hyphenationEnabled = false;
+    bool embeddedStyle = false;
+    uint8_t imageRendering = 0;
+    bool bionicReadingEnabled = false;
+    bool guideReadingEnabled = false;
+    uint8_t tableRendering = 0;
+
+    // File paths + build workspace. tmpSectionPath is where onPageComplete
+    // writes; finalizeBuild atomic-renames to filePath at the end. The
+    // parser references parsePath/contentBase/imageBasePath by reference,
+    // so they must live in the context (which outlives the parser).
+    std::string tmpSectionPath;
+    std::string parsePath;
+    std::string htmlPath;
+    std::string tmpHtmlPath;
+    std::string contentBase;
+    std::string imageBasePath;
+    bool reusedHtml = false;
+    CssParser* cssParser = nullptr;
+
+    // Snapshotted at startBuild for the imagesSuppressed sidecar rebuild
+    // threshold that finalizeBuild patches into the header.
+    uint32_t buildStartMaxAlloc = 0;
+
+    // Out-param pointers from the createSectionFile caller. Nullable.
+    bool* imagesWereSuppressedOut = nullptr;
+    bool* layoutAbortedForLowMemoryOut = nullptr;
+
+    // v18.9.9.6 Level 2 tables-suppress parser guard armed at startBuild
+    // via setChapterParserSuppressTablesForSimple(true). finalizeBuild /
+    // abandonBuild disarm it. (Replaces the SimpleFlagGuard RAII that was
+    // stack-scoped inside the one-shot createSectionFile.)
+    bool tablesGuardArmed = false;
+    // v18.9.9.30: popup callback fired from buildSomeMore's parseStep loop
+    // every ~250 ms. Restores the animated popup that used to live inside
+    // parseAndBuildPages (which C1 replaced with a Section-driven parseStep
+    // loop). Copied off the parser so buildSomeMore can call it without a
+    // parser accessor. Optional -- one-shot createSectionFile passes its
+    // dots-cycling lambda; C2 will pass a lambda that reads pageCount.
+    std::function<void()> popupFn;
+    // Last-fired timestamp so the 250 ms cadence is preserved across
+    // buildSomeMore(N) yield boundaries (a C2 caller might return control
+    // to the render loop between ticks -- keep the popup smooth anyway).
+    uint32_t lastPopupTickMs = 0;
+
+    // v18.9.9.76: byte-ratio page-count estimate (ported from crosspoint's
+    // feat-smart-indexing). estimatedTotalPages() extrapolates from
+    // bytesConsumed/totalBytes ratio with an EMA smoothing pass so the
+    // "Indexing… page X of ~Y" popup doesn't jitter mid-parse. bytesConsumed
+    // captured per buildSomeMore yield; totalBytes captured once at
+    // startBuild. smoothedEstimate and smoothedAtConsumed are the EMA state.
+    uint32_t bytesConsumed = 0;
+    uint32_t totalBytes = 0;
+    float smoothedEstimate = 0.0f;
+    uint32_t smoothedAtConsumed = 0;
+  };
+  std::unique_ptr<BuildContext> build_;
+  bool buildComplete_ = false;
+  // v18.9.9.30 (v20 Phase C2): snapshotted at finalizeBuild time (success)
+  // AND at buildSomeMore's Error branch (failure). Callers driving the
+  // incremental build across render ticks can't hold on to stack-scoped
+  // out-param pointers, so query these getters after isBuildComplete()
+  // (success) or after buildSomeMore returns false (failure).
+  bool lastBuildLayoutAbortedForLowMemory_ = false;
+  bool lastBuildImagesWereSuppressed_ = false;
+
+  // v18.9.9.29 (v20 Phase C1) internal: called by buildSomeMore when the
+  // parser reports Done. Writes LUT / anchors / trailer, patches the
+  // header, closes the file, and atomic-renames tmp -> live. Also drains
+  // build_'s out-param pointers into the caller's bool*.
+  bool finalizeBuild();
 
  public:
   uint16_t pageCount = 0;
   int currentPage = 0;
 
-  explicit Section(const std::shared_ptr<Epub>& epub, const int spineIndex, GfxRenderer& renderer)
-      : epub(epub),
-        spineIndex(spineIndex),
-        renderer(renderer),
-        filePath(epub->getCachePath() + "/sections/" + std::to_string(spineIndex) + ".bin"),
-        prebakeFilePath(epub->getCachePath() + "/sections-prebake/" + std::to_string(spineIndex) + ".bin"),
-        activeFilePath(filePath) {}
-  ~Section() = default;
+  // Constructor and destructor are out-of-line so unique_ptr<BuildContext>
+  // (which forward-declares ChapterHtmlSlimParser) can be
+  // constructed/destroyed where the parser's full definition is visible.
+  // The destructor calls abandonBuild so every section.reset() path tears
+  // down an in-flight build cleanly and removes its partial tmp section
+  // file.
+  explicit Section(const std::shared_ptr<Epub>& epub, int spineIndex, GfxRenderer& renderer);
+  ~Section();
   // CrumBLE: when prebakeFallbackEnabled is false, only the live sections/
   // file is consulted (matches stock 3.7.3 behaviour). When true, the live
   // file is tried first, then sections-prebake/ as a read-only fallback.
@@ -217,14 +346,97 @@ class Section {
   bool loadSectionFile(int fontId, float lineCompression, uint8_t extraParagraphSpacing, bool forceParagraphIndents,
                        uint8_t paragraphAlignment, uint16_t viewportWidth, uint16_t viewportHeight,
                        bool hyphenationEnabled, bool embeddedStyle, uint8_t imageRendering, bool bionicReadingEnabled,
-                       bool guideReadingEnabled, bool prebakeFallbackEnabled = false);
+                       bool guideReadingEnabled, uint8_t tableRendering, bool prebakeFallbackEnabled = false,
+                       bool forceSimpleRendering = false);
   bool clearCache() const;
+  // v18.9.6: forceSimpleRendering overrides the styling knobs to their most
+  // memory-frugal state for a retry-after-abort parse: images suppressed
+  // (imageRendering=2), embedded style skipped, bionic+guide reading off,
+  // tables forced to paragraph flow (via
+  // setChapterParserSuppressTablesForSimple). Caller passes the user's
+  // real settings; when the flag is true, the function ignores them for
+  // those five knobs.
+  // v18.9.9.6 Level 2: suppressTablesOnly is orthogonal to forceSimpleRendering.
+  // When true (and forceSimpleRendering false), the parser suppresses only
+  // table fragments -- images/embedded style/bionic/guide follow the passed
+  // values. When both false, everything follows the passed values (full
+  // render). When forceSimpleRendering is true it subsumes suppressTablesOnly.
   bool createSectionFile(int fontId, float lineCompression, uint8_t extraParagraphSpacing, bool forceParagraphIndents,
                          uint8_t paragraphAlignment, uint16_t viewportWidth, uint16_t viewportHeight,
                          bool hyphenationEnabled, bool embeddedStyle, uint8_t imageRendering, bool bionicReadingEnabled,
-                         bool guideReadingEnabled, const std::function<void()>& popupFn = nullptr,
-                         bool* imagesWereSuppressed = nullptr, bool* layoutAbortedForLowMemory = nullptr);
+                         bool guideReadingEnabled, uint8_t tableRendering,
+                         const std::function<void()>& popupFn = nullptr,
+                         bool* imagesWereSuppressed = nullptr, bool* layoutAbortedForLowMemory = nullptr,
+                         bool forceSimpleRendering = false, bool suppressTablesOnly = false);
+
+  // v18.9.9.29 (v20 Phase C1): incremental build API. Lay out a section a
+  // few pages at a time so a large chapter can be rendered / scrolled
+  // through while the rest is still being parsed.
+  //
+  //   if (!startBuild(...)) fail;
+  //   each render tick: buildSomeMore(N);  // returns false on error
+  //   check isBuildComplete(); if true, finalizeBuild has already committed.
+  //
+  // createSectionFile() is the one-shot wrapper: start + buildSomeMore(0)
+  // (0 = build to completion in one call). Behaviour is identical to the
+  // pre-refactor version -- C1 is a pure refactor. C2 (reader drives
+  // buildSomeMore across ticks) and C3 (loadPageDuringBuild) land later.
+  bool startBuild(int fontId, float lineCompression, uint8_t extraParagraphSpacing, bool forceParagraphIndents,
+                  uint8_t paragraphAlignment, uint16_t viewportWidth, uint16_t viewportHeight, bool hyphenationEnabled,
+                  bool embeddedStyle, uint8_t imageRendering, bool bionicReadingEnabled, bool guideReadingEnabled,
+                  uint8_t tableRendering, const std::function<void()>& popupFn = nullptr,
+                  bool* imagesWereSuppressed = nullptr, bool* layoutAbortedForLowMemory = nullptr,
+                  bool forceSimpleRendering = false, bool suppressTablesOnly = false);
+  // Advance the in-progress build by up to maxPages more pages. maxPages
+  // <= 0 means "run to completion". Returns false on parse error / cleanup
+  // failure (build is torn down). When the parser reports Done, buildSomeMore
+  // calls finalizeBuild internally and sets isBuildComplete().
+  bool buildSomeMore(int maxPages);
+  bool isBuilding() const { return static_cast<bool>(build_); }
+  bool isBuildComplete() const { return buildComplete_; }
+  // v18.9.9.30 (v20 Phase C2): last-build outcome flags. Set by the
+  // buildSomeMore Error branch and by finalizeBuild's success path.
+  // Callers that drive incremental builds across render ticks can't rely
+  // on stack-scoped bool* out-params (they'd be dangling by the time the
+  // parser reports Done or Error), so we snapshot the flags on Section
+  // itself. lastBuildLayoutAbortedForLowMemory()  = parser aborted for
+  // heap pressure; lastBuildImagesWereSuppressed() = parser fell back to
+  // suppressing images. Both cleared on the next startBuild.
+  bool lastBuildLayoutAbortedForLowMemory() const { return lastBuildLayoutAbortedForLowMemory_; }
+  bool lastBuildImagesWereSuppressed() const { return lastBuildImagesWereSuppressed_; }
+  // v18.9.9.76: byte-ratio page-count estimate for the "Indexing… page X of ~Y"
+  // popup. Returns pageCount unmodified when there's no active build (already-
+  // finalized sections need no estimate — pageCount is exact). During an active
+  // build, extrapolates from bytesConsumed/totalBytes with an EMA smoothing pass
+  // so the estimate doesn't jitter as long chapters have variable page density.
+  // Ported from crosspoint/feat-smart-indexing; ALPHA=0.25 matches theirs.
+  uint16_t estimatedTotalPages() const;
+  // Drop an in-flight build without committing. Called from ~Section and
+  // from every error path inside startBuild / buildSomeMore. Idempotent.
+  void abandonBuild();
+
   std::unique_ptr<Page> loadPageFromSectionFile();
+  // v18.9.9.10: streamed page render. Deserializes and renders ONE
+  // PageElement at a time, dropping each before reading the next. Peak
+  // heap footprint is ~500 bytes per page (one TextBlock compact block)
+  // instead of the ~10 KB whole-DOM peak of loadPageFromSectionFile +
+  // Page::render. Used by the reader whenever BT is linked -- the
+  // guaranteed-fit compat-mode render path.
+  //
+  // v18.9.9.11: btLinked hint. When true, PageImage elements skip render
+  // (image slot left blank -- JPEG decoder won't fit post-BT budget) and
+  // PageTableFragment elements render via renderContentOnly (cell text
+  // without borders/structure). Reader passes its own BT-state check.
+  // Returns true on successful render, false on file open / seek /
+  // deserialize error.
+  // v18.9.9.57: pxcImagesSafe -- when true, TAG_PageImage elements attempt a
+  // cache-only blit (ImageBlock::renderIfCached) instead of being skipped.
+  // Reader passes true iff pxcManifest_.has_value() && wasLoadedFromPrebake()
+  // -- both together guarantee any image referenced by this section has a
+  // valid .pxc entry, so the JPEG-decoder fallback path (~53 KB, OOM under
+  // BT) never fires.
+  bool renderPageStreamed(GfxRenderer& renderer, int fontId, int xOffset, int yOffset,
+                          bool foregroundBlack, bool btLinked, bool pxcImagesSafe = false);
 
   // Look up the page number for an anchor id from the section cache file.
   std::optional<uint16_t> getPageForAnchor(const std::string& anchor) const;
@@ -357,6 +569,16 @@ class Section {
   // it can re-open the file to read the block contents on demand without
   // disturbing the rest of Section's file state.
   const std::string& activeFilePathForGlyphSubset() const { return activeFilePath; }
+  // v18.9.9.56: true iff the most recently loaded section file was the
+  // read-only prebake artifact (sections-prebake/) rather than the live
+  // sections/ slot. Used by the reader render gate to decide whether the
+  // whole-DOM path is safe under BT -- prebake-served sections read all
+  // their images from the .pxc cache (~2 KB blit each, no JPEG decoder),
+  // while a fresh/cold-built section's images fall through to the ~53 KB
+  // decoder path which OOM's under BT.
+  bool wasLoadedFromPrebake() const {
+    return !prebakeFilePath.empty() && activeFilePath == prebakeFilePath;
+  }
 
   // CrumBLE 4.3 option 3: pre-allocate the ~18 KB page-heap reserve at
   // boot, while heap is least fragmented. Returns true on success. Call

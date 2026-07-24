@@ -14,6 +14,8 @@
 
 #include "../home/RecentBookProgress.h"
 #include "../reader/BookStatsView.h"
+#include "../reader/GlobalReadingStats.h"
+#include "../reader/ReadingStatsUtils.h"
 #include "../reader/EpubReaderActivity.h"
 #include "../reader/TxtReaderActivity.h"
 #include "../reader/XtcReaderActivity.h"
@@ -26,6 +28,9 @@
 #include "components/UITheme.h"
 #include "components/themes/minimal/MinimalTheme.h"
 #include "fontIds.h"
+#include "util/SleepCache.h"
+
+#include <InputManager.h>  // v18.9.9.264: POWER_BUTTON_PIN for bake-cancel poll
 #include "images/Logo120.h"
 #include "images/MoonIcon.h"
 
@@ -38,6 +43,14 @@ constexpr int sleepBuildInfoSideMargin = 20;
 // like the other silentReboot* RTC_NOINIT_ATTR slots in main.cpp). Used to
 // pick HALF every Nth cycle to scrub ghost buildup, FAST the rest of the time.
 RTC_NOINIT_ATTR uint32_t sleepCycleCounter;
+// v18.9.9.305: also survives across deep-sleep wakes. Set true when a cycle
+// draws a grayscale bitmap; consumed on the NEXT cycle to force HALF_REFRESH
+// so the panel scrubs the LSB/MSB planes before the incoming BW-only draw.
+// Without this, a fast-tap onto a BW-only image ghost-overlays the previous
+// grayscale image (Eiffel Tower under a new hooded-figure BMP was the field
+// repro). uint8_t not bool because RTC_NOINIT_ATTR bools can't guarantee a
+// clean boot-time value; we treat any non-zero as "yes".
+RTC_NOINIT_ATTR uint8_t sleepCycleLastDrewGrayscale;
 // CrumBLE 4.5.1: chip-specific cadence. X3's panel handles 2-in-a-row FAST
 // refreshes cleanly, so HALF every 3rd cycle (FAST FAST FAST HALF) is fine.
 // X4's panel leaves more residue from FAST refreshes; cycle every 2 (FAST
@@ -286,7 +299,15 @@ bool decodeSleepPngToBuffer(GfxRenderer& renderer, const std::string& filename, 
     return false;
   }
 
-  constexpr size_t MIN_FREE_HEAP = 60 * 1024;  // PNG decoder ~42 KB + overhead
+  // v18.9.9.294: was 60 KB, lowered to 48 KB. The old value was set
+  // conservatively when NimBLE ate 40+ KB resident and the decoder had
+  // to squeeze into whatever remained. v285 deinit(false) reclaims ~40 KB
+  // before sleep entry via the disable() call in main.cpp's enterDeepSleep,
+  // so actual PNG decoder usage (~42 KB per the comment above) leaves
+  // ~6 KB safety margin at 48 KB gate. Second-test symptom: gate refused
+  // at 60844 free vs 61440 threshold -- 596 bytes short of a value that
+  // had 18 KB of unused headroom above real usage.
+  constexpr size_t MIN_FREE_HEAP = 48 * 1024;
   if (ESP.getFreeHeap() < MIN_FREE_HEAP) {
     LOG_ERR("SLP", "Not enough heap for PNG decoder: %u free, need %u for %s", ESP.getFreeHeap(),
             static_cast<unsigned>(MIN_FREE_HEAP), filename.c_str());
@@ -400,6 +421,12 @@ void renderBitmapToSleepScreen(GfxRenderer& renderer, const Bitmap& bitmap, bool
 
   const bool hasGreyscale = bitmap.hasGreyscale() &&
                             SETTINGS.sleepScreenCoverFilter == CrossPointSettings::SLEEP_SCREEN_COVER_FILTER::NO_FILTER;
+  // v18.9.9.294: diagnostic log for the "BMP no greys on first entry"
+  // mystery -- capture the state going in so a repro attaches log
+  // context we can act on next iteration.
+  LOG_INF("SLP", "renderBitmap: hasGrey=%d bmpGrey=%d filter=%d skipGrey=%d",
+          hasGreyscale ? 1 : 0, bitmap.hasGreyscale() ? 1 : 0,
+          static_cast<int>(SETTINGS.sleepScreenCoverFilter), skipGreyscalePass ? 1 : 0);
 
   renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight, cropX, cropY);
 
@@ -407,14 +434,21 @@ void renderBitmapToSleepScreen(GfxRenderer& renderer, const Bitmap& bitmap, bool
     renderer.invertScreen();
   }
 
-  renderer.displayBuffer(bwRefresh, TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
+  // v18.9.9.305: only turn off the panel after the BW pass when NO grayscale
+  // pass follows. Prior code always passed TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH,
+  // powering the panel down between the BW and LSB/MSB passes; the grayscale
+  // display then either fired at a dark panel (no grays visible) or produced
+  // ghost-on-ghost overlays on X4 tap-cycles. composePngOverReaderPage got this
+  // right (line 1348 pattern); this path matches it now.
+  const bool willRunGrayscale = hasGreyscale && !skipGreyscalePass;
+  renderer.displayBuffer(bwRefresh, !willRunGrayscale && TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
 
   // Cache the composed B/W full-screen sleep image so a later heap-starved sleep
   // can restore it without a decode (see SLEEP_FB_CACHE_PATH). Snapshot the B/W
   // buffer here, before the optional grayscale passes overwrite it below.
   writeFramebufferCache(SLEEP_FB_CACHE_PATH);
 
-  if (hasGreyscale && !skipGreyscalePass) {
+  if (willRunGrayscale) {
     bitmap.rewindToData();
     renderer.clearScreen(0x00);
     renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
@@ -429,6 +463,10 @@ void renderBitmapToSleepScreen(GfxRenderer& renderer, const Bitmap& bitmap, bool
 
     renderer.displayGrayBuffer(TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
     renderer.setRenderMode(GfxRenderer::BW);
+    // v18.9.9.305: signal to the NEXT cycleScreensaverFromDeepSleep tap
+    // that it must use HALF_REFRESH, since FAST_REFRESH will leave this
+    // grayscale RAM on the panel and ghost the incoming BW image.
+    sleepCycleLastDrewGrayscale = 1;
   }
 }
 
@@ -476,6 +514,17 @@ enum class SleepImageMode : uint8_t { Custom, Overlay };
 struct SleepImageSelection {
   std::string path;
   bool isPng = false;
+  // v18.9.9.257: deferred-commit fields. When a select function advances a
+  // persistent cursor (cycle: sidecar+SETTINGS; random: recentSleepImages),
+  // do it AFTER the caller has decoded the image successfully -- else a
+  // tight-heap decode failure silently skips the image visually but the
+  // cursor moved past it, so the user "loses" one sleep frame per failed
+  // decode. Callers set the fields via the select fn and then must call
+  // commitSleepSelectionAdvance() on decode success.
+  enum class AdvanceKind : uint8_t { None, Cycle, Random };
+  AdvanceKind advanceKind = AdvanceKind::None;
+  uint16_t pendingCycleNextIndex = 0;   // Cycle: value to write to sidecar + SETTINGS.sleepScreenCycleIndex
+  uint16_t pendingRandomIndex = 0;      // Random: index to pushRecentSleep()
 };
 
 bool isBmpSleepImagePath(const std::string& path) { return FsHelpers::hasBmpExtension(path); }
@@ -587,11 +636,38 @@ bool selectRandomSleepImage(SleepImageMode /*mode*/, SleepImageSelection& select
     randomFileIndex = static_cast<uint16_t>(random(fileCount));
   }
 
-  APP_STATE.pushRecentSleep(randomFileIndex);
-  APP_STATE.saveToFile();
+  // v18.9.9.257: defer cursor state advance to post-decode. See
+  // SleepImageSelection.AdvanceKind for why -- tight-heap PNG decode can
+  // fail after we've marked an image as "recently shown", making that
+  // image invisible next round even though the user never saw it.
   selection.path = std::string(sleepDir) + "/" + files[randomFileIndex];
   selection.isPng = FsHelpers::hasPngExtension(selection.path);
+  selection.advanceKind = SleepImageSelection::AdvanceKind::Random;
+  selection.pendingRandomIndex = randomFileIndex;
   return true;
+}
+
+// v18.9.9.203: tiny sidecar for the cycle cursor. The settings-JSON save
+// (SETTINGS.saveToFile) can defer under low heap (needs 16 KB free / 4 KB
+// maxAlloc); if sleep entry follows the defer before the main-loop retry
+// fires, the advance is lost and next boot restarts at index 0 (the field
+// report). A 2-byte file with no heap gate always writes and always reads
+// back. Loaded here on cycle-pick so it beats a stale SETTINGS value.
+constexpr const char* kSleepCycleSidecar = "/.crosspoint/sleep_cycle.bin";
+uint16_t readCycleIndexSidecar() {
+  FsFile f;
+  if (!Storage.openFileForRead("SLP", kSleepCycleSidecar, f)) return UINT16_MAX;
+  uint16_t v = 0;
+  const size_t n = f.read(reinterpret_cast<uint8_t*>(&v), sizeof(v));
+  f.close();
+  return n == sizeof(v) ? v : UINT16_MAX;
+}
+void writeCycleIndexSidecar(uint16_t v) {
+  Storage.mkdir("/.crosspoint");
+  FsFile f;
+  if (!Storage.openFileForWrite("SLP", kSleepCycleSidecar, f)) return;
+  f.write(reinterpret_cast<const uint8_t*>(&v), sizeof(v));
+  f.close();
 }
 
 // Cycle through /.sleep/ in alphabetical order, picking by the persisted cursor
@@ -652,17 +728,49 @@ bool selectCycleSleepImage(SleepImageSelection& selection) {
   std::sort(files.begin(), files.end());
 
   const uint16_t fileCount = static_cast<uint16_t>(std::min(files.size(), static_cast<size_t>(UINT16_MAX)));
-  const uint16_t storedIndex = SETTINGS.sleepScreenCycleIndex;
+  // v18.9.9.203: sidecar wins over SETTINGS if present -- it's the source of
+  // truth for the cursor across deep-sleep boundaries where the JSON save
+  // may have deferred. Falls back to SETTINGS on cold boot (no sidecar yet).
+  const uint16_t sidecarIndex = readCycleIndexSidecar();
+  const uint16_t storedIndex =
+      (sidecarIndex != UINT16_MAX) ? sidecarIndex : SETTINGS.sleepScreenCycleIndex;
   const uint16_t idx = static_cast<uint16_t>(storedIndex % fileCount);
   selection.path = std::string(sleepDir) + "/" + files[idx];
   selection.isPng = FsHelpers::hasPngExtension(selection.path);
 
   const uint16_t nextIndex = static_cast<uint16_t>((idx + 1) % fileCount);
-  SETTINGS.sleepScreenCycleIndex = nextIndex;
-  const bool saveOk = SETTINGS.saveToFile();
-  LOG_INF("SLP", "Cycle: count=%u stored=%u picked=%u next=%u save=%s file=%s", fileCount, storedIndex, idx, nextIndex,
-          saveOk ? "ok" : "DEFERRED", selection.path.c_str());
+  // v18.9.9.257: defer cursor advance to post-decode (see AdvanceKind
+  // comment on SleepImageSelection). Under tight heap, PNG decode of the
+  // picked image can fail after we've already stamped the sidecar +
+  // SETTINGS with nextIndex, so the failed image is "skipped" visually
+  // and the user never sees it again until the cursor wraps around.
+  // Now the caller commits after a successful decode.
+  selection.advanceKind = SleepImageSelection::AdvanceKind::Cycle;
+  selection.pendingCycleNextIndex = nextIndex;
+  LOG_INF("SLP", "Cycle: count=%u stored=%u (sidecar=%s) picked=%u pending-next=%u file=%s", fileCount,
+          storedIndex, sidecarIndex == UINT16_MAX ? "none" : "present",
+          idx, nextIndex, selection.path.c_str());
   return true;
+}
+
+// v18.9.9.257: commit the pending cursor/recent advance after successful
+// decode. No-op for AdvanceKind::None (pinned or /sleep.bmp fallback --
+// nothing to advance). Called from renderCustomSleepScreen just after
+// the image renders without falling through to the error path.
+void commitSleepSelectionAdvance(const SleepImageSelection& selection) {
+  switch (selection.advanceKind) {
+    case SleepImageSelection::AdvanceKind::None:
+      return;
+    case SleepImageSelection::AdvanceKind::Cycle:
+      SETTINGS.sleepScreenCycleIndex = selection.pendingCycleNextIndex;
+      writeCycleIndexSidecar(selection.pendingCycleNextIndex);
+      SETTINGS.saveToFile();
+      return;
+    case SleepImageSelection::AdvanceKind::Random:
+      APP_STATE.pushRecentSleep(selection.pendingRandomIndex);
+      APP_STATE.saveToFile();
+      return;
+  }
 }
 
 }  // namespace
@@ -693,12 +801,31 @@ void SleepActivity::onEnter() {
 
   // Show the popup in the reader's orientation when sleep starts from an open book.
   // Reset to portrait afterwards so the sleep screen renderer keeps its existing layout.
-  if (APP_STATE.lastSleepFromReader) {
-    ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
-    GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
-    renderer.setOrientation(GfxRenderer::Orientation::Portrait);
-  } else {
-    GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
+  // v18.9.9.348: skip the popup for OVERLAY sleep mode -- overlay renders
+  // the book page + sleep image over it in ONE additional flash; the
+  // popup added a redundant FAST_REFRESH before that. Field-observed
+  // triple-flash on highlighted book pages (popup + BW overlay + optional
+  // grayscale). Overlay is quick enough (~2 s) that no reassurance popup
+  // is needed. Other sleep modes (Custom/Cover/Cover_Custom) still show
+  // it since their render can take longer.
+  const bool isOverlayMode = SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::OVERLAY;
+  if (!isOverlayMode) {
+    if (APP_STATE.lastSleepFromReader) {
+      ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
+      GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
+      renderer.setOrientation(GfxRenderer::Orientation::Portrait);
+    } else {
+      GUI.drawPopup(renderer, tr(STR_ENTERING_SLEEP));
+    }
+  }
+
+  // v18.9.9.462 (P3b): when Dashboard is the UI theme, always route sleep to
+  // the stats overlay renderer regardless of sleepScreen mode. Dashboard is
+  // a "stats-forward" identity — the theme choice itself implies the user
+  // wants stats visible on sleep. Users who explicitly want a non-stats
+  // sleep can switch UI theme.
+  if (SETTINGS.uiTheme == CrossPointSettings::UI_THEME::DASHBOARD) {
+    return renderMinimalStatsSleepScreen();
   }
 
   switch (SETTINGS.sleepScreen) {
@@ -720,6 +847,8 @@ void SleepActivity::onEnter() {
       return renderReadingStatsSleepScreen();
     case (CrossPointSettings::SLEEP_SCREEN_MODE::MINIMAL_SLEEP):
       return renderMinimalSleepScreen();
+    case (CrossPointSettings::SLEEP_SCREEN_MODE::MINIMAL_STATS_SLEEP):
+      return renderMinimalStatsSleepScreen();
     default:
       return renderDefaultSleepScreen();
   }
@@ -736,8 +865,47 @@ void SleepActivity::renderCustomSleepScreen() const {
   if (selectPinnedSleepImage(SleepImageMode::Custom, selection) || trySelectFallback()) {
     LOG_INF("SLP", "Loading custom sleep image: %s", selection.path.c_str());
     delay(100);
+    // v18.9.9.258: try the pre-baked .slp cache first. Loads the
+    // ready-to-blit 1bpp framebuffer bytes straight from SD, skipping
+    // PNG/BMP decode + the transient buffers that path allocates. On
+    // tight post-BT / post-book-open heap, that's the difference
+    // between "sleep frame shows" and "no image, falls to default".
+    // Cache mismatch (bad magic, panel resolution changed, no .slp
+    // file) returns false and we fall through to the source decoder
+    // as before.
+    // v18.9.9.279: skip .slp entirely for transparent PNGs. Baked .slp
+    // freezes whatever pixels were behind the alpha regions at bake
+    // time (typically white), so an old bake shows white instead of
+    // the reader page. Runtime composePngOverReaderPage restores the
+    // cycle cache first and composites on top -- the whole reason we
+    // support transparent sleep PNGs. One extra header sniff per
+    // sleep entry (~a few hundred bytes off SD) is cheap.
+    //
+    // v18.9.9.281: same treatment for grayscale BMPs (bpp > 1). The
+    // grayscale second pass (LSB + MSB layers) can't be represented in
+    // a single 1bpp .slp -- a baked .slp for these shows the 1-bit
+    // render only, no greys. Skip the cache so the fallthrough hits
+    // renderBitmapSleepScreen which runs both passes.
+    const bool transparentPng = selection.isPng && SleepCache::pngHasTransparency(selection.path);
+    const bool grayscaleBmp = !selection.isPng && SleepCache::bmpHasGreyscale(selection.path);
+    if (!transparentPng && !grayscaleBmp && renderer.hasFrameBuffer() &&
+        SleepCache::loadIntoFramebuffer(selection.path, renderer.getFrameBuffer(),
+                                         renderer.getBufferSize(),
+                                         renderer.getScreenWidth(),
+                                         renderer.getScreenHeight())) {
+      renderer.displayBuffer(HalDisplay::HALF_REFRESH, TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
+      commitSleepSelectionAdvance(selection);
+      return;
+    }
     if (selection.isPng) {
-      composePngOverReaderPage(selection.path);
+      // v18.9.9.260: composePngOverReaderPage now returns success. Only
+      // commit the cursor advance if the PNG source actually decoded --
+      // fallback to SLEEP_FB_CACHE_PATH (last successful image) means
+      // the user is seeing a DIFFERENT image than the one at the current
+      // cursor, so advancing would silently skip the picked image.
+      if (composePngOverReaderPage(selection.path)) {
+        commitSleepSelectionAdvance(selection);
+      }
       return;
     } else {
       FsFile file;
@@ -745,6 +913,7 @@ void SleepActivity::renderCustomSleepScreen() const {
         Bitmap bitmap(file, true);
         if (bitmap.parseHeaders() == BmpReaderError::Ok) {
           renderBitmapSleepScreen(bitmap);
+          commitSleepSelectionAdvance(selection);
           return;
         }
         LOG_ERR("SLP", "Failed to parse custom sleep BMP: %s", selection.path.c_str());
@@ -840,11 +1009,61 @@ void SleepActivity::cycleScreensaverFromDeepSleep(GfxRenderer& renderer) {
   // tuned per chip -- X4 panel needs more frequent HALF sweeps.
   const uint32_t halfEveryN = gpio.deviceIsX3() ? kSleepCycleHalfEveryN_X3 : kSleepCycleHalfEveryN_X4;
   ++sleepCycleCounter;
+  // v18.9.9.305: scrub the panel whenever the previous cycle painted
+  // grayscale (LSB+MSB) planes. FAST_REFRESH after grayscale only diffs
+  // the BW plane and leaves the grayscale RAM lit, ghost-overlaying the
+  // new image (Eiffel-Tower + hooded-figure field bug). Consumed here so
+  // the scrub fires exactly once, on the cycle immediately after
+  // grayscale.
+  //
+  // v18.9.9.305 attempt 2: HALF_REFRESH is not sufficient. On X4 the
+  // HALF path is a no-op resync (the extra X3 resync in HalDisplay is
+  // gpio.deviceIsX3()-gated), so we get plain HALF which does not clear
+  // the panel's LSB/MSB waveform state. Ghost persisted after a HALF
+  // scrub. Bump to FULL_REFRESH -- costs an extra ~500 ms wave cycle on
+  // this one cycle, but reliably clears the grayscale RAM on both
+  // panels. Only fires the cycle after grayscale, so the amortised cost
+  // is one FULL per pair of grayscale-adjacent taps.
+  const bool scrubAfterGray = sleepCycleLastDrewGrayscale != 0;
+  sleepCycleLastDrewGrayscale = 0;
   const bool useHalf = (sleepCycleCounter % halfEveryN) == 0;
+  // v18.9.9.346: transparent PNGs demand HALF_REFRESH. FAST_REFRESH's DU
+  // waveform under-drives black->white transitions on pixels the new
+  // PNG's transparent regions leave uncovered -- symptom being the
+  // previous PNG's opaque parts ghosting under the current one.
+  //
+  // v18.9.9.350: for PNGs specifically, HALF is enough even after a
+  // grayscale predecessor -- we're compositing on top of the book-page
+  // background whose grayscale panel state is EXACTLY what we want to
+  // keep visible under the transparent PNG regions. Scrub-after-gray
+  // FULL only helps opaque BW frames (BMPs). For PNGs the FULL wave
+  // was showing up as an extra visible flash without a benefit --
+  // user-reported "triple flash before some PNGs on highlight
+  // background". BMP with grays -> BMP still gets the FULL scrub.
+  const bool needsPngScrub = selection.isPng;
   const HalDisplay::RefreshMode cycleRefresh =
-      useHalf ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH;
-  LOG_DBG("SLP", "Cycle refresh: %s (count=%u)", useHalf ? "HALF" : "FAST",
-          static_cast<unsigned>(sleepCycleCounter));
+      needsPngScrub                   ? HalDisplay::HALF_REFRESH
+      : scrubAfterGray                ? HalDisplay::FULL_REFRESH
+      : useHalf                       ? HalDisplay::HALF_REFRESH
+                                      : HalDisplay::FAST_REFRESH;
+  LOG_DBG("SLP", "Cycle refresh: %s (count=%u, postGray=%d, isPng=%d)",
+          needsPngScrub ? "HALF-png" : (scrubAfterGray ? "FULL" : (useHalf ? "HALF" : "FAST")),
+          static_cast<unsigned>(sleepCycleCounter), scrubAfterGray ? 1 : 0, needsPngScrub ? 1 : 0);
+
+  // v18.9.9.281: always advance the cycle cursor before we return,
+  // regardless of decode/render outcome. This function was the only
+  // sleep-image path that never called commitSleepSelectionAdvance
+  // (v257 added the commit-after-decode discipline to
+  // renderCustomSleepScreen but missed the deep-sleep cycle path),
+  // so alphabetical-mode users tap-cycling from deep sleep saw the
+  // SAME image every tap forever. On failure we still advance -- if
+  // the current image can't decode this cycle (typically post-BT
+  // heap starvation), staying on it just means the next tap fails
+  // the same way. Better to move on.
+  struct AdvanceGuard {
+    const SleepImageSelection& sel;
+    ~AdvanceGuard() { commitSleepSelectionAdvance(sel); }
+  } _advance{selection};
 
   if (selection.isPng) {
     // Try to use the cached last reader page as the background so transparent
@@ -884,6 +1103,151 @@ void SleepActivity::cycleScreensaverFromDeepSleep(GfxRenderer& renderer) {
   // the user explicitly turns it on in Display settings.
   const bool skipGrayscale = SETTINGS.sleepCycleSkipGrayscale != 0;
   renderBitmapToSleepScreen(renderer, bitmap, skipGrayscale, cycleRefresh);
+}
+
+// v18.9.9.258: bake .slp caches for all sleep source images.
+// Iterates /.sleep/ (or /sleep/), skips images with a valid existing
+// .slp companion, decodes the rest via the same helpers used by the
+// runtime sleep path, and snapshots the 1bpp framebuffer bytes via
+// SleepCache::saveFramebuffer. Blocking; caller draws a progress popup.
+SleepActivity::BakeResult SleepActivity::bakeAllSleepImages(GfxRenderer& renderer, BakeProgressFn onProgress) {
+  BakeResult result;
+  FsFile dir;
+  const char* sleepDir = nullptr;
+  if (!openPreferredSleepDirectory(dir, sleepDir)) {
+    LOG_INF("SLP", "Bake: no sleep directory found");
+    return result;
+  }
+
+  // Enumerate PNG/BMP candidates first so we know `total` for progress.
+  std::vector<std::string> files;
+  files.reserve(16);
+  char name[500];
+  for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
+    if (file.isDirectory()) { file.close(); continue; }
+    file.getName(name, sizeof(name));
+    std::string filename(name);
+    if (filename.empty() || filename[0] == '.') { file.close(); continue; }
+    const bool isBmp = FsHelpers::hasBmpExtension(filename);
+    const bool isPng = FsHelpers::hasPngExtension(filename);
+    if (!isBmp && !isPng) { file.close(); continue; }
+    files.emplace_back(std::move(filename));
+    file.close();
+  }
+  dir.close();
+
+  result.total = static_cast<int>(files.size());
+  if (result.total == 0) {
+    LOG_INF("SLP", "Bake: sleep dir is empty (after PNG/BMP filter)");
+    return result;
+  }
+
+  const int pageWidth = renderer.getScreenWidth();
+  const int pageHeight = renderer.getScreenHeight();
+
+  // v18.9.9.264: raw-GPIO Back/cancel via power button between images.
+  // The bake runs in main.cpp setup() before MappedInputManager exists,
+  // so we poll the pin directly. INPUT_PULLUP -> LOW when pressed.
+  // Cancels leave already-baked images untouched -- resuming later just
+  // skips them (cacheExists check). Fast (~1 microsecond digitalRead).
+  pinMode(InputManager::POWER_BUTTON_PIN, INPUT_PULLUP);
+
+  for (int i = 0; i < result.total; ++i) {
+    if (digitalRead(InputManager::POWER_BUTTON_PIN) == LOW) {
+      LOG_INF("SLP", "Bake: cancelled by user after %d/%d", i, result.total);
+      break;
+    }
+    const std::string fullPath = std::string(sleepDir) + "/" + files[i];
+    // v18.9.9.279: transparent PNGs must NOT be baked. .slp is a fixed
+    // 1bpp framebuffer -- baking freezes whatever background pixels
+    // were behind the PNG at bake time (typically clearScreen white),
+    // which defeats the whole point of a transparent overlay. Runtime
+    // path falls through to composePngOverReaderPage, which restores
+    // the last reader page from the cycle cache first. Also purge any
+    // .slp left over from an older build that baked these wrong.
+    if (FsHelpers::hasPngExtension(files[i]) && SleepCache::pngHasTransparency(fullPath)) {
+      SleepCache::removeCache(fullPath);
+      result.skipped++;
+      // v18.9.9.299: don't call onProgress on skip. Skips are ~10 ms
+      // (file open + 30-byte header read + close) but the progress
+      // popup redraw is a ~500 ms display refresh. 26 skips = 13 s of
+      // wasted screen fade with no visible progress. Skip the callback
+      // so the popup stays static while we blaze through.
+      continue;
+    }
+    if (SleepCache::cacheExists(fullPath)) {
+      // Already baked. Cheap skip -- no header validation here; a later
+      // load with header mismatch will just fall back to the source
+      // decoder as always.
+      result.skipped++;
+      // v18.9.9.299: don't call onProgress on skip. Skips are ~10 ms
+      // (file open + 30-byte header read + close) but the progress
+      // popup redraw is a ~500 ms display refresh. 26 skips = 13 s of
+      // wasted screen fade with no visible progress. Skip the callback
+      // so the popup stays static while we blaze through.
+      continue;
+    }
+
+    // Fresh decode into framebuffer. Use the same helpers the runtime
+    // sleep path uses so the baked pixels are what the user would see
+    // otherwise. clearScreen first so transparent PNG regions don't
+    // pick up whatever the previous iteration left behind.
+    renderer.clearScreen();
+    bool decoded = false;
+    if (FsHelpers::hasPngExtension(files[i])) {
+      decoded = decodeSleepPngToBuffer(renderer, fullPath, pageWidth, pageHeight);
+    } else {
+      FsFile bmpFile;
+      if (Storage.openFileForRead("SLP", fullPath, bmpFile)) {
+        Bitmap bitmap(bmpFile, true);
+        if (bitmap.parseHeaders() == BmpReaderError::Ok) {
+          // v18.9.9.281: BMPs with bpp > 1 rely on a grayscale second
+          // pass that renderBitmapToSleepScreen only runs when
+          // skipGreyscalePass=false. .slp is a fixed B/W framebuffer
+          // that can't carry the LSB+MSB grayscale layers, so baking
+          // one for a grayscale BMP produces a 1-bit-only sleep image
+          // (visible symptom: the specific BMP that "loses its greys"
+          // has a .slp; the others fall through to the full render).
+          // Skip the bake + purge stale .slp so the runtime path takes
+          // over.
+          if (bitmap.hasGreyscale()) {
+            SleepCache::removeCache(fullPath);
+            result.skipped++;
+            // v18.9.9.299: don't call onProgress on skip (see comment in
+            // the earlier skip branches).
+            bmpFile.close();
+            continue;
+          }
+          // renderBitmapToSleepScreen draws row-by-row + calls
+          // displayBuffer(HALF_REFRESH). During bake we accept the
+          // brief flash of each image as visual progress feedback
+          // -- and the framebuffer is left holding the decoded
+          // bytes we need to snapshot into .slp.
+          renderBitmapToSleepScreen(renderer, bitmap, /*skipGreyscalePass=*/true);
+          decoded = true;
+        }
+      }
+    }
+    if (!decoded) {
+      LOG_ERR("SLP", "Bake: decode failed for %s", fullPath.c_str());
+      result.failed++;
+      if (onProgress) onProgress(i + 1, result.total);
+      continue;
+    }
+
+    if (SleepCache::saveFramebuffer(fullPath, renderer.getFrameBuffer(), renderer.getBufferSize(),
+                                     pageWidth, pageHeight)) {
+      result.baked++;
+    } else {
+      LOG_ERR("SLP", "Bake: save failed for %s", fullPath.c_str());
+      result.failed++;
+    }
+    if (onProgress) onProgress(i + 1, result.total);
+  }
+
+  LOG_INF("SLP", "Bake done: baked=%d skipped=%d failed=%d total=%d",
+          result.baked, result.skipped, result.failed, result.total);
+  return result;
 }
 
 void SleepActivity::renderCoverSleepScreen() const {
@@ -956,6 +1320,39 @@ void SleepActivity::renderMinimalSleepScreen() const {
   writeFramebufferCache(SLEEP_FB_CACHE_PATH);
 }
 
+// v18.9.9.445 (CrossInk parity): Minimal Stats sleep screen. Falls back to
+// plain Minimal when no book open. Reader-type + streak overlay only shows
+// meaningful values when clock is valid (X3 always, X4 after SNTP).
+void SleepActivity::renderMinimalStatsSleepScreen() const {
+  const std::string& path = currentBookPath.empty() ? APP_STATE.openEpubPath : currentBookPath;
+  if (path.empty()) {
+    LOG_INF("SLP", "MinimalStatsSleep: no book path, fallback to default sleep screen");
+    return renderDefaultSleepScreen();
+  }
+  RecentBook book = recentBookForPath(path);
+  book.coverBmpPath = SleepCoverAssets::cachedMinimalCoverPathFor(path);
+  const BookReadingStats bookStats = loadBookStatsForPath(path);
+  const float progressPercent = RecentBookProgress::loadPercent(book);
+  const GlobalReadingStats globalStats = GlobalReadingStats::load();
+  ReadingStatsDateTime nowLocal;
+  const bool clockValid = getCurrentLocalReadingStatsDateTime(nowLocal);
+  LOG_INF("SLP", "MinimalStatsSleep: clockValid=%d ToD=%u/%u/%u/%u streakAnchor=%u",
+          clockValid ? 1 : 0,
+          static_cast<unsigned>(globalStats.timeOfDaySeconds[0]),
+          static_cast<unsigned>(globalStats.timeOfDaySeconds[1]),
+          static_cast<unsigned>(globalStats.timeOfDaySeconds[2]),
+          static_cast<unsigned>(globalStats.timeOfDaySeconds[3]),
+          static_cast<unsigned>(globalStats.readingHistoryAnchorDay));
+  MinimalTheme theme;
+  // v18.9.9.466: renamed drawSleepScreenWithStats → drawStatsSleepScreen
+  // (1:1 with CrossInk). Passes globalStats as pointer; inverted=false
+  // = BLACK background (default sleep style).
+  (void)clockValid;  // gate now lives inside drawStatsOverlay
+  theme.drawStatsSleepScreen(renderer, book, &bookStats, &globalStats, progressPercent, /*inverted=*/false);
+  renderer.displayBuffer(HalDisplay::HALF_REFRESH, TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
+  writeFramebufferCache(SLEEP_FB_CACHE_PATH);
+}
+
 void SleepActivity::renderLastScreenSleepScreen() const {
   const auto pageHeight = renderer.getScreenHeight();
   renderer.drawImage(MoonIcon, 0, pageHeight - MOONICON_HEIGHT, MOONICON_WIDTH, MOONICON_HEIGHT);
@@ -967,7 +1364,7 @@ void SleepActivity::renderBlankSleepScreen() const {
   renderer.displayBuffer(HalDisplay::HALF_REFRESH, TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
 }
 
-void SleepActivity::composePngOverReaderPage(const std::string& pngPath) const {
+bool SleepActivity::composePngOverReaderPage(const std::string& pngPath) const {
   // Mirror the overlay mode flow but with a caller-supplied PNG path: restore
   // (or rebuild) the last reader page as background, then decode the PNG with
   // transparency preserved so the reader page shows through transparent
@@ -1044,7 +1441,9 @@ void SleepActivity::composePngOverReaderPage(const std::string& pngPath) const {
       renderDefaultSleepScreen();
     }
     renderer.setOrientation(savedOrientation);
-    return;
+    // v18.9.9.260: signal decode failure so caller doesn't advance the
+    // sleep cycle cursor -- the user never actually saw THIS image.
+    return false;
   }
 
   // Cache the composed B/W sleep image for the low-heap restore above. Snapshot
@@ -1058,11 +1457,15 @@ void SleepActivity::composePngOverReaderPage(const std::string& pngPath) const {
       backgroundSupportsGrayscale && (backgroundWasRebuilt || (overlayPageBufferTrusted && !path.empty()));
   renderer.displayBuffer(HalDisplay::HALF_REFRESH, !shouldRunGrayscalePass && TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
 
-  if (!shouldRunGrayscalePass) return;
+  // Beyond this point the PNG source itself decoded successfully -- the
+  // grayscale-pass branches are enhancement steps for the reader-page
+  // background, not the PNG itself. Any failure there still leaves the
+  // BW PNG on screen, so we return true.
+  if (!shouldRunGrayscalePass) return true;
 
   if (!renderer.storeBwBuffer()) {
     LOG_ERR("SLP", "Compose PNG: failed to store BW buffer for grayscale pass");
-    return;
+    return true;
   }
 
   renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
@@ -1070,7 +1473,7 @@ void SleepActivity::composePngOverReaderPage(const std::string& pngPath) const {
     LOG_ERR("SLP", "Compose PNG: failed to rebuild page for grayscale LSB pass");
     renderer.setRenderMode(GfxRenderer::BW);
     renderer.restoreBwBuffer();
-    return;
+    return true;
   }
   renderer.copyGrayscaleLsbBuffers();
 
@@ -1079,13 +1482,18 @@ void SleepActivity::composePngOverReaderPage(const std::string& pngPath) const {
     LOG_ERR("SLP", "Compose PNG: failed to rebuild page for grayscale MSB pass");
     renderer.setRenderMode(GfxRenderer::BW);
     renderer.restoreBwBuffer();
-    return;
+    return true;
   }
   renderer.copyGrayscaleMsbBuffers();
 
   renderer.displayGrayBuffer(TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
   renderer.setRenderMode(GfxRenderer::BW);
   renderer.restoreBwBuffer();
+  // v18.9.9.305: see sleepCycleLastDrewGrayscale doc block. Composed PNG
+  // over reader page also leaves LSB/MSB planes lit; the next tap-cycle
+  // must scrub via HALF_REFRESH.
+  sleepCycleLastDrewGrayscale = 1;
+  return true;
 }
 
 void SleepActivity::renderOverlaySleepScreen() const {
@@ -1243,8 +1651,19 @@ void SleepActivity::renderOverlaySleepScreen() const {
   }
 
   renderer.setOrientation(savedOrientation);
+  // v18.9.9.346: gate grayscale pass on whether the reader's last render
+  // actually needed it. Previously we ran it whenever the underlying
+  // page was rebuilt OR the BW backup was trusted, but for a text-only
+  // (or highlight-only) page the extra LSB/MSB rebuild + gray display
+  // is two additional full-screen refreshes with no visible benefit --
+  // the triple-flash bug on highlighted pages. On a fresh boot (no
+  // reader render this session, e.g. sleep-cycle from cold boot) the
+  // flag defaults to false; we still run the pass when backgroundWasRebuilt
+  // to preserve the safe default for un-flagged rebuild paths.
+  const bool readerFlaggedGrayscale = APP_STATE.lastReaderPageNeededGrayscale;
   const bool shouldRunGrayscalePass =
-      backgroundSupportsGrayscale && (backgroundWasRebuilt || (overlayPageBufferTrusted && !path.empty()));
+      backgroundSupportsGrayscale && readerFlaggedGrayscale &&
+      (backgroundWasRebuilt || (overlayPageBufferTrusted && !path.empty()));
   renderer.displayBuffer(HalDisplay::HALF_REFRESH, !shouldRunGrayscalePass && TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
 
   if (!shouldRunGrayscalePass) {
@@ -1277,4 +1696,6 @@ void SleepActivity::renderOverlaySleepScreen() const {
   renderer.displayGrayBuffer(TURN_OFF_SCREEN_AFTER_SLEEP_REFRESH);
   renderer.setRenderMode(GfxRenderer::BW);
   renderer.restoreBwBuffer();
+  // v18.9.9.305: overlay path also lit the LSB/MSB planes.
+  sleepCycleLastDrewGrayscale = 1;
 }

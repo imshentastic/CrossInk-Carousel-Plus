@@ -37,6 +37,12 @@ class CrossPointWebServerActivity final : public Activity {
 
   // Web server - owned by this activity
   std::unique_ptr<CrossPointWebServer> webServer;
+  // v18.9.9.83: latched at onEnter from the SILENT_REBOOT_LOWHEAP_RECOVERY_HINT
+  // sentinel so the mid-serve floor-breach check (loop() → handleClient path)
+  // can see we already tried the silent-restart path once. Prevents an infinite
+  // low-heap silent-restart loop when the fresh-boot heap still can't fit the
+  // web server allocation.
+  bool justLowHeapRestarted_ = false;
 
   // Server status
   std::string connectedIP;
@@ -45,6 +51,20 @@ class CrossPointWebServerActivity final : public Activity {
   // Performance monitoring
   unsigned long lastHandleClientTime = 0;
 
+  // v18.9.9.372/v373: passive heap watchdog. Timestamp when the current
+  // low-heap streak began (0 = not currently low). Once the streak
+  // exceeds a threshold duration, silent-restart to FT.
+  uint32_t heapLowStreakStartMs_ = 0;
+  // v18.9.9.417: parallel streak-start for the upload-fragmentation
+  // watchdog. Non-zero while maxAlloc has been below the fragmentation
+  // floor for an active upload; resets to 0 when maxAlloc recovers or
+  // when no upload is in flight.
+  uint32_t uploadFragStreakStartMs_ = 0;
+  // v18.9.9.373: timestamp when this FT activity was entered (post-boot
+  // dispatch or fresh open). Used to enforce a minimum cooldown between
+  // silent-restart-to-FT attempts.
+  uint32_t activityEnteredAtMs_ = 0;
+
   // Sustained WiFi-loss tracking; abandon only after WIFI_ABANDON_MS.
   int consecutiveDisconnects = 0;
   unsigned long firstDisconnectAt = 0;
@@ -52,6 +72,10 @@ class CrossPointWebServerActivity final : public Activity {
 
   // Cached signal-strength bracket (0..4) for the WiFi indicator.
   int lastWifiBars = 0;
+  // v18.9.9.300: last polled RSSI in dBm (0 = not connected / not measured).
+  // Cached so render() can show a weak-signal warning without hitting the
+  // WiFi API each frame.
+  int lastWifiRssi = 0;
 
   void renderServerRunning() const;
   void renderWifiIndicator(int subHeaderTop) const;

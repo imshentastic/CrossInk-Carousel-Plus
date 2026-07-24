@@ -15,29 +15,31 @@
 #include "fontIds.h"
 
 namespace {
-// Menu items in their natural order. Clock entries are appended only when the
-// DS3231 RTC is present so X4 devices don't see them at all.
+// v18.9.9.305: Sync clock now moved out to Settings -> Sync & Network
+// (as "Sync Time"). The item never belonged in a display-toggle menu;
+// pairing it with WiFi / KOReader / OPDS makes more sense and lets X4
+// users find it without the DS3231-gated visibility.
 enum MenuItem {
   ITEM_CHAPTER_PAGE_COUNT = 0,
   ITEM_BOOK_PROGRESS_PERCENTAGE,
+  ITEM_STABLE_PAGE_NUMBERS,  // v18.9.9.286: CrossInk-parity placement
   ITEM_PROGRESS_BAR,
   ITEM_PROGRESS_BAR_THICKNESS,
   ITEM_TITLE,
   ITEM_BATTERY,
   ITEM_XTC_STATUS_BAR,
-  ITEM_CLOCK,             // X3 only
-  ITEM_CLOCK_FORMAT,      // X3 only
-  ITEM_CLOCK_UTC_OFFSET,  // X3 only, launches ClockOffsetActivity
-  ITEM_CLOCK_SYNC,        // X3 only, launches ClockSyncActivity
+  ITEM_CLOCK,
+  ITEM_CLOCK_FORMAT,
+  ITEM_CLOCK_UTC_OFFSET,  // launches ClockOffsetActivity
   ITEM_COUNT
 };
 
-constexpr int BASE_MENU_ITEMS = ITEM_CLOCK;  // Items shown on every device
-constexpr int FULL_MENU_ITEMS = ITEM_COUNT;  // Items shown when RTC is available
+constexpr int FULL_MENU_ITEMS = ITEM_COUNT;
 
 const StrId menuNames[FULL_MENU_ITEMS] = {
     StrId::STR_CHAPTER_PAGE_COUNT,
     StrId::STR_BOOK_PROGRESS_PERCENTAGE,
+    StrId::STR_STABLE_PAGE_NUMBERS,
     StrId::STR_PROGRESS_BAR,
     StrId::STR_PROGRESS_BAR_THICKNESS,
     StrId::STR_TITLE,
@@ -46,7 +48,6 @@ const StrId menuNames[FULL_MENU_ITEMS] = {
     StrId::STR_CLOCK,
     StrId::STR_CLOCK_FORMAT,
     StrId::STR_CLOCK_UTC_OFFSET,
-    StrId::STR_CLOCK_SYNC_NOW,
 };
 
 constexpr int CLOCK_FORMAT_ITEMS = 2;
@@ -85,7 +86,11 @@ void StatusBarSettingsActivity::onEnter() {
   Activity::onEnter();
 
   selectedIndex = 0;
-  visibleItemCount = halClock.isAvailable() ? FULL_MENU_ITEMS : BASE_MENU_ITEMS;
+  // v18.9.9.304: always show clock items -- X4 lacks the DS3231 but can
+  // still keep valid time via SNTP over WiFi. Users who never sync see
+  // the clock stay hidden (BaseTheme::drawStatusBar gates on
+  // hasValidTime()), but they can still enable the toggle in advance.
+  visibleItemCount = FULL_MENU_ITEMS;
 
   // Clamp statusBarProgressBar and statusBarTitle in case of corrupt/migrated data
   if (SETTINGS.statusBarProgressBar >= PROGRESS_BAR_ITEMS) {
@@ -159,6 +164,9 @@ void StatusBarSettingsActivity::handleSelection() {
     case ITEM_BOOK_PROGRESS_PERCENTAGE:
       SETTINGS.statusBarBookProgressPercentage = (SETTINGS.statusBarBookProgressPercentage + 1) % 2;
       break;
+    case ITEM_STABLE_PAGE_NUMBERS:
+      SETTINGS.showStablePageNumbers = (SETTINGS.showStablePageNumbers + 1) % 2;
+      break;
     case ITEM_PROGRESS_BAR:
       SETTINGS.statusBarProgressBar = (SETTINGS.statusBarProgressBar + 1) % PROGRESS_BAR_ITEMS;
       break;
@@ -175,18 +183,35 @@ void StatusBarSettingsActivity::handleSelection() {
     case ITEM_XTC_STATUS_BAR:
       SETTINGS.xtcStatusBarMode = (SETTINGS.xtcStatusBarMode + 1) % XTC_STATUS_BAR_ITEMS;
       break;
-    case ITEM_CLOCK:
+    case ITEM_CLOCK: {
+      const bool wasOff = SETTINGS.statusBarClock == 0;
       SETTINGS.statusBarClock = (SETTINGS.statusBarClock + 1) % 2;
+      // v18.9.9.305: turning Clock ON when the device has no valid time
+      // (X4 pre-SNTP or X3 whose DS3231 lost its battery) is a strong
+      // signal the user wants a clock right now, not "in 10 minutes when
+      // I remember to sync". Push ClockSyncActivity inline so they get
+      // the "Syncing from NTP..." popup + result feedback without having
+      // to hunt for Sync & Network > Sync Time. Skipped when time is
+      // already valid: clock renders immediately, no sync needed.
+      if (wasOff && SETTINGS.statusBarClock != 0 && !halClock.hasValidTime()) {
+        SETTINGS.saveToFile();
+        // v18.9.9.361: was nullptr callback which caused ClockSync to
+        // pop back to the default Home instead of returning to
+        // Customise Status Bar. Explicit requestUpdate keeps us here
+        // so the user sees the toggle flip take effect on the same
+        // page they were on.
+        startActivityForResult(std::make_unique<ClockSyncActivity>(renderer, mappedInput),
+                               [this](const ActivityResult&) { requestUpdate(); });
+        return;
+      }
       break;
+    }
     case ITEM_CLOCK_FORMAT:
       SETTINGS.clockFormat = (SETTINGS.clockFormat + 1) % CLOCK_FORMAT_ITEMS;
       break;
     case ITEM_CLOCK_UTC_OFFSET:
       // Launch the dedicated offset picker. It saves on exit, no result handler needed.
       startActivityForResult(std::make_unique<ClockOffsetActivity>(renderer, mappedInput), nullptr);
-      return;
-    case ITEM_CLOCK_SYNC:
-      startActivityForResult(std::make_unique<ClockSyncActivity>(renderer, mappedInput), nullptr);
       return;
     default:
       return;
@@ -223,6 +248,8 @@ void StatusBarSettingsActivity::render(RenderLock&&) {
             return SETTINGS.statusBarChapterPageCount ? tr(STR_SHOW) : tr(STR_HIDE);
           case ITEM_BOOK_PROGRESS_PERCENTAGE:
             return SETTINGS.statusBarBookProgressPercentage ? tr(STR_SHOW) : tr(STR_HIDE);
+          case ITEM_STABLE_PAGE_NUMBERS:
+            return SETTINGS.showStablePageNumbers ? tr(STR_SHOW) : tr(STR_HIDE);
           case ITEM_PROGRESS_BAR:
             return I18N.get(progressBarNames[SETTINGS.statusBarProgressBar]);
           case ITEM_PROGRESS_BAR_THICKNESS:
@@ -241,8 +268,6 @@ void StatusBarSettingsActivity::render(RenderLock&&) {
           }
           case ITEM_CLOCK_UTC_OFFSET:
             return formatUtcOffset(SETTINGS.clockUtcOffsetQ);
-          case ITEM_CLOCK_SYNC:
-            return SETTINGS.clockHasBeenSynced ? tr(STR_CLOCK_SYNCED) : tr(STR_NOT_SET);
           default:
             return tr(STR_HIDE);
         }

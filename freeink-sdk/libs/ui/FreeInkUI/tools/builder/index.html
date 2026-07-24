@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>FreeInkUI Builder</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/builder.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <svg class="brand__logo" viewBox="0 0 40 40" aria-hidden="true">
+          <circle cx="6" cy="6" r="1.5"/><circle cx="13" cy="6" r="1.5"/><circle cx="20" cy="6" r="1.5"/>
+          <circle class="brand__spark" cx="27" cy="6" r="1.5" opacity="0.7"/><circle class="brand__spark" cx="34" cy="6" r="1.5" opacity="0.35"/>
+          <circle cx="6" cy="13" r="1.5"/><circle cx="13" cy="13" r="1.5"/><circle cx="20" cy="13" r="1.5"/>
+          <circle class="brand__spark" cx="27" cy="13" r="1.5" opacity="0.7"/><circle class="brand__spark" cx="34" cy="13" r="1.5" opacity="0.7"/>
+          <circle cx="6" cy="20" r="1.5"/><circle cx="13" cy="20" r="1.5"/><circle cx="20" cy="20" r="1.5"/><circle cx="27" cy="20" r="1.5"/><circle cx="34" cy="20" r="1.5"/>
+          <circle cx="6" cy="27" r="1.5"/><circle cx="13" cy="27" r="1.5"/><circle cx="20" cy="27" r="1.5"/><circle cx="27" cy="27" r="1.5"/><circle cx="34" cy="27" r="1.5"/>
+          <circle cx="6" cy="34" r="1.5"/><circle cx="13" cy="34" r="1.5"/><circle cx="20" cy="34" r="1.5"/><circle cx="27" cy="34" r="1.5"/><circle cx="34" cy="34" r="1.5"/>
+        </svg>
+        <div>
+          <h1>Free<span>Ink</span></h1>
+          <p>UI Builder</p>
+        </div>
+      </div>
+      <div class="topbar__actions">
+        <select id="deviceSelect" aria-label="Preview device"></select>
+        <select id="orientationSelect" aria-label="Preview orientation">
+          <option value="portrait">Portrait</option>
+          <option value="landscape">Landscape</option>
+        </select>
+        <button id="importBtn" type="button">Import JSON</button>
+        <button id="exportBtn" type="button">Export JSON</button>
+        <button id="generateBtn" type="button" class="primary">Generate C++</button>
+      </div>
+      <input id="fileInput" type="file" accept="application/json,.json" hidden>
+    </header>
+
+    <main class="shell">
+      <aside class="panel palette">
+        <div class="panel__head">
+          <h2>Palette</h2>
+          <input id="paletteFilter" type="search" placeholder="Filter">
+        </div>
+        <div id="paletteList" class="palette__list"></div>
+      </aside>
+
+      <section class="stage">
+        <div class="stage__toolbar">
+          <label class="toolbar-field">
+            <span>Screen</span>
+            <input id="screenName" type="text" aria-label="Screen name">
+          </label>
+          <div class="toolbar-insets" role="group" aria-label="Safe area">
+            <span>Safe area</span>
+            <div class="toolbar-insets__grid">
+              <input id="safeAreaTop" type="number" min="0" placeholder="T" aria-label="Safe area top">
+              <input id="safeAreaRight" type="number" min="0" placeholder="R" aria-label="Safe area right">
+              <input id="safeAreaBottom" type="number" min="0" placeholder="B" aria-label="Safe area bottom">
+              <input id="safeAreaLeft" type="number" min="0" placeholder="L" aria-label="Safe area left">
+            </div>
+          </div>
+          <div class="toolbar-insets" role="group" aria-label="Margin">
+            <span>Margin</span>
+            <div class="toolbar-insets__grid">
+              <input id="contentMarginTop" type="number" min="0" placeholder="T" aria-label="Content margin top">
+              <input id="contentMarginRight" type="number" min="0" placeholder="R" aria-label="Content margin right">
+              <input id="contentMarginBottom" type="number" min="0" placeholder="B" aria-label="Content margin bottom">
+              <input id="contentMarginLeft" type="number" min="0" placeholder="L" aria-label="Content margin left">
+            </div>
+          </div>
+        </div>
+        <div class="device-wrap">
+          <div id="devicePreview" class="device">
+            <div id="screenCanvas" class="screen"></div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="panel inspector">
+        <div class="panel__head">
+          <h2>Inspector</h2>
+          <button id="deleteBtn" type="button">Delete</button>
+        </div>
+        <div id="inspectorFields" class="inspector__fields"></div>
+        <div class="panel__head panel__head--sub">
+          <h2>Schema</h2>
+          <button id="applyJsonBtn" type="button">Apply</button>
+        </div>
+        <textarea id="schemaText" spellcheck="false"></textarea>
+        <div class="panel__head panel__head--sub">
+          <h2>Generated C++</h2>
+          <button id="copyCppBtn" type="button">Copy</button>
+        </div>
+        <pre id="cppOutput"></pre>
+      </aside>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/builder.js"></script>
+  </body>
+</html>

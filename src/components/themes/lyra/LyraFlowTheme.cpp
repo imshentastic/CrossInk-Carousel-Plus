@@ -1,8 +1,10 @@
 #include "LyraFlowTheme.h"
 
+#include <Arduino.h>
 #include <Bitmap.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
+#include <Logging.h>
 
 #include <algorithm>
 #include <cmath>
@@ -12,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "CoverTiles.h"
 #include "RecentBooksStore.h"
 #include "activities/reader/BookReadingStats.h"
 #include "components/UITheme.h"
@@ -86,10 +89,147 @@ void cutRoundedCorners(GfxRenderer& renderer, int x, int y, int w, int h, int r)
 }
 }  // namespace
 
+// v18.9.9.212: bulk-bake helper for Settings > Bake Carousel Covers. Bakes
+// the 3 tile roles (L-side perspective, R-side perspective, center thumb)
+// for one cover, skipping any that already pass current-format validation.
+// Idempotent -- running twice in a row does no work.
+//
+// Heap peak: ~5 KB (side buffer) + ~17 KB (center buffer at max 220x320)
+// = ~22 KB transient, but the two are freed sequentially so peak alive-
+// at-once is ~17 KB. That's within the Settings-time budget (fresh heap
+// after leaving Home) but the SettingsActivity caller does no other
+// concurrent alloc during the bake loop, so this is safe.
+int LyraFlowTheme::bakeAllTilesForCover(GfxRenderer& renderer, const std::string& coverBmpPath) {
+  const std::string cp = UITheme::getCoverThumbPath(coverBmpPath, centerCoverHeight);
+  if (cp.empty()) return -1;
+
+  // Resolve source dimensions once. Prefer the imageCache handle (already
+  // parsed), fall back to a header-only probe of the SD file. The center
+  // thumb's aspect-fit W/H depends on srcW/srcH, so we need them before
+  // we can even LOAD-CHECK the center tile.
+  int srcW = 0, srcH = 0;
+  GfxRenderer::CachedBitmap* handle = renderer.lookupCachedBitmap(cp);
+  const bool haveCached =
+      renderer.getCachedBitmapDimensions(handle, &srcW, &srcH) && srcW > 0 && srcH > 0;
+  if (!haveCached) {
+    FsFile probe;
+    if (!Storage.openFileForRead("BAKE", cp, probe)) return -1;
+    Bitmap probeBmp(probe);
+    if (probeBmp.parseHeaders() != BmpReaderError::Ok ||
+        probeBmp.getWidth() <= 0 || probeBmp.getHeight() <= 0) {
+      probe.close();
+      return -1;
+    }
+    srcW = probeBmp.getWidth();
+    srcH = probeBmp.getHeight();
+    probe.close();
+  }
+
+  int newlyBaked = 0;
+
+  // -------- Side tiles (roles 1 = left, 3 = right) --------
+  // Both share hMax = max(sideInner, sideOuter) = 288 -> ~5 KB per tile
+  // buffer @ 2bpp. Reuse the same buffer for both roles.
+  const int sideHMax = std::max(sideInnerHeight, sideOuterHeight);
+  const int sideStride = (sideCoverWidth + 3) / 4;
+  const size_t sideBytes = static_cast<size_t>(sideStride) * static_cast<size_t>(sideHMax);
+  std::unique_ptr<uint8_t[]> sideBuf(new (std::nothrow) uint8_t[sideBytes]);
+  if (sideBuf) {
+    const struct { uint8_t role; int hL; int hR; } sides[] = {
+        {CoverTiles::kRoleLeftFar, sideInnerHeight, sideOuterHeight},
+        {CoverTiles::kRoleRightNear, sideOuterHeight, sideInnerHeight},
+    };
+    for (const auto& s : sides) {
+      std::memset(sideBuf.get(), 0xFF, sideBytes);
+      const bool loaded = CoverTiles::loadTile(
+          cp, s.role, CoverTiles::kFormat2bpp,
+          sideCoverWidth, sideHMax, sideStride,
+          sideInnerHeight, sideOuterHeight, sideCoverWidth,
+          sideBuf.get(), sideBytes);
+      if (loaded) continue;  // already fresh
+
+      std::memset(sideBuf.get(), 0xFF, sideBytes);
+      bool walked = false;
+      if (haveCached) {
+        renderer.renderPerspectiveBitmapToPacked2bpp(handle, sideCoverWidth, s.hL, s.hR, sideBuf.get());
+        walked = true;
+      } else {
+        FsFile file;
+        if (Storage.openFileForRead("BAKE", cp, file)) {
+          Bitmap bitmap(file);
+          if (bitmap.parseHeaders() == BmpReaderError::Ok) {
+            renderer.renderPerspectiveBitmapToPacked2bpp(bitmap, sideCoverWidth, s.hL, s.hR, sideBuf.get());
+            walked = true;
+          }
+          file.close();
+        }
+      }
+      if (walked && CoverTiles::saveTile(cp, s.role, CoverTiles::kFormat2bpp,
+                                           sideCoverWidth, sideHMax, sideStride,
+                                           sideInnerHeight, sideOuterHeight, sideCoverWidth,
+                                           sideBuf.get(), sideBytes)) {
+        newlyBaked++;
+      }
+    }
+  }
+
+  // -------- Center thumb (role 5) — aspect-fit --------
+  const float fitScale = std::min(static_cast<float>(centerCoverWidth) / static_cast<float>(srcW),
+                                    static_cast<float>(centerCoverHeight) / static_cast<float>(srcH));
+  const int actualW = std::min(centerCoverWidth, static_cast<int>(std::round(srcW * fitScale)));
+  const int actualH = std::min(centerCoverHeight, static_cast<int>(std::round(srcH * fitScale)));
+  if (actualW > 0 && actualH > 0) {
+    const int centerStride = (actualW + 3) / 4;
+    const size_t centerBytes = static_cast<size_t>(centerStride) * static_cast<size_t>(actualH);
+    std::unique_ptr<uint8_t[]> centerBuf(new (std::nothrow) uint8_t[centerBytes]);
+    if (centerBuf) {
+      std::memset(centerBuf.get(), 0xFF, centerBytes);
+      const bool loaded = CoverTiles::loadTile(
+          cp, CoverTiles::kRoleCenterThumb, CoverTiles::kFormat2bpp,
+          actualW, actualH, centerStride,
+          0, 0, 0,  // perspective params unused for center thumb
+          centerBuf.get(), centerBytes);
+      if (!loaded) {
+        std::memset(centerBuf.get(), 0xFF, centerBytes);
+        bool walked = false;
+        if (haveCached) {
+          renderer.renderCachedBitmapToPacked2bpp(handle, actualW, actualH, centerBuf.get());
+          walked = true;
+        } else {
+          FsFile file;
+          if (Storage.openFileForRead("BAKE", cp, file)) {
+            Bitmap bitmap(file);
+            if (bitmap.parseHeaders() == BmpReaderError::Ok) {
+              renderer.renderBitmapToPacked2bpp(bitmap, actualW, actualH, centerBuf.get());
+              walked = true;
+            }
+            file.close();
+          }
+        }
+        if (walked && CoverTiles::saveTile(cp, CoverTiles::kRoleCenterThumb, CoverTiles::kFormat2bpp,
+                                             actualW, actualH, centerStride,
+                                             0, 0, 0,
+                                             centerBuf.get(), centerBytes)) {
+          newlyBaked++;
+        }
+      }
+    }
+  }
+
+  return newlyBaked;
+}
+
 void LyraFlowTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const std::vector<RecentBook>& recentBooks,
                                         int selectorIndex, bool& coverRendered, bool& coverBufferStored,
                                         bool& bufferRestored, const std::function<bool()>& storeCoverBuffer,
                                         const BookReadingStats* stats, float progressPercent) const {
+  // CrumBLE 4.5.5+ profiling: capture entry timestamp + the input
+  // skipCarouselCoverLoads value before the function consumes it. The full
+  // repaint path is the slow one (carousel=1006-1181 ms in field RPROF);
+  // we only log when we actually pay that cost so the skip-path doesn't
+  // spam the console.
+  const unsigned long carT0 = millis();
+  const bool wasFullRepaint = !skipCarouselCoverLoads;
   if (recentBooks.empty()) {
     drawEmptyRecents(renderer, rect);
     return;
@@ -138,59 +278,118 @@ void LyraFlowTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const 
     // each adjacent book shows more of its content. The (separately-
     // tuned) 7 px white border around the center cover gives a clean
     // framed look between center and adjacent books.
-    const int drawX = isLeft ? (isFar ? 24 : 74) : (isFar ? 390 : 340);
+    //
+    // v18.9.9.304: symmetric side-cover offsets. Prior tuning (left near
+    // blended 18 px into center vs right's 2 px; left far sat 98 px past
+    // slot vs right's 48 px) was a 16 px asymmetry inherited from the
+    // original X4 layout that never got audited. On both X3 and X4 it
+    // showed a visibly wider left-to-far-book gap than right-to-far-book
+    // and a noticeably chunkier overlap onto the center cover's left.
+    // Slot edges are derived from centerCoverWidth (fixed 220) so
+    // positions don't jitter as the user cycles books of varying aspect.
+    // Near covers now blend the same 2 px into center on both sides
+    // (under the 7 px center white border, so no visible overlap); far
+    // covers sit the same 48 px outside the slot, giving equidistant
+    // margins to left/right screen edges for any framebuffer width.
+    const int slotLeftEdge = centerX - centerCoverWidth / 2;
+    const int slotRightEdge = centerX + centerCoverWidth / 2;
+    const int drawX = isLeft
+        ? (isFar ? slotLeftEdge - (48 + sideCoverWidth) : slotLeftEdge - (sideCoverWidth - 2))
+        : (isFar ? slotRightEdge + 48 : slotRightEdge - 2);
     const int drawY = centerY + (centerCoverHeight / 2) - (hMax / 2);
 
-    // CrumBLE #125: tile-cache fast path. The 4 side covers in the Flow
-    // carousel share only 2 unique perspective shapes per book (left and
-    // right; near/far on the same side use the same shape, only drawX
-    // differs). prerenderCarouselSideTiles() bakes both shapes once at
-    // home entry, so every carousel L/R press here is a pure 1bpp blit
-    // instead of a ~70k-source-pixel perspective walk per cover. Falls
-    // through to the perspective-render path below when the tile cache
-    // is cold (first frame before prerender completes) or the book's
-    // tile failed to allocate (low heap during prerender).
+    // v18.9.9.210 Phase 2: 2bpp grayscale variant of the Phase 1 pipeline.
+    // Same three paths (load / walk+bake / placeholder) but the tile
+    // preserves the source's 4-gray value per pixel, so covers render at
+    // their true tone instead of a BW threshold. Existing Phase 1 1bpp
+    // tiles fail the format check (loadTile requires expFormat match)
+    // and get re-baked as 2bpp on this render -- self-healing migration.
+    // Tile size: 2bpp packed => stride = (sideCoverWidth+3)/4 = 17 B per
+    // row, ~5 KB per tile (up from ~2.4 KB in Phase 1). Still transient
+    // per-blit heap, freed at scope exit.
     bool drawn = false;
-    const std::string& tileKey = recentBooks[idx].path;
-    auto tileIt = sideTileCache_.find(tileKey);
-    if (tileIt != sideTileCache_.end()) {
-      const PerspectiveTile& tile = isLeft ? tileIt->second.left : tileIt->second.right;
-      if (tile.pixels && tile.width > 0 && tile.height > 0) {
-        // OR-style blit: pre-clear the bbox to opaque white so any
-        // previous side cover that was here doesn't bleed through.
-        renderer.fillRect(drawX, drawY, sideCoverWidth, hMax, false);
-        const int dstStride = (tile.width + 7) / 8;
-        renderer.drawPacked1bpp(tile.pixels.get(), dstStride, drawX, drawY, tile.width, tile.height);
-        drawn = true;
+    const std::string coverPath = UITheme::getCoverThumbPath(recentBooks[idx].coverBmpPath, centerCoverHeight);
+    const uint8_t tileRole = isLeft ? CoverTiles::kRoleLeftFar : CoverTiles::kRoleRightNear;
+    const int tileStride = (sideCoverWidth + 3) / 4;
+    const size_t tileBytes = static_cast<size_t>(tileStride) * static_cast<size_t>(hMax);
+    if (!coverPath.empty() && tileBytes > 0) {
+      std::unique_ptr<uint8_t[]> tileBuf(new (std::nothrow) uint8_t[tileBytes]);
+      if (tileBuf) {
+        // Init to 0xFF (all pixels = 3 = white) -- render-to-buffer walk
+        // uses last-write-wins in the colTop..colTop+colH range, pixels
+        // outside that range stay at their init white value.
+        std::memset(tileBuf.get(), 0xFF, tileBytes);
+        const bool loaded = CoverTiles::loadTile(
+            coverPath, tileRole, CoverTiles::kFormat2bpp,
+            sideCoverWidth, hMax, tileStride,
+            sideInnerHeight, sideOuterHeight, sideCoverWidth,
+            tileBuf.get(), tileBytes);
+        if (loaded) {
+          // Pre-clear substrate to white so anything beneath us doesn't
+          // bleed through. drawPacked2bpp then paints the per-plane
+          // pixels (BW / GRAY_MSB / GRAY_LSB) matching drawPerspectiveBitmap.
+          renderer.fillRect(drawX, drawY, sideCoverWidth, hMax, false);
+          renderer.drawPacked2bpp(tileBuf.get(), tileStride, drawX, drawY, sideCoverWidth, hMax);
+          drawn = true;
+        }
       }
-    }
 
-    const std::string coverPath =
-        drawn ? std::string{} : UITheme::getCoverThumbPath(recentBooks[idx].coverBmpPath, centerCoverHeight);
-    if (!drawn && !coverPath.empty()) {
-      // CrumBLE Phase A perf: try the in-RAM cache first. The Cached
-      // overload reads 2bpp packed pixels directly out of the cache
-      // entry, no SD I/O. Cache miss / budget-rejected -> fall back to
-      // direct SD-streamed drawPerspectiveBitmap.
-      GfxRenderer::CachedBitmap* handle = renderer.lookupCachedBitmap(coverPath);
-      int srcW = 0, srcH = 0;
-      if (renderer.getCachedBitmapDimensions(handle, &srcW, &srcH) && srcW > 0 && srcH > 0) {
-        // drawPerspectiveBitmap is OR-style (only writes black), so any
-        // white area of the cover would show through to whatever side
-        // cover was drawn beneath us. Pre-clear the bbox to opaque white.
-        renderer.fillRect(drawX, drawY, sideCoverWidth, hMax, false);
-        renderer.drawPerspectiveBitmap(handle, drawX, drawY, sideCoverWidth, hL, hR);
-        drawn = true;
-      } else {
-        FsFile file;
-        if (Storage.openFileForRead("HOME", coverPath, file)) {
-          Bitmap bitmap(file);
-          if (bitmap.parseHeaders() == BmpReaderError::Ok) {
-            renderer.fillRect(drawX, drawY, sideCoverWidth, hMax, false);
-            renderer.drawPerspectiveBitmap(bitmap, drawX, drawY, sideCoverWidth, hL, hR);
-            drawn = true;
+      if (!drawn && tileBuf) {
+        std::memset(tileBuf.get(), 0xFF, tileBytes);
+        bool walked = false;
+        GfxRenderer::CachedBitmap* handle = renderer.lookupCachedBitmap(coverPath);
+        int srcW = 0, srcH = 0;
+        if (renderer.getCachedBitmapDimensions(handle, &srcW, &srcH) && srcW > 0 && srcH > 0) {
+          renderer.renderPerspectiveBitmapToPacked2bpp(handle, sideCoverWidth, hL, hR, tileBuf.get());
+          walked = true;
+        } else {
+          FsFile file;
+          if (Storage.openFileForRead("HOME", coverPath, file)) {
+            Bitmap bitmap(file);
+            if (bitmap.parseHeaders() == BmpReaderError::Ok) {
+              renderer.renderPerspectiveBitmapToPacked2bpp(bitmap, sideCoverWidth, hL, hR, tileBuf.get());
+              walked = true;
+            }
+            file.close();
           }
-          file.close();
+        }
+        if (walked) {
+          renderer.fillRect(drawX, drawY, sideCoverWidth, hMax, false);
+          renderer.drawPacked2bpp(tileBuf.get(), tileStride, drawX, drawY, sideCoverWidth, hMax);
+          drawn = true;
+          CoverTiles::saveTile(coverPath, tileRole, CoverTiles::kFormat2bpp,
+                                sideCoverWidth, hMax, tileStride,
+                                sideInnerHeight, sideOuterHeight, sideCoverWidth,
+                                tileBuf.get(), tileBytes);
+        }
+      }
+
+      // v18.9.9.214: extreme-tight-heap legacy fallback. When maxAlloc drops
+      // below ~5 KB (observed post-dict-thrash mid-session), the tileBuf
+      // new(nothrow) above returns nullptr and both fast + walk paths
+      // above are skipped. Pre-v209 code streamed drawPerspectiveBitmap
+      // row-by-row directly to the framebuffer with no transient tile
+      // allocation, so it worked even at maxAlloc <5 KB. Bring that back
+      // as a THIRD-tier fallback so the side covers never render as the
+      // solid-black placeholder just because we're heap-starved.
+      if (!drawn) {
+        GfxRenderer::CachedBitmap* handle = renderer.lookupCachedBitmap(coverPath);
+        int srcW = 0, srcH = 0;
+        if (renderer.getCachedBitmapDimensions(handle, &srcW, &srcH) && srcW > 0 && srcH > 0) {
+          renderer.fillRect(drawX, drawY, sideCoverWidth, hMax, false);
+          renderer.drawPerspectiveBitmap(handle, drawX, drawY, sideCoverWidth, hL, hR);
+          drawn = true;
+        } else {
+          FsFile file;
+          if (Storage.openFileForRead("HOME", coverPath, file)) {
+            Bitmap bitmap(file);
+            if (bitmap.parseHeaders() == BmpReaderError::Ok) {
+              renderer.fillRect(drawX, drawY, sideCoverWidth, hMax, false);
+              renderer.drawPerspectiveBitmap(bitmap, drawX, drawY, sideCoverWidth, hL, hR);
+              drawn = true;
+            }
+            file.close();
+          }
         }
       }
     }
@@ -283,6 +482,8 @@ void LyraFlowTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const 
     actualCoverHeight = std::min(centerCoverHeight, static_cast<int>(std::round(centerSrcH * fitScale)));
   }
 
+  const unsigned long carT1 = millis();  // after center cover header probe
+
   int cX = centerX - actualCoverWidth / 2;
   int actualY = centerY + (centerCoverHeight - actualCoverHeight) / 2;
 
@@ -291,11 +492,14 @@ void LyraFlowTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const 
   // drawRecentBookCover's cost on every "L/R on shelf/menu" type input
   // where the carousel doesn't visually change. The center-cover header
   // peek above still runs so the footer geometry stays consistent.
+  unsigned long carT2 = carT1;  // after 4 side covers (overwritten in full-repaint branch)
+  unsigned long carT3 = carT1;  // after center cover paint
   if (!skipCarouselCoverLoads) {
     if (count >= 5) drawStackedCover(idx3, true, true);
     if (count >= 4) drawStackedCover(idx5, false, true);
     if (count >= 2) drawStackedCover(idx2, true, false);
     if (count >= 3) drawStackedCover(idx4, false, false);
+    carT2 = millis();
 
     // Clear behind the cover so side-cover overlap doesn't bleed
     // through. CrumBLE used to clear the FULL slot (centerCoverWidth +
@@ -313,36 +517,79 @@ void LyraFlowTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const 
     renderer.fillRect(clearX, clearY, clearW, clearH, false);
 
     if (centerParsed) {
-      // Lookup HERE (not earlier): the side-cover draws above also
-      // touch the cache and may evict, so any handle obtained before
-      // the side loop would be dangling. Re-lookup gives a fresh,
-      // promoted entry (and the side-cover loads have already biased
-      // LRU toward eviction of older entries, so this lookup is what
-      // pins the center for the next render).
-      GfxRenderer::CachedBitmap* centerHandle = cp.empty() ? nullptr : renderer.lookupCachedBitmap(cp);
-      if (centerHandle) {
-        // rhythmerc perf hack #62016fba: Opaque=true writes both inks (the
-        // surrounding fillRect just painted white substrate, so we don't
-        // need the cover to leave white pixels visible). bookCornerRadius
-        // arg makes the blit skip the four corner triangles, which
-        // replaces the per-pixel cutRoundedCorners loop below for the
-        // cached path. Fallback path still pays the cutRoundedCorners cost
-        // since drawBitmap doesn't have the corner-skip arg yet.
-        renderer.drawCachedBitmap<true>(centerHandle, cX, actualY, actualCoverWidth, actualCoverHeight,
-                                        0.0f, 0.0f, bookCornerRadius);
-      } else {
-        // Budget-tight fall through: stream the cover directly. Open the
-        // file fresh here -- we deliberately closed the probe file above
-        // to keep file-handle pressure bounded across the side-cover loop.
-        FsFile fallbackFile;
-        if (Storage.openFileForRead("HOME", cp, fallbackFile)) {
-          Bitmap centerFallbackBitmap(fallbackFile);
-          if (centerFallbackBitmap.parseHeaders() == BmpReaderError::Ok) {
-            renderer.drawBitmap(centerFallbackBitmap, cX, actualY, actualCoverWidth, actualCoverHeight);
+      // v18.9.9.211 Phase 3: SD-baked center thumb (role=5). ~17 KB
+      // transient buffer holds the aspect-fit-scaled 2bpp cover; load
+      // hits skip the BMP header + row decode + scaling walk (~235 ms
+      // per RPROF log) and become a straight file read + drawPacked2bpp
+      // blit. Falls back to today's drawCachedBitmap / streaming path
+      // on miss OR on buffer alloc failure -- keeping the legacy path
+      // as a graceful degradation when heap can't spare the ~17 KB.
+      bool centerDrawn = false;
+      const int tileStride = (actualCoverWidth + 3) / 4;
+      const size_t tileBytes = static_cast<size_t>(tileStride) * static_cast<size_t>(actualCoverHeight);
+      std::unique_ptr<uint8_t[]> tileBuf(tileBytes > 0 ? new (std::nothrow) uint8_t[tileBytes] : nullptr);
+      if (tileBuf && !cp.empty()) {
+        std::memset(tileBuf.get(), 0xFF, tileBytes);
+        const bool loaded = CoverTiles::loadTile(
+            cp, CoverTiles::kRoleCenterThumb, CoverTiles::kFormat2bpp,
+            actualCoverWidth, actualCoverHeight, tileStride,
+            0, 0, 0,  // perspective params unused for center thumb
+            tileBuf.get(), tileBytes);
+        if (loaded) {
+          renderer.drawPacked2bpp(tileBuf.get(), tileStride, cX, actualY, actualCoverWidth, actualCoverHeight);
+          cutRoundedCorners(renderer, cX, actualY, actualCoverWidth, actualCoverHeight, bookCornerRadius);
+          centerDrawn = true;
+        } else {
+          std::memset(tileBuf.get(), 0xFF, tileBytes);
+          bool walked = false;
+          GfxRenderer::CachedBitmap* centerHandle = renderer.lookupCachedBitmap(cp);
+          if (centerHandle) {
+            renderer.renderCachedBitmapToPacked2bpp(centerHandle, actualCoverWidth, actualCoverHeight, tileBuf.get());
+            walked = true;
+          } else {
+            FsFile fallbackFile;
+            if (Storage.openFileForRead("HOME", cp, fallbackFile)) {
+              Bitmap centerFallbackBitmap(fallbackFile);
+              if (centerFallbackBitmap.parseHeaders() == BmpReaderError::Ok) {
+                renderer.renderBitmapToPacked2bpp(centerFallbackBitmap, actualCoverWidth, actualCoverHeight,
+                                                    tileBuf.get());
+                walked = true;
+              }
+              fallbackFile.close();
+            }
           }
-          fallbackFile.close();
+          if (walked) {
+            renderer.drawPacked2bpp(tileBuf.get(), tileStride, cX, actualY, actualCoverWidth, actualCoverHeight);
+            cutRoundedCorners(renderer, cX, actualY, actualCoverWidth, actualCoverHeight, bookCornerRadius);
+            centerDrawn = true;
+            CoverTiles::saveTile(cp, CoverTiles::kRoleCenterThumb, CoverTiles::kFormat2bpp,
+                                  actualCoverWidth, actualCoverHeight, tileStride,
+                                  0, 0, 0,
+                                  tileBuf.get(), tileBytes);
+          }
         }
-        cutRoundedCorners(renderer, cX, actualY, actualCoverWidth, actualCoverHeight, bookCornerRadius);
+      }
+
+      // Legacy path: fires when tileBuf alloc failed (heap tight) or
+      // both the tile load AND the walk-to-buffer path missed (unusual
+      // -- would mean the source cover exists but readNextRow failed
+      // partway through). Keeps the same visual output as pre-v211.
+      if (!centerDrawn) {
+        GfxRenderer::CachedBitmap* centerHandle = cp.empty() ? nullptr : renderer.lookupCachedBitmap(cp);
+        if (centerHandle) {
+          renderer.drawCachedBitmap<true>(centerHandle, cX, actualY, actualCoverWidth, actualCoverHeight,
+                                          0.0f, 0.0f, bookCornerRadius);
+        } else {
+          FsFile fallbackFile;
+          if (Storage.openFileForRead("HOME", cp, fallbackFile)) {
+            Bitmap centerFallbackBitmap(fallbackFile);
+            if (centerFallbackBitmap.parseHeaders() == BmpReaderError::Ok) {
+              renderer.drawBitmap(centerFallbackBitmap, cX, actualY, actualCoverWidth, actualCoverHeight);
+            }
+            fallbackFile.close();
+          }
+          cutRoundedCorners(renderer, cX, actualY, actualCoverWidth, actualCoverHeight, bookCornerRadius);
+        }
       }
     } else {
     // Placeholder: black lower-2/3 with the cover icon centered just below
@@ -392,6 +639,7 @@ void LyraFlowTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const 
     // focused book. Dropping the always-on stroke eliminates the
     // last visible source of corner-hook artifacts.
 
+    carT3 = millis();
   }  // end of if (!skipCarouselCoverLoads)
 
   // CrumBLE #125: reconcile the selection border AFTER the cover-block
@@ -495,6 +743,7 @@ void LyraFlowTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const 
     renderer.drawText(kAuthorFontId, centerX - aw / 2, authorY, truncatedAuthor.c_str(), true,
                       EpdFontFamily::REGULAR);
   }
+  const unsigned long carT4 = millis();  // after title + author strip
 
   // --- Reading-progress footer below the center cover. Modelled on the
   //     LyraCarousel footer: a 5-px dithered-track progress bar across the
@@ -582,6 +831,12 @@ void LyraFlowTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const 
                static_cast<unsigned>((seconds % 3600) / 60));
     }
     renderer.drawText(kFooterFontId, footerX, infoY, buf, true, EpdFontFamily::REGULAR);
+  }
+  if (wasFullRepaint) {
+    const unsigned long carT5 = millis();
+    LOG_INF("RPROF",
+            "carousel stages: probe=%lu sides=%lu center=%lu title+author=%lu footer=%lu total=%lu",
+            carT1 - carT0, carT2 - carT1, carT3 - carT2, carT4 - carT3, carT5 - carT4, carT5 - carT0);
   }
 }
 
@@ -784,6 +1039,12 @@ void LyraFlowTheme::drawBookshelfStrip(GfxRenderer& renderer, Rect rect, const c
       // a pre-scaled 1bpp buffer (~1 ms). Cache miss (budget tight under
       // BLE / low heap) falls back to direct drawBitmap so the cell
       // still renders.
+      // v18.9.9.345: was lookupCachedBitmapPinned -- v192's pinned tier
+      // was up to ~24 KB persistent Home tax. Field-observed heap
+      // fragmentation (maxAlloc dropping to ~2 KB on 44-book library +
+      // Collections) outweighed the ~150 ms per-cell cold-decode cost
+      // the pinning avoided. Fall back to the LRU-only cache; covers
+      // reload after menu overlays but Home breathes ~24 KB more.
       GfxRenderer::CachedBitmap* handle = renderer.lookupCachedBitmap(cellPath);
       int srcW = 0, srcH = 0;
       const bool cacheHit =
@@ -1058,65 +1319,6 @@ void LyraFlowTheme::drawBookshelfStripFocusUpdate(GfxRenderer& renderer, Rect re
   }
   (void)bookCount;  // future-proof for visiblePerPage / scroll-arrow logic
 }
-
-void LyraFlowTheme::prerenderCarouselSideTiles(GfxRenderer& renderer,
-                                                const std::vector<RecentBook>& recentBooks) const {
-  // Always rebuild from scratch -- the recentBooks vector may have
-  // reordered (just-read book promotion) or shrunk (delete). Tiles are
-  // keyed by book PATH so the table is stable across reorderings, but
-  // we drop stale entries here for tidiness.
-  sideTileCache_.clear();
-
-  // Same hL/hR convention drawStackedCover uses. Left side: taller on
-  // left edge, shorter on right edge. Right side is the mirror. Tiles
-  // are rendered at the natural hMax (288) so they cover the trapezoidal
-  // bounding box; positions inside the box with colH < hMax are simply
-  // unset bits in the tile.
-  const int hL_left = sideInnerHeight;
-  const int hR_left = sideOuterHeight;
-  const int hL_right = sideOuterHeight;
-  const int hR_right = sideInnerHeight;
-  const int hMax = std::max(sideInnerHeight, sideOuterHeight);
-  const int dstStride = (sideCoverWidth + 7) / 8;
-  const size_t tileBytes = static_cast<size_t>(dstStride) * static_cast<size_t>(hMax);
-
-  for (const auto& book : recentBooks) {
-    if (book.path.empty()) continue;
-    const std::string coverPath = UITheme::getCoverThumbPath(book.coverBmpPath, centerCoverHeight);
-    if (coverPath.empty()) continue;
-    // Triggers SD load + cache populate if not already resident. Same
-    // call drawStackedCover would do on first render anyway -- we just
-    // do it up front so the per-press path stays pure RAM.
-    GfxRenderer::CachedBitmap* handle = renderer.lookupCachedBitmap(coverPath);
-    int srcW = 0, srcH = 0;
-    if (!renderer.getCachedBitmapDimensions(handle, &srcW, &srcH) || srcW <= 0 || srcH <= 0) {
-      continue;  // skip; drawStackedCover will fall through to perspective-render
-    }
-
-    BookSideTiles& tiles = sideTileCache_[book.path];
-
-    // Left-perspective tile (used for both left-near and left-far drawX).
-    tiles.left.pixels.reset(new (std::nothrow) uint8_t[tileBytes]);
-    if (tiles.left.pixels) {
-      std::memset(tiles.left.pixels.get(), 0, tileBytes);
-      renderer.renderPerspectiveBitmapToPacked1bpp(handle, sideCoverWidth, hL_left, hR_left, tiles.left.pixels.get());
-      tiles.left.width = sideCoverWidth;
-      tiles.left.height = hMax;
-    }
-
-    // Right-perspective tile (mirror of left).
-    tiles.right.pixels.reset(new (std::nothrow) uint8_t[tileBytes]);
-    if (tiles.right.pixels) {
-      std::memset(tiles.right.pixels.get(), 0, tileBytes);
-      renderer.renderPerspectiveBitmapToPacked1bpp(handle, sideCoverWidth, hL_right, hR_right,
-                                                    tiles.right.pixels.get());
-      tiles.right.width = sideCoverWidth;
-      tiles.right.height = hMax;
-    }
-  }
-}
-
-void LyraFlowTheme::clearCarouselSideTiles() const { sideTileCache_.clear(); }
 
 void LyraFlowTheme::drawButtonMenu(GfxRenderer& renderer, Rect /*rect*/, int buttonCount, int selectedIndex,
                                    const std::function<std::string(int index)>& buttonLabel,

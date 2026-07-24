@@ -15,7 +15,11 @@
 #include <string>
 
 #include "MappedInputManager.h"
+#include "ReadingStats.h"
+#include "ReadingStatsUtils.h"
 #include "RecentBooksStore.h"
+#include "SilentRestart.h"
+#include "activities/home/RecentBookProgress.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -43,19 +47,66 @@ std::string statsCachePathFor(const std::string& bookPath) {
   return "/.crosspoint/txt_" + std::to_string(h);
 }
 
+// v18.9.9.189 — small duplicates of DashboardTheme's time-left / est-finish
+// helpers so the per-book stats page can show the same derived stats
+// Dashboard shows on Home. Duplicated (not shared) to keep this change
+// scoped to BookStatsActivity and avoid header churn in DashboardTheme.
+bool fallbackEstimatedTimeLeft(const BookReadingStats& stats, const float progressPercent, uint32_t& seconds) {
+  seconds = 0;
+  if (progressPercent <= 0.0f || progressPercent >= 100.0f || stats.totalReadingSeconds < 120) return false;
+  const float progress = progressPercent / 100.0f;
+  const float estimate = (static_cast<float>(stats.totalReadingSeconds) * (1.0f - progress)) / progress;
+  if (estimate <= 0.0f) return false;
+  seconds = static_cast<uint32_t>(estimate + 0.5f);
+  return seconds > 0;
+}
+
+bool estimatedTimeLeftFor(const BookReadingStats& stats, const float progressPercent, uint32_t& seconds) {
+  if (stats.estimatedTimeLeftSeconds > 0) {
+    seconds = stats.estimatedTimeLeftSeconds;
+    return true;
+  }
+  return fallbackEstimatedTimeLeft(stats, progressPercent, seconds);
+}
+
+bool estimateFinishDateFromDailyPace(const BookReadingStats& stats, const ReadingStatsDateTime& today,
+                                     const uint32_t estimatedReadingSeconds, ReadingStatsDate& outDate) {
+  outDate = {};
+  if (!today.isValid() || !stats.startDate.isValid() || estimatedReadingSeconds == 0 ||
+      stats.totalReadingSeconds == 0) {
+    return false;
+  }
+  const uint16_t elapsedDays = readingSpanDaysElapsed(stats.startDate, today.date);
+  const uint16_t readingDays = std::max<uint16_t>(1, elapsedDays);
+  const uint64_t estimatedCalendarSeconds =
+      (static_cast<uint64_t>(estimatedReadingSeconds) * static_cast<uint64_t>(readingDays) * 86400ULL +
+       static_cast<uint64_t>(stats.totalReadingSeconds) / 2ULL) /
+      static_cast<uint64_t>(stats.totalReadingSeconds);
+  if (estimatedCalendarSeconds == 0) return false;
+  ReadingStatsDateTime estimatedFinish = today;
+  addSecondsToReadingStatsDateTime(estimatedFinish,
+                                   static_cast<uint32_t>(std::min<uint64_t>(estimatedCalendarSeconds, UINT32_MAX)));
+  outDate = estimatedFinish.date;
+  return outDate.isValid();
+}
+
 }  // namespace
 
 BookStatsActivity::BookStatsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                      const std::string& bookPath, const std::string& title,
                                      const std::string& coverBmpPath, const BookReadingStats& stats,
-                                     const GlobalReadingStats& globalStats, bool backToHome)
+                                     const GlobalReadingStats& globalStats, bool backToHome,
+                                     bool startOnAllBooksPage)
     : Activity("BookStats", renderer, mappedInput),
       initialBookPath(bookPath),
       initialBookTitle(title),
       initialCoverBmpPath(coverBmpPath),
       initialStats(stats),
       globalStats(globalStats),
-      backToHome(backToHome) {}
+      backToHome(backToHome) {
+  // v18.9.9.199: "All Books" is a data-source toggle now, not a page.
+  if (startOnAllBooksPage) showAllBooks_ = true;
+}
 
 void BookStatsActivity::buildNavList() {
   nav.clear();
@@ -116,50 +167,209 @@ void BookStatsActivity::loadCurrent(int index) {
     currentStats = e.stats;
     useInitialStats = false;
   }
+
+  // v18.9.9.189: pull reading progress for THIS book (one SD read per
+  // book-nav, cached in currentProgressPercent_ until next L/R).
+  RecentBook rb;
+  rb.path = e.path;
+  rb.title = e.title;
+  rb.author = e.author;
+  rb.coverBmpPath = e.coverBmpPath;
+  currentProgressPercent_ = RecentBookProgress::loadPercent(rb);
 }
 
 void BookStatsActivity::onEnter() {
   Activity::onEnter();
+  // v18.9.9.474: arm terminate-recovery to Home so a mid-buildNavList /
+  // per-book stats-load OOM (typically hit on cold-boot with a very large
+  // recents list) lands on a clean Home instead of whatever activity was
+  // previously armed.
+  armSilentRestartTarget(/*SILENT_REBOOT_TARGET_HOME=*/0);
   buildNavList();
   loadCurrent(currentIndex);
   requestUpdate();
 }
 
+void BookStatsActivity::onExit() {
+  Activity::onExit();
+  // v18.9.9.474: clear our terminate-recovery arming so a later terminate
+  // uses whatever the next activity arms.
+  clearArmedSilentRestartTarget();
+}
+
 void BookStatsActivity::loop() {
+  constexpr unsigned long kEditHoldMs = 800;
+
+  // v18.9.9.202: date-editor mode intercepts everything.
+  if (editingDates_) {
+    if (!confirmLongHandled_ && mappedInput.isPressed(MappedInputManager::Button::Confirm) &&
+        mappedInput.getHeldTime() >= kEditHoldMs) {
+      confirmLongHandled_ = true;
+      clearEditedDateGroup();
+      requestUpdate();
+      return;
+    }
+    if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+      if (confirmLongHandled_) {
+        confirmLongHandled_ = false;
+        return;
+      }
+      editField_ = (editField_ + 1) % 6;
+      requestUpdate();
+      return;
+    }
+    if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+      commitEditedDates();
+      editingDates_ = false;
+      requestUpdate();
+      return;
+    }
+    if (mappedInput.wasReleased(MappedInputManager::Button::Up) ||
+        mappedInput.wasReleased(MappedInputManager::Button::Right)) {
+      adjustEditedDateField(+1);
+      requestUpdate();
+      return;
+    }
+    if (mappedInput.wasReleased(MappedInputManager::Button::Down) ||
+        mappedInput.wasReleased(MappedInputManager::Button::Left)) {
+      adjustEditedDateField(-1);
+      requestUpdate();
+      return;
+    }
+    return;
+  }
+
   if (mappedInput.wasReleased(MappedInputManager::Button::Back)) {
     finish();
     return;
   }
-  // Confirm opens the book currently in view. onSelectBook → goToReader →
-  // replaceActivity clears the whole stack (including the parent that
-  // opened us via startActivityForResult). The reader exits to a fresh
-  // HomeActivity, and because opening a book bumps it to RECENT_BOOKS[0],
-  // the next time the user opens Reading Stats from Home it'll show the
-  // just-opened book first — same "current book" behavior the carousel
-  // already gives.
+  // v18.9.9.202: long-press Toggle on the book stats page opens the date
+  // editor. Short-press stays the This Book ↔ All Books toggle.
+  if (!confirmLongHandled_ && !showAllBooks_ && currentPage_ == 0 &&
+      mappedInput.isPressed(MappedInputManager::Button::Confirm) && mappedInput.getHeldTime() >= kEditHoldMs) {
+    confirmLongHandled_ = true;
+    editingDates_ = true;
+    editField_ = 0;
+    requestUpdate();
+    return;
+  }
+  // v18.9.9.199: Confirm = Toggle. Swaps the data source between the
+  // current book and the All Books aggregate; both pages keep their
+  // layout, just re-render with the other source. (The old "Open book
+  // from stats" behavior is gone — Back → Home → open covers that.)
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    if (!currentBookPath.empty() && Storage.exists(currentBookPath.c_str())) {
-      LOG_DBG("BSA", "Opening book from stats: %s", currentBookPath.c_str());
-      onSelectBook(currentBookPath);
+    if (confirmLongHandled_) {
+      confirmLongHandled_ = false;
       return;
     }
+    showAllBooks_ = !showAllBooks_;
+    requestUpdate();
+    return;
   }
-  // Right + Down → next book; Left + Up → previous book. Side buttons
-  // mirror the bottom rocker so either pair cycles books.
-  if (mappedInput.wasReleased(MappedInputManager::Button::Right) ||
-      mappedInput.wasReleased(MappedInputManager::Button::Down)) {
-    if (nav.size() > 1) {
-      loadCurrent(currentIndex + 1);
-      requestUpdate();
-    }
-  }
-  if (mappedInput.wasReleased(MappedInputManager::Button::Left) ||
+  // Up / Down flip between the stats page (0) and the charts page (1).
+  if (mappedInput.wasReleased(MappedInputManager::Button::Down) ||
       mappedInput.wasReleased(MappedInputManager::Button::Up)) {
-    if (nav.size() > 1) {
-      loadCurrent(currentIndex - 1);
-      requestUpdate();
+    currentPage_ ^= 1;
+    requestUpdate();
+    return;
+  }
+  // L/R cycle books — only meaningful when showing a single book.
+  if (!showAllBooks_) {
+    if (mappedInput.wasReleased(MappedInputManager::Button::Right)) {
+      if (nav.size() > 1) {
+        loadCurrent(currentIndex + 1);
+        requestUpdate();
+      }
+    }
+    if (mappedInput.wasReleased(MappedInputManager::Button::Left)) {
+      if (nav.size() > 1) {
+        loadCurrent(currentIndex - 1);
+        requestUpdate();
+      }
     }
   }
+}
+
+void BookStatsActivity::adjustEditedDateField(int delta) {
+  const bool finishGroup = editField_ >= 3;
+  ReadingStatsDate& date = finishGroup ? currentStats.finishDate : currentStats.startDate;
+  if (!date.isValid()) {
+    // Seed a cleared date: sibling date, else today, else a sane default.
+    const ReadingStatsDate& other = finishGroup ? currentStats.startDate : currentStats.finishDate;
+    ReadingStatsDateTime now;
+    if (other.isValid()) {
+      date = other;
+    } else if (getCurrentLocalReadingStatsDateTime(now)) {
+      date = now.date;
+    } else {
+      date = {2026, 1, 1};
+    }
+  }
+  switch (editField_ % 3) {
+    case 0: {  // month, wraps
+      int m = static_cast<int>(date.month) + delta;
+      if (m < 1) m = 12;
+      if (m > 12) m = 1;
+      date.month = static_cast<uint8_t>(m);
+      break;
+    }
+    case 1: {  // day, wraps within the month
+      const int monthDays = daysInMonth(date.year, date.month);
+      int d = static_cast<int>(date.day) + delta;
+      if (d < 1) d = monthDays;
+      if (d > monthDays) d = 1;
+      date.day = static_cast<uint8_t>(d);
+      break;
+    }
+    default: {  // year, clamps to the format's range
+      int yr = static_cast<int>(date.year) + delta;
+      if (yr < 2000) yr = 2000;
+      if (yr > 2099) yr = 2099;
+      date.year = static_cast<uint16_t>(yr);
+      break;
+    }
+  }
+  // Month/year changes can strand the day past the month's end.
+  const int monthDays = daysInMonth(date.year, date.month);
+  if (date.day > monthDays) date.day = static_cast<uint8_t>(monthDays);
+  currentStats.flags |=
+      finishGroup ? BookReadingStats::FLAG_FINISH_DATE_MANUAL : BookReadingStats::FLAG_START_DATE_MANUAL;
+}
+
+void BookStatsActivity::clearEditedDateGroup() {
+  if (editField_ >= 3) {
+    currentStats.finishDate.clear();
+    currentStats.flags &= static_cast<uint8_t>(~BookReadingStats::FLAG_FINISH_DATE_MANUAL);
+    if (currentStats.isCompleted) {
+      currentStats.isCompleted = false;
+      if (globalStats.completedBooks > 0) globalStats.completedBooks--;
+    }
+  } else {
+    currentStats.startDate.clear();
+    currentStats.flags &= static_cast<uint8_t>(~BookReadingStats::FLAG_START_DATE_MANUAL);
+  }
+}
+
+void BookStatsActivity::commitEditedDates() {
+  // Keep finish >= start when both are set.
+  if (currentStats.startDate.isValid() && currentStats.finishDate.isValid() &&
+      compareReadingStatsDate(currentStats.finishDate, currentStats.startDate) < 0) {
+    currentStats.finishDate = currentStats.startDate;
+  }
+  // A manually-set finish date means the book is done.
+  if (currentStats.finishDate.isValid() && !currentStats.isCompleted) {
+    currentStats.isCompleted = true;
+    globalStats.completedBooks++;
+  }
+  if (!currentBookPath.empty()) {
+    currentStats.save(statsCachePathFor(currentBookPath));
+  }
+  globalStats.save();
+  // Keep the L/R nav cache + initial-book override in sync with the edit.
+  if (currentIndex >= 0 && currentIndex < static_cast<int>(nav.size())) {
+    nav[currentIndex].stats = currentStats;
+  }
+  useInitialStats = false;
 }
 
 void BookStatsActivity::render(RenderLock&&) {
@@ -167,6 +377,7 @@ void BookStatsActivity::render(RenderLock&&) {
 
   const auto& metrics = UITheme::getInstance().getMetrics();
   const int screenWidth = renderer.getScreenWidth();
+  const int screenHeight = renderer.getScreenHeight();
 
   // ─── Page-level layout constants ─────────────────────────────────────────
   // Print-style: typography only. No boxes, outlines, dividers.
@@ -185,6 +396,75 @@ void BookStatsActivity::render(RenderLock&&) {
 
   // Cursor that walks down the page; each section advances it.
   int y = metrics.topPadding + metrics.headerHeight + 18;  // 18px below the screen title
+
+  // ─── Date editor (v18.9.9.202, P2c) ──────────────────────────────────────
+  if (editingDates_) {
+    const int edUi12Lh = renderer.getLineHeight(UI_12_FONT_ID);
+    const int edSmallLh = renderer.getLineHeight(SMALL_FONT_ID);
+    y += 12;
+    // Book title for context.
+    {
+      const std::string t =
+          renderer.truncatedText(UI_10_FONT_ID, currentTitle.c_str(), screenWidth - 32, EpdFontFamily::BOLD);
+      const int tw = renderer.getTextWidth(UI_10_FONT_ID, t.c_str(), EpdFontFamily::BOLD);
+      renderer.drawText(UI_10_FONT_ID, (screenWidth - tw) / 2, y, t.c_str(), true, EpdFontFamily::BOLD);
+      y += renderer.getLineHeight(UI_10_FONT_ID) + 24;
+    }
+
+    constexpr int kBoxH = 44;
+    constexpr int kBoxGap = 10;
+    constexpr int kMonthW = 90;
+    constexpr int kDayW = 70;
+    constexpr int kYearW = 110;
+    const int rowW = kMonthW + kDayW + kYearW + kBoxGap * 2;
+    const int rowX = (screenWidth - rowW) / 2;
+
+    auto drawDateRow = [&](int rowY, const char* label, const ReadingStatsDate& date, int firstFieldIdx) -> int {
+      const int lw = renderer.getTextWidth(UI_12_FONT_ID, label, EpdFontFamily::BOLD);
+      renderer.drawText(UI_12_FONT_ID, (screenWidth - lw) / 2, rowY, label, true, EpdFontFamily::BOLD);
+      rowY += edUi12Lh + 8;
+
+      char vals[3][12];
+      if (date.isValid()) {
+        formatReadingStatsMonthToken(date, vals[0], sizeof(vals[0]));
+        snprintf(vals[1], sizeof(vals[1]), "%u", static_cast<unsigned>(date.day));
+        snprintf(vals[2], sizeof(vals[2]), "%u", static_cast<unsigned>(date.year));
+      } else {
+        for (auto& v : vals) snprintf(v, sizeof(v), "-");
+      }
+      const int widths[3] = {kMonthW, kDayW, kYearW};
+      int bx = rowX;
+      for (int i = 0; i < 3; ++i) {
+        const bool selected = editField_ == firstFieldIdx + i;
+        if (selected) {
+          renderer.fillRect(bx, rowY, widths[i], kBoxH, true);
+        } else {
+          renderer.drawRect(bx, rowY, widths[i], kBoxH, true);
+        }
+        const int vw = renderer.getTextWidth(UI_12_FONT_ID, vals[i], EpdFontFamily::BOLD);
+        renderer.drawText(UI_12_FONT_ID, bx + (widths[i] - vw) / 2, rowY + (kBoxH - edUi12Lh) / 2, vals[i],
+                          !selected, EpdFontFamily::BOLD);
+        bx += widths[i] + kBoxGap;
+      }
+      return rowY + kBoxH + 26;
+    };
+
+    y = drawDateRow(y, tr(STR_STATS_STARTED), currentStats.startDate, 0);
+    y = drawDateRow(y, tr(STR_STATS_FINISHED_DATE), currentStats.finishDate, 3);
+
+    // Usage hint.
+    {
+      const char* hint = "Hold Toggle to clear a date";
+      const int hw = renderer.getTextWidth(SMALL_FONT_ID, hint);
+      renderer.drawText(SMALL_FONT_ID, (screenWidth - hw) / 2, y + 4, hint, true);
+      (void)edSmallLh;
+    }
+
+    const auto edLabels = mappedInput.mapLabels(tr(STR_DONE), tr(STR_NEXT), "-", "+");
+    GUI.drawButtonHints(renderer, edLabels.btn1, edLabels.btn2, edLabels.btn3, edLabels.btn4);
+    renderer.displayBuffer();
+    return;
+  }
 
   // ─── Section 1: Cover (no border, no rounded corners, raw bitmap) ────────
   // Aspect-fit within (448 × 280) and center horizontally. If no cached
@@ -209,7 +489,292 @@ void BookStatsActivity::render(RenderLock&&) {
   constexpr int kCoverMaxH = 320;
   constexpr int kCoverGapBottom = 14;
 
-  if (!currentCoverBmpPath.empty()) {
+  // Typography line-heights (declared here so the mini-heatmap branch below
+  // and the stats grid further down both see the same values).
+  const int ui12Lh = renderer.getLineHeight(UI_12_FONT_ID);
+  const int smallLh = renderer.getLineHeight(SMALL_FONT_ID);
+
+  // v18.9.9.472/475/199: reading heatmap block — month labels above, day
+  // labels left, legend below. Shared by the charts page (both sources)
+  // and by the All Books stats view, where it fills the cover slot.
+  // bookOnly filters the reading-days log to the current book's hash.
+  // Returns the y just past the legend labels.
+  auto drawHeatmapBlock = [&](int hy, bool bookOnly) -> int {
+    int y = hy;
+    constexpr int kHmCell = 14;
+    constexpr int kHmGap = 2;
+    constexpr int kHmStride = kHmCell + kHmGap;
+    constexpr int kHmWeeks = 20;
+    constexpr int kHmDays = 7;
+    constexpr int kHmLabelW = 34;  // matches ReadingHeatmap kLabelWidth
+    const int gridW = kHmWeeks * kHmStride - kHmGap;
+    const int gridH = kHmDays * kHmStride - kHmGap;
+    // Center (labels + grid) as a unit horizontally with a small extra
+    // left inset so day-labels ("Mon", "Wed", "Fri") aren't kissing the
+    // screen edge — the standalone Heatmap draws labels at x=0 which the
+    // user flagged.
+    const int totalBlockW = kHmLabelW + gridW;
+    const int blockX = std::max(contentX, (screenWidth - totalBlockW) / 2);
+    const int gridX = blockX + kHmLabelW;
+
+    // Data window: 20 weeks back from today, week starts on Sunday
+    // (matches ReadingHeatmap; the "Sat below Fri" ask is satisfied by
+    // this order — Sat is the last row). Same 20-week window for a
+    // single book — sparse for a recent book, but the frame stays
+    // consistent between sources.
+    const auto aggregates = bookOnly ? ReadingStats::loadAggregatesForBook(currentBookPath.c_str())
+                                     : ReadingStats::loadAggregates();
+    uint32_t today = ReadingStats::todayEpochDay();
+    if (today == 0) {
+      for (const auto& agg : aggregates)
+        if (agg.epochDay > today) today = agg.epochDay;
+      if (today == 0) today = (kHmWeeks - 1) * 7 + 6;
+    }
+    const uint8_t todayDow = ReadingStats::epochDayToDow(today);
+    const uint32_t firstDay = today - todayDow - (kHmWeeks - 1) * 7;
+
+    const int windowDays = kHmWeeks * kHmDays;
+    std::vector<uint16_t> minutes(windowDays, 0);
+    uint16_t viewMax = 0;
+    for (const auto& agg : aggregates) {
+      if (agg.epochDay < firstDay || agg.epochDay > today) continue;
+      const int idx = static_cast<int>(agg.epochDay - firstDay);
+      if (idx < 0 || idx >= windowDays) continue;
+      minutes[idx] = agg.minutesRead;
+      if (agg.minutesRead > viewMax) viewMax = agg.minutesRead;
+    }
+
+    // Month labels ABOVE the grid: label the week whose first day starts a
+    // new month, aligned to that week's column.
+    const int monthLabelY = y;
+    y += smallLh + 4;  // reserve row space
+    const int gridY = y;
+    {
+      uint8_t prevMonth = 0;
+      static const char* kMonthShort[13] = {"", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+      for (int w = 0; w < kHmWeeks; ++w) {
+        const uint32_t weekStart = firstDay + w * kHmDays;
+        uint16_t yy = 0;
+        uint8_t mm = 0, dd = 0;
+        ReadingStats::epochDayToYmd(weekStart, yy, mm, dd);
+        if (mm != prevMonth) {
+          prevMonth = mm;
+          const int lx = gridX + w * kHmStride;
+          renderer.drawText(SMALL_FONT_ID, lx, monthLabelY, kMonthShort[mm]);
+        }
+      }
+    }
+
+    // Day labels on the left. Sun-first ordering (kDowLabels[0]="" for Sun,
+    // [6]="" for Sat). Sat sits at row 6 — the visual bottom, below Fri.
+    static const char* kDowLabels[7] = {"", "Mon", "", "Wed", "", "Fri", ""};
+    for (int d = 0; d < kHmDays; ++d) {
+      if (kDowLabels[d][0] == '\0') continue;
+      const int ly = gridY + d * kHmStride + kHmCell - 4;
+      renderer.drawText(SMALL_FONT_ID, blockX, ly, kDowLabels[d]);
+    }
+
+    // Grid.
+    for (int w = 0; w < kHmWeeks; ++w) {
+      for (int d = 0; d < kHmDays; ++d) {
+        const int idx = w * kHmDays + d;
+        const uint32_t cellDay = firstDay + idx;
+        if (cellDay > today) continue;
+        const int cx = gridX + w * kHmStride;
+        const int cy = gridY + d * kHmStride;
+        Color c = Color::White;
+        if (viewMax > 0 && minutes[idx] > 0) {
+          const uint32_t scaled = (static_cast<uint32_t>(minutes[idx]) * 3 + viewMax - 1) / viewMax;
+          const uint8_t b = static_cast<uint8_t>(std::min<uint32_t>(3, scaled));
+          c = (b == 1) ? Color::LightGray : (b == 2) ? Color::DarkGray : Color::Black;
+        }
+        renderer.fillRectDither(cx, cy, kHmCell, kHmCell, c);
+      }
+    }
+
+    // Legend BELOW the grid: 4 tone squares, evenly spaced across the grid
+    // width, each with its threshold label centered underneath. No "Less"/
+    // "More" text — the squares + numbers are self-explanatory.
+    const int legendY = gridY + kHmDays * kHmStride + 6;
+    auto legendBuckets = [&](int idx, char* out, size_t n) {
+      // Adaptive thresholds (matches standalone heatmap formula). If we
+      // have no data, degrade to fixed "0/<30m/<60m/60m+" placeholders.
+      const uint16_t m = viewMax > 0 ? viewMax : 90;
+      switch (idx) {
+        case 0: snprintf(out, n, "0"); break;
+        case 1: snprintf(out, n, "<%um", m / 3); break;
+        case 2: snprintf(out, n, "<%um", (m * 2) / 3); break;
+        default: {
+          const uint16_t hours = m / 60;
+          const uint16_t mins = m % 60;
+          if (hours > 0) snprintf(out, n, "%uh %um+", hours, mins);
+          else snprintf(out, n, "%um+", mins);
+          break;
+        }
+      }
+    };
+    // v18.9.9.476: tighter legend cluster. Was spread across gridW/4 slots
+    // (~70px each) which put the labels far apart from adjacent squares.
+    // Now fixed 62px between square centers, cluster centered under the
+    // grid, label sitting directly under its own square with a 2px gap.
+    constexpr int kLegendSlotW = 62;
+    const int legendClusterW = kLegendSlotW * 4;
+    const int legendStartX = gridX + std::max(0, (gridW - legendClusterW) / 2);
+    for (int b = 0; b < 4; ++b) {
+      const int slotCenterX = legendStartX + b * kLegendSlotW + kLegendSlotW / 2;
+      const int squareX = slotCenterX - kHmCell / 2;
+      renderer.fillRectDither(squareX, legendY, kHmCell, kHmCell,
+                              (b == 0)   ? Color::White
+                              : (b == 1) ? Color::LightGray
+                              : (b == 2) ? Color::DarkGray
+                                         : Color::Black);
+      if (b == 0) renderer.drawRect(squareX, legendY, kHmCell, kHmCell, true);
+      char lbl[16];
+      legendBuckets(b, lbl, sizeof(lbl));
+      const int lw = renderer.getTextWidth(SMALL_FONT_ID, lbl);
+      // Label sits directly under its square (drawText y = top of line).
+      renderer.drawText(SMALL_FONT_ID, slotCenterX - lw / 2, legendY + kHmCell + 2, lbl);
+    }
+
+    // Bottom of the painted block: legend squares + their labels + a pad.
+    return legendY + kHmCell + 2 + smallLh + 4;
+  };
+
+  if (currentPage_ == 1) {
+    // ─── Charts page: heatmap on top, then ToD + DoW bar cards. Data
+    // source follows showAllBooks_ (Toggle). Renders fully here and
+    // short-circuits the stats-page code below.
+    constexpr int kP2CardTitleH = 28;
+    constexpr int kP2BarH = 16;
+    constexpr int kP2BarRowGap = 8;
+    constexpr int kP2ChartPad = 8;
+    constexpr int kP2CardGap = 8;
+    constexpr int kP2LabelMinW = 74;
+    constexpr int kP2LabelLeftInset = 10;
+    constexpr int kP2BarLeftInset = 8;
+    constexpr int kP2BarRightInset = 12;
+
+    auto p2Frame = [&](int fx, int fy, int fw, int fh, const char* fTitle) {
+      renderer.drawRect(fx, fy, fw, fh);
+      renderer.drawLine(fx, fy + kP2CardTitleH, fx + fw, fy + kP2CardTitleH);
+      const int titleTextW = renderer.getTextWidth(UI_10_FONT_ID, fTitle, EpdFontFamily::BOLD);
+      const int titleLh = renderer.getLineHeight(UI_10_FONT_ID);
+      renderer.drawText(UI_10_FONT_ID, fx + (fw - titleTextW) / 2, fy + (kP2CardTitleH - titleLh) / 2, fTitle, true,
+                        EpdFontFamily::BOLD);
+    };
+    auto p2Bars = [&](int fx, int fy, int fw, const uint32_t* vals, const char* const* labs, int n) {
+      uint32_t maxV = 0;
+      for (int i = 0; i < n; ++i)
+        if (vals[i] > maxV) maxV = vals[i];
+      const int labelLh = renderer.getLineHeight(UI_10_FONT_ID);
+      const int rowH = std::max(labelLh, kP2BarH);
+      const int rowStride = rowH + kP2BarRowGap;
+      int maxLabelW = 0;
+      for (int i = 0; i < n; ++i) {
+        const int lw = renderer.getTextWidth(UI_10_FONT_ID, labs[i]);
+        if (lw > maxLabelW) maxLabelW = lw;
+      }
+      const int labelColW = std::max(kP2LabelMinW, kP2LabelLeftInset + maxLabelW + 6);
+      const int barX = fx + labelColW + kP2BarLeftInset;
+      const int barW = std::max(0, fw - labelColW - kP2BarLeftInset - kP2BarRightInset);
+      const int contentTop = fy + kP2CardTitleH + kP2ChartPad;
+      for (int i = 0; i < n; ++i) {
+        const int rowTop = contentTop + i * rowStride;
+        const int labY = rowTop + (rowH - labelLh) / 2;
+        const int barY = rowTop + (rowH - kP2BarH) / 2;
+        renderer.drawText(UI_10_FONT_ID, fx + kP2LabelLeftInset, labY, labs[i]);
+        if (maxV > 0 && vals[i] > 0) {
+          const int fillW = std::max(2, static_cast<int>((static_cast<int64_t>(barW) * vals[i]) / maxV));
+          renderer.fillRect(barX, barY, fillW, kP2BarH, true);
+        }
+      }
+    };
+
+    int p2y = metrics.topPadding + metrics.headerHeight + 8;
+
+    // Context line: which source the charts show ("All Books" or the
+    // book title). UI_10 keeps it compact — the heatmap below is the star.
+    {
+      const char* ctx = showAllBooks_ ? tr(STR_STATS_ALL_TIME) : currentTitle.c_str();
+      const std::string truncCtx = renderer.truncatedText(UI_10_FONT_ID, ctx, contentW, EpdFontFamily::BOLD);
+      const int tw = renderer.getTextWidth(UI_10_FONT_ID, truncCtx.c_str(), EpdFontFamily::BOLD);
+      renderer.drawText(UI_10_FONT_ID, (screenWidth - tw) / 2, p2y, truncCtx.c_str(), true, EpdFontFamily::BOLD);
+      p2y += renderer.getLineHeight(UI_10_FONT_ID) + 4;
+    }
+
+    // Heatmap on top — filtered to this book unless showing All Books.
+    p2y = drawHeatmapBlock(p2y, !showAllBooks_) + kP2CardGap;
+
+    // v18.9.9.477: card height must use the actual per-row content height
+    // (max of label line-height and bar height), not just bar height.
+    // Otherwise labelLh > barH causes the bottom row to bleed into the
+    // card below — the reason "Night" and "Sun" were previously clipping
+    // into their sibling cards' title bars.
+    const int p2RowH = std::max(renderer.getLineHeight(UI_10_FONT_ID), kP2BarH);
+
+    // Time of Day.
+    {
+      constexpr int rows = 4;
+      const int cardH = kP2CardTitleH + kP2ChartPad * 2 + rows * p2RowH + (rows - 1) * kP2BarRowGap;
+      p2Frame(contentX, p2y, contentW, cardH, tr(STR_STATS_TIME_OF_DAY));
+      const auto& tod = showAllBooks_ ? globalStats.timeOfDaySeconds : currentStats.timeOfDaySeconds;
+      const uint32_t vals[rows] = {tod[0], tod[1], tod[2], tod[3]};
+      const char* labs[rows] = {tr(STR_STATS_MORNING), tr(STR_STATS_AFTERNOON), tr(STR_STATS_EVENING),
+                                tr(STR_STATS_NIGHT)};
+      p2Bars(contentX, p2y, contentW, vals, labs, rows);
+      p2y += cardH + kP2CardGap;
+    }
+
+    // Day of Week.
+    {
+      constexpr int rows = 7;
+      const int cardH = kP2CardTitleH + kP2ChartPad * 2 + rows * p2RowH + (rows - 1) * kP2BarRowGap;
+      p2Frame(contentX, p2y, contentW, cardH, tr(STR_STATS_DAY_OF_WEEK));
+      const auto& dow = showAllBooks_ ? globalStats.dayOfWeekSeconds : currentStats.dayOfWeekSeconds;
+      const uint32_t vals[rows] = {dow[0], dow[1], dow[2], dow[3], dow[4], dow[5], dow[6]};
+      const char* labs[rows] = {tr(STR_STATS_MON), tr(STR_STATS_TUE), tr(STR_STATS_WED), tr(STR_STATS_THU),
+                                tr(STR_STATS_FRI), tr(STR_STATS_SAT), tr(STR_STATS_SUN)};
+      p2Bars(contentX, p2y, contentW, vals, labs, rows);
+      p2y += cardH + kP2CardGap;
+    }
+
+    // Page indicator dots — drawn inline because the charts page short-
+    // circuits the shared code below.
+    {
+      constexpr int kDotSize = 8;
+      constexpr int kDotGap = 8;
+      constexpr int kTotalPages = 2;
+      const int clusterW = kTotalPages * kDotSize + (kTotalPages - 1) * kDotGap;
+      const int startX = (screenWidth - clusterW) / 2;
+      const int dotY = screenHeight - metrics.buttonHintsHeight - kDotSize - 8;
+      for (int i = 0; i < kTotalPages; ++i) {
+        const int dx = startX + i * (kDotSize + kDotGap);
+        if (i == currentPage_) {
+          renderer.fillRect(dx, dotY, kDotSize, kDotSize, true);
+        } else {
+          renderer.drawRect(dx, dotY, kDotSize, kDotSize, true);
+        }
+      }
+    }
+    const bool booksNavigableP2 = !showAllBooks_ && nav.size() > 1;
+    const char* prevLblP2 = booksNavigableP2 ? tr(STR_DIR_PREV) : "";
+    const char* nextLblP2 = booksNavigableP2 ? tr(STR_DIR_NEXT) : "";
+    const auto labelsP2 =
+        mappedInput.mapLabels(backToHome ? tr(STR_HOME) : tr(STR_BACK), tr(STR_TOGGLE), prevLblP2, nextLblP2);
+    GUI.drawButtonHints(renderer, labelsP2.btn1, labelsP2.btn2, labelsP2.btn3, labelsP2.btn4);
+    renderer.displayBuffer();
+    return;
+  }
+
+  // ─── Stats page (page 0) ──────────────────────────────────────────────────
+  // All Books: the cover slot hosts the aggregate heatmap. This Book:
+  // the cover (when one exists).
+  if (showAllBooks_) {
+    // Title + grid follow right below the heatmap — a tight gap beats
+    // aligning with the (taller) cover band, which left a dead zone.
+    y = drawHeatmapBlock(y, false) + 12;
+  } else if (!currentCoverBmpPath.empty()) {
     const std::string thumbPath = UITheme::getCoverThumbPath(currentCoverBmpPath, metrics.homeCoverHeight);
 
     // CrumBLE: shared constants between the cover-rendering lambda and
@@ -400,47 +965,57 @@ void BookStatsActivity::render(RenderLock&&) {
     }
   }
 
-  // ─── Typography ──────────────────────────────────────────────────────────
-  //   book title       = UI_12 BOLD       (largest body text — primary landmark)
-  //   author           = SMALL regular    (visually secondary under the title)
-  //   "All Books"      = UI_12 BOLD       (clear section heading)
-  //   stat value       = UI_10 BOLD       (centered in cell — slightly smaller than v3 to fit the page)
-  //   stat label       = SMALL regular    (centered, sits below value)
-  const int ui12Lh = renderer.getLineHeight(UI_12_FONT_ID);
-  const int valueLh = renderer.getLineHeight(UI_10_FONT_ID);
-  const int smallLh = renderer.getLineHeight(SMALL_FONT_ID);
+  // ─── Typography (already declared above cover section for mini-heatmap use) ─
 
-  // ─── Section 2: book title (centered) ────────────────────────────────────
+  // ─── Section 2: title line ───────────────────────────────────────────────
+  // v18.9.9.471: on the All Books page, "All Books" replaces the book title
+  // in this slot (was drawn as a separate heading below the grid before,
+  // which read as redundant next to a nameless cover).
   {
-    const std::string truncTitle =
-        renderer.truncatedText(UI_12_FONT_ID, currentTitle.c_str(), contentW, EpdFontFamily::BOLD);
+    const char* titleText = showAllBooks_ ? tr(STR_STATS_ALL_TIME) : currentTitle.c_str();
+    const std::string truncTitle = renderer.truncatedText(UI_12_FONT_ID, titleText, contentW, EpdFontFamily::BOLD);
     const int tw = renderer.getTextWidth(UI_12_FONT_ID, truncTitle.c_str(), EpdFontFamily::BOLD);
     renderer.drawText(UI_12_FONT_ID, (screenWidth - tw) / 2, y, truncTitle.c_str(), true, EpdFontFamily::BOLD);
     y += ui12Lh;
   }
-  // CrumBLE #125: gaps halved across the text/stats sections so the
-  // taller 220x320 cover (vs the previous 162x236) doesn't push the
-  // global stats grid off the bottom of the screen.
-  y += 5;  // gap before per-book stats grid (matched with all-books heading→grid)
+  y += 5;
 
-  // ─── Stat grid helper ────────────────────────────────────────────────────
-  // 3 equal-width columns spanning contentW (~149 px each on a 480 px screen).
-  // Each cell stacks: bold value, 6 px gap, small regular label, both
-  // horizontally centered. 10 px padding above and below the value/label
-  // pair keeps the grid tight.
-  // If the last row contains fewer than gridColumns stats, that row's cells
-  // widen to evenly divide contentW so the partial row reads centered (the
-  // 5-stat per-book grid → row 2 has 2 cells × 224 px instead of 2 cells ×
-  // 149 px stuck to the left).
-  constexpr int gridColumns = 3;
+  // ─── Stat grid helpers ────────────────────────────────────────────────────
+  // v18.9.9.470: 2-column UI_12 grid for global All Books view.
+  // v18.9.9.475: added drawStatRow (variable cells-per-row) so page 0's
+  // per-book view can use 3/3/4 layout (10 stats without vertical clipping).
+  constexpr int gridColumns = 2;
   const int gridFullColW = contentW / gridColumns;
-  // CrumBLE #125: halved from 6/10/10 so the per-book grid + global
-  // grid both fit under the taller 220x320 cover. Tighter spacing
-  // also reads as more data-dense, which suits a stats screen.
-  constexpr int gridValueLabelGap = 3;
-  constexpr int gridRowPadTop = 5;
-  constexpr int gridRowPadBottom = 5;
-  const int gridRowH = gridRowPadTop + valueLh + gridValueLabelGap + smallLh + gridRowPadBottom;
+  constexpr int gridValueLabelGap = 5;
+  constexpr int gridRowPadTop = 6;
+  constexpr int gridRowPadBottom = 6;
+  const int gridRowH = gridRowPadTop + ui12Lh + gridValueLabelGap + smallLh + gridRowPadBottom;
+  // 4-cell rows use UI_10 for the value so long strings ("1h 5 min",
+  // "Jul 21") don't get clipped by the ~112-px cell on X4.
+  const int valueLhSmallRow = renderer.getLineHeight(UI_10_FONT_ID);
+  const int gridRowHSmall = gridRowPadTop + valueLhSmallRow + gridValueLabelGap + smallLh + gridRowPadBottom;
+
+  auto drawStatRow = [&](int rowY, int cellsInRow,
+                         std::initializer_list<std::pair<const char*, const char*>> cells) -> int {
+    const int cellW = contentW / cellsInRow;
+    const int fontId = cellsInRow >= 4 ? UI_10_FONT_ID : UI_12_FONT_ID;
+    const int useValueLh = cellsInRow >= 4 ? valueLhSmallRow : ui12Lh;
+    const int useRowH = cellsInRow >= 4 ? gridRowHSmall : gridRowH;
+    int i = 0;
+    for (const auto& kv : cells) {
+      const char* label = kv.first;
+      const char* value = kv.second;
+      const int cellX = contentX + i * cellW;
+      const int valueY = rowY + gridRowPadTop;
+      const int labelY = valueY + useValueLh + gridValueLabelGap;
+      const int vw = renderer.getTextWidth(fontId, value, EpdFontFamily::BOLD);
+      renderer.drawText(fontId, cellX + (cellW - vw) / 2, valueY, value, true, EpdFontFamily::BOLD);
+      const int lw = renderer.getTextWidth(SMALL_FONT_ID, label);
+      renderer.drawText(SMALL_FONT_ID, cellX + (cellW - lw) / 2, labelY, label, true);
+      ++i;
+    }
+    return rowY + useRowH;
+  };
 
   auto drawStatGrid = [&](int gridY, std::initializer_list<std::pair<const char*, const char*>> stats) -> int {
     const int total = static_cast<int>(stats.size());
@@ -452,9 +1027,6 @@ void BookStatsActivity::render(RenderLock&&) {
       const int col = i % gridColumns;
       const int row = i / gridColumns;
 
-      // Cells keep the full-row width even when the last row is partial; we
-      // just center the partial row by offsetting its left edge so the cells
-      // sit close together rather than spread to the screen edges.
       int cellsInRow = gridColumns;
       if (row == totalRows - 1) cellsInRow = total - row * gridColumns;
       const int rowOffsetX = (contentW - cellsInRow * gridFullColW) / 2;
@@ -463,10 +1035,10 @@ void BookStatsActivity::render(RenderLock&&) {
       const int cellX = contentX + rowOffsetX + col * cellW;
       const int cellY = gridY + row * gridRowH;
       const int valueY = cellY + gridRowPadTop;
-      const int labelY = valueY + valueLh + gridValueLabelGap;
+      const int labelY = valueY + ui12Lh + gridValueLabelGap;
 
-      const int vw = renderer.getTextWidth(UI_10_FONT_ID, value, EpdFontFamily::BOLD);
-      renderer.drawText(UI_10_FONT_ID, cellX + (cellW - vw) / 2, valueY, value, true, EpdFontFamily::BOLD);
+      const int vw = renderer.getTextWidth(UI_12_FONT_ID, value, EpdFontFamily::BOLD);
+      renderer.drawText(UI_12_FONT_ID, cellX + (cellW - vw) / 2, valueY, value, true, EpdFontFamily::BOLD);
 
       const int lw = renderer.getTextWidth(SMALL_FONT_ID, label);
       renderer.drawText(SMALL_FONT_ID, cellX + (cellW - lw) / 2, labelY, label, true);
@@ -475,85 +1047,208 @@ void BookStatsActivity::render(RenderLock&&) {
     return gridY + totalRows * gridRowH;
   };
 
-  // ─── Section 2 (continued): per-book grid ────────────────────────────────
-  // 5 stats — Sessions, Reading Time, Pages Turned, Avg Session, Pages/Min.
-  // 3-col grid: row 1 fully populated, row 2's last cell stays empty.
-  char sessionsBuf[16];
-  char timeBuf[24];
-  char pagesBuf[16];
-  char avgBuf[24];
-  char ppmBuf[8];
-  snprintf(sessionsBuf, sizeof(sessionsBuf), "%u", static_cast<unsigned>(currentStats.sessionCount));
-  BookReadingStats::formatDuration(currentStats.totalReadingSeconds, timeBuf, sizeof(timeBuf));
-  snprintf(pagesBuf, sizeof(pagesBuf), "%lu", static_cast<unsigned long>(currentStats.totalPagesTurned));
-  {
-    const uint32_t avgSecs =
-        currentStats.sessionCount > 0 ? currentStats.totalReadingSeconds / currentStats.sessionCount : 0;
-    BookReadingStats::formatDuration(avgSecs, avgBuf, sizeof(avgBuf));
-  }
-  if (currentStats.totalReadingSeconds > 60) {
-    const float ppm = static_cast<float>(currentStats.totalPagesTurned) * 60.0f /
-                      static_cast<float>(currentStats.totalReadingSeconds);
-    snprintf(ppmBuf, sizeof(ppmBuf), "%.1f", ppm);
+  // ─── Section 2 (continued): stat grid, source per showAllBooks_ ─────────
+  char buf[10][24];  // shared scratch for cell values (max 10 cells)
+  if (!showAllBooks_) {
+    // Per-book stats — 10 cells in a 2×5 grid, covers everything
+    // stats_v5.bin exposes:
+    //   Reading Time, Time Left, Progress, Pages Turned, Sessions,
+    //   Avg Session, Pages/Min, Daily Avg, Started, Est/Finished date.
+    BookReadingStats::formatDuration(currentStats.totalReadingSeconds, buf[0], sizeof(buf[0]));
+
+    {
+      uint32_t timeLeftSecs = 0;
+      if (estimatedTimeLeftFor(currentStats, currentProgressPercent_, timeLeftSecs)) {
+        BookReadingStats::formatDuration(timeLeftSecs, buf[1], sizeof(buf[1]));
+      } else {
+        snprintf(buf[1], sizeof(buf[1]), "-");
+      }
+    }
+
+    if (currentProgressPercent_ >= 0.0f) {
+      snprintf(buf[2], sizeof(buf[2]), "%d%%", static_cast<int>(currentProgressPercent_ + 0.5f));
+    } else {
+      snprintf(buf[2], sizeof(buf[2]), "-");
+    }
+
+    snprintf(buf[3], sizeof(buf[3]), "%lu", static_cast<unsigned long>(currentStats.totalPagesTurned));
+
+    snprintf(buf[4], sizeof(buf[4]), "%u", static_cast<unsigned>(currentStats.sessionCount));
+
+    {
+      const uint32_t avgSecs =
+          currentStats.sessionCount > 0 ? currentStats.totalReadingSeconds / currentStats.sessionCount : 0;
+      BookReadingStats::formatDuration(avgSecs, buf[5], sizeof(buf[5]));
+    }
+
+    if (currentStats.totalReadingSeconds > 60) {
+      const float ppm = static_cast<float>(currentStats.totalPagesTurned) * 60.0f /
+                        static_cast<float>(currentStats.totalReadingSeconds);
+      snprintf(buf[6], sizeof(buf[6]), "%.1f", ppm);
+    } else {
+      snprintf(buf[6], sizeof(buf[6]), "0.0");
+    }
+
+    ReadingStatsDateTime todayDT;
+    const bool hasToday = getCurrentLocalReadingStatsDateTime(todayDT);
+    if (currentStats.startDate.isValid() && hasToday && currentStats.totalReadingSeconds > 0) {
+      const uint16_t days = std::max<uint16_t>(1, readingSpanDaysElapsed(currentStats.startDate, todayDT.date));
+      BookReadingStats::formatDuration(currentStats.totalReadingSeconds / days, buf[7], sizeof(buf[7]));
+    } else {
+      snprintf(buf[7], sizeof(buf[7]), "-");
+    }
+
+    if (currentStats.startDate.isValid()) {
+      formatReadingStatsShortDate(currentStats.startDate, buf[8], sizeof(buf[8]));
+    } else {
+      snprintf(buf[8], sizeof(buf[8]), "-");
+    }
+
+    {
+      ReadingStatsDate finishDate;
+      bool haveDate = false;
+      if (currentStats.isCompleted && currentStats.finishDate.isValid()) {
+        finishDate = currentStats.finishDate;
+        haveDate = true;
+      } else if (hasToday) {
+        uint32_t est = 0;
+        if (estimatedTimeLeftFor(currentStats, currentProgressPercent_, est)) {
+          if (estimateFinishDateFromDailyPace(currentStats, todayDT, est, finishDate)) {
+            haveDate = true;
+          }
+        }
+      }
+      if (haveDate) {
+        formatReadingStatsShortDate(finishDate, buf[9], sizeof(buf[9]));
+      } else {
+        snprintf(buf[9], sizeof(buf[9]), "-");
+      }
+    }
+
+    // 3 / 3 / 4 layout — top two rows are the "core" 6 stats (matches
+    // X4 Dashboard's stat set) with big UI_12 values; last row is the
+    // 4 secondary date/count stats in UI_10 so they fit without clipping.
+    y = drawStatRow(y, 3,
+                    {
+                        {tr(STR_STATS_TIME_LBL), buf[0]},
+                        {tr(STR_TIME_LEFT), buf[1]},
+                        {tr(STR_STATS_PROGRESS_LBL), buf[2]},
+                    });
+    y = drawStatRow(y, 3,
+                    {
+                        {tr(STR_STATS_SESSIONS_LBL), buf[4]},
+                        {tr(STR_STATS_AVG_SESSION_LBL), buf[5]},
+                        {tr(STR_STATS_PAGES_PER_MIN), buf[6]},
+                    });
+    y = drawStatRow(y, 4,
+                    {
+                        {tr(STR_STATS_PAGES_LBL), buf[3]},
+                        {tr(STR_STATS_DAILY_AVG_LBL), buf[7]},
+                        {tr(STR_STATS_STARTED), buf[8]},
+                        {currentStats.isCompleted ? tr(STR_STATS_FINISHED_DATE) : tr(STR_STATS_EST_FINISH_DATE),
+                         buf[9]},
+                    });
   } else {
-    snprintf(ppmBuf, sizeof(ppmBuf), "0.0");
+    // All Books aggregate — same 2-col grid. Title slot above already
+    // says "All Books" (v18.9.9.471) so no separate heading here.
+    snprintf(buf[0], sizeof(buf[0]), "%lu", static_cast<unsigned long>(globalStats.totalSessions));
+    BookReadingStats::formatDuration(globalStats.totalReadingSeconds, buf[1], sizeof(buf[1]));
+    snprintf(buf[2], sizeof(buf[2]), "%lu", static_cast<unsigned long>(globalStats.totalPagesTurned));
+    {
+      const uint32_t globalAvgSecs =
+          globalStats.totalSessions > 0 ? globalStats.totalReadingSeconds / globalStats.totalSessions : 0;
+      BookReadingStats::formatDuration(globalAvgSecs, buf[3], sizeof(buf[3]));
+    }
+    if (globalStats.totalReadingSeconds > 60) {
+      const float gppm = static_cast<float>(globalStats.totalPagesTurned) * 60.0f /
+                         static_cast<float>(globalStats.totalReadingSeconds);
+      snprintf(buf[4], sizeof(buf[4]), "%.1f", gppm);
+    } else {
+      snprintf(buf[4], sizeof(buf[4]), "0.0");
+    }
+    snprintf(buf[5], sizeof(buf[5]), "%lu", static_cast<unsigned long>(globalStats.completedBooks));
+
+    // v18.9.9.476: current + longest streak from the 730-day bitfield.
+    ReadingStatsDateTime streakToday;
+    const bool haveClock = getCurrentLocalReadingStatsDateTime(streakToday);
+    const uint16_t curStreak = computeReadingHistoryCurrentStreak(
+        globalStats.readingHistoryAnchorDay, globalStats.readingHistoryBits,
+        haveClock ? &streakToday.date : nullptr);
+    const uint16_t longestStreak = std::max(globalStats.longestReadingStreak, curStreak);
+    snprintf(buf[6], sizeof(buf[6]), "%u", static_cast<unsigned>(curStreak));
+    snprintf(buf[7], sizeof(buf[7]), "%u", static_cast<unsigned>(longestStreak));
+
+    // v18.9.9.201: Books Started — recent books with any recorded reading.
+    // (Scoped to the recents list; there's no global started-counter in
+    // the stats file, and recents covers every actively-read book.)
+    int booksStarted = 0;
+    for (const auto& e : nav) {
+      if (e.stats.sessionCount > 0 || e.stats.startDate.isValid()) ++booksStarted;
+    }
+    snprintf(buf[8], sizeof(buf[8]), "%d", booksStarted);
+
+    // Reader Type — dominant time-of-day bucket across all reading.
+    const char* readerType = tr(STR_STATS_NEW_READER);
+    {
+      const auto& todAll = globalStats.timeOfDaySeconds;
+      uint32_t total = 0;
+      size_t dominant = 0;
+      for (size_t i = 0; i < todAll.size(); ++i) {
+        total += todAll[i];
+        if (todAll[i] > todAll[dominant]) dominant = i;
+      }
+      if (total > 0) {
+        switch (static_cast<ReadingTimeBucket>(dominant)) {
+          case ReadingTimeBucket::Morning: readerType = tr(STR_STATS_MORNING_READER); break;
+          case ReadingTimeBucket::Afternoon: readerType = tr(STR_STATS_AFTERNOON_READER); break;
+          case ReadingTimeBucket::Evening: readerType = tr(STR_STATS_EVENING_READER); break;
+          case ReadingTimeBucket::Night:
+          default: readerType = tr(STR_STATS_NIGHT_READER); break;
+        }
+      }
+    }
+
+    drawStatGrid(y, {
+                        {tr(STR_STATS_SESSIONS_LBL), buf[0]},
+                        {tr(STR_STATS_TIME_LBL), buf[1]},
+                        {tr(STR_STATS_PAGES_LBL), buf[2]},
+                        {tr(STR_STATS_AVG_SESSION_LBL), buf[3]},
+                        {tr(STR_STATS_PAGES_PER_MIN), buf[4]},
+                        {tr(STR_STATS_COMPLETED_LBL), buf[5]},
+                        {tr(STR_STATS_CURRENT_STREAK_LBL), buf[6]},
+                        {tr(STR_STATS_LONGEST_STREAK_LBL), buf[7]},
+                        {tr(STR_STATS_BOOKS_STARTED_LBL), buf[8]},
+                        {tr(STR_STATS_READER_TYPE_LBL), readerType},
+                    });
   }
 
-  y = drawStatGrid(y, {
-                          {tr(STR_STATS_SESSIONS_LBL), sessionsBuf},
-                          {tr(STR_STATS_TIME_LBL), timeBuf},
-                          {tr(STR_STATS_PAGES_LBL), pagesBuf},
-                          {tr(STR_STATS_AVG_SESSION_LBL), avgBuf},
-                          {tr(STR_STATS_PAGES_PER_MIN), ppmBuf},
-                      });
-
-  // ─── Section 3: All Books (centered heading) ─────────────────────────────
-  // CrumBLE #125: gaps halved (18→9, 10→5) to fit under the taller cover.
-  y += 9;
+  // ─── Page indicator dots ─────────────────────────────────────────────────
+  // 2 squares: filled = current page, outlined = the other. Centered
+  // above the button hints (side rockers have no slot in the hint strip).
   {
-    const int hw = renderer.getTextWidth(UI_12_FONT_ID, tr(STR_STATS_ALL_TIME), EpdFontFamily::BOLD);
-    renderer.drawText(UI_12_FONT_ID, (screenWidth - hw) / 2, y, tr(STR_STATS_ALL_TIME), true, EpdFontFamily::BOLD);
+    constexpr int kDotSize = 8;
+    constexpr int kDotGap = 8;
+    constexpr int kTotalPages = 2;
+    const int clusterW = kTotalPages * kDotSize + (kTotalPages - 1) * kDotGap;
+    const int startX = (screenWidth - clusterW) / 2;
+    const int dotY = screenHeight - metrics.buttonHintsHeight - kDotSize - 8;
+    for (int i = 0; i < kTotalPages; ++i) {
+      const int dx = startX + i * (kDotSize + kDotGap);
+      if (i == currentPage_) {
+        renderer.fillRect(dx, dotY, kDotSize, kDotSize, true);
+      } else {
+        renderer.drawRect(dx, dotY, kDotSize, kDotSize, true);
+      }
+    }
   }
-  y += ui12Lh + 5;  // heading sits 5 px above the grid that follows (matches title→grid)
-
-  // 6 stats — Sessions, Reading Time, Pages Turned, Avg Session, Pages/Min,
-  // and Books Read (existing STR_STATS_COMPLETED_LBL backing the same data).
-  char gSessionsBuf[16];
-  char gTimeBuf[24];
-  char gPagesBuf[16];
-  char gAvgBuf[24];
-  char gPpmBuf[8];
-  char gCompletedBuf[16];
-  snprintf(gSessionsBuf, sizeof(gSessionsBuf), "%lu", static_cast<unsigned long>(globalStats.totalSessions));
-  BookReadingStats::formatDuration(globalStats.totalReadingSeconds, gTimeBuf, sizeof(gTimeBuf));
-  snprintf(gPagesBuf, sizeof(gPagesBuf), "%lu", static_cast<unsigned long>(globalStats.totalPagesTurned));
-  {
-    const uint32_t globalAvgSecs =
-        globalStats.totalSessions > 0 ? globalStats.totalReadingSeconds / globalStats.totalSessions : 0;
-    BookReadingStats::formatDuration(globalAvgSecs, gAvgBuf, sizeof(gAvgBuf));
-  }
-  if (globalStats.totalReadingSeconds > 60) {
-    const float gppm = static_cast<float>(globalStats.totalPagesTurned) * 60.0f /
-                       static_cast<float>(globalStats.totalReadingSeconds);
-    snprintf(gPpmBuf, sizeof(gPpmBuf), "%.1f", gppm);
-  } else {
-    snprintf(gPpmBuf, sizeof(gPpmBuf), "0.0");
-  }
-  snprintf(gCompletedBuf, sizeof(gCompletedBuf), "%lu", static_cast<unsigned long>(globalStats.completedBooks));
-
-  drawStatGrid(y, {
-                      {tr(STR_STATS_SESSIONS_LBL), gSessionsBuf},
-                      {tr(STR_STATS_TIME_LBL), gTimeBuf},
-                      {tr(STR_STATS_PAGES_LBL), gPagesBuf},
-                      {tr(STR_STATS_AVG_SESSION_LBL), gAvgBuf},
-                      {tr(STR_STATS_PAGES_PER_MIN), gPpmBuf},
-                      {tr(STR_STATS_COMPLETED_LBL), gCompletedBuf},
-                  });
 
   // ─── Button hints ────────────────────────────────────────────────────────
-  const char* prevLbl = nav.size() > 1 ? tr(STR_DIR_PREV) : "";
-  const char* nextLbl = nav.size() > 1 ? tr(STR_DIR_NEXT) : "";
-  const auto labels = mappedInput.mapLabels(backToHome ? tr(STR_HOME) : tr(STR_BACK), tr(STR_OPEN), prevLbl, nextLbl);
+  // Confirm = Toggle (This Book ↔ All Books). L/R cycle books only in
+  // single-book mode.
+  const bool booksNavigable = !showAllBooks_ && nav.size() > 1;
+  const char* prevLbl = booksNavigable ? tr(STR_DIR_PREV) : "";
+  const char* nextLbl = booksNavigable ? tr(STR_DIR_NEXT) : "";
+  const auto labels = mappedInput.mapLabels(backToHome ? tr(STR_HOME) : tr(STR_BACK), tr(STR_TOGGLE), prevLbl, nextLbl);
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 
   renderer.displayBuffer();

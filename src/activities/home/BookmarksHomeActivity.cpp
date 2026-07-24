@@ -9,6 +9,7 @@
 #include "CrossPointState.h"
 #include "FileBrowserActionActivity.h"
 #include "MappedInputManager.h"
+#include "SilentRestart.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -29,6 +30,12 @@ void BookmarksHomeActivity::reloadBookmarks() {
 void BookmarksHomeActivity::onEnter() {
   Activity::onEnter();
 
+  // v18.9.9.474: arm terminate-recovery to Home so a mid-entry OOM (bookmark
+  // list scan against a large store) lands on a clean Home instead of
+  // whatever activity was previously armed (e.g. Settings from an earlier
+  // nav in the same session). Matches the Settings pattern (v18.9.9.446).
+  armSilentRestartTarget(/*SILENT_REBOOT_TARGET_HOME=*/0);
+
   reloadBookmarks();
   selectedIndex = 0;
   requestUpdate();
@@ -36,7 +43,15 @@ void BookmarksHomeActivity::onEnter() {
 
 void BookmarksHomeActivity::onExit() {
   Activity::onExit();
+  // v18.9.9.474: clear our terminate-recovery arming so a later terminate
+  // (post-exit) uses whatever the next activity arms.
+  clearArmedSilentRestartTarget();
   books.clear();
+  // v18.9.9.361: silent-restart-to-Home for a clean transition.
+  // See ReadingHeatmapActivity.cpp for rationale (multi-flash refresh
+  // vs single silent-restart flash).
+  silentRestart();
+  // never returns
 }
 
 void BookmarksHomeActivity::loop() {

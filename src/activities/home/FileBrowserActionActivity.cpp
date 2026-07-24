@@ -20,11 +20,17 @@ constexpr int kBatteryTextReserveWidth = 90;
 
 void FileBrowserActionActivity::onEnter() {
   Activity::onEnter();
-  // CrumBLE 4.2: -1 is the "Optimized" header focus sentinel; 0..N-1 are
-  // regular menu items. We always START on item 0 (most-likely action)
-  // even when the Optimized header is interactive -- the user has to
-  // explicitly press UP to focus the badge.
-  selectedIndex = 0;
+  // v18.9.9.343: honor the constructor's initialSelectedIndex hint (default
+  // 0) instead of blindly resetting. Lets HomeActivity re-open the
+  // shelf-header menu on the row the user just toggled instead of
+  // bouncing focus back to the first item on every Show/Hide flip.
+  // Bounds-clamp defensively: 0 <= idx < items.size(). -1 (the
+  // prebake-badge header focus sentinel from CrumBLE 4.2) is allowed
+  // but only meaningful when the header is selectable; harmless
+  // otherwise since Loop will treat it as the header row.
+  if (selectedIndex < 0 || selectedIndex >= static_cast<int>(items.size())) {
+    selectedIndex = items.empty() ? 0 : 0;
+  }
   requestUpdate();
 }
 

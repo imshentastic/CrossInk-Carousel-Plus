@@ -111,3 +111,50 @@ void clearLastLogs() {
   logHead = 0;
   rtcLogMagic = LOG_RTC_MAGIC;
 }
+
+// v18.9.9.332: last-known-operation beacon. See Logging.h for design notes.
+// v18.9.9.334: storage moved to RTC_NOINIT so it survives ANY crash type,
+// not just std::terminate. ESP-IDF panics (heap-poisoning asserts, Guru
+// Meditation faults, wpa_supplicant null derefs) bypass our C++ terminate
+// handler and go through the framework's panic_abort path -- but they
+// still preserve RTC_NOINIT memory across the auto-reboot. On next boot,
+// consumeCheckpointFromPrevBoot() reads and clears it so setup() can log
+// what the previous boot was doing when it died.
+constexpr uint32_t kCheckpointMagic = 0xC1EC1004u;
+RTC_NOINIT_ATTR uint32_t gCheckpointMagic;
+RTC_NOINIT_ATTR char gLastCheckpoint[48];
+
+void setLastCheckpoint(const char* name) {
+  if (gCheckpointMagic != kCheckpointMagic) {
+    gCheckpointMagic = kCheckpointMagic;
+    gLastCheckpoint[0] = '\0';
+  }
+  if (!name) { gLastCheckpoint[0] = '\0'; return; }
+  // strncpy + explicit NUL: no allocation, safe from any task.
+  size_t i = 0;
+  while (i < sizeof(gLastCheckpoint) - 1 && name[i]) {
+    gLastCheckpoint[i] = name[i];
+    ++i;
+  }
+  gLastCheckpoint[i] = '\0';
+}
+const char* getLastCheckpoint() {
+  if (gCheckpointMagic != kCheckpointMagic) return "(uninit)";
+  return gLastCheckpoint[0] ? gLastCheckpoint : "(none)";
+}
+
+// Called once in setup() after boot-reset diagnostic. Reads the RTC-persisted
+// checkpoint from the previous boot (if any) so setup() can log it. Then
+// clears it so a clean boot doesn't keep re-logging stale data. Returns
+// nullptr when RTC is uninitialised (cold boot) or already consumed.
+const char* consumeCheckpointFromPrevBoot() {
+  if (gCheckpointMagic != kCheckpointMagic) return nullptr;
+  if (gLastCheckpoint[0] == '\0') return nullptr;
+  // Copy to static buffer so caller can log after clear (though our caller
+  // typically logs inline; belt-and-suspenders in case anyone extends).
+  static char sPrev[48];
+  strncpy(sPrev, gLastCheckpoint, sizeof(sPrev) - 1);
+  sPrev[sizeof(sPrev) - 1] = '\0';
+  gLastCheckpoint[0] = '\0';
+  return sPrev;
+}

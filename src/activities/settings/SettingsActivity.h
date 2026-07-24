@@ -43,6 +43,44 @@ enum class SettingAction {
   // previously, via the in-reader menu). BT input still only delivers
   // page-turn events inside the reader -- pairing just bonds the device.
   PageTurnerSetup,
+  // CrumBLE 4.5.4: emergency "Restore CrossPoint" recovery flash. Lives
+  // under Settings -> System -> Recovery (two levels deep) and triggers
+  // a guarded HTTPS download + flash of the latest CrossPoint release.
+  // Safeguards (battery >50%, WiFi up, hold-to-confirm, URL display)
+  // are inside RestoreCrossPointActivity, NOT this dispatcher.
+  RestoreCrossPoint,
+  // v18.9.9.212: bulk-bake perspective + center tiles for every book in
+  // RECENT_BOOKS. Non-destructive: books whose tiles already pass current
+  // format validation are skipped. Blocking action with progress popup;
+  // typical run ~3-5 s for 18 books.
+  BakeCoverTiles,
+  // v18.9.9.222: wipe all cached author keys in LibraryIndex so the next
+  // Sort by Author re-populates via OPF peek. Used to pick up v220's
+  // trailing-punctuation / ';' -split fixes on entries whose keys were
+  // populated before v220. Cheap (metadata only, no per-book IO).
+  RebuildAuthorKeys,
+  // v18.9.9.258: bake .slp caches for every image in /.sleep/ (or
+  // /sleep/). One-time per source: decodes each PNG/BMP once and
+  // snapshots the 1bpp framebuffer bytes so runtime sleep entry can
+  // skip the decoder entirely and just fread bytes into the panel.
+  // Idempotent -- already-baked images are skipped.
+  BakeSleepImages,
+  // v18.9.9.290: launch standalone Reading Heatmap view. First surface
+  // for the stats data; future work integrates the grid into Home as a
+  // long-press-toggle collections view.
+  ReadingHeatmap,
+  // v18.9.9.305: Sync time from NTP. Previously lived in Customise Status
+  // Bar (as "Sync clock now") which hid it from X4 users (that menu gated
+  // on DS3231 presence) and mis-scoped it as a display-toggle. Now sits
+  // in Sync & Network next to WiFi / OPDS / KOReader, where X3 gets a
+  // clock refresh and X4 gets the ONLY way to make reading stats start
+  // logging.
+  ClockSync,
+  // v18.9.9.369: launch ClockOffsetActivity (UTC offset picker). Same
+  // wheel-picker as Customise Status Bar > UTC Offset, but reachable
+  // from Sync & Network > Sync Time so users configuring clock/stats
+  // don't have to hunt in the Reader status-bar submenu.
+  ClockUtcOffset,
 };
 
 struct SettingInfo {
@@ -228,6 +266,8 @@ class SettingsActivity final : public Activity {
 
   void toggleCurrentSetting();
   void openSleepTimeoutPicker();
+  // v18.9.5.2: same picker UI as sleep timeout, targeting btAutoDisconnectMinutes.
+  void openBtAutoDisconnectPicker();
   void rebuildSettingsLists();
   void syncQuickResumeTimeoutForSleepScreen(bool sleepScreenChanged, bool quickResumeTimeoutChanged);
 

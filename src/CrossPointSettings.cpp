@@ -12,7 +12,10 @@
 #include <string>
 
 #include "I18nKeys.h"
+#include "SdCardFontSystem.h"
+#include "SettingsList.h"
 #include "fontIds.h"
+#include "util/SettingsViewCache.h"
 
 // Initialize the static instance
 CrossPointSettings CrossPointSettings::instance;
@@ -28,7 +31,15 @@ void readAndValidate(FsFile& file, uint8_t& member, const uint8_t maxValue) {
 namespace {
 constexpr uint8_t SETTINGS_FILE_VERSION = 1;
 constexpr char SETTINGS_FILE_BIN[] = "/.crosspoint/settings.bin";
-constexpr char SETTINGS_FILE_JSON[] = "/.crosspoint/settings.json";
+// v19: CrumBLE writes to its own JSON so users can flash between CrumBLE,
+// CrossPoint, CrossInk, vCodex, etc. without settings collisions. Boot
+// order: crumble-settings.json → settings.json (legacy read-only migration
+// on first CrumBLE boot after v19) → settings.bin (binary legacy).
+// CrumBLE NEVER writes to /settings.json after v19 -- that path is
+// CrossPoint's now. Matches CrossInk's crossink-settings.json split
+// (their v1.3.3 release).
+constexpr char SETTINGS_FILE_JSON[] = "/.crosspoint/crumble-settings.json";
+constexpr char LEGACY_SETTINGS_FILE_JSON[] = "/.crosspoint/settings.json";
 constexpr char SETTINGS_FILE_BAK[] = "/.crosspoint/settings.bin.bak";
 constexpr char LANG_FILE_BIN[] = "/.crosspoint/language.bin";
 constexpr char LANG_FILE_BAK[] = "/.crosspoint/language.bin.bak";
@@ -44,6 +55,7 @@ constexpr uint8_t SLEEP_SCREEN_STORAGE_ORDER[] = {
     static_cast<uint8_t>(CrossPointSettings::READING_STATS_SLEEP),
     static_cast<uint8_t>(CrossPointSettings::MINIMAL_SLEEP),
     static_cast<uint8_t>(CrossPointSettings::QUICK_RESUME),
+    static_cast<uint8_t>(CrossPointSettings::MINIMAL_STATS_SLEEP),
 };
 constexpr uint8_t SLEEP_SCREEN_STORAGE_ORDER_COUNT =
     sizeof(SLEEP_SCREEN_STORAGE_ORDER) / sizeof(SLEEP_SCREEN_STORAGE_ORDER[0]);
@@ -335,45 +347,228 @@ namespace {
 // NimBLE held the heap. Guard the write behind a heap floor and defer it rather
 // than risk the abort; the main loop retries once heap recovers (e.g. after the
 // BLE remote disconnects), so the change still persists instead of being lost.
-constexpr uint32_t kSettingsSaveMinFree = 32U * 1024U;
-constexpr uint32_t kSettingsSaveMinMaxAlloc = 8U * 1024U;
+// CrumBLE 4.5.7 v18.6: cut kSettingsSaveMinFree 32KB -> 16KB.
+// Field measurement: even from a lean-boot bt-settings path (skip library
+// loads, no reader activity), post-BT-connect free heap lands ~31KB --
+// literally 1300 bytes under the old 32KB floor, so Map Buttons save was
+// permanently deferred no matter what UX flow the user took. The 32KB
+// figure was set as belt-and-suspenders; actual saveSettings() peak is
+// ~8-12KB (JsonDocument + working buffer for a ~3-5KB serialized file).
+// 16KB free / 4KB maxAlloc leaves 2x headroom above real peak while
+// letting Map Buttons work under BT + light-reader heap conditions
+// (typical: ~20-30KB free after BT connect + reader onEnter).
+// v18.9.9.333: bumped 16 KB -> 25 KB. Field trace showed the retry firing
+// green at a heap snapshot of ~25 KB free but a concurrent task consumed
+// heap between the pre-check and the actual save, leaving the save with
+// 21 KB free / 9 KB maxAlloc -> bad_alloc -> terminate. 25 KB provides a
+// wider margin against these transient dips (collections resolve, glyph
+// atlas installs, dictionary discoverAll, etc. can eat 5-8 KB in a tick).
+// Trade-off: settings persistence is deferred longer while a CJK book
+// is open (steady-state heap 20-30 KB free) -- users still get their
+// change applied in-memory this session; disk persist waits until they
+// exit to Home or close the book. Acceptable given the alternative was
+// a hard restart mid-session.
+constexpr uint32_t kSettingsSaveMinFree = 25U * 1024U;
+// v18.9.9.327: was 4 KB. The 4 KB floor was arithmetically inconsistent with
+// the comment above that (correctly) claims 8-12 KB peak allocation for the
+// JsonDocument + serialize buffer.
+// v18.9.9.333: bumped 12 KB -> 20 KB for the same transient-consumption
+// race as kSettingsSaveMinFree above.
+constexpr uint32_t kSettingsSaveMinMaxAlloc = 20U * 1024U;
 bool gSettingsSaveDeferred = false;
-}  // namespace
+// v18.9.9.363: debounced save state. Mutation callsites call saveToFile()
+// which now just marks pending + timestamp. Actual disk write happens
+// once burst-of-mutations settles (kDebounceMs of no new mutations)
+// OR at critical exit points (silent restart, sleep entry) via
+// flushIfDirtyNow(). Reduces SD-write pressure that was causing rename
+// failures under contention -- fewer writes = fewer contentions.
+constexpr uint32_t kSaveDebounceMs = 5000;
+uint32_t gLastMutationMs = 0;
+uint32_t gLastSuccessfulSaveMs = 0;
+bool gPendingWrite = false;
 
-bool CrossPointSettings::hasDeferredSave() { return gSettingsSaveDeferred; }
-
-bool CrossPointSettings::saveToFile() const {
-  if (!MemoryBudget::hasHeap(MemoryBudget::snapshot(), kSettingsSaveMinFree, kSettingsSaveMinMaxAlloc)) {
+bool writeSettingsToDiskNow_(const CrossPointSettings& s, bool bypassHeapGate = false) {
+  if (!bypassHeapGate &&
+      !MemoryBudget::hasHeap(MemoryBudget::snapshot(), kSettingsSaveMinFree, kSettingsSaveMinMaxAlloc)) {
     const auto heap = MemoryBudget::snapshot();
-    LOG_ERR("CPS", "Deferring settings save: heap too low (free=%u, maxAlloc=%u)", heap.freeHeap, heap.maxAllocHeap);
+    LOG_ERR("CPS", "Deferring settings write: heap too low (free=%u, maxAlloc=%u)", heap.freeHeap, heap.maxAllocHeap);
     gSettingsSaveDeferred = true;
     return false;
   }
   Storage.mkdir("/.crosspoint");
-  const bool ok = JsonSettingsIO::saveSettings(*this, SETTINGS_FILE_JSON);
-  gSettingsSaveDeferred = !ok;  // a real write failure also retries later
+  // v18.9.9.420: fresh-snapshot pre-serialize floor. Field crash: retry
+  // passed the outer 25 KB / 20 KB gate but heap dropped to free=17712
+  // maxAlloc=16372 by the time JsonSettingsIO::saveSettings ran its
+  // ArduinoJson doc[key]=value churn -> bad_alloc -> std::terminate ->
+  // hard-restart to Home. Storage.mkdir + FS traversal above allocate,
+  // and concurrent tasks (glyph atlas, dictionary discoverAll,
+  // collections resolve) can eat several KB in one tick. Re-check with a
+  // fresh snapshot right before the serialize; if maxAlloc has drifted
+  // below the safe point, keep deferred and let retryDeferredSaveIfNeeded
+  // try again next tick. Same shape as the v402 WS BIN floor. Do NOT run
+  // this when bypassHeapGate is set -- flushIfDirtyNow relies on being
+  // allowed to attempt the write even below the floor (silent-restart
+  // is about to lose the in-memory state anyway).
+  if (!bypassHeapGate) {
+    constexpr uint32_t kSerializeHardFloorMaxAlloc = 20u * 1024u;
+    const uint32_t maxAllocNow = ESP.getMaxAllocHeap();
+    if (maxAllocNow < kSerializeHardFloorMaxAlloc) {
+      LOG_ERR("CPS",
+              "Deferring settings write pre-serialize: maxAlloc=%u dropped below floor %u after mkdir/FS churn",
+              maxAllocNow, static_cast<unsigned>(kSerializeHardFloorMaxAlloc));
+      gSettingsSaveDeferred = true;
+      return false;
+    }
+  }
+  SET_CHECKPOINT("cps:serialize");
+  const bool ok = JsonSettingsIO::saveSettings(s, SETTINGS_FILE_JSON);
+  gSettingsSaveDeferred = !ok;
+  if (ok) {
+    gPendingWrite = false;
+    gLastSuccessfulSaveMs = millis();
+  }
   return ok;
+}
+}  // namespace
+
+bool CrossPointSettings::hasDeferredSave() { return gSettingsSaveDeferred || gPendingWrite; }
+void CrossPointSettings::markSaveDeferred() { gSettingsSaveDeferred = true; }
+
+bool CrossPointSettings::saveToFile() const {
+  // v18.9.9.363: mark dirty + timestamp; actual write is deferred until
+  // debounce elapses (main-loop tick calls retryDeferredSaveIfNeeded).
+  // Critical exits flush unconditionally via flushIfDirtyNow().
+  gPendingWrite = true;
+  gLastMutationMs = millis();
+  return true;
+}
+
+bool CrossPointSettings::flushIfDirtyNow() const {
+  if (!gPendingWrite && !gSettingsSaveDeferred) return true;
+  LOG_INF("CPS", "flushIfDirtyNow: forcing write (pending=%d deferred=%d)",
+          gPendingWrite ? 1 : 0, gSettingsSaveDeferred ? 1 : 0);
+  // v18.9.9.389: safety floor. writeSettingsToDiskNow_ bypasses the pre-flight
+  // gate (v369), but the downstream JsonSettingsIO::saveSettings still does
+  // dozens of doc[key] = value allocations BEFORE its own measureJson check
+  // -- under extreme heap pressure (maxAlloc < 6 KB) one of those internal
+  // allocations can throw and terminate the process. Field crash: BT-enable
+  // silent-restart fired at maxAlloc=4596, flush ran, terminate at
+  // "section:loadPage" checkpoint -> hard-restart to Home, user lost BT
+  // intent AND their reading position mid-chapter. If we're below the floor,
+  // accept losing the pending setting (log so we can see it in traces) --
+  // strictly better than terminating.
+  // v18.9.9.451: floor raised 6 KB -> 12 KB. Field crashes: bad_alloc at
+  // maxAlloc=7668 during flushIfDirtyNow called from settings-preflight
+  // silent-restart path -- the JSON write's internal peaks land above 6 KB
+  // but below 8 KB. Losing the setting mutation is strictly better than
+  // std::terminate + hard-restart. v440 preserves the armed target on
+  // terminate so UX-wise even a terminated flush lands the user right,
+  // but we still want to prevent the terminate itself when we can.
+  constexpr uint32_t kFlushHardFloorMaxAlloc = 12u * 1024u;
+  const uint32_t maxAllocNow = ESP.getMaxAllocHeap();
+  if (maxAllocNow < kFlushHardFloorMaxAlloc) {
+    LOG_ERR("CPS",
+            "flushIfDirtyNow SKIPPED: maxAlloc=%u below hard floor %u -- setting change lost across restart",
+            maxAllocNow, static_cast<unsigned>(kFlushHardFloorMaxAlloc));
+    return false;
+  }
+  // v18.9.9.369: bypass the heap floor. Callers are silent-restart and deep-
+  // sleep entry -- ESP.restart() is about to lose the dirty in-memory state.
+  // Field bug: silent-restart fires at maxAlloc=10K (below the 20K floor),
+  // flushIfDirtyNow refused the write, restart landed with SD holding the
+  // pre-toggle values -> Show/Hide toggles for virtual collections reverted
+  // to Hidden after a few seconds. Accepting the vanishingly-rare bad_alloc
+  // during JSON build -- terminate handler restarts to Home cleanly -- is
+  // strictly better than guaranteed data loss on every low-heap restart.
+  return writeSettingsToDiskNow_(*this, /*bypassHeapGate=*/true);
 }
 
 void CrossPointSettings::retryDeferredSaveIfNeeded() const {
-  if (!gSettingsSaveDeferred) return;
+  // v18.9.9.363: fires on either debounce elapsed (batched save) or
+  // heap-recovered deferred retry.
+  const bool hasPending = gPendingWrite || gSettingsSaveDeferred;
+  if (!hasPending) return;
+  const uint32_t now = millis();
+  const uint32_t sinceLastMutation = now - gLastMutationMs;
+  if (gPendingWrite && sinceLastMutation < kSaveDebounceMs) {
+    return;  // still batching burst-of-mutations
+  }
   if (!MemoryBudget::hasHeap(MemoryBudget::snapshot(), kSettingsSaveMinFree, kSettingsSaveMinMaxAlloc)) return;
-  LOG_INF("CPS", "Retrying deferred settings save (heap recovered)");
-  saveToFile();
+  SET_CHECKPOINT("cps:retryDeferredSave");
+  const bool ok = writeSettingsToDiskNow_(*this);
+  if (ok) {
+    LOG_INF("CPS", "Debounced save committed (%u ms after last mutation)", sinceLastMutation);
+    // v18.9.9.50: rebuild the settings-view cache after JSON write.
+    // v18.9.9.354: 55K/30K threshold to avoid getSettingsList crash.
+    constexpr uint32_t kCacheBuildMinFree = 55U * 1024U;
+    constexpr uint32_t kCacheBuildMinMaxAlloc = 30U * 1024U;
+    if (MemoryBudget::hasHeap(MemoryBudget::snapshot(), kCacheBuildMinFree, kCacheBuildMinMaxAlloc)) {
+      const auto list = getSettingsList(&sdFontSystem.registry());
+      saveSettingsViewCache(list);
+    }
+  }
 }
 
 bool CrossPointSettings::loadFromFile() {
-  // Try JSON first
-  if (Storage.exists(SETTINGS_FILE_JSON)) {
-    String json = Storage.readFile(SETTINGS_FILE_JSON);
+  // v19: try CrumBLE's own crumble-settings.json first.
+  // v18.9.9.311: use readFileWithFallback so a corrupt/missing primary
+  // auto-recovers from crumble-settings.json.bak (written by
+  // writeFileWithBackup on every successful save).
+  if (Storage.exists(SETTINGS_FILE_JSON) || Storage.exists((String(SETTINGS_FILE_JSON) + ".bak").c_str())) {
+    bool fromBackup = false;
+    String json = Storage.readFileWithFallback(SETTINGS_FILE_JSON, fromBackup);
     if (!json.isEmpty()) {
+      if (fromBackup) {
+        LOG_INF("CPS", "crumble-settings.json corrupt or missing; recovered from .bak");
+      }
       bool resave = false;
       bool result = JsonSettingsIO::loadSettings(*this, json.c_str(), &resave);
+      if (!result) {
+        // v18.9.9.399: BREAK BOOT LOOP. Field bug: SD write corruption
+        // left settings.json with "InvalidInput" JSON on read. Every boot
+        // then loaded the corrupt content, defaulted state, and later some
+        // path (postFirstRenderCleanup or a Home-side setting mutation)
+        // triggered a deferred save which threw std::terminate mid-
+        // serialize under the fragmented heap left by the failing tmp+
+        // rename. Result: 6-second boot loop, forever, until user power-
+        // cycles or reflashes. Fix: delete BOTH primary and .bak here so
+        // the next boot starts genuinely clean (defaults + no stale file
+        // to re-load). Cost: user loses whatever partial state was in the
+        // corrupted file, which they were losing anyway on every boot.
+        LOG_ERR("CPS", "Settings JSON unparseable -- deleting %s (+.bak) to break boot-loop",
+                SETTINGS_FILE_JSON);
+        Storage.remove(SETTINGS_FILE_JSON);
+        Storage.remove((String(SETTINGS_FILE_JSON) + ".bak").c_str());
+        migrateLanguageBinaryFile();
+        return false;
+      }
       if (result && resave) {
         if (saveToFile()) {
           LOG_DBG("CPS", "Resaved settings to update format");
         } else {
           LOG_ERR("CPS", "Failed to resave settings after format update");
+        }
+      }
+      migrateLanguageBinaryFile();
+      return result;
+    }
+  }
+
+  // v19: no crumble-settings.json yet. Try the legacy /settings.json (a
+  // fresh CrumBLE install on a device that previously ran CrossPoint /
+  // CrossInk / vCodex). Copy the settings over on first successful load
+  // by resaving to the new path. The legacy file is left INTACT so if
+  // the user flashes back to CrossPoint their old settings survive.
+  if (Storage.exists(LEGACY_SETTINGS_FILE_JSON)) {
+    String json = Storage.readFile(LEGACY_SETTINGS_FILE_JSON);
+    if (!json.isEmpty()) {
+      bool resave = false;
+      bool result = JsonSettingsIO::loadSettings(*this, json.c_str(), &resave);
+      if (result) {
+        LOG_INF("CPS", "First-boot migration: copied settings from legacy %s into %s",
+                LEGACY_SETTINGS_FILE_JSON, SETTINGS_FILE_JSON);
+        if (!saveToFile()) {
+          LOG_ERR("CPS", "Migration save to crumble-settings.json failed");
         }
       }
       migrateLanguageBinaryFile();

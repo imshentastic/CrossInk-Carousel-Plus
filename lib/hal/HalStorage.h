@@ -27,6 +27,26 @@ class HalStorage {
   // Write a string to `path` on the SD card. Overwrites existing file.
   // Returns true on success.
   bool writeFile(const char* path, const String& content);
+
+  // v18.9.9.311: atomic write + rolling backup. Sequence:
+  //   1. Write to <path>.tmp (fresh file).
+  //   2. On success, rename existing <path> to <path>.bak (previous good).
+  //   3. Rename <path>.tmp to <path>.
+  //   4. Retries the whole sequence once after 100 ms on failure -- helps
+  //      with the "cheap SD card transient write reject" pattern users
+  //      report on the bundled cards.
+  // Post-condition guarantee: EITHER <path> is the newly-written content,
+  // OR the previous <path> and <path>.bak are both intact. A crash / power
+  // loss mid-sequence can leave <path>.tmp behind but never corrupts the
+  // main file. Callers can use readFileWithFallback to auto-recover from
+  // .bak when a subsequent read finds <path> unreadable.
+  bool writeFileWithBackup(const char* path, const String& content);
+
+  // v18.9.9.311: paired reader. Tries <path> first; on empty/failure tries
+  // <path>.bak. Sets `outFromBackup=true` iff .bak served the content, so
+  // the caller can log a warning or (later) prompt the user. Returns the
+  // content as a String -- empty String means both primary and .bak failed.
+  String readFileWithFallback(const char* path, bool& outFromBackup);
   // Ensure a directory exists, creating it if necessary. Returns true on success.
   bool ensureDirectoryExists(const char* path);
 

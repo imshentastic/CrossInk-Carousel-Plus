@@ -52,6 +52,32 @@ class BookStatsActivity final : public Activity {
   std::string currentAuthor;
   std::string currentCoverBmpPath;
   std::string currentBookPath;
+  // v18.9.9.189: reading progress for the currently-viewed book (0-100,
+  // -1 = unknown). Loaded on each L/R nav so per-book "Progress %" /
+  // "Time Left" / "Est Finish" don't hit SD on every render.
+  float currentProgressPercent_ = -1.0f;
+  // v18.9.9.199 redesign: 2 pages × 2 data sources.
+  //   Page 0 = stats view (cover + stat grid; All Books swaps the cover
+  //            slot for the aggregate heatmap)
+  //   Page 1 = charts view (heatmap + Time of Day + Day of Week bars)
+  // Up/Down flips the page. Confirm toggles showAllBooks_ — same layouts,
+  // aggregate data. L/R cycles books only when showing a single book.
+  int currentPage_ = 0;
+  bool showAllBooks_ = false;
+
+  // v18.9.9.202 (P2c): date editor. Long-press Toggle on the book stats
+  // page edits Started / Finished dates: 6 fields (start M/D/Y, finish
+  // M/D/Y), Up/Down/L/R adjust, Confirm advances, long-press Confirm
+  // clears the selected date, Back commits + exits. Manually-set dates
+  // get the manual flag so the reader stops auto-populating them, and a
+  // valid finish date marks the book completed (clearing it un-completes).
+  bool editingDates_ = false;
+  int editField_ = 0;  // 0..5
+  bool confirmLongHandled_ = false;
+
+  void adjustEditedDateField(int delta);
+  void clearEditedDateGroup();
+  void commitEditedDates();
 
   void buildNavList();
   void loadCurrent(int index);
@@ -59,9 +85,11 @@ class BookStatsActivity final : public Activity {
  public:
   BookStatsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, const std::string& bookPath,
                     const std::string& title, const std::string& coverBmpPath, const BookReadingStats& stats,
-                    const GlobalReadingStats& globalStats, bool backToHome = false);
+                    const GlobalReadingStats& globalStats, bool backToHome = false,
+                    bool startOnAllBooksPage = false);
 
   void onEnter() override;
+  void onExit() override;
   void loop() override;
   void render(RenderLock&&) override;
   bool allowPowerAsConfirmInReaderMode() const override { return true; }

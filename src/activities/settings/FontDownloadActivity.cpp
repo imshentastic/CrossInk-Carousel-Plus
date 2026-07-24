@@ -116,6 +116,36 @@ void FontDownloadActivity::onEnter() {
 
   LOG_INF("FONT", "onEnter: free heap %u, maxAlloc %u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
+  // v18.9.9.308: heap pre-flight. WiFi.mode(WIFI_STA) allocates 4 lwIP
+  // RX buffers (~50 KB contiguous) plus the mbedtls handshake for the
+  // manifest HTTPS fetch needs another ~40-50 KB. Field crash: user
+  // entered at maxAlloc=26612, WiFi RX init reported "Expected to init
+  // 4 rx buffer, actual is 1", then the activity dereferenced a null
+  // handle -> panic. Same class as KO / OPDS / OTA pre-flights.
+  //
+  // Threshold matches the KO/OPDS pattern (95 KB free / 48 KB maxAlloc,
+  // see EpubReaderActivity.cpp:4254): wifi.begin + mbedtls cert-chain
+  // + manifest download all fit comfortably. Silent-restart to self
+  // (via SILENT_REBOOT_TARGET_FONT_DOWNLOAD) so the user lands back in
+  // Manage Fonts on the fresh ~150 KB heap -- preserves navigation
+  // intent instead of dumping them on Home. g_postFontDownloadSilentReboot
+  // guards against loop if a fresh boot is somehow still under floor.
+  constexpr uint32_t kFontMinFreeHeap = 95u * 1024u;
+  constexpr uint32_t kFontMinMaxAlloc = 48u * 1024u;
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+  if ((freeHeap < kFontMinFreeHeap || maxAlloc < kFontMinMaxAlloc) && !g_postFontDownloadSilentReboot) {
+    LOG_INF("FONT",
+            "Manage Fonts pre-flight low (free=%u maxAlloc=%u, need %u/%u) -- silent-restart to recover heap",
+            freeHeap, maxAlloc, kFontMinFreeHeap, kFontMinMaxAlloc);
+    silentRestartToFontDownload();
+    return;
+  }
+  if (g_postFontDownloadSilentReboot) {
+    LOG_INF("FONT", "Post-silent-restart entry: free=%u maxAlloc=%u (proceeding)", freeHeap, maxAlloc);
+    g_postFontDownloadSilentReboot = false;
+  }
+
   // CrumBLE: tear NimBLE down before HTTPS + manifest fetch + font
   // installs. NimBLE holds ~58 KB of stack state while connected, and
   // HttpDownloader's TLS handshake + manifest buffers + font file
@@ -143,6 +173,12 @@ void FontDownloadActivity::onEnter() {
   }
 
   sdFontSystem.releaseLoadedFont(renderer);
+  // v18.9.9.265: stop BLE before WiFi init (see CrossPoint feat-bluetooth
+  // c1a396c1). ESP32-C3 shared radio + WiFi RX/TX pool sizing.
+  if (BluetoothHIDManager::getInstance().isEnabled()) {
+    LOG_INF("FDL", "Disabling BT before WiFi init to free radio+heap");
+    BluetoothHIDManager::getInstance().disable();
+  }
   WiFi.mode(WIFI_STA);
   startActivityForResult(std::make_unique<WifiSelectionActivity>(renderer, mappedInput),
                          [this](const ActivityResult& result) { onWifiSelectionComplete(!result.isCancelled); });
@@ -185,6 +221,11 @@ void FontDownloadActivity::onWifiSelectionComplete(const bool success) {
     state_ = FAMILY_LIST;
     selectedIndex_ = 0;
   }
+  // v18.9.9.311: without this, the FAMILY_LIST render only fired on the next
+  // input event -- user landed on a blank screen and had to press a nav key
+  // to see the fonts list. requestUpdate() forces the paint to fire in the
+  // next loop tick regardless of input.
+  requestUpdate();
 }
 
 // --- Manifest fetching ---

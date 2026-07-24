@@ -528,7 +528,17 @@ void RecentBooksGridActivity::applyLayoutFromSettings() {
       // 220 width keeps the 2x2 from overflowing the 250 px wide
       // half-pane with room for the selection ring + gutters.
       coverWidth_ = 220;
-      coverHeight_ = 320;
+      // CrumBLE 4.5.4: title-top mode loses 53 px of contentTop budget
+      // and 6 px of rowSpacing budget compared to title-bottom (which
+      // packs covers at contentTop=66 with rowSpacing=4). With the
+      // original 320 height in title-top, row 2 cleared into the page-
+      // dot indicator Y on X3-class panels (the visible overlap in the
+      // field-report screenshot). Trimming to 290 reserves a clean band
+      // at the bottom for dots + margin. Title-bottom keeps 320 because
+      // its title strip occupies the same band title-top now leaves
+      // empty -- they end up reserving the same total footer height,
+      // which is the spacing parity the user asked for.
+      coverHeight_ = (SETTINGS.bookshelfTitlePlacement == CrossPointSettings::BOOKSHELF_TITLE_PLACEMENT_TOP) ? 290 : 320;
       break;
     case CrossPointSettings::BOOKSHELF_LAYOUT_3X3:
     default:
@@ -999,6 +1009,8 @@ void RecentBooksGridActivity::promptDeleteBook(const RecentBook& book) {
     BookActions::clearFileMetadata(path);
     if (!Storage.remove(path.c_str())) {
       LOG_ERR("RBGA", "Failed to delete file: %s", path.c_str());
+      BookActions::drawToast(renderer, tr(STR_BOOK_DELETE_FAILED));
+      delay(1500);
       return;
     }
 
@@ -1435,6 +1447,9 @@ void RecentBooksGridActivity::render(RenderLock&&) {
         // entry (low heap / many cached covers competing) but the file
         // DOES exist on SD -- without the fallback those books render
         // as placeholders even though we have a real thumb to show.
+        // v18.9.9.345: was lookupCachedBitmapPinned -- see LyraFlowTheme
+        // for rationale. Bookshelf grid re-decodes on each page-flip in
+        // exchange for ~24 KB less persistent Home heap tax.
         GfxRenderer::CachedBitmap* handle = renderer.lookupCachedBitmap(thumbPath);
         int srcW = 0, srcH = 0;
         if (renderer.getCachedBitmapDimensions(handle, &srcW, &srcH) && srcW > 0 && srcH > 0) {
@@ -1485,12 +1500,11 @@ void RecentBooksGridActivity::render(RenderLock&&) {
                                            ? filenameWithoutExtension(recentBooks[bookIdx].book.path)
                                            : recentBooks[bookIdx].book.title;
         constexpr int kPlaceholderPadX = 6;
-        // CrumBLE #133 follow-up: cap is 5 lines at 3x3 and below
-        // (per-user) so the title block reads as a "label" rather than
-        // a wall of wrapped text. Larger covers (4x4/2x2) keep the
-        // larger cap since they have more vertical room and very
-        // long titles do need it.
-        const int kPlaceholderMaxLines = is3x3 ? 5 : 12;
+        // v18.9.9.193: cap unified at 5 lines across all grid sizes.
+        // Previously 4x4 / 2x2 kept a 12-line cap; field feedback: at 4x4
+        // a 10-line wrapped title reads as a wall of text and looks worse
+        // than a truncated 5-line label, even though the cell has room.
+        const int kPlaceholderMaxLines = 5;
         const auto titleLines = renderer.wrappedText(SMALL_FONT_ID, bookTitle.c_str(), bw - 2 * kPlaceholderPadX,
                                                      kPlaceholderMaxLines, EpdFontFamily::BOLD);
         const int lineH = renderer.getLineHeight(SMALL_FONT_ID);

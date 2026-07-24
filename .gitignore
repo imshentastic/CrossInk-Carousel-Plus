@@ -23,3 +23,12 @@ release.md
 lib/EpdFont/scripts/downloaded_fonts/
 lib/EpdFont/scripts/instanced_fonts/
 lib/EpdFont/scripts/output/
+tools/crumble-prebake/build-wasm/
+
+# v18.9.9.69 (ported from crosspoint 7b6df60a): NimBLE-shrink custom_sdkconfig
+# rebuilds the Arduino core lib from source. These are the resulting artifacts
+# platformio + pioarduino leave in the tree.
+/managed_components
+/.dummy
+dependencies.lock
+sdkconfig.default

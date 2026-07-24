@@ -49,6 +49,14 @@ void DictionaryWordSelectActivity::onEnter() {
 void DictionaryWordSelectActivity::onExit() {
   Activity::onExit();
 
+  // v18.9.9.196: user hit Back to leave word-select -- return to reader is
+  // a heap-healing event, no need to restart. Cancel any pending deferral.
+  if (deferredRestartAtMs_ != 0) {
+    LOG_DBG("DICT", "cancelling deferred restart on onExit (returning to reader)");
+    deferredRestartAtMs_ = 0;
+    deferredRestartWord_.clear();
+  }
+
   // FIX: Aggressively free all resources and defragment heap before returning to the reader
   words.clear();
   words.shrink_to_fit();
@@ -127,7 +135,11 @@ void DictionaryWordSelectActivity::extractWords() {
         if (!lookup.empty()) {
           int wordIndex = static_cast<int>(words.size());
           words.emplace_back(current_word, baseX + pre_w, currentY, word_w, currentRowIndex);
-          words.back().lookupText = lookup;
+          // CrumBLE 4.5.5: no per-word lookupText assignment. computeLookup
+          // TextAt(wordIndex) reproduces the same strip-apostrophes logic
+          // on demand at lookup time. The local `lookup` variable above
+          // is still used for the empty-check gate (we don't add an entry
+          // for a word that strips down to nothing -- pure punctuation).
           rows[currentRowIndex].wordIndices.push_back(wordIndex);
         }
       };
@@ -203,6 +215,71 @@ int DictionaryWordSelectActivity::findClosestWordIndexInRow(int rowIndex, int ta
 }
 
 void DictionaryWordSelectActivity::loop() {
+  // v18.9.9.235: auto-recover on Low Memory -- two phases.
+  //
+  // Phase 1: popup has been shown for POPUP_HOLD_MS so the user can see the
+  // "Low memory" message. Close the overlay cleanly (this will restore the
+  // BW backup if valid, else requestUpdate to re-render word-select), then
+  // arm a deferred restart to give the render task time to finish before
+  // the sleep-frame snapshot fires. Sleep-frame captures a CLEAN
+  // word-select page (no def-composite), which is small enough for packbits
+  // to compress -- the v215 truncation panic class is out of reach.
+  //
+  // Phase 2: deferred deadline hit -> silentRestartToReaderWithCursorWord.
+  // Post-boot's OpenLookupAtWord dispatch (already-wired but previously
+  // unused) lands cursor back on the word. One Confirm tap re-lookups on
+  // freshly defragmented heap.
+  constexpr unsigned long POPUP_HOLD_MS = 1500;
+  constexpr unsigned long RENDER_SETTLE_MS = 800;
+  if (pendingLowMemoryAutoRestart_ && millis() - lowMemoryPopupShownAtMs_ >= POPUP_HOLD_MS) {
+    LOG_INF("DICT", "auto-recover: dismissing Low-memory popup, arming silent-restart-with-cursor-word '%s'",
+            lowMemoryRestartWord_.c_str());
+    pendingLowMemoryAutoRestart_ = false;
+    lowMemoryRestartAtMs_ = millis() + RENDER_SETTLE_MS;
+    closeDefinitionOverlay();
+    return;
+  }
+  if (lowMemoryRestartAtMs_ != 0 && millis() >= lowMemoryRestartAtMs_) {
+    const std::string word = std::move(lowMemoryRestartWord_);
+    const uint32_t chunkStart = lowMemoryRestartChunkStart_;
+    lowMemoryRestartAtMs_ = 0;
+    lowMemoryRestartChunkStart_ = 0;
+    // v18.9.9.249: chunk-transition refuse path arms chunkStart > 0.
+    // Fire the chunk-aware variant so post-boot the definition opens
+    // directly on the chunk the user was paging into. For wrap-guard /
+    // readDef-refuse (chunkStart == 0), fire the cursor-only variant
+    // as before -- the user's cursor lands back on the word, one tap
+    // reopens the definition at chunk 0 on the fresh heap.
+    if (chunkStart != 0u) {
+      LOG_INF("DICT",
+              "auto-recover: firing silentRestartToReaderWithDefinitionAtChunk('%s', chunkStart=%u)",
+              word.c_str(), chunkStart);
+      silentRestartToReaderWithDefinitionAtChunk(word.c_str(), chunkStart);
+    } else {
+      LOG_INF("DICT", "auto-recover: firing silentRestartToReaderWithCursorWord('%s')", word.c_str());
+      silentRestartToReaderWithCursorWord(word.c_str());
+    }
+    return;  // never returns
+  }
+
+  // v18.9.9.232: deferred close-guard restart machinery removed. It was the
+  // root cause of a recurring class of panic ("BW restore truncated at
+  // literal"): silentRestartToReaderWithDefinition's sleep-frame snapshot
+  // carried whatever framebuffer state we had into the reboot, post-boot
+  // openDefinitionOverlay's storeBwBuffer re-captured that state, packbits
+  // silently truncated when it exceeded the 32 KB budget, and the next
+  // closeDefinitionOverlay's restoreBwBuffer decoded past the end -> heap
+  // poisoning -> reboot loop. The whole "restart to defrag heap on tight
+  // dismiss" pattern (v196/v213/v215/v227/v231) is deleted. On tight heap
+  // the pre-flight guard in Dictionary::readDefinition (v222) surfaces a
+  // "Low memory" popup, user dismisses, and a page-turn defrags manually.
+  //
+  // The pending-word Phase 1/2 code below is preserved because
+  // OpenLookupAtWord silent-restarts (from EpubReaderActivity's lookup
+  // pre-flight, not from this file) still use it. Those restarts happen
+  // BEFORE the def overlay opens on the target boot, so the sleep-frame
+  // carries a clean reader-page framebuffer -- no packbits truncation.
+
   // CrumBLE 4.4 post-bisect: post-silent-restart restore is two-phase.
   // Phase 1 (first loop tick after onEnter+first render): navigate the
   // cursor to the previously-looked-up word and request a redraw. We
@@ -216,8 +293,12 @@ void DictionaryWordSelectActivity::loop() {
   if (!pendingDefinitionWord_.empty() && !defOverlay_) {
     if (!pendingDefinitionCursorMoved_) {
       // Phase 1: locate the word + move cursor + redraw.
+      // CrumBLE 4.5.5: per-word lookupText was removed -- compare against
+      // the on-demand computation. Restore is rare (only after a silent
+      // restart during a lookup), so the per-word string allocation here
+      // doesn't matter; the per-word extraction-time cost did.
       for (size_t i = 0; i < words.size(); ++i) {
-        if (words[i].lookupText == pendingDefinitionWord_) {
+        if (computeLookupTextAt(static_cast<int>(i)) == pendingDefinitionWord_) {
           for (size_t r = 0; r < rows.size(); ++r) {
             for (size_t w = 0; w < rows[r].wordIndices.size(); ++w) {
               if (rows[r].wordIndices[w] == static_cast<int>(i)) {
@@ -231,6 +312,10 @@ void DictionaryWordSelectActivity::loop() {
       }
     cursorMoved:
       pendingDefinitionCursorMoved_ = true;
+      // v18.9.9.246: mark session as post-restart so guards downstream
+      // avoid the auto-recover -> restart -> refuse -> auto-recover loop
+      // when the target word still doesn't fit even on freshly rebooted heap.
+      sessionBornFromRestart_ = true;
       requestUpdate();
       return;
     }
@@ -257,14 +342,67 @@ void DictionaryWordSelectActivity::loop() {
       closeDefinitionOverlay();
       return;
     }
-    if (defMaxScroll_ > 0) {
-      if (mappedInput.wasReleased(MappedInputManager::Button::Up) && defScrollOffset_ > 0) {
-        defScrollOffset_ = std::max(0, defScrollOffset_ - std::max(1, defLinesPerPage_ - 1));
+    // v18.9.9.198: Left/Right cycle through entries when the word has more
+    // than one. v247: also reset the target entry's chunk to 0 since chunks
+    // are per-entry.
+    if (defEntryStreams_.size() > 1) {
+      if (mappedInput.wasReleased(MappedInputManager::Button::Left) && currentEntryIndex_ > 0) {
+        currentEntryIndex_--;
+        defScrollOffset_ = 0;
+        defLines_.clear();
+        defLines_.shrink_to_fit();
+        loadChunkForCurrentEntry(0u);
         requestUpdate();
-      } else if (mappedInput.wasReleased(MappedInputManager::Button::Down) && defScrollOffset_ < defMaxScroll_) {
+        return;
+      }
+      if (mappedInput.wasReleased(MappedInputManager::Button::Right) &&
+          currentEntryIndex_ + 1 < static_cast<int>(defEntryStreams_.size())) {
+        currentEntryIndex_++;
+        defScrollOffset_ = 0;
+        defLines_.clear();
+        defLines_.shrink_to_fit();
+        loadChunkForCurrentEntry(0u);
+        requestUpdate();
+        return;
+      }
+    }
+    // v18.9.9.247: chunk-aware Up/Down. At the last visible line of the
+    // current chunk, Down loads the next chunk (if there is more entry
+    // remaining). At the first visible line, Up loads the previous chunk
+    // (if there's anything before). Within the current chunk, Up/Down
+    // just scrolls the pre-wrapped defLines_ as before.
+    const EntryStream* es = (currentEntryIndex_ >= 0 &&
+                              currentEntryIndex_ < static_cast<int>(defEntryStreams_.size()))
+                                ? &defEntryStreams_[currentEntryIndex_]
+                                : nullptr;
+    const bool hasMoreForward = es && es->bufferRawEnd < es->totalSize;
+    const bool hasMoreBackward = es && es->bufferRawStart > 0u;
+    if (mappedInput.wasReleased(MappedInputManager::Button::Down)) {
+      if (defScrollOffset_ < defMaxScroll_) {
         defScrollOffset_ = std::min(defMaxScroll_, defScrollOffset_ + std::max(1, defLinesPerPage_ - 1));
         requestUpdate();
+      } else if (hasMoreForward) {
+        LOG_DBG("DICT", "Down at chunk end: loading next chunk from %u", es->bufferRawEnd);
+        defScrollOffset_ = 0;
+        loadChunkForCurrentEntry(es->bufferRawEnd);
+        requestUpdate();
       }
+      return;
+    }
+    if (mappedInput.wasReleased(MappedInputManager::Button::Up)) {
+      if (defScrollOffset_ > 0) {
+        defScrollOffset_ = std::max(0, defScrollOffset_ - std::max(1, defLinesPerPage_ - 1));
+        requestUpdate();
+      } else if (hasMoreBackward) {
+        const uint32_t newStart = es->bufferRawStart > DEF_CHUNK_SIZE
+                                       ? es->bufferRawStart - DEF_CHUNK_SIZE
+                                       : 0u;
+        LOG_DBG("DICT", "Up at chunk start: loading previous chunk from %u", newStart);
+        loadChunkForCurrentEntry(newStart);
+        defScrollOffset_ = defMaxScroll_;  // start at bottom of previous chunk
+        requestUpdate();
+      }
+      return;
     }
     return;
   }
@@ -329,7 +467,10 @@ void DictionaryWordSelectActivity::loop() {
       int selectedWordIdx = rows[currentRow].wordIndices[currentWordInRow];
 
       if (mode_ == Mode::Lookup) {
-        openDefinitionOverlay(words[selectedWordIdx].lookupText);
+        // CrumBLE 4.5.5: on-demand lookup-text build (was a per-word
+        // WordInfo field; now computed from text + apostrophe strip +
+        // hyphenation join). Same result, no per-extraction cost.
+        openDefinitionOverlay(computeLookupTextAt(selectedWordIdx));
       } else if (mode_ == Mode::HighlightSingleWord) {
         // One-tap mode for cross-page END pick. Capture some lead-in
         // context BEFORE the picked word so the saved preview reads
@@ -572,13 +713,42 @@ void DictionaryWordSelectActivity::mergeHyphenatedWords() {
   if (words.empty()) return;
   for (size_t i = 0; i < words.size(); ++i) {
     if (words[i].isHyphenatedLineEnd && i + 1 < words.size()) {
-      std::string merged = words[i].lookupText + words[i + 1].lookupText;
-      words[i].lookupText = merged;
-      words[i + 1].lookupText = merged;
-      words[i].continuationIndex = static_cast<int>(i + 1);
-      words[i + 1].continuationOf = static_cast<int>(i);
+      // CrumBLE 4.5.5: lookupText merge removed -- computeLookupTextAt()
+      // joins on demand via continuationIndex / continuationOf at lookup
+      // time. This loop now only sets the continuation pointers for the
+      // render path (drawing the joined-word highlight across the line
+      // break) and for the on-demand lookup join.
+      words[i].continuationIndex = static_cast<int16_t>(i + 1);
+      words[i + 1].continuationOf = static_cast<int16_t>(i);
     }
   }
+}
+
+// CrumBLE 4.5.5: compute the dictionary-lookup form of words[idx] on demand.
+// Replaces the per-word WordInfo::lookupText field that used to be filled
+// during extractWords (saved ~6-16 KB of vector mass on CJK pages). Called
+// at most once per user tap from the Lookup path -- the per-page cost goes
+// from O(N words) at extraction to O(1) at click.
+std::string DictionaryWordSelectActivity::computeLookupTextAt(int idx) const {
+  if (idx < 0 || idx >= static_cast<int>(words.size())) return {};
+  std::string out = words[idx].text;
+  // Hyphenated continuation: join with the next-line half (only the start
+  // of a hyphenated pair carries continuationIndex; the continuation half
+  // carries continuationOf and is the right operand).
+  if (words[idx].continuationIndex >= 0 &&
+      words[idx].continuationIndex < static_cast<int16_t>(words.size())) {
+    out += words[words[idx].continuationIndex].text;
+  } else if (words[idx].continuationOf >= 0 &&
+             words[idx].continuationOf < static_cast<int16_t>(words.size())) {
+    // Tapped the second half of a hyphenated pair -- prepend the first half
+    // so the lookup string matches what the dictionary would have for the
+    // full word.
+    out = words[words[idx].continuationOf].text + out;
+  }
+  // Same apostrophe strip extractWords used to do inline.
+  while (!out.empty() && out.back() == '\'') out.pop_back();
+  while (!out.empty() && out.front() == '\'') out.erase(0, 1);
+  return out;
 }
 
 // CrumBLE 4.4 post-bisect: inline definition overlay implementation. Replaces
@@ -588,15 +758,43 @@ void DictionaryWordSelectActivity::mergeHyphenatedWords() {
 // User's selection cursor is preserved across the lookup.
 
 void DictionaryWordSelectActivity::openDefinitionOverlay(const std::string& word) {
-  // CrumBLE 4.4 post-bisect: NO preemptive pre-flight gate. We try the lookup
-  // first and only silent-restart when wrap actually fails. This keeps
-  // common-case lookups fast (no unnecessary restarts) AND lets the silent-
-  // restart-with-word recovery path kick in for the genuinely heap-starved case.
-  // See wrapDefinition() for the recovery trigger.
+  // v18.9.9.232: v213 rapid-cycle guard removed. It called
+  // silentRestartToReaderWithDefinition on rapid double-tap under tight
+  // heap, which fed the sleep-frame-composite panic loop (see loop()'s
+  // comment above). Rapid re-tap on tight heap now takes the same benign
+  // path as any other open: storeBwBuffer either succeeds (dismiss
+  // restores cleanly) or fails (dismiss re-renders word-select), and
+  // wrap OOM is caught by Dictionary::readDefinition's pre-flight guard
+  // -> "Low memory" popup. No silent-restart path from this file.
   clearSilentRebootContinuationFlag();
+  // v18.9.9.240: cancel any pending auto-recover from a previous overlay
+  // session. Rapid successive Confirms can layer: overlay A refuses ->
+  // auto-recover armed -> user taps word B before Phase 2 fires ->
+  // overlay B opens. If B succeeds we don't want A's stale timer to
+  // fire mid-render (that's what caused v239's contended-lock white
+  // flash: overlay B's wrap was still running when overlay A's phase 2
+  // fired). If B also fails, its own wrap guard re-arms with B's word
+  // and a fresh timestamp.
+  pendingLowMemoryAutoRestart_ = false;
+  lowMemoryRestartAtMs_ = 0;
+  lowMemoryRestartWord_.clear();
+  // v18.9.9.244: pre-open guard removed. It made "every other word" trigger
+  // auto-recover on X3+BLE because word-select mode entry itself consumes
+  // ~23 KB of maxAlloc, leaving <22 KB (or <16 KB) at lookup time -- an
+  // untenable UX regression vs v241, where the guard was absent and users
+  // could sustain 6+ lookups before the occasional big-entry crash. The
+  // occasional crash-to-Home on genuinely-oversized entries is worse than
+  // "constant restart friction" only when it happens; users tolerate
+  // rare crashes better than pervasive restarts. Real fix for the crash
+  // class is BT-off-by-default (recovers ~20 KB, lets wrap+render fit
+  // without needing aggressive guarding).
   defTargetWord_ = word;
   defLines_.clear();
   defLines_.shrink_to_fit();
+  // v18.9.9.198: drop any prior lookup's entries before starting a new one.
+  defEntryStreams_.clear();
+  defEntryStreams_.shrink_to_fit();
+  currentEntryIndex_ = 0;
   defScrollOffset_ = 0;
   defOverlayNotFound_ = false;
   defOverlayLowMemory_ = false;
@@ -614,46 +812,207 @@ void DictionaryWordSelectActivity::openDefinitionOverlay(const std::string& word
   // then perform the synchronous lookup, then re-render with the result.
   requestUpdate();
   performDefinitionLookup();
+  // v18.9.9.175: reverted v171 post-wrap check and v173 auto-restart. The
+  // post-wrap check tripped at post-restart maxAlloc=15K which was actually
+  // fine to render. The auto-restart's isContinuingFromSilentReboot guard
+  // fired AFTER clearSilentRebootContinuationFlag() at line 636 so it
+  // couldn't tell we'd just restarted -- caused infinite restart loop.
+  // Restored original flow: user dismisses Low-memory popup on failure and
+  // the closeDefinitionOverlay guard handles the silent-restart cleanly.
   defOverlayLoading_ = false;
   requestUpdate();
 }
 
 void DictionaryWordSelectActivity::performDefinitionLookup() {
-  std::string definition = Dictionary::lookup(defTargetWord_);
-  if (definition.empty()) {
+  Dictionary::clearLastRefusedDueToMemory();
+  // v18.9.9.247: fetch entry HANDLES (offset+size only) instead of full
+  // data. Then loadChunkForCurrentEntry loads the first 3 KB of the first
+  // entry on-demand. Multi-entry cycling reloads the target entry's chunk
+  // to 0 in the Left/Right handler.
+  auto handles = Dictionary::lookupAllHandles(defTargetWord_);
+  if (handles.empty()) {
     auto stems = Dictionary::getStemVariants(defTargetWord_);
     for (const auto& stem : stems) {
-      definition = Dictionary::lookup(stem);
-      if (!definition.empty()) {
+      handles = Dictionary::lookupAllHandles(stem);
+      if (!handles.empty()) {
         defTargetWord_ = stem;
         break;
       }
     }
   }
   Dictionary::freeMemory();
-  if (definition.empty()) {
-    defOverlayNotFound_ = true;
+  defEntryStreams_.clear();
+  for (const auto& h : handles) {
+    defEntryStreams_.push_back(EntryStream{h.offset, h.size, 0u, 0u, {}});
+  }
+  if (defEntryStreams_.empty()) {
+    // v18.9.9.237: distinguish "actually not found" from "readDefinition
+    // refused due to memory." The user's field log showed several
+    // consecutive lookups landing in the refuse path on tight heap while
+    // the popup misleadingly said "Word not found" -- they thought the
+    // dict was missing common words. Arm the same auto-recover flow
+    // wrapDefinition's guard uses.
+    if (Dictionary::wasLastRefusedDueToMemory()) {
+      defOverlayLowMemory_ = true;
+      if (!sessionBornFromRestart_) {
+        LOG_ERR("DICT",
+                "performDefinitionLookup: readDefinition refused for memory; arming auto-recover on '%s'",
+                defTargetWord_.c_str());
+        pendingLowMemoryAutoRestart_ = true;
+        lowMemoryPopupShownAtMs_ = millis();
+        lowMemoryRestartWord_ = defTargetWord_;
+      } else {
+        LOG_INF("DICT", "performDefinitionLookup: readDefinition refused post-restart; NOT re-arming (would loop)");
+      }
+    } else {
+      defOverlayNotFound_ = true;
+    }
     return;
   }
+  // v18.9.9.246: successful lookup clears the post-restart flag so a later
+  // heavier word CAN arm auto-recover fresh.
+  sessionBornFromRestart_ = false;
+  currentEntryIndex_ = 0;
   LookupHistory::addWord(cachePath, defTargetWord_);
-  wrapDefinition(definition);
+  // v18.9.9.247: load the first chunk of the first entry. If load fails
+  // (heap tight for even a 3 KB range read), the readDef refuse path in
+  // loadChunkForCurrentEntry sets defOverlayLowMemory_ and arms recovery.
+  //
+  // v18.9.9.249: if the ERA post-boot dispatch handed us a chunk-start
+  // offset (from silentRestartToReaderWithDefinitionAtChunk), open at
+  // that chunk instead of chunk 0. Clamp to the first entry's totalSize
+  // so a bogus offset (word matched a different-length entry after the
+  // restart -- unlikely but not impossible) doesn't push us past EOF.
+  uint32_t initialChunk = 0u;
+  if (pendingDefinitionChunkStart_ != 0u && !defEntryStreams_.empty()) {
+    const uint32_t totalSize = defEntryStreams_[0].totalSize;
+    if (pendingDefinitionChunkStart_ < totalSize) {
+      initialChunk = pendingDefinitionChunkStart_;
+      LOG_INF("DICT", "performDefinitionLookup: opening at chunkStart=%u (from post-restart)",
+              initialChunk);
+    } else {
+      LOG_INF("DICT",
+              "performDefinitionLookup: pendingDefinitionChunkStart_=%u >= totalSize=%u; using 0",
+              pendingDefinitionChunkStart_, totalSize);
+    }
+    pendingDefinitionChunkStart_ = 0u;
+  }
+  loadChunkForCurrentEntry(initialChunk);
+}
+
+bool DictionaryWordSelectActivity::loadChunkForCurrentEntry(uint32_t chunkStart) {
+  if (currentEntryIndex_ < 0 ||
+      currentEntryIndex_ >= static_cast<int>(defEntryStreams_.size())) {
+    return false;
+  }
+  EntryStream& es = defEntryStreams_[currentEntryIndex_];
+  if (chunkStart >= es.totalSize) return false;
+  const uint32_t remaining = es.totalSize - chunkStart;
+  const uint32_t bytesToRead = remaining < DEF_CHUNK_SIZE ? remaining : DEF_CHUNK_SIZE;
+  // v18.9.9.248: chunk-transition guard. This branch fires when Up/Down at
+  // a chunk boundary triggers loading the next/previous chunk. The wrap
+  // formula in wrapDefinition predicts ~10 KB for a 3 KB chunk, but the
+  // v247 field crash on 'lie' at maxAlloc=15860 showed actual wrap+render
+  // peak is closer to ~15 KB on tight heap (wrap itself ~10 KB, then
+  // renderer's per-glyph SD loads and drawText temp buffers push another
+  // ~5 KB). If we let the load through and wrap runs, the current-chunk
+  // defLines_ have already been cleared -- terminate handler then kicks
+  // to Home. Guard here BEFORE clearing so if we refuse, the current
+  // chunk stays visible and the user can Back out cleanly.
+  //
+  // Only fires for chunk navigation (chunkStart > 0 OR loading a chunk
+  // whose start doesn't match what we already have). For the initial
+  // load path (called from performDefinitionLookup / Left+Right entry
+  // cycling), the caller has already cleared defLines_ and the standard
+  // wrapDefinition guard handles refuse + auto-recover.
+  // v18.9.9.250: revert v249's silent-restart-to-chunk. The
+  // silentRestartToReaderWithDefinitionAtChunk path auto-opened the
+  // definition overlay post-boot, and the pre-restart framebuffer
+  // (word-select page + selection cursor + hint text) got carried into
+  // the RTC sleep-frame snapshot -- packbits truncated on write, then
+  // the reader page's first paint post-boot ran the grayscale AA
+  // storeBwBuffer/restoreBwBuffer cycle which decoded past the end of
+  // the truncated backup -> heap poisoning -> panic. This is the same
+  // class of bug that killed the v215 / v228 close-guard restart
+  // machinery; the v246 cursor-word restart survives it only because
+  // post-boot lands in cursor-only mode with no overlay auto-open.
+  //
+  // Behavior for v250: chunk-transition refuse just returns false and
+  // keeps the current chunk visible. User Backs out normally when they
+  // hit the wall. Initial-load refuse falls through to wrapDefinition's
+  // existing wrap-only guard (armed cursor-word restart, same as v247).
+  //
+  // Threshold lowered 18 KB -> 15 KB: post-tap wrapDefinition itself
+  // fragments the heap down to 15-17 KB maxAlloc (observed on tight
+  // post-BT-off heap), and 18 KB refused nearly every chunk transition,
+  // making the reader unusable for long entries. 15 KB catches the
+  // observed crash class (v247 crashed at 15860 during wrap+render of
+  // a 3 KB chunk) with minimal room to spare; on tight sessions the
+  // second chunk is best-effort.
+  if (bytesToRead == DEF_CHUNK_SIZE) {
+    constexpr uint32_t CHUNK_WRAP_PLUS_RENDER_MAX_ALLOC = 15u * 1024u;
+    const bool isTransition = !es.content.empty() && chunkStart != es.bufferRawStart;
+    if (isTransition && ESP.getMaxAllocHeap() < CHUNK_WRAP_PLUS_RENDER_MAX_ALLOC) {
+      LOG_INF("DICT",
+              "loadChunkForCurrentEntry: refusing chunk-transition to %u (maxAlloc=%u < 15 KB); "
+              "staying on current chunk (user Backs out)",
+              chunkStart, ESP.getMaxAllocHeap());
+      return false;
+    }
+  }
+  std::string content = Dictionary::readDefinitionRange(es.offset, es.totalSize, chunkStart, bytesToRead);
+  if (content.empty() && bytesToRead > 0) {
+    // Load failed. If Dictionary marked it as memory-refused, arm the same
+    // auto-recover as v237's readDef-refuse path -- else treat as IO error.
+    if (Dictionary::wasLastRefusedDueToMemory()) {
+      defOverlayLowMemory_ = true;
+      if (!sessionBornFromRestart_) {
+        LOG_ERR("DICT", "loadChunkForCurrentEntry: refused for memory; arming auto-recover on '%s'",
+                defTargetWord_.c_str());
+        pendingLowMemoryAutoRestart_ = true;
+        lowMemoryPopupShownAtMs_ = millis();
+        lowMemoryRestartWord_ = defTargetWord_;
+      }
+    } else {
+      defOverlayNotFound_ = true;
+    }
+    return false;
+  }
+  es.bufferRawStart = chunkStart;
+  es.bufferRawEnd = chunkStart + bytesToRead;  // raw bytes consumed, not post-strip
+  es.content = std::move(content);
+  wrapDefinition(es.content);
+  return true;
 }
 
 void DictionaryWordSelectActivity::wrapDefinition(const std::string& definition) {
-  // CrumBLE 4.4 post-bisect: NO silent-restart from this path. Heap corruption
-  // crashes were repeatedly triggered by the silent-restart-into-LOOKUP-with-
-  // word flow (multi_heap_free assert during post-boot dispatch's LOOKUP
-  // setup). Instead, show the "Low memory" message and let the user back out
-  // through the existing flow: dismiss popup -> back to text-selection ->
-  // back to reader -> re-invoke Lookup. The Lookup entry's pre-flight gate
-  // (already battle-tested) handles the silent-restart, opening text-selection
-  // fresh -- one extra step for the user, but reliably crash-free.
-  if (ESP.getMaxAllocHeap() < 10 * 1024) {
+  // v18.9.9.246: retuned formula from v241/v244's 1.4x + 3K to 1.4x + 6K.
+  // v245 BT-off didn't recover enough heap for large entries; v244's formula
+  // let 'light' (10.7 KB) proceed past the guard at maxAlloc ~20 KB, wrap
+  // allocated ~14 KB, and hit terminate at maxAlloc=4852. Bumping the fixed
+  // overhead from 3 KB to 6 KB raises the 'light' threshold to ~21 KB --
+  // refuses cleanly instead of crashing. Cost: small entries still fine
+  // (10 KB floor unchanged); some medium entries (5-7 KB) refuse where
+  // they would have passed on v244 but succeeded barely (crash risk).
+  const uint32_t defSize = static_cast<uint32_t>(definition.size());
+  const uint32_t wrapNeeded = (defSize * 14u / 10u) + 6u * 1024u;
+  const uint32_t threshold = wrapNeeded > 10u * 1024u ? wrapNeeded : 10u * 1024u;
+  if (ESP.getMaxAllocHeap() < threshold) {
     LOG_ERR("DICT",
-            "wrapDefinition: maxAlloc=%u too low (< 10 KB); showing Low-memory popup "
-            "(user dismisses + re-invokes Lookup to silent-restart cleanly)",
-            ESP.getMaxAllocHeap());
+            "wrapDefinition: maxAlloc=%u too low (< %u for defSize=%u); Low-memory popup",
+            ESP.getMaxAllocHeap(), threshold, defSize);
     defOverlayLowMemory_ = true;
+    // v18.9.9.246: gate auto-recover arming on sessionBornFromRestart_.
+    // If this session was already born from a silent-restart-with-cursor,
+    // 'light' STILL didn't fit -- don't loop, just show popup and let user
+    // Back out to reader. Restored from v242 (was reverted in v244).
+    if (!sessionBornFromRestart_) {
+      pendingLowMemoryAutoRestart_ = true;
+      lowMemoryPopupShownAtMs_ = millis();
+      lowMemoryRestartWord_ = defTargetWord_;
+    } else {
+      LOG_INF("DICT", "wrapDefinition: refused post-restart; NOT re-arming (would loop)");
+    }
     return;
   }
   // CrumBLE 4.4 post-bisect: kindle-style bottom-pinned popup. The popup
@@ -664,16 +1023,58 @@ void DictionaryWordSelectActivity::wrapDefinition(const std::string& definition)
   const int kPopupBottomMargin = 60;  // leave room for button hints below
   const int kPopupPadding = 12;
   const int popupMaxWidth = renderer.getScreenWidth() - (kPopupHorizMargin * 2) - (kPopupPadding * 2);
+  // v18.9.9.236: prewarm SD-font glyphs for every codepoint in the definition
+  // BEFORE measurement + wrap. Ported from CrossPoint's
+  // DictionaryDefinitionActivity::wrapText.
+  //
+  // v18.9.9.238: guard with a heap check. Prewarm loads glyphs in a big
+  // batch (50-200 B per novel codepoint × 60+ codepoints for a
+  // Wiktionary IPA/pronunciation entry = 5-12 KB of new cache slots).
+  // On tight heap that was the crash suspect for "lies-kicks-to-Home"
+  // (v236 field: maxAlloc dropped 15 KB -> 1.4 KB in 776 ms during
+  // lookup). When heap is thin, skip the batch and let wrap fall back
+  // to on-demand per-glyph loads -- same total memory, but paced so
+  // the allocator can coalesce/evict between allocations.
+  if (ESP.getMaxAllocHeap() >= 20 * 1024) {
+    renderer.ensureSdCardFontReady(BITTER_12_FONT_ID, definition.c_str(), 0x01 /* REGULAR */);
+  } else {
+    LOG_INF("DICT", "wrapDefinition: skipping prewarm (maxAlloc=%u < 20 KB); falling back to on-demand glyph loads",
+            ESP.getMaxAllocHeap());
+  }
+  // v18.9.9.248: clear before append. Chunk transitions (Up/Down at
+  // chunk boundary) call wrapDefinition on a new chunk without clearing
+  // defLines_ at the callsite -- v247 accumulated old + new chunk lines
+  // in defLines_, doubling then tripling memory over successive chunk
+  // loads and eventually rendering wrong text (still showing chunk 1's
+  // first page after Down had loaded chunk 2). Clearing here also
+  // shrinks the vector: if the previous chunk had 40 lines and the new
+  // chunk has 20, capacity was 40 -- shrink_to_fit keeps peak proportional
+  // to current chunk, not the largest chunk seen this session.
+  defLines_.clear();
+  defLines_.shrink_to_fit();
   defLines_.reserve(20);
-  std::stringstream ss(definition);
+  // v18.9.9.241: manual paragraph walk instead of std::stringstream +
+  // std::getline. Stringstream's copy-into-internal-buffer approach
+  // doubles the definition's transient heap footprint -- pure waste on
+  // tight heap. Walk the source directly, extract each paragraph into a
+  // single reusable temp string (one alloc, grows in place), feed to
+  // wrappedText. Peak transient during wrap: one paragraph, not the
+  // whole definition.
   std::string paragraph;
-  while (std::getline(ss, paragraph, '\n')) {
-    if (paragraph.empty()) {
-      defLines_.push_back("");
-      continue;
+  paragraph.reserve(128);
+  const size_t n = definition.size();
+  size_t start = 0;
+  for (size_t i = 0; i <= n; ++i) {
+    if (i == n || definition[i] == '\n') {
+      if (i == start) {
+        defLines_.push_back("");
+      } else {
+        paragraph.assign(definition, start, i - start);
+        auto pLines = renderer.wrappedText(BITTER_12_FONT_ID, paragraph.c_str(), popupMaxWidth, 1000);
+        for (auto& line : pLines) defLines_.push_back(std::move(line));
+      }
+      start = i + 1;
     }
-    auto pLines = renderer.wrappedText(BITTER_12_FONT_ID, paragraph.c_str(), popupMaxWidth, 1000);
-    for (auto& line : pLines) defLines_.push_back(std::move(line));
   }
   const int lineHeight = renderer.getLineHeight(BITTER_12_FONT_ID);
   const int titleH = renderer.getLineHeight(BITTER_12_FONT_ID);
@@ -732,13 +1133,26 @@ void DictionaryWordSelectActivity::renderDefinitionOverlay() {
   } else if (defOverlayNotFound_) {
     renderer.drawText(BITTER_12_FONT_ID, textX, currentY, defTargetWord_.c_str(), EpdFontFamily::BOLD);
     currentY += renderer.getLineHeight(BITTER_12_FONT_ID) * 2;
-    std::string msg = std::string(tr(STR_WORD_NOT_FOUND)) + defTargetWord_;
-    renderer.drawText(BITTER_12_FONT_ID, textX, currentY, msg.c_str());
+    // v18.9.9.233: the word is already drawn bold above, so we don't need
+    // to concatenate it after "Word not found" -- pre-v233 that produced
+    // no-space runs like "Word not foundlight".
+    renderer.drawText(BITTER_12_FONT_ID, textX, currentY, tr(STR_WORD_NOT_FOUND));
   } else {
     renderer.drawText(BITTER_12_FONT_ID, textX, currentY, defTargetWord_.c_str(), EpdFontFamily::BOLD);
     const int titleH = renderer.getLineHeight(BITTER_12_FONT_ID);
     const int titleWidth = renderer.getTextWidth(BITTER_12_FONT_ID, defTargetWord_.c_str(), EpdFontFamily::BOLD);
     renderer.fillRect(textX, currentY + titleH + 4, titleWidth, 2, true);
+    // v18.9.9.198: multi-entry badge "2/3" right-aligned on the title row when
+    // the word has >1 entry. Silent on single-entry lookups so the common case
+    // stays uncluttered.
+    if (defEntryStreams_.size() > 1) {
+      char badge[16];
+      snprintf(badge, sizeof(badge), "%d/%d", currentEntryIndex_ + 1,
+               static_cast<int>(defEntryStreams_.size()));
+      const int badgeW = renderer.getTextWidth(BITTER_12_FONT_ID, badge);
+      const int overlayRight = popupX + popupW - kPopupPadding;
+      renderer.drawText(BITTER_12_FONT_ID, overlayRight - badgeW, currentY, badge);
+    }
     currentY += titleH + (kPopupPadding);
     const int lineHeight = renderer.getLineHeight(BITTER_12_FONT_ID);
     const int linesToDraw = std::min(defLinesPerPage_, static_cast<int>(defLines_.size()) - defScrollOffset_);
@@ -771,7 +1185,16 @@ void DictionaryWordSelectActivity::renderDefinitionOverlay() {
   // the darkMode arg passed to drawButtonHints below.
   const bool darkMode = ReaderUtils::readerDarkModeEnabled();
   renderer.fillRect(0, hintsStripY, renderer.getScreenWidth(), hintsStripH, darkMode);
-  const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", "", "");
+  // v18.9.9.296: when the word has multiple StarDict entries (the top-right
+  // "1/2" indicator is visible), also show Prev/Next hints on the physical
+  // rocker slots. Users otherwise didn't know they could cycle. Hints only
+  // appear when there's actually somewhere to move -- Prev grays out at
+  // entry 0, Next at the last entry.
+  const bool multiEntry = defEntryStreams_.size() > 1;
+  const char* prevLabel = (multiEntry && currentEntryIndex_ > 0) ? tr(STR_PREV) : "";
+  const char* nextLabel =
+      (multiEntry && currentEntryIndex_ + 1 < static_cast<int>(defEntryStreams_.size())) ? tr(STR_NEXT) : "";
+  const auto labels = mappedInput.mapLabels(tr(STR_BACK), "", prevLabel, nextLabel);
   GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4,
                        /*allowInvertedText=*/false, darkMode);
   renderer.displayBuffer(HalDisplay::FAST_REFRESH);
@@ -784,6 +1207,12 @@ void DictionaryWordSelectActivity::closeDefinitionOverlay() {
   defOverlayLowMemory_ = false;
   defLines_.clear();
   defLines_.shrink_to_fit();
+  // v18.9.9.198: release all entries -- they were only kept alive so the user
+  // could Left/Right-cycle within this overlay session. Freeing them on close
+  // recovers up to ~6× the single-entry byte cost as heap for the next lookup.
+  defEntryStreams_.clear();
+  defEntryStreams_.shrink_to_fit();
+  currentEntryIndex_ = 0;
   defScrollOffset_ = 0;
   // CrumBLE 4.4 post-bisect: aggressive cleanup to keep heap fragmentation
   // from accumulating across consecutive lookups. wrappedText leaves a
@@ -794,9 +1223,28 @@ void DictionaryWordSelectActivity::closeDefinitionOverlay() {
     fcm->clearCache();
   }
   Dictionary::freeMemory();
-  // Restore the captured selection screen and FAST-refresh -- the user sees
-  // their cursor exactly where it was. If capture was invalid, requestUpdate
-  // falls back to the full word-select render.
+  // v18.9.9.225: RESTORE ALWAYS. v215's wholesale skip-visual-dismiss
+  // path caused heap corruption on X3: pre-restart framebuffer with the
+  // def box was carried through reboot by the sleep-frame snapshot
+  // pipeline (which also re-seeds the RAM framebuffer post-boot), so
+  // post-boot openDefinitionOverlay's storeBwBuffer captured that
+  // composite (>32 KB packbits budget -> silent truncation), and the
+  // next closeDefinitionOverlay's restoreBwBuffer decoded past the end
+  // -> heap poisoning -> panic.
+  //
+  // v18.9.9.228 tried to split by capture-validity to reintroduce the
+  // "hidden restart" only when storeBwBuffer had FAILED at open (thinking
+  // no packbits backup could get truncated). v229 crash confirmed that
+  // reasoning wrong: the RAM framebuffer state (def box + word-select)
+  // still survives reboot regardless of whether WE captured a backup,
+  // so post-boot's OWN storeBwBuffer still traps into the >32 KB packbits
+  // path and truncates. Reverted here as of v231. The correct fix for
+  // the "no longer very hidden" symptom is downstream (see the deferred
+  // delay extension below).
+  // v18.9.9.232: dismiss is one path now -- restore the packbits capture if
+  // we have one, else re-render word-select. No deferred-restart arming.
+  // See loop()'s header comment for the crash history that motivated the
+  // revert.
   if (defOverlayCaptureValid_) {
     renderer.restoreBwBuffer();
     renderer.displayBuffer(HalDisplay::FAST_REFRESH);
@@ -804,26 +1252,9 @@ void DictionaryWordSelectActivity::closeDefinitionOverlay() {
   } else {
     requestUpdate();
   }
-  // CrumBLE 4.4 post-bisect: post-dismiss silent-restart at a clean
-  // checkpoint. closeDefinitionOverlay just finished aggressive cleanup
-  // (font cache + dictionary memory freed, overlay state cleared) so heap
-  // is in the safest state we can reach without an actual restart. If
-  // MaxAlloc is still below a healthy floor, silent-restart with OpenLookup
-  // now -- before the user can fire another lookup that would either fail
-  // mid-flow (the buggy path) or show "Low memory". Post-boot opens
-  // text-selection on a fresh ~115 KB heap; cursor is reset to default
-  // (a known trade-off, but predictable and crash-free).
-  // CrumBLE 4.4 post-bisect: 13 KB threshold (just above the 10 KB wrap floor
-  // with ~3 KB margin). Lower than the original 22 KB to let users get 2-3
-  // lookups between restarts instead of one. Trade-off: tighter per-lookup
-  // heap, so closer to wrap-fail risk -- if wrap-fail rate climbs, revert
-  // to 22 KB or land somewhere between (e.g. 16 KB).
-  constexpr uint32_t LOOKUP_POST_DISMISS_MIN_MAX_ALLOC = 13000;
-  if (ESP.getMaxAllocHeap() < LOOKUP_POST_DISMISS_MIN_MAX_ALLOC && !isContinuingFromSilentReboot()) {
-    LOG_INF("DICT",
-            "closeDefinitionOverlay: maxAlloc=%u below %u; silent-restart with OpenLookupAtWord('%s') "
-            "to give next lookup a fresh heap AND preserve cursor on this word",
-            ESP.getMaxAllocHeap(), LOOKUP_POST_DISMISS_MIN_MAX_ALLOC, defTargetWord_.c_str());
-    silentRestartToReaderWithCursorWord(defTargetWord_.c_str());
-  }
+  // v18.9.9.242: DO NOT reset sessionBornFromRestart_ here. It persists
+  // through this session's overlay open/close cycles so subsequent lookups
+  // that also refuse won't infinite-loop the auto-recover. Reset happens
+  // only after a SUCCESSFUL lookup (in performDefinitionLookup) or when the
+  // activity is destructed and a fresh word-select session starts.
 }

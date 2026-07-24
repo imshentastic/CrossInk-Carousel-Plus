@@ -148,6 +148,32 @@ std::string deobfuscateFromBase64(const char* encoded, DecodeStatus* status) {
     return plaintext;
   }
 
+  // v18.9.9.347: sanity-check LEGACY output. hasValidatedPrefix failed,
+  // so we're falling back to the unchecksummed pre-CPV1 format. If the
+  // HW-key changed between when the credential was written and now
+  // (partition move, eFuse-not-ready-at-init edge, etc.), XOR-with-key
+  // returns garbage bytes that pass isEmpty() but aren't a valid WPA2
+  // password. Returning that garbage upstream lets the caller either
+  // fail to connect OR (worse pre-v347) resave the garbage as a
+  // valid CPV1 record. WPA2-PSK requires 8..63 printable ASCII chars;
+  // if the LEGACY plaintext falls outside that window, treat it as
+  // invalid instead of legacy.
+  bool looksPlausible = result.size() >= 8U && result.size() <= 63U;
+  if (looksPlausible) {
+    for (unsigned char c : result) {
+      if (c < 0x20 || c > 0x7E) {
+        looksPlausible = false;
+        break;
+      }
+    }
+  }
+  if (!looksPlausible) {
+    LOG_ERR("OBF",
+            "LEGACY decode produced implausible output (len=%zu); marking INVALID so caller doesn't resave garbage",
+            result.size());
+    if (status) *status = DecodeStatus::INVALID;
+    return "";
+  }
   if (status) *status = DecodeStatus::LEGACY;
   return result;
 }

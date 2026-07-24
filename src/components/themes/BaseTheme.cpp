@@ -374,9 +374,11 @@ void BaseTheme::drawList(const GfxRenderer& renderer, Rect rect, int itemCount, 
 }
 
 void BaseTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* title, const char* subtitle) const {
-  // Hide last battery draw
-  constexpr int maxBatteryWidth = 80;
-  renderer.fillRect(rect.x + rect.width - maxBatteryWidth, rect.y + 5, maxBatteryWidth,
+  // v18.9.9.341: bumped clear width from 80 -> 140 so the clock text
+  // added below (~40 px + gap + battery cluster) is fully cleared on
+  // repaint. Prevents stale "HH:MM" digits ghosting across nav.
+  constexpr int maxHeaderRightClusterWidth = 140;
+  renderer.fillRect(rect.x + rect.width - maxHeaderRightClusterWidth, rect.y + 5, maxHeaderRightClusterWidth,
                     BaseMetrics::values.batteryHeight + 10, false);
 
   const bool showBatteryPercentage =
@@ -387,8 +389,37 @@ void BaseTheme::drawHeader(const GfxRenderer& renderer, Rect rect, const char* t
                    Rect{batteryX, rect.y + 5, BaseMetrics::values.batteryWidth, BaseMetrics::values.batteryHeight},
                    showBatteryPercentage);
 
+  // v18.9.9.343: Home/global-header clock uses its own SETTINGS.homeClockShow
+  // toggle (Display > Theme & Layout > Show clock on Home). Separated from
+  // statusBarClock (in-book status bar) so users can enable one without
+  // the other. Only draws when time is valid -- X3's DS3231 always has
+  // time; on X4 it appears after the first NTP sync (Sync Time from
+  // Settings > Sync & Network, or the boot-time silent sync if enabled).
+  int clockTextWidth = 0;
+  if (SETTINGS.homeClockShow && halClock.hasValidTime()) {
+    char timeBuf[9];
+    if (halClock.formatTime(timeBuf, sizeof(timeBuf), SETTINGS.clockUtcOffsetQ, SETTINGS.clockFormat == 1)) {
+      clockTextWidth = renderer.getTextWidth(SMALL_FONT_ID, timeBuf);
+      // Left edge of the battery cluster: percentage text + spacing if
+      // percentage is shown, else the icon's left edge.
+      int batteryClusterLeft = batteryX;
+      if (showBatteryPercentage) {
+        const std::string pct = std::to_string(powerManager.getBatteryPercentage()) + "%";
+        batteryClusterLeft -= renderer.getTextWidth(SMALL_FONT_ID, pct.c_str()) + batteryPercentSpacing;
+      }
+      constexpr int kClockToBatteryGap = 10;
+      const int clockX = batteryClusterLeft - kClockToBatteryGap - clockTextWidth;
+      renderer.drawText(SMALL_FONT_ID, clockX, rect.y + 5, timeBuf);
+    }
+  }
+
   if (title) {
+    // v18.9.9.341: extend the right-padding by the clock width (0 when
+    // clock isn't shown) so a long title truncates before overrunning
+    // the clock text. Keeps title still visually centered because we
+    // mirror the extra padding on the left side too via the *2.
     int padding = rect.width - batteryX + BaseMetrics::values.batteryWidth;
+    if (clockTextWidth > 0) padding += clockTextWidth + 10;
     auto truncatedTitle = renderer.truncatedText(UI_12_FONT_ID, title,
                                                  rect.width - padding * 2 - BaseMetrics::values.contentSidePadding * 2,
                                                  EpdFontFamily::BOLD);
@@ -715,7 +746,12 @@ Rect BaseTheme::drawPopup(const GfxRenderer& renderer, const char* message, int 
   const int textX = leftAlignText ? (x + marginX) : (x + (w - actualTextWidth) / 2);
   const int textY = y + marginY + metrics.popupTextBaselineOffsetY;
   renderer.drawText(UI_12_FONT_ID, textX, textY, message, metrics.popupTextInverted, popupFontFamily);
-  renderer.displayBuffer(refreshMode);
+  // CrumBLE 4.5.6: NO_REFRESH sentinel is used by silent-restart paths that
+  // want the popup drawn into the framebuffer but NOT refreshed on the panel
+  // (the boot HALF refresh restores the snapshot in one flash instead of two).
+  if (refreshMode != HalDisplay::NO_REFRESH) {
+    renderer.displayBuffer(refreshMode);
+  }
   return Rect{x, y, w, h};
 }
 
@@ -746,7 +782,8 @@ void BaseTheme::fillPopupProgress(const GfxRenderer& renderer, const Rect& layou
 
 void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, const int currentPage,
                               const int pageCount, std::string title, const int paddingBottom, const int textYOffset,
-                              const bool isPageBookmarked, const bool darkMode) const {
+                              const bool isPageBookmarked, const bool darkMode,
+                              ReaderStatusIcon readerIcon, uint32_t timeLeftSeconds) const {
   // CrumBLE 4.4: ported per-element flip pattern from upstream CrossInk
   // v1.3.2. foregroundBlack flips every draw colour; the bookmark notch is
   // the lone exception -- it's a cutout into the bookmark body and must paint
@@ -766,12 +803,44 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
     // Right aligned text for progress counter
     char progressStr[32];
 
+    // v18.9.9.43 (task #28): pageCount < 0 is the "build still in progress"
+    // sentinel from renderStatusBar. The partial pageCount would grow
+    // misleadingly as pages land ("5/8" then "5/47"), so we show an
+    // ellipsis for the total until finalize commits the real count.
+    const bool buildInProgress = pageCount < 0;
     if (SETTINGS.statusBarBookProgressPercentage && SETTINGS.statusBarChapterPageCount) {
-      snprintf(progressStr, sizeof(progressStr), "%d/%d  %.0f%%", currentPage, pageCount, bookProgress);
+      if (buildInProgress) {
+        snprintf(progressStr, sizeof(progressStr), "%d/...  %.0f%%", currentPage, bookProgress);
+      } else {
+        snprintf(progressStr, sizeof(progressStr), "%d/%d  %.0f%%", currentPage, pageCount, bookProgress);
+      }
     } else if (SETTINGS.statusBarBookProgressPercentage) {
       snprintf(progressStr, sizeof(progressStr), "%.0f%%", bookProgress);
     } else {
-      snprintf(progressStr, sizeof(progressStr), "%d/%d", currentPage, pageCount);
+      if (buildInProgress) {
+        snprintf(progressStr, sizeof(progressStr), "%d/...", currentPage);
+      } else {
+        snprintf(progressStr, sizeof(progressStr), "%d/%d", currentPage, pageCount);
+      }
+    }
+
+    // v18.9.9.463: append time-left when enabled AND we have pace data.
+    // Format matches BookReadingStats::formatDuration ("45 min" / "2h 30 min").
+    // Guard on !buildInProgress — time-left during indexing would be
+    // misleading since pageCount is still growing.
+    if (SETTINGS.statusBarTimeLeft && timeLeftSeconds > 0 && !buildInProgress) {
+      char timeBuf[24];
+      const uint32_t hours = timeLeftSeconds / 3600u;
+      const uint32_t minutes = (timeLeftSeconds % 3600u) / 60u;
+      if (hours > 0) {
+        snprintf(timeBuf, sizeof(timeBuf), "  %luh %lum", static_cast<unsigned long>(hours),
+                 static_cast<unsigned long>(minutes));
+      } else if (minutes > 0) {
+        snprintf(timeBuf, sizeof(timeBuf), "  %lum", static_cast<unsigned long>(minutes));
+      } else {
+        snprintf(timeBuf, sizeof(timeBuf), "  <1m");
+      }
+      strncat(progressStr, timeBuf, sizeof(progressStr) - strlen(progressStr) - 1);
     }
 
     progressTextWidth = renderer.getTextWidth(SMALL_FONT_ID, progressStr);
@@ -786,8 +855,12 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
     // ("9999/9999  100%") so the previous text is always covered before
     // the new text draws. The clear is right-anchored to the same
     // position the text uses, so it stays out of the title's column.
-    const int maxProgressTextWidth =
-        renderer.getTextWidth(SMALL_FONT_ID, "9999/9999  100%");
+    // v18.9.9.463: widened pre-clear to include the maximum time-left tail
+    // ("  99h 59m") when statusBarTimeLeft is on, so the digit-count
+    // transitions still get a clean band.
+    const char* preclearRef =
+        SETTINGS.statusBarTimeLeft ? "9999/9999  100%  99h 59m" : "9999/9999  100%";
+    const int maxProgressTextWidth = renderer.getTextWidth(SMALL_FONT_ID, preclearRef);
     const int textHeight = renderer.getTextHeight(SMALL_FONT_ID);
     const int clearX = renderer.getScreenWidth() - metrics.statusBarHorizontalMargin -
                        orientedMarginRight - maxProgressTextWidth;
@@ -800,16 +873,26 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
     const int progressBarMaxWidth = renderer.getScreenWidth() - orientedMarginLeft - orientedMarginRight;
     const int progressBarY = renderer.getScreenHeight() - orientedMarginBottom -
                              ((SETTINGS.statusBarProgressBarThickness + 1) * 2) - paddingBottom;
-    size_t progress;
+    size_t progress = 0;
+    bool drawBar = true;
     if (SETTINGS.statusBarProgressBar == CrossPointSettings::STATUS_BAR_PROGRESS_BAR::BOOK_PROGRESS) {
       progress = static_cast<size_t>(bookProgress);
     } else {
-      // Chapter progress
-      progress = (pageCount > 0) ? (static_cast<float>(currentPage) / pageCount) * 100 : 0;
+      // Chapter progress. v18.9.9.43: hide the bar during in-progress
+      // builds (pageCount == -1 sentinel) since we don't know the real
+      // total yet -- rendering it against the partial pageCount would
+      // shrink visibly as more pages land.
+      if (pageCount < 0) {
+        drawBar = false;
+      } else {
+        progress = (pageCount > 0) ? (static_cast<float>(currentPage) / pageCount) * 100 : 0;
+      }
     }
-    const int barWidth = progressBarMaxWidth * progress / 100;
-    renderer.fillRect(orientedMarginLeft, progressBarY, barWidth, ((SETTINGS.statusBarProgressBarThickness + 1) * 2),
-                      foregroundBlack);
+    if (drawBar) {
+      const int barWidth = progressBarMaxWidth * progress / 100;
+      renderer.fillRect(orientedMarginLeft, progressBarY, barWidth, ((SETTINGS.statusBarProgressBarThickness + 1) * 2),
+                        foregroundBlack);
+    }
   }
 
   // Bookmark icon: drawn at the far left of the status bar when the current page is bookmarked.
@@ -846,9 +929,109 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
   // Bluetooth state remains visible through the "Connecting Bluetooth..."
   // popup during connect attempts and through the in-reader QC affordances.
 
-  // Draw Clock (X3 only — DS3231 RTC)
+  // v18.9.9.15: reader-mode indicator slot right after the battery.
+  //   Reduced (flipped gauge, needle to upper-LEFT): Simple Rendering /
+  //     compat mode is active for this session -- images off, tables as
+  //     paragraphs, embedded style off. Signals reduced fidelity.
+  //   Prebake (lightning bolt): the book has a prebake cache manifest and
+  //     it's serving as the reader's fast path. Signals accelerated load.
+  //   None: normal reading, no icon (baseline).
+  if (readerIcon != ReaderStatusIcon::None) {
+    static constexpr int iconGapFromBattery = 6;
+    static constexpr int iconWidth = 12;
+    static constexpr int iconHeight = 12;
+
+    int iconSlotX = batteryX;
+    if (SETTINGS.statusBarBattery) {
+      iconSlotX += metrics.batteryWidth;
+      if (showBatteryPercentage) {
+        // Reserve the widest possible percentage-text width so the icon
+        // doesn't jitter horizontally across battery-percentage transitions
+        // (e.g. 100 -> 99 -> 100).
+        iconSlotX += batteryPercentSpacing + renderer.getTextWidth(SMALL_FONT_ID, "100");
+      }
+    }
+    iconSlotX += iconGapFromBattery;
+
+    // Vertical alignment: match the bookmark icon's +5 nub-compensation trick
+    // so the icon visually centres alongside the battery body.
+    const int iconY = textY + (metrics.batteryHeight - iconHeight) / 2 + 5;
+
+    if (readerIcon == ReaderStatusIcon::Reduced) {
+      // Top-half circle outline (drawn as two quadrant arcs) + a needle
+      // rising from the bottom-centre pivot toward the upper-LEFT (the
+      // "slow" end of the gauge; a normal speedometer's fast needle
+      // points upper-right).
+      const int cx = iconSlotX + iconWidth / 2;
+      const int cy = iconY + iconHeight - 2;
+      const int r = iconWidth / 2;
+      renderer.drawArc(r, cx, cy, -1, -1, 2, foregroundBlack);
+      renderer.drawArc(r, cx, cy, +1, -1, 2, foregroundBlack);
+      // Needle: from pivot up to a point on the upper-left arc.
+      const int needleTipX = cx - (r * 7) / 10;
+      const int needleTipY = cy - (r * 7) / 10;
+      renderer.drawLine(cx, cy, needleTipX, needleTipY, 2, foregroundBlack);
+      // Pivot dot.
+      renderer.fillRect(cx - 1, cy - 1, 3, 3, foregroundBlack);
+    } else if (readerIcon == ReaderStatusIcon::Prebake ||
+               readerIcon == ReaderStatusIcon::PrebakeDeclined) {
+      // v18.9.9.54 (task #39) / v18.9.9.55 (task #40 -- follow-up): the
+      // bolt renders at full icon size for the plain Prebake case, but
+      // shrinks inside the ⊘ circle for the PrebakeDeclined case so
+      // it's visibly contained by the badge (user feedback: the v54
+      // slash paralleled the bolt's diagonal strokes and merged into
+      // them; also the bolt overlapping the ring made the badge look
+      // busy). Shape is unchanged: tighter zigzag mid-right top ->
+      // mid-left center -> mid-right center -> mid-left bottom, sitting
+      // upright rather than the pre-v54 diagonal-noodle.
+      const int x0 = iconSlotX;
+      const int y0 = iconY;
+      const int w = iconWidth;
+      const int h = iconHeight;
+      const bool declined = readerIcon == ReaderStatusIcon::PrebakeDeclined;
+      // Bolt bounding box. When declined, shrink to ~60% width /
+      // 70% height and re-centre inside the icon slot so it clears
+      // the circle rim on all sides.
+      const int bw = declined ? (w * 6) / 10 : w;
+      const int bh = declined ? (h * 7) / 10 : h;
+      const int bx = x0 + (w - bw) / 2;
+      const int by = y0 + (h - bh) / 2;
+      const int topRightX = bx + (bw * 65) / 100;
+      const int midY = by + bh / 2;
+      const int midLeftX = bx + (bw * 30) / 100;
+      const int midRightX = bx + (bw * 60) / 100;
+      const int botLeftX = bx + (bw * 25) / 100;
+      renderer.drawLine(topRightX, by, midLeftX, midY, 2, foregroundBlack);
+      renderer.drawLine(midLeftX, midY, midRightX, midY, 2, foregroundBlack);
+      renderer.drawLine(midRightX, midY, botLeftX, by + bh, 2, foregroundBlack);
+      if (declined) {
+        // Circle + slash for the "prohibited" badge. Circle expands
+        // slightly past the nominal icon box (r = w/2 + 1) so the ⊘
+        // reads at a glance; the bolt inside stays clear of the rim.
+        // The slash runs UPPER-LEFT to LOWER-RIGHT so it crosses the
+        // bolt's own diagonals PERPENDICULARLY instead of paralleling
+        // them (v54 field feedback: the v54 lower-left/upper-right
+        // slash aligned with the bolt's strokes and was hard to see).
+        const int cx = x0 + w / 2;
+        const int cy = y0 + h / 2;
+        const int r = w / 2 + 1;
+        renderer.drawArc(r, cx, cy, +1, +1, 1, foregroundBlack);
+        renderer.drawArc(r, cx, cy, +1, -1, 1, foregroundBlack);
+        renderer.drawArc(r, cx, cy, -1, +1, 1, foregroundBlack);
+        renderer.drawArc(r, cx, cy, -1, -1, 1, foregroundBlack);
+        const int slashInset = r / 4;
+        renderer.drawLine(cx - r + slashInset, cy - r + slashInset, cx + r - slashInset, cy + r - slashInset, 2,
+                          foregroundBlack);
+      }
+    }
+  }
+
+  // Draw Clock. v18.9.9.304: hasValidTime() -- was isAvailable(), which
+  // only knew about the DS3231 (X3 only). Both devices' ESP32-C3 has an
+  // internal RTC counter; once SNTP sets the system clock, X4 renders
+  // the clock too.
   int clockTextWidth = 0;
-  if (SETTINGS.statusBarClock && halClock.isAvailable()) {
+  if (SETTINGS.statusBarClock && halClock.hasValidTime()) {
     char timeBuf[9];
     if (halClock.formatTime(timeBuf, sizeof(timeBuf), SETTINGS.clockUtcOffsetQ, SETTINGS.clockFormat == 1)) {
       clockTextWidth = renderer.getTextWidth(SMALL_FONT_ID, timeBuf);
@@ -891,10 +1074,21 @@ void BaseTheme::drawStatusBar(GfxRenderer& renderer, const float bookProgress, c
       titleWidth = renderer.getTextWidth(SMALL_FONT_ID, title.c_str());
     }
 
-    renderer.drawText(SMALL_FONT_ID,
-                      titleMarginLeftAdjusted + metrics.statusBarHorizontalMargin + orientedMarginLeft +
-                          (availableTitleSpace - titleWidth) / 2,
-                      textY, title.c_str(), foregroundBlack);
+    // v18.9.9.442: pre-clear the title band so a shorter title on the next
+    // page doesn't leave tails from the previous page's longer title. Field
+    // bug: FAST_REFRESH doesn't clean the title row, and the title is
+    // horizontally centred within its available band, so a chapter title
+    // that changes width between pages produces a "shifting/ghosting"
+    // effect. Mirrors the pre-clear already in place for the page-number
+    // row above. Clears the FULL available title band (worst-case widest)
+    // then draws the new (potentially shorter, potentially recentred)
+    // title on top.
+    const int titleBandX = titleMarginLeftAdjusted + metrics.statusBarHorizontalMargin + orientedMarginLeft;
+    const int titleTextHeight = renderer.getTextHeight(SMALL_FONT_ID);
+    renderer.fillRect(titleBandX, textY, availableTitleSpace, titleTextHeight, darkMode);
+
+    renderer.drawText(SMALL_FONT_ID, titleBandX + (availableTitleSpace - titleWidth) / 2, textY, title.c_str(),
+                      foregroundBlack);
   }
 }
 

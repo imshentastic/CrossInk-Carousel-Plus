@@ -1,0 +1,10 @@
+{
+  "name": "FrontlightManager",
+  "version": "1.0.0",
+  "description": "FreeInk PWM frontlight manager driven by BoardConfig::ACTIVE.frontlight. Inert on boards without a frontlight; brightness PWM functional now, warm/cool color mixing scaffolded.",
+  "keywords": "frontlight, backlight, pwm, ledc",
+  "authors": [{"name": "FreeInk SDK Contributors"}],
+  "dependencies": {},
+  "platforms": "espressif32",
+  "frameworks": ["arduino"]
+}

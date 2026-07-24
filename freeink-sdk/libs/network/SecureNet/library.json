@@ -1,0 +1,11 @@
+{
+  "name": "SecureNet",
+  "version": "1.0.0",
+  "description": "FreeInk TLS 1.3 networking: a wolfSSL-backed SecureClient and an HTTPClient-compatible SecureHttpClient shim that bypass the precompiled system mbedTLS (which ships TLS 1.3 as empty stubs). Opt-in via -DFREEINK_NET_WOLFSSL=1 plus a wolfSSL lib_dep.",
+  "keywords": "tls, tls13, wolfssl, https, network",
+  "authors": [{"name": "FreeInk SDK Contributors"}],
+  "dependencies": {},
+  "platforms": "espressif32",
+  "frameworks": ["arduino"],
+  "notes": "When FREEINK_NET_WOLFSSL is defined, add a wolfSSL source library to the consuming project's lib_deps (e.g. wolfssl/wolfssl) and provide a wolfSSL user_settings.h enabling TLS 1.3 + PSA."
+}

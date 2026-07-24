@@ -6,6 +6,7 @@
 #include <Logging.h>
 
 #include "../../SilentRestart.h"  // CrumBLE 4.4: skip HALF refresh on first paint post-silent-reboot
+#include "../../components/UITheme.h"
 #include "MappedInputManager.h"
 
 namespace ReaderUtils {
@@ -76,6 +77,48 @@ inline PageTurnResult detectPageTurn(const MappedInputManager& input) {
   // fromSideBtn is true when only side buttons contributed to this page turn.
   const bool fromSide = (sidePrev || sideNext) && !(frontPrev || frontNext);
   return {tiltPrev || sidePrev || frontPrev, tiltNext || sideNext || frontNext, fromSide, tiltPrev || tiltNext};
+}
+
+// v18.9.9.167: status-bar ghost mitigation (ported from crosspoint 204d7d5).
+// When the status bar carries dynamic content (page counter, progress %, bar),
+// a plain FAST_REFRESH cycle leaves visible ghosting of the previous values.
+// These helpers let renderContents actively drive the status-bar band white
+// before the fast refresh, then repaint it fresh.
+inline bool hasDynamicStatusBarContent() {
+  // v18.9.9.205: clock + time-left added — both change across page turns
+  // and ghost under FAST refresh exactly like the page counter.
+  return SETTINGS.statusBarChapterPageCount || SETTINGS.statusBarBookProgressPercentage ||
+         SETTINGS.statusBarProgressBar != CrossPointSettings::STATUS_BAR_PROGRESS_BAR::HIDE_PROGRESS ||
+         SETTINGS.statusBarClock || SETTINGS.statusBarTimeLeft;
+}
+
+inline bool shouldPreclearStatusBarBeforeFastRefresh(int pagesUntilFullRefresh) {
+  return hasDynamicStatusBarContent() && pagesUntilFullRefresh > 1;
+}
+
+inline void clearStatusBarBand(const GfxRenderer& renderer, int orientedMarginBottom, int paddingBottom = 0) {
+  (void)orientedMarginBottom;
+  const int statusBarHeight = UITheme::getInstance().getStatusBarHeight();
+  if (statusBarHeight <= 0) {
+    return;
+  }
+  // v18.9.9.207: compute the band top from the same BASE margins that
+  // BaseTheme::drawStatusBar positions with (getOrientedViewableTRBL).
+  // Callers used to pass the reader's INFLATED orientedMarginBottom —
+  // which already includes the max(screenMargin, statusBar+3) text
+  // reserve — so the clear started a full reserve ABOVE the actual
+  // status row and white-flashed the last line of body text on every
+  // preclear. drawStatusBar draws its text at
+  //   screenH - statusBarHeight - baseMarginBottom - padding - 4
+  // so that exact y is the band's top edge; everything the status bar
+  // paints sits at or below it.
+  int baseTop, baseRight, baseBottom, baseLeft;
+  renderer.getOrientedViewableTRBL(&baseTop, &baseRight, &baseBottom, &baseLeft);
+  int clearY = renderer.getScreenHeight() - baseBottom - paddingBottom - statusBarHeight - 4;
+  if (clearY < 0) {
+    clearY = 0;
+  }
+  renderer.fillRect(0, clearY, renderer.getScreenWidth(), renderer.getScreenHeight() - clearY, false);
 }
 
 inline void displayWithRefreshCycle(const GfxRenderer& renderer, int& pagesUntilFullRefresh) {

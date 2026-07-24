@@ -6,6 +6,7 @@
 #include "MappedInputManager.h"
 #include "OpdsServerStore.h"
 #include "OpdsSettingsActivity.h"
+#include "SilentRestart.h"
 #include "activities/ActivityManager.h"
 #include "activities/browser/OpdsBookBrowserActivity.h"
 #include "components/UITheme.h"
@@ -23,13 +24,23 @@ int OpdsServerListActivity::getItemCount() const {
 void OpdsServerListActivity::onEnter() {
   Activity::onEnter();
 
+  // v18.9.9.474: arm terminate-recovery to OPDS Browser so a mid-load OOM
+  // (server-list scan against many entries, network preflight) lands back
+  // in OPDS on the fresh boot heap instead of Home carousel. The dispatcher
+  // for target=7 already exists (main.cpp:3448 → goToBrowser).
+  armSilentRestartTarget(/*SILENT_REBOOT_TARGET_OPDS_BROWSER=*/7);
+
   // Reload from disk in case servers were added/removed by a subactivity or the web UI
   OPDS_STORE.loadFromFile();
   selectedIndex = 0;
   requestUpdate();
 }
 
-void OpdsServerListActivity::onExit() { Activity::onExit(); }
+void OpdsServerListActivity::onExit() {
+  Activity::onExit();
+  // v18.9.9.474: clear our terminate-recovery arming.
+  clearArmedSilentRestartTarget();
+}
 
 void OpdsServerListActivity::loop() {
   if (mappedInput.wasPressed(MappedInputManager::Button::Back)) {

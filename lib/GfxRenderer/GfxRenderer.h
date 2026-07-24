@@ -62,6 +62,11 @@ class GfxRenderer {
     int height = 0;
     bool topDown = false;
     uint32_t lastUsedTick = 0;
+    // v18.9.9.192: caller-requested "please survive eviction" flag. Used by
+    // shelf covers on the Home screen so they don't get flushed when NimBLE
+    // starves imageCacheBudget_ to 0. Total pinned bytes are capped
+    // (kPinnedBytesCap_ in the .cpp) so pinning can't blow up NimBLE headroom.
+    bool pinned = false;
 
     std::unique_ptr<uint8_t[]> scaledPixels;
     size_t scaledPixelsBytes = 0;
@@ -186,6 +191,14 @@ class GfxRenderer {
   // evicts to 0 below the floor.
   mutable size_t imageCacheBudget_ = 64u * 1024u;
   mutable uint32_t imageCacheTick_ = 0;
+  // v18.9.9.192: total bytes held by CachedBitmap entries with pinned=true.
+  // Kept separate from imageCacheBytes_ so we can cap pinned growth
+  // independent of the free-heap-driven budget policy.
+  mutable size_t imageCachePinnedBytes_ = 0;
+  // Reentrancy flag: when nonzero, lookupCachedBitmap treats the entry as
+  // pinned-request-in-progress (skips budget==0 short-circuit, keeps the
+  // returned entry safe from immediate eviction). Set by lookupCachedBitmapPinned.
+  mutable uint32_t pinnedRequestDepth_ = 0;
   // Builds (or rebuilds) `entry->scaledPixels` at (targetW, targetH) from
   // the 2bpp source. Bytes accounted against imageCacheBytes_.
   void buildScaledBitmap(CachedBitmap* entry, int targetW, int targetH, float cropX = 0.0f,
@@ -332,8 +345,13 @@ class GfxRenderer {
   int getScreenWidth() const;
   int getScreenHeight() const;
   void displayBuffer(HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH, bool turnOffScreen = false) const;
-  // EXPERIMENTAL: Windowed update - display only a rectangular region
-  // void displayWindow(int x, int y, int width, int height) const;
+
+  // 4.5.5+: passthrough for partial refresh. See HalDisplay::displayBufferRegion
+  // for semantics. Caller passes the dirty bounding box (from DirtyRegion
+  // typically); display layer handles bounds clamping and the 70%-of-screen
+  // fallback to full refresh.
+  void displayBufferRegion(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                           HalDisplay::RefreshMode refreshMode = HalDisplay::FAST_REFRESH) const;
   void invertScreen() const;
   void clearScreen(uint8_t color = 0xFF) const;
   void getOrientedViewableTRBL(int* outTop, int* outRight, int* outBottom, int* outLeft) const;
@@ -351,6 +369,14 @@ class GfxRenderer {
   void maskRoundedRectOutsideCorners(int x, int y, int width, int height, int radius, Color color = Color::White) const;
   void fillRect(int x, int y, int width, int height, bool state = true) const;
   void fillRectDither(int x, int y, int width, int height, Color color) const;
+  // CrumBLE 4.5.6 (INX highlight lattice, byte-aligned + additive):
+  // paint a sparse-ink dot pattern into the given rect WITHOUT clearing
+  // pixels that were already black. Every (step-th, step-th) pixel is
+  // ANDed to black; other pixels are left untouched. Used by the reader's
+  // highlight overlay: dot pattern reads as ~25% grey on a 1-bit panel
+  // AND preserves the text glyphs underneath. Byte-aligned interior bytes
+  // are &= with a precomputed lattice mask; edges use head/tail masks.
+  void fillSparseInkLatticeInRect(int x, int y, int width, int height, int step = 2, bool state = true) const;
   void fillRoundedRect(int x, int y, int width, int height, int cornerRadius, Color color) const;
   void fillRoundedRect(int x, int y, int width, int height, int cornerRadius, bool roundTopLeft, bool roundTopRight,
                        bool roundBottomLeft, bool roundBottomRight, Color color) const;
@@ -372,6 +398,18 @@ class GfxRenderer {
   // Subsequent calls return the same handle (cache hit).
   CachedBitmap* lookupCachedBitmap(const char* path) const;
   CachedBitmap* lookupCachedBitmap(const std::string& path) const { return lookupCachedBitmap(path.c_str()); }
+  // v18.9.9.192: pinned variant. Bypasses the budget==0 refuse (which fires
+  // under NimBLE-tight heap and disables the whole cache), marks the entry
+  // pinned so it survives evictImageCacheToBudget. Total pinned bytes are
+  // capped at ~24 KB (see kImageCachePinnedCap in .cpp); over that, the
+  // oldest pinned entry is unpinned and becomes an ordinary eviction
+  // candidate. Used by the Home shelf so scrolling stays snappy across
+  // BT-tight sessions where the general image cache is force-flushed.
+  CachedBitmap* lookupCachedBitmapPinned(const char* path) const;
+  CachedBitmap* lookupCachedBitmapPinned(const std::string& path) const { return lookupCachedBitmapPinned(path.c_str()); }
+  // Drop pinned status on ALL cached bitmaps. Called on cover-refresh flows
+  // and library invalidation so stale cover data doesn't stick.
+  void unpinAllCachedBitmaps() const;
   // Reads dimensions from a cache handle without forcing a paint. Returns
   // false if handle is null or hasn't been decoded yet (which shouldn't
   // happen for handles returned by lookupCachedBitmap).
@@ -442,6 +480,24 @@ class GfxRenderer {
   // Output is always BW: any source pixel value < 3 (non-pure-white) sets
   // the corresponding bit. Independent of the renderer's renderMode.
   void renderPerspectiveBitmapToPacked1bpp(CachedBitmap* handle, int w, int hL, int hR, uint8_t* dst) const;
+  // CrumBLE 4.5.5+: Bitmap-source variant. Streams 2bpp rows directly from
+  // SD via Bitmap::readNextRow — no imageCache_ dependency, so this works
+  // even when the cache budget is 0 (typical for Home after the cover-
+  // snapshot pre-alloc has eaten the slack). Used by
+  // LyraFlowTheme::prerenderCarouselSideTiles to populate the side-tile
+  // cache reliably regardless of cache state. The Bitmap must already have
+  // parseHeaders() called; this consumes the row stream so the same Bitmap
+  // can only be used once unless rewound externally.
+  void renderPerspectiveBitmapToPacked1bpp(const Bitmap& bitmap, int w, int hL, int hR, uint8_t* dst) const;
+  // CrumBLE 4.5.5+: dual-tile variant. Bakes the LEFT-perspective and
+  // RIGHT-perspective tiles for the same source bitmap in a SINGLE
+  // file/row pass. The Flow carousel's prerender needs both shapes per
+  // book; rendering them separately would double the SD I/O cost (re-open
+  // + re-stream). Each dst buffer must be ((w + 7) / 8) * max(hL_X, hR_X)
+  // bytes and zero-filled by the caller before this call.
+  void renderPerspectiveBitmapToPacked1bppDual(const Bitmap& bitmap, int w,
+                                                int hL_a, int hR_a, uint8_t* dst_a,
+                                                int hL_b, int hR_b, uint8_t* dst_b) const;
 
   // CrumBLE #125: blit a 1bpp packed buffer (MSB-first per byte) to the
   // framebuffer. `srcStride` is the byte count per source row. Each set
@@ -449,6 +505,39 @@ class GfxRenderer {
   // bits are skipped (transparent overlay). Used together with
   // renderPerspectiveBitmapToPacked1bpp to consume the tile cache.
   void drawPacked1bpp(const uint8_t* src, int srcStride, int x, int y, int w, int h, bool state = true) const;
+
+  // v18.9.9.210 Phase 2: 2bpp packed variants. Same geometry as the 1bpp
+  // pair but preserve the source's 4-gray value per pixel (0=black,
+  // 3=white). Used by LyraFlowTheme's Phase 2 tile cache so grayscale
+  // covers render at their true tone instead of a BW threshold.
+  //
+  // Dst layout: 2bpp packed MSB-first per byte, 4 pixels per byte,
+  // stride = (w + 3) / 4. Caller MUST pre-fill dst with 0xFF (all
+  // pixels = 3 = white) -- the walk uses last-write-wins semantics on
+  // pixels within colTop..colTop+colH, and pixels outside that range
+  // stay at their init value.
+  void renderPerspectiveBitmapToPacked2bpp(CachedBitmap* handle, int w, int hL, int hR, uint8_t* dst) const;
+  void renderPerspectiveBitmapToPacked2bpp(const Bitmap& bitmap, int w, int hL, int hR, uint8_t* dst) const;
+
+  // Blit a 2bpp packed buffer to the framebuffer. Mirrors the per-plane
+  // logic of drawPerspectiveBitmap (BW mode paints val<3, GRAY_MSB
+  // paints val=1|2, GRAY_LSB paints val=1). No state parameter -- the
+  // pixel color is implied by (val, renderMode).
+  void drawPacked2bpp(const uint8_t* src, int srcStride, int x, int y, int w, int h) const;
+
+  // v18.9.9.211 Phase 3: aspect-fit scaled 2bpp packed tile for center
+  // covers. Same math as buildScaledBitmap (cropX/cropY, xRatio/yRatio,
+  // nearest-neighbor sample) but preserves the source's 4-gray value
+  // per pixel into the packed dst instead of thresholding to 1bpp.
+  //
+  // dst layout: 2bpp packed MSB-first, stride = (dstW + 3) / 4. Caller
+  // must pre-fill dst with 0xFF (all white). Buffer size must be at
+  // least stride * dstH bytes.
+  void renderCachedBitmapToPacked2bpp(CachedBitmap* handle, int dstW, int dstH, uint8_t* dst,
+                                       float cropX = 0.0f, float cropY = 0.0f) const;
+  void renderBitmapToPacked2bpp(const Bitmap& bitmap, int dstW, int dstH, uint8_t* dst,
+                                 float cropX = 0.0f, float cropY = 0.0f) const;
+
   void fillPolygon(const int* xPoints, const int* yPoints, int numPoints, bool state = true) const;
 
   // Text
@@ -486,6 +575,11 @@ class GfxRenderer {
   void copyGrayscaleLsbBuffers() const;
   void copyGrayscaleMsbBuffers() const;
   void displayGrayBuffer(bool turnOffScreen = false) const;
+  // CrumBLE 4.5.5+: experimental ~61 ms B/W refresh for home-nav-style updates.
+  // Caller must have done a full FAST/HALF refresh recently to establish a
+  // clean panel baseline; see HalDisplay::displayBufferFastLut for the full
+  // contract. Use only on activities that opt in (currently HomeActivity).
+  void displayBufferFastLut(bool turnOffScreen = false) const;
   bool storeBwBuffer();    // Returns true if buffer was stored successfully
   void restoreBwBuffer();  // Restore the stored buffer (does NOT free it)
   // True if a compressed BW backup is currently held (either from a prior
@@ -493,10 +587,25 @@ class GfxRenderer {
   // store path leaving its backup around). Callers can use this to decide
   // whether restoreBwBuffer() will produce useful framebuffer content.
   bool hasStoredBwBuffer() const { return bwCompressedBackup != nullptr; }
+  // CrumBLE 4.5.7 v18.7: explicitly discard the stored backup and its heap.
+  // BW backup can be up to ~32 KB (dense image page). storeBwBuffer callers
+  // (drawer, dictionary word-select, grayscale render) don't free after their
+  // use because restoreBwBuffer keeps it around for reuse. But before BT
+  // enable those bytes are dead weight NimBLE could use. Public so the
+  // reader's pre-BT cleanup can drop it explicitly.
+  void discardStoredBwBuffer();
   void cleanupGrayscaleWithFrameBuffer() const;
 
   // Font helpers
   const uint8_t* getGlyphBitmap(const EpdFontData* fontData, const EpdGlyph* glyph) const;
+
+  // v18.9.9.70 (ported from crosspoint 05c1e9aa): lend the framebuffer to
+  // memory-hungry phases such as section pagination. Nothing may draw/display
+  // while it is released. restore returns the buffer white, so callers must
+  // redraw the full screen afterward.
+  void releaseFrameBufferForBuild();
+  bool restoreFrameBufferAfterBuild();
+  bool hasFrameBuffer() const { return frameBuffer != nullptr; }
 
   // Low level functions
   uint8_t* getFrameBuffer() const;

@@ -23,7 +23,12 @@ bool shouldPrepareFullCover() {
 }
 
 bool shouldPrepareMinimalCover() {
-  return SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::MINIMAL_SLEEP;
+  // v18.9.9.460: also prepare for MINIMAL_STATS_SLEEP — same layout, same
+  // cover thumb dimensions. Without this, the sleep screen shows a
+  // placeholder because cachedMinimalCoverPathFor returns empty when the
+  // BMP was never generated for the book.
+  return SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::MINIMAL_SLEEP ||
+         SETTINGS.sleepScreen == CrossPointSettings::SLEEP_SCREEN_MODE::MINIMAL_STATS_SLEEP;
 }
 
 bool fileExists(const std::string& path) { return !path.empty() && Storage.exists(path.c_str()); }

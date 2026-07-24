@@ -114,6 +114,27 @@ enum class FileBrowserAction : int {
   // stats.bin via BookReadingStats::remove(). Surfaced from the file
   // browser's long-press menu when an EPUB is selected.
   DeleteStats = 26,
+  // v18.9.6.2: toggle the Simple Rendering sidecar flag on/off for this
+  // book. When set, the reader opens the book with tables collapsed to
+  // paragraphs, images suppressed, embedded style skipped, bionic + guide
+  // off. Manual override / discovery for the auto-set that fires when the
+  // book crashes-then-recovers in Simple Rendering.
+  ToggleSimpleRendering = 27,
+  // v18.9.9.170: nukes the book's cached thumb_<W>x<H>.bmp files + any
+  // thumb_failed_*.marker so the next home carousel / grid render regenerates
+  // the cover from source. Surfaced on the home long-press menu for books
+  // that came in with a placeholder because the initial library walk was
+  // heap-starved (e.g. right after a big upload).
+  RefreshCover = 28,
+  // v18.9.9.356: global "retry failed covers" surface, mirrors
+  // SettingAction::RetryFailedCovers. Available from the shelf-header
+  // menu and book long-press menu so users don't have to navigate to
+  // Settings to clear a placeholder cover.
+  RetryFailedCovers = 29,
+  // Sentinel: used as a "no-focus" hint when re-opening the shelf-header
+  // action menu after a toggle. Never appears in a MenuItem list; only
+  // used as a default arg to showShelfHeaderActionMenu(focusOn=).
+  None = 255,
 };
 
 class FileBrowserActionActivity final : public Activity {
@@ -147,13 +168,15 @@ class FileBrowserActionActivity final : public Activity {
 
   FileBrowserActionActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string title,
                             std::vector<MenuItem> items, bool ignoreInitialConfirmRelease = false,
-                            std::string headerRightLabel = {}, std::string subtitle = {})
+                            std::string headerRightLabel = {}, std::string subtitle = {},
+                            int initialSelectedIndex = 0)
       : Activity("FileBrowserAction", renderer, mappedInput),
         title(std::move(title)),
         subtitle(std::move(subtitle)),
         headerRightLabel(std::move(headerRightLabel)),
         items(std::move(items)),
-        ignoreConfirmRelease(ignoreInitialConfirmRelease) {}
+        ignoreConfirmRelease(ignoreInitialConfirmRelease),
+        selectedIndex(initialSelectedIndex) {}
 
   void onEnter() override;
   void loop() override;

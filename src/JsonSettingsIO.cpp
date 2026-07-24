@@ -1,5 +1,6 @@
 #include "JsonSettingsIO.h"
 
+#include <Arduino.h>  // ESP.getFreeHeap/getMaxAllocHeap (v18.9.9.351)
 #include <ArduinoJson.h>
 #ifdef SIMULATOR
 #include <ArduinoJsonStringCompat.h>
@@ -106,7 +107,13 @@ bool JsonSettingsIO::saveState(const CrossPointState& s, const char* path) {
 
   String json;
   serializeJson(doc, json);
-  return Storage.writeFile(path, json);
+  // v18.9.9.311: atomic write + rolling .bak. Prior direct writeFile could
+  // corrupt crumble-state.json mid-write on a cheap SD card, leaving the
+  // device with no persistent state (openEpubPath / silent-restart target
+  // etc). writeFileWithBackup does tmp+rename with retry and promotes the
+  // prior good file to .bak; loadFromFile below auto-recovers on parse
+  // failure.
+  return Storage.writeFileWithBackup(path, json);
 }
 
 bool JsonSettingsIO::loadState(CrossPointState& s, const char* json) {
@@ -188,12 +195,47 @@ bool JsonSettingsIO::saveSettings(const CrossPointSettings& s, const char* path)
   if (s.sdFontFamilyName[0] != '\0') {
     doc["sdFontFamilyName"] = s.sdFontFamilyName;
   }
+  // CrumBLE 4.5.4: UI font fallback family. Stored as a string so the
+  // saved name survives changes to the SD font set on disk (Toggle order
+  // depends on registry enumeration which can shift when families are
+  // added/removed). Same shape as sdFontFamilyName.
+  if (s.uiFontFallbackFamily[0] != '\0') {
+    doc["uiFontFallbackFamily"] = s.uiFontFallbackFamily;
+  }
+  if (s.uiFontFallbackPointSize > 0) {
+    doc["uiFontFallbackPointSize"] = s.uiFontFallbackPointSize;
+  }
 
   // Bluetooth bonded remote metadata is not represented in SettingsList, but it
   // must survive reboot so the firmware can reconnect to the remembered device.
   doc["bleBondedDeviceAddr"] = s.bleBondedDeviceAddr;
   doc["bleBondedDeviceName"] = s.bleBondedDeviceName;
   doc["bleBondedDeviceAddrType"] = s.bleBondedDeviceAddrType;
+  // v18.9.9.256: persist bluetoothEnabled. Pre-v256 this field was set in
+  // RAM by BluetoothSettingsActivity's toggle and quick-connect paths but
+  // never written to JSON -- every boot loadFromFile got the struct
+  // default (0). The bug went unnoticed until v245 made the field
+  // load-bearing at boot (BT-off release only fires when disk says 0),
+  // at which point flipping BT on in Settings + silent-restart still
+  // came back to bluetoothEnabled=0 -> release ran -> post-restart
+  // enable() refused (v252 guard) -> BT stuck off.
+  doc["bluetoothEnabled"] = s.bluetoothEnabled;
+
+  // CrumBLE 4.5.5: rich BLE button map. Each occupied slot serialises as a
+  // 3-element array [keyKind, keyValue, button] under a fixed-size array.
+  // Empty slots are skipped on write; the reader uses positional matching
+  // is not required (the file is replayed back into bleKeyMap[] starting
+  // at slot 0, so order survives).
+  {
+    JsonArray arr = doc["bleKeyMap"].to<JsonArray>();
+    for (const auto& e : s.bleKeyMap) {
+      if (e.button == 0xFF || e.keyKind == 0xFF) continue;
+      JsonArray row = arr.add<JsonArray>();
+      row.add(e.keyKind);
+      row.add(e.keyValue);
+      row.add(e.button);
+    }
+  }
 
   // CrumBLE: opt-in virtual-collection visibility (Recently Added / All Books /
   // Finished / New). All persist with the same JSON keys to survive reboots.
@@ -210,9 +252,50 @@ bool JsonSettingsIO::saveSettings(const CrossPointSettings& s, const char* path)
   // Stored as ISO code string ("EN", "DE", ...) for stability across enum reorders.
   doc["language"] = (s.language < getLanguageCount()) ? LANGUAGE_CODES[s.language] : "EN";
 
+  // v18.9.9.351: measure output size before reserving to avoid bad_alloc
+  // in serializeJson->String::reserve. Field crash: preflight passed
+  // (free=38k/maxAlloc=18k) but serialize threw because output needed
+  // more contiguous than maxAlloc.
+  const size_t neededBytes = measureJson(doc);
+  const uint32_t neededWithMargin = static_cast<uint32_t>(std::max<size_t>(neededBytes * 3U / 2U, 4096U));
+  const uint32_t maxAllocNow = ESP.getMaxAllocHeap();
+  const uint32_t freeNow = ESP.getFreeHeap();
+  if (maxAllocNow < neededWithMargin) {
+    LOG_ERR("JSI",
+            "Settings write skipped: measured=%u needed+margin=%u exceeds maxAlloc=%u (free=%u)",
+            static_cast<unsigned>(neededBytes), neededWithMargin, maxAllocNow, freeNow);
+    return false;
+  }
   String json;
+  json.reserve(neededBytes + 32);
   serializeJson(doc, json);
-  return Storage.writeFile(path, json);
+  // v18.9.9.400: skip the SD write entirely when the serialized JSON matches
+  // what we wrote last time. Field data: reader prebake-fingerprint-restore
+  // path (EpubReaderActivity ~L1692/2489/2571) writes 8-15 SETTINGS fields on
+  // every mismatched book open even when NONE of them differ from current
+  // state -- e.g. reopening a book the reader already matches. Two "Debounced
+  // save committed" lines per book open observed even when the user was doing
+  // no interactive settings changes. FNV-1a hash of the fresh JSON compared
+  // against the last-written hash cheaply detects the no-op case. In-memory
+  // only (resets on boot); cost is one guaranteed write per boot even for
+  // no-op saves, which is fine.
+  static uint32_t lastWrittenHash = 0;
+  uint32_t hash = 2166136261u;
+  for (size_t i = 0; i < json.length(); ++i) {
+    hash ^= static_cast<uint8_t>(json[i]);
+    hash *= 16777619u;
+  }
+  if (lastWrittenHash != 0 && hash == lastWrittenHash) {
+    LOG_INF("JSI", "Settings write skipped: content unchanged (%u bytes, hash=0x%08x)",
+            static_cast<unsigned>(json.length()), hash);
+    return true;
+  }
+  // v18.9.9.311: atomic write + rolling .bak (see saveState above). Losing
+  // settings.json wipes user preferences (font family/size, sleep screen
+  // mode, WiFi auto-connect flag, etc.) -- worth protecting.
+  const bool ok = Storage.writeFileWithBackup(path, json);
+  if (ok) lastWrittenHash = hash;
+  return ok;
 }
 
 bool JsonSettingsIO::loadSettings(CrossPointSettings& s, const char* json, bool* needsResave) {
@@ -338,6 +421,36 @@ bool JsonSettingsIO::loadSettings(CrossPointSettings& s, const char* json, bool*
 
   s.bleBondedDeviceAddrType = doc["bleBondedDeviceAddrType"] | s.bleBondedDeviceAddrType;
 
+  // v18.9.9.256: bluetoothEnabled. Tolerates absence (pre-v256 configs)
+  // by falling back to the current struct value, which is the pre-v256
+  // default (0) on a fresh install.
+  s.bluetoothEnabled = doc["bluetoothEnabled"] | s.bluetoothEnabled;
+
+  // CrumBLE 4.5.5: rich BLE button map deserialise. Clear-then-fill so a
+  // freshly-emptied entry on disk wipes the in-memory slot too. Tolerates
+  // a missing key (older configs) -- ble button map stays empty.
+  for (auto& e : s.bleKeyMap) {
+    e = CrossPointSettings::BleKeyMapEntry{};
+  }
+  if (doc["bleKeyMap"].is<JsonArray>()) {
+    JsonArray arr = doc["bleKeyMap"].as<JsonArray>();
+    uint8_t slot = 0;
+    for (JsonVariant rowVar : arr) {
+      if (slot >= CrossPointSettings::BLE_KEY_MAP_CAPACITY) break;
+      if (!rowVar.is<JsonArray>()) continue;
+      JsonArray row = rowVar.as<JsonArray>();
+      if (row.size() < 3) continue;
+      const uint8_t kind = row[0] | 0xFF;
+      const uint8_t value = row[1] | 0;
+      const uint8_t button = row[2] | 0xFF;
+      if (kind == 0xFF || button == 0xFF) continue;
+      s.bleKeyMap[slot].keyKind = kind;
+      s.bleKeyMap[slot].keyValue = value;
+      s.bleKeyMap[slot].button = button;
+      ++slot;
+    }
+  }
+
   // CrumBLE: opt-in virtual-collection visibility. If either key is present the
   // config predates neither (already migrated) -- clear the pending flag so
   // main.cpp skips the one-time existing-user migration. Absent keys leave it
@@ -363,6 +476,11 @@ bool JsonSettingsIO::loadSettings(CrossPointSettings& s, const char* json, bool*
   const char* sfn = doc["sdFontFamilyName"] | "";
   strncpy(s.sdFontFamilyName, sfn, sizeof(s.sdFontFamilyName) - 1);
   s.sdFontFamilyName[sizeof(s.sdFontFamilyName) - 1] = '\0';
+  // CrumBLE 4.5.4: UI font fallback family. Mirrors sdFontFamilyName.
+  const char* uifb = doc["uiFontFallbackFamily"] | "";
+  strncpy(s.uiFontFallbackFamily, uifb, sizeof(s.uiFontFallbackFamily) - 1);
+  s.uiFontFallbackFamily[sizeof(s.uiFontFallbackFamily) - 1] = '\0';
+  s.uiFontFallbackPointSize = static_cast<uint8_t>(doc["uiFontFallbackPointSize"] | 0);
 
   // Language -- stored as code string for stability across enum reorders.
   if (doc["language"].is<const char*>()) {
@@ -416,9 +534,16 @@ bool JsonSettingsIO::loadWifi(WifiCredentialStore& store, const char* json, bool
 
     obfuscation::DecodeStatus status = obfuscation::DecodeStatus::INVALID;
     cred.password = obfuscation::deobfuscateFromBase64(obj["password_obf"] | "", &status);
-    if (status == obfuscation::DecodeStatus::LEGACY && !cred.password.empty() && needsResave) {
-      *needsResave = true;
-    }
+    // v18.9.9.347: DO NOT auto-mark LEGACY reads for resave. Field
+    // observation: some OTA flashes drop through XOR-with-HW-MAC into
+    // garbage bytes that still look non-empty; the old auto-resave then
+    // locked those garbage bytes into the CPV1-validated slot on disk,
+    // permanently breaking the credential. Symptom: users had to
+    // forget+rejoin WiFi after a random subset of firmware upgrades.
+    // Only mark for resave when we PROVE the password works -- that
+    // happens later in setLastConnectedSsid (i.e. after a successful
+    // connect). Until then, keep the legacy string in memory but leave
+    // the on-disk copy alone.
     if (status == obfuscation::DecodeStatus::INVALID || status == obfuscation::DecodeStatus::EMPTY ||
         cred.password.empty()) {
       cred.password = obj["password"] | std::string("");

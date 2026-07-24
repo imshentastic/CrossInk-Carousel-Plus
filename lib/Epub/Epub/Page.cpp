@@ -69,10 +69,16 @@ std::unique_ptr<PageLine> PageLine::deserialize(FsFile& file) {
   // the page DOM with a corrupt PageLine that survives heap recovery and
   // panic-crashes later.
   //
-  // 96-byte margin = sizeof(PageLine) ~32 + shared_ptr ctrl block ~24
-  // + bookkeeping. Cheap to over-reserve.
-  if (ESP.getMaxAllocHeap() < 96) {
-    LOG_ERR("PGE", "Refusing PageLine alloc: maxAlloc=%u < 96 (risk of corrupt shared_ptr ctrl block)",
+  // CrumBLE 4.5.6: raised from 96 to 256. Field crash on X4 + 12pt +
+  // Readerly SD-font + BT: guard fired at maxAlloc=68 for iteration K, but
+  // iteration K-1 had allocated PageLine's shared_ptr ctrl block at a
+  // borderline maxAlloc (just above 96), got a partial-heap "success" whose
+  // ctrl-block mutex pointer was garbage, and Page destruction crashed in
+  // pthread_mutex_destroy. shared_ptr ctrl block + PageLine object + heap
+  // overhead + fragmentation slack needs ~200 B contiguous to be safe. 256
+  // leaves margin without starving legitimate pages.
+  if (ESP.getMaxAllocHeap() < 256) {
+    LOG_ERR("PGE", "Refusing PageLine alloc: maxAlloc=%u < 256 (risk of corrupt shared_ptr ctrl block)",
             ESP.getMaxAllocHeap());
     return nullptr;
   }
@@ -90,6 +96,10 @@ void PageImage::render(GfxRenderer& renderer, const int fontId, const int xOffse
   // right-side-up in dark mode (no negative-photo effect).
   (void)foregroundBlack;
   imageBlock->render(renderer, xPos + xOffset, yPos + yOffset);
+}
+
+void PageImage::renderIfCached(GfxRenderer& renderer, const int xOffset, const int yOffset) {
+  imageBlock->renderIfCached(renderer, xPos + xOffset, yPos + yOffset);
 }
 
 bool PageImage::serialize(FsFile& file) {
@@ -305,6 +315,40 @@ void PageTableFragment::render(GfxRenderer& renderer, const int fontId, const in
   }
 }
 
+void PageTableFragment::renderContentOnly(GfxRenderer& renderer, const int fontId, const int xOffset,
+                                          const int yOffset, const bool foregroundBlack) {
+  if (columnCount == 0 || rows.empty() || width < 2) {
+    return;
+  }
+  const int drawX = xPos + xOffset;
+  const int drawY = yPos + yOffset;
+  // Same column-start computation as render() so cell text lands at the
+  // same x positions -- only the drawRect / column-lines / row-separator
+  // draws are skipped.
+  std::vector<int16_t> columnStarts(columnCount + 1);
+  for (uint8_t i = 0; i < columnCount; i++) {
+    columnStarts[i] = static_cast<int16_t>((static_cast<uint32_t>(width) * i) / columnCount);
+  }
+  columnStarts[columnCount] = static_cast<int16_t>(width - 1);
+  int currentY = 0;
+  for (size_t rowIndex = 0; rowIndex < rows.size(); rowIndex++) {
+    const auto& row = rows[rowIndex];
+    for (size_t colIndex = 0; colIndex < row.cells.size() && colIndex < columnCount; colIndex++) {
+      const auto& cell = row.cells[colIndex];
+      const int cellTextX = drawX + columnStarts[colIndex] + cellPadding;
+      const int cellTextY = drawY + currentY + cellPadding;
+      for (size_t lineIndex = 0; lineIndex < cell.lines.size(); lineIndex++) {
+        if (cell.lines[lineIndex]) {
+          cell.lines[lineIndex]->render(renderer, fontId, cellTextX,
+                                        cellTextY + static_cast<int>(lineIndex) * lineHeight,
+                                        foregroundBlack);
+        }
+      }
+    }
+    currentY += row.height;
+  }
+}
+
 bool PageTableFragment::serialize(FsFile& file) {
   if (rows.size() > MAX_TABLE_ROWS_PER_FRAGMENT) {
     LOG_ERR("PTB", "Serialization failed: fragment row count %u exceeds maximum", static_cast<uint32_t>(rows.size()));
@@ -327,6 +371,23 @@ bool PageTableFragment::serialize(FsFile& file) {
 }
 
 std::unique_ptr<PageTableFragment> PageTableFragment::deserialize(FsFile& file) {
+  // v18.9.9.7: pre-flight refuse. Deserializing a table fragment allocates
+  // multiple vector<TableFragmentRow>/vector<TableFragmentCell>/unique_ptr
+  // <TextBlock> layers, each with per-row TextBlock compact blocks. Under
+  // post-BT tightness a page-turn deserialize drops from MaxAlloc=8180
+  // to MaxAlloc=16 over 30 ms, and any late TXB refuse leaves the vector
+  // stack in a state whose unwind panics in a corrupted control block.
+  // Refuse the whole fragment upfront when MaxAlloc is already below the
+  // safe-to-unwind threshold. Section::loadPageFromSectionFile propagates
+  // the nullptr to the reader's escalation branch (Level 1 defrag ->
+  // Level 2 tables-only -> Level 3 Simple Rendering).
+  constexpr uint32_t TABLE_FRAGMENT_MIN_MAX_ALLOC = 3000;
+  if (ESP.getMaxAllocHeap() < TABLE_FRAGMENT_MIN_MAX_ALLOC) {
+    LOG_ERR("PTB", "Refusing fragment deserialize: maxAlloc=%u < %u (would panic in unwind)",
+            ESP.getMaxAllocHeap(), TABLE_FRAGMENT_MIN_MAX_ALLOC);
+    return nullptr;
+  }
+
   int16_t xPos = 0;
   int16_t yPos = 0;
   uint16_t width = 0;
@@ -386,10 +447,19 @@ void Page::renderImages(GfxRenderer& renderer, const int fontId, const int xOffs
                              [](const PageElement& element) { return element.getTag() == TAG_PageImage; });
 }
 
-bool Page::serialize(FsFile& file) const {
+void Page::blankImageRects(GfxRenderer& renderer, const int xOffset, const int yOffset) const {
+  for (const auto& el : elements) {
+    if (el->getTag() != TAG_PageImage) continue;
+    const auto& img = static_cast<const PageImage&>(*el);
+    renderer.fillRect(img.xPos + xOffset, img.yPos + yOffset, img.getImageBlock().getWidth(),
+                      img.getImageBlock().getHeight(), false);
+  }
+}
+
+bool Page::serialize(FsFile& file, uint8_t fileVersion) const {
   const uint16_t count = elements.size();
   if (elements.size() > MAX_PAGE_ELEMENTS) {
-    LOG_ERR("PGE", "Serialization failed: element count %u exceeds maximum", static_cast<uint32_t>(elements.size()));
+    LOG_ERR("PGE", "Serialization failed: element count %u exceeds maximum", static_cast<unsigned>(elements.size()));
     return false;
   }
   if (!serialization::tryWritePod(file, count)) {
@@ -398,14 +468,35 @@ bool Page::serialize(FsFile& file) const {
   }
 
   for (const auto& el : elements) {
-    // Use getTag() method to determine type
     if (!serialization::tryWritePod(file, static_cast<uint8_t>(el->getTag()))) {
       LOG_ERR("PGE", "Serialization failed: could not write element tag");
       return false;
     }
-
-    if (!el->serialize(file)) {
-      return false;
+    // v18.9.9.19: for v42+, prepend TAG_PageTableFragment payload with its
+    // byte size. Write a placeholder, emit the payload, then seek back and
+    // patch the size. Other tags stay unprefixed -- their deserialize cost
+    // (PageLine, PageImage, PageHorizontalRule) is small enough that a skip
+    // isn't worth the space.
+    if (fileVersion >= 42 && el->getTag() == TAG_PageTableFragment) {
+      const uint32_t sizeFieldPos = file.position();
+      if (!serialization::tryWritePod(file, static_cast<uint32_t>(0))) {
+        LOG_ERR("PGE", "Serialization failed: could not reserve table size prefix");
+        return false;
+      }
+      const uint32_t payloadStart = file.position();
+      if (!el->serialize(file)) {
+        return false;
+      }
+      const uint32_t payloadEnd = file.position();
+      const uint32_t payloadSize = payloadEnd - payloadStart;
+      if (!file.seek(sizeFieldPos) || !serialization::tryWritePod(file, payloadSize) || !file.seek(payloadEnd)) {
+        LOG_ERR("PGE", "Serialization failed: could not patch table size prefix");
+        return false;
+      }
+    } else {
+      if (!el->serialize(file)) {
+        return false;
+      }
     }
   }
 
@@ -427,7 +518,7 @@ bool Page::serialize(FsFile& file) const {
   return true;
 }
 
-std::unique_ptr<Page> Page::deserialize(FsFile& file) {
+std::unique_ptr<Page> Page::deserialize(FsFile& file, uint8_t fileVersion) {
   auto* rawPage = new (std::nothrow) Page();
   if (!rawPage) {
     LOG_ERR("PGE", "Deserialization failed: could not allocate Page");
@@ -466,6 +557,18 @@ std::unique_ptr<Page> Page::deserialize(FsFile& file) {
       }
       page->elements.push_back(std::move(pi));
     } else if (tag == TAG_PageTableFragment) {
+      // v18.9.9.19: v42+ files carry a uint32_t payloadSize between the
+      // tag byte and the fragment payload -- consume it here (unused by
+      // full deserialize; v18.9.9.20's streamed reader uses it to cheap-
+      // skip the fragment). Older sections don't have it.
+      if (fileVersion >= 42) {
+        uint32_t payloadSize;
+        if (!serialization::tryReadPod(file, payloadSize)) {
+          LOG_ERR("PGE", "Deserialization failed: truncated table size prefix");
+          return nullptr;
+        }
+        (void)payloadSize;
+      }
       auto fragment = PageTableFragment::deserialize(file);
       if (!fragment) {
         return nullptr;

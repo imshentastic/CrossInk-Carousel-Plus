@@ -70,13 +70,36 @@ bool SdCardFontManager::loadFamily(const SdCardFontFamilyInfo& family, GfxRender
   EpdFontFamily fontFamily(font->getEpdFont(0), font->getEpdFont(1), font->getEpdFont(2), font->getEpdFont(3));
   renderer.insertFont(fontId, fontFamily);
 
+  // CrumBLE 4.5.4 Shape 3: the UI font fallback is owned by
+  // SdCardFontSystem::ensureFallbackLoaded, NOT auto-set here. Reason:
+  // previously this load (which the reader calls per-book-open) would
+  // overwrite the user's chosen fallback whenever a book opened with a
+  // different primary font, leaving the carousel/UI back at '?' on
+  // CJK after first book open. Now the explicit setting in
+  // SETTINGS.uiFontFallbackFamily is the only thing that touches the
+  // global fallback.
+
   loadedFamilyName_ = family.name;
   loadedPointSize_ = selected->pointSize;
+  loadedFontId_ = fontId;
   return true;
 }
 
 void SdCardFontManager::unloadAll(GfxRenderer& renderer) {
-  renderer.clearSdCardFonts();
+  // CrumBLE 4.5.4 Shape 3: don't touch the global UI fallback here.
+  // SdCardFontSystem::ensureFallbackLoaded is the only thing allowed to
+  // change the fallback pointer. If the user has a non-fallback primary
+  // and that primary unloads (book close / settings transition), the
+  // fallback must survive untouched.
+  //
+  // CrumBLE 4.5.4 hotfix: removed renderer.clearSdCardFonts() global
+  // wipe. With two managers in play (primary + fallback) each holding
+  // their own entries in renderer.sdCardFonts_, a global clear from one
+  // manager would orphan the OTHER manager's registration (entries
+  // erased from sdCardFonts_ but still present in fontMap), causing the
+  // 'Font ID NNN collides with existing font' loop the user hit. The
+  // per-fontId removeFont() below already erases this manager's own
+  // entries from BOTH maps -- that's all this manager owns.
   for (auto& lf : loaded_) {
     renderer.removeFont(lf.fontId);
     delete lf.font;
@@ -84,6 +107,7 @@ void SdCardFontManager::unloadAll(GfxRenderer& renderer) {
   loaded_.clear();
   loadedFamilyName_.clear();
   loadedPointSize_ = 0;
+  loadedFontId_ = 0;
 }
 
 int SdCardFontManager::getFontId(const std::string& familyName) const {

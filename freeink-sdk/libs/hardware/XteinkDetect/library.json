@@ -1,0 +1,10 @@
+{
+  "name": "XteinkDetect",
+  "version": "1.0.0",
+  "description": "FreeInk Xteink X3/X4 runtime auto-detection. The X3 and X4 share one ESP32-C3 binary but differ in panel controller (UC8253 vs SSD1677) and battery backend. An I2C fingerprint of the X3-only peripherals (BQ27220 gauge, DS3231 RTC, QMI8658 IMU) on SDA20/SCL0 distinguishes the two; this helper probes, calls BoardConfig::selectDevice(), and reports whether to put the display in X3 mode.",
+  "keywords": "xteink, x3, x4, detect, board",
+  "authors": [{"name": "FreeInk SDK Contributors"}],
+  "dependencies": {},
+  "platforms": "espressif32",
+  "frameworks": ["arduino"]
+}

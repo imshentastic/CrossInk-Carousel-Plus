@@ -240,10 +240,27 @@ class BaseTheme {
   virtual void fillPopupProgress(const GfxRenderer& renderer, const Rect& layout, const int progress) const;
   // CrumBLE 4.4: darkMode flips foreground to white and background to black
   // (for the reader's dark mode); default false matches all prior callers.
+  // v18.9.9.15: small icon slot right after the battery in the status bar's
+  // left cluster. Reduced = Simple Rendering / compat mode is active (flipped
+  // gauge with needle to upper-left). Prebake = book has a prebake manifest
+  // being used as the cache source (lightning bolt). None = normal reader.
+  // v18.9.9.53 (task #38): PrebakeDeclined added -- book has a prebake
+  // manifest available BUT the user's current settings differ from the
+  // prebake fingerprint and they haven't accepted "use prepared layout",
+  // so every chapter is being cold-built. Rendered as the Prebake bolt
+  // with a diagonal slash so the user can tell at a glance whether the
+  // reader is serving from prebake or cold-building.
+  enum class ReaderStatusIcon : uint8_t { None = 0, Reduced = 1, Prebake = 2, PrebakeDeclined = 3 };
+  // v18.9.9.463: added optional timeLeftSeconds. 0 = don't show. Non-zero
+  // AND SETTINGS.statusBarTimeLeft enabled → append time-left to the
+  // progress-count field. Reader passes stats.avgSecondsPerForwardPage ×
+  // pagesRemaining. Other callers can leave the default 0.
   virtual void drawStatusBar(GfxRenderer& renderer, const float bookProgress, const int currentPage,
                              const int pageCount, std::string title, const int paddingBottom = 0,
                              const int textYOffset = 0, const bool isPageBookmarked = false,
-                             const bool darkMode = false) const;
+                             const bool darkMode = false,
+                             ReaderStatusIcon readerIcon = ReaderStatusIcon::None,
+                             uint32_t timeLeftSeconds = 0) const;
   virtual void drawHelpText(const GfxRenderer& renderer, Rect rect, const char* label) const;
   virtual void drawTextField(const GfxRenderer& renderer, Rect rect, const int textWidth, bool cursorMode = false,
                              int contentStartX = 0, int contentWidth = 0) const;

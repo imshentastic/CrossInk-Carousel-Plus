@@ -157,6 +157,112 @@ inline uint8_t closestBuiltinFontSizeIndex(const uint8_t targetPointSize) {
 
 // Build the font family setting dynamically. When registry is non-null, SD card fonts
 // are appended after the built-in fonts. Otherwise only built-in fonts are listed.
+// CrumBLE 4.5.4 Shape 3: UI Font Fallback picker. Lists "None" + every
+// SD-card family currently present on disk. Stores the chosen family
+// name (or empty for "None") in SETTINGS.uiFontFallbackFamily. The
+// per-tick poll in main.cpp loop() picks up the change without reboot.
+inline SettingInfo buildUiFontFallbackSetting(const SdCardFontRegistry* registry) {
+  SettingInfo s;
+  s.nameId = StrId::STR_UI_FONT_FALLBACK;
+  s.type = SettingType::ENUM;
+  s.key = "uiFontFallbackFamily";
+  s.category = StrId::STR_CAT_DISPLAY;
+
+  // Index 0 is always "None" so the user always has a way back to the
+  // disabled state regardless of what's on SD.
+  std::vector<std::string> familyNames;
+  familyNames.reserve(1);
+  familyNames.push_back("");  // "None" sentinel -- empty string in storage
+  if (registry) {
+    for (const auto& f : registry->getFamilies()) {
+      familyNames.push_back(f.name);
+    }
+  }
+  // The render code prefers enumStringValues over enumValues when both
+  // are present, so build display labels here.
+  s.enumStringValues.reserve(familyNames.size());
+  s.enumStringValues.push_back("None");
+  for (size_t i = 1; i < familyNames.size(); ++i) {
+    s.enumStringValues.push_back(familyNames[i]);
+  }
+
+  s.valueGetter = [familyNames]() -> uint8_t {
+    const char* cur = SETTINGS.uiFontFallbackFamily;
+    if (cur[0] == '\0') return 0;
+    for (size_t i = 1; i < familyNames.size(); ++i) {
+      if (familyNames[i] == cur) return static_cast<uint8_t>(i);
+    }
+    // Stored family is no longer on SD (deleted since last save). Show as
+    // "None" but DON'T clear the saved name -- if the file comes back
+    // (user re-uploads same .cpfont) we'll auto-rebind.
+    return 0;
+  };
+
+  s.valueSetter = [familyNames](uint8_t v) {
+    SETTINGS.uiFontFallbackFamily[0] = '\0';
+    if (v == 0 || v >= familyNames.size()) return;
+    const std::string& name = familyNames[v];
+    strncpy(SETTINGS.uiFontFallbackFamily, name.c_str(), sizeof(SETTINGS.uiFontFallbackFamily) - 1);
+    SETTINGS.uiFontFallbackFamily[sizeof(SETTINGS.uiFontFallbackFamily) - 1] = '\0';
+    // Family change resets the picked size to "auto" -- the user's last
+    // size was relative to the prior family, which may not have a
+    // matching size in the new one. ensureFallbackLoaded honors 0 = auto.
+    SETTINGS.uiFontFallbackPointSize = 0;
+  };
+  return s;
+}
+
+// CrumBLE 4.5.4: companion size picker for the fallback family. Lists
+// "Auto (smallest)" + every size available in the currently-selected
+// uiFontFallbackFamily. Stored as the literal point size (uint8_t);
+// 0 = auto = legacy behavior (smallest available). The per-tick poll
+// picks up the change without reboot.
+inline SettingInfo buildUiFontFallbackSizeSetting(const SdCardFontRegistry* registry) {
+  SettingInfo s;
+  s.nameId = StrId::STR_UI_FONT_FALLBACK_SIZE;
+  s.type = SettingType::ENUM;
+  s.key = "uiFontFallbackPointSize";
+  s.category = StrId::STR_CAT_DISPLAY;
+
+  // sizes[0] reserved for 0 = auto sentinel. Remaining entries: literal pt
+  // sizes from the currently-selected family. If no family is selected,
+  // we still show the picker (with just "Auto"); it's a no-op until a
+  // family is chosen.
+  std::vector<uint8_t> sizes;
+  sizes.reserve(8);
+  sizes.push_back(0);  // auto
+  if (registry && SETTINGS.uiFontFallbackFamily[0] != '\0') {
+    const auto* fam = registry->findFamily(SETTINGS.uiFontFallbackFamily);
+    if (fam) {
+      for (const uint8_t pt : fam->availableSizes()) sizes.push_back(pt);
+    }
+  }
+
+  s.enumStringValues.reserve(sizes.size());
+  s.enumStringValues.push_back("Auto");
+  for (size_t i = 1; i < sizes.size(); ++i) {
+    s.enumStringValues.push_back(std::to_string(static_cast<int>(sizes[i])) + " pt");
+  }
+
+  s.valueGetter = [sizes]() -> uint8_t {
+    const uint8_t cur = SETTINGS.uiFontFallbackPointSize;
+    if (cur == 0) return 0;
+    for (size_t i = 1; i < sizes.size(); ++i) {
+      if (sizes[i] == cur) return static_cast<uint8_t>(i);
+    }
+    return 0;
+  };
+
+  s.valueSetter = [sizes](uint8_t v) {
+    if (v == 0 || v >= sizes.size()) {
+      SETTINGS.uiFontFallbackPointSize = 0;
+      return;
+    }
+    SETTINGS.uiFontFallbackPointSize = sizes[v];
+  };
+  return s;
+}
+
 inline SettingInfo buildFontFamilySetting(const SdCardFontRegistry* registry) {
   // Built-in font labels (StrId). CrumBLE: OMIT_BITTER_FONT,
   // OMIT_CHAREINK_FONT and OMIT_LEXENDDECA_FONT drop their respective
@@ -318,10 +424,16 @@ inline SettingInfo buildFontFamilySetting(const SdCardFontRegistry* registry) {
 }
 
 inline SettingInfo buildSleepScreenSetting() {
+  // v18.9.9.446: Reading Stats sleep screen (the pre-v445 BookStatsView-on-
+  // sleep mode) removed from the picker — superseded by Minimal Stats which
+  // has cleaner typography and consistent theming with the rest of Minimal.
+  // Enum value + dispatch case are kept in code for source-compat but
+  // legacy persisted saves auto-migrate at boot (see main.cpp migration).
   SettingInfo s = SettingInfo::Enum(StrId::STR_SLEEP_SCREEN, &CrossPointSettings::sleepScreen,
                                     {StrId::STR_DARK, StrId::STR_LIGHT, StrId::STR_CUSTOM, StrId::STR_COVER,
                                      StrId::STR_NONE_OPT, StrId::STR_COVER_CUSTOM, StrId::STR_PAGE_OVERLAY,
-                                     StrId::STR_READING_STATS, StrId::STR_THEME_MINIMAL, StrId::STR_QUICK_RESUME},
+                                     StrId::STR_THEME_MINIMAL, StrId::STR_QUICK_RESUME,
+                                     StrId::STR_MINIMAL_STATS},
                                     "sleepScreen", StrId::STR_CAT_DISPLAY);
   s.withEnumRawValues({
       static_cast<uint8_t>(CrossPointSettings::DARK),
@@ -331,9 +443,9 @@ inline SettingInfo buildSleepScreenSetting() {
       static_cast<uint8_t>(CrossPointSettings::BLANK),
       static_cast<uint8_t>(CrossPointSettings::COVER_CUSTOM),
       static_cast<uint8_t>(CrossPointSettings::OVERLAY),
-      static_cast<uint8_t>(CrossPointSettings::READING_STATS_SLEEP),
       static_cast<uint8_t>(CrossPointSettings::MINIMAL_SLEEP),
       static_cast<uint8_t>(CrossPointSettings::QUICK_RESUME),
+      static_cast<uint8_t>(CrossPointSettings::MINIMAL_STATS_SLEEP),
   });
   return s;
 }
@@ -386,7 +498,8 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
         "refreshFrequency", StrId::STR_CAT_DISPLAY));
     add(SettingInfo::Enum(StrId::STR_UI_THEME, &CrossPointSettings::uiTheme,
                           {StrId::STR_THEME_CLASSIC, StrId::STR_THEME_LYRA, StrId::STR_THEME_LYRA_EXTENDED,
-                           StrId::STR_THEME_FLOW, StrId::STR_THEME_ROUNDEDRAFF, StrId::STR_THEME_MINIMAL
+                           StrId::STR_THEME_FLOW, StrId::STR_THEME_ROUNDEDRAFF, StrId::STR_THEME_MINIMAL,
+                           StrId::STR_THEME_DASHBOARD
 #if defined(CROSSINK_ENABLE_LYRA_CAROUSEL) && CROSSINK_ENABLE_LYRA_CAROUSEL
                            ,
                            StrId::STR_THEME_LYRA_CAROUSEL
@@ -395,7 +508,8 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                           "uiTheme", StrId::STR_CAT_DISPLAY)
             .withEnumRawValues({CrossPointSettings::UI_THEME::CLASSIC, CrossPointSettings::UI_THEME::LYRA,
                                 CrossPointSettings::UI_THEME::LYRA_3_COVERS, CrossPointSettings::UI_THEME::LYRA_FLOW,
-                                CrossPointSettings::UI_THEME::ROUNDEDRAFF, CrossPointSettings::UI_THEME::MINIMAL
+                                CrossPointSettings::UI_THEME::ROUNDEDRAFF, CrossPointSettings::UI_THEME::MINIMAL,
+                                CrossPointSettings::UI_THEME::DASHBOARD
 #if defined(CROSSINK_ENABLE_LYRA_CAROUSEL) && CROSSINK_ENABLE_LYRA_CAROUSEL
                                 ,
                                 CrossPointSettings::UI_THEME::LYRA_CAROUSEL
@@ -422,6 +536,10 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
     // and the per-tick poll in main.cpp.
     add(SettingInfo::Toggle(StrId::STR_SUNLIGHT_FADING_FIX, &CrossPointSettings::fadingFix, "fadingFix",
                             StrId::STR_CAT_DISPLAY));
+    // v18.9.9.178: UI Font Fallback picker removed. Feature was armed by
+    // the setting value and cost ~8-9 KB per session on first glyph miss.
+    // Retired for heap headroom; box glyphs render as tofu; long-term fix
+    // is expanding Bitter's Unicode coverage (see memory notes).
 
     // --- Reader ---
     // Built-in font-family entry. Replaced per-call with a registry-aware
@@ -476,6 +594,10 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                             StrId::STR_CAT_READER));
     add(SettingInfo::Toggle(StrId::STR_TEXT_AA, &CrossPointSettings::textAntiAliasing, "textAntiAliasing",
                             StrId::STR_CAT_READER));
+    // v18.9.9.405: opt-in single-pass page turn. See CrossPointSettings.h
+    // for the rationale.
+    add(SettingInfo::Toggle(StrId::STR_SINGLE_PASS_PAGE_TURN, &CrossPointSettings::singlePassPageTurn,
+                            "singlePassPageTurn", StrId::STR_CAT_READER));
     add(SettingInfo::Toggle(StrId::STR_READER_DARK_MODE, &CrossPointSettings::readerDarkMode, "readerDarkMode",
                             StrId::STR_CAT_READER));
     // CrumBLE 4.4 (ported from CPR-vCodex): Text Darkness, 4-way enum.
@@ -487,6 +609,13 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
     add(SettingInfo::Enum(StrId::STR_IMAGES, &CrossPointSettings::imageRendering,
                           {StrId::STR_IMAGES_DISPLAY, StrId::STR_IMAGES_PLACEHOLDER, StrId::STR_IMAGES_SUPPRESS},
                           "imageRendering", StrId::STR_CAT_READER));
+    // v18.9.9.24: user-facing tables toggle. PARAGRAPHS collapses cells to
+    // paragraph runs at parse time (same guard Compat mode uses). Locked to
+    // PARAGRAPHS while APP_STATE.readerCompatModeActive is true -- see
+    // isCompatLockedSetting in SettingsActivity.cpp.
+    add(SettingInfo::Enum(StrId::STR_TABLES, &CrossPointSettings::tableRendering,
+                          {StrId::STR_TABLES_DISPLAY, StrId::STR_TABLES_PARAGRAPHS},
+                          "tableRendering", StrId::STR_CAT_READER));
     // CrumBLE 4.4: promoted from a two-state toggle ("Extra Spacing") to a
     // three-way enum ("Paragraph Spacing"). 0/TIGHT = classic text-indent
     // paragraphs with no vertical gap; 1/NORMAL = block-style paragraphs with
@@ -502,6 +631,12 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                             "bionicReadingEnabled", StrId::STR_CAT_READER));
     add(SettingInfo::Toggle(StrId::STR_GUIDE_READING, &CrossPointSettings::guideReadingEnabled, "guideReadingEnabled",
                             StrId::STR_CAT_READER));
+    // v18.9.9.78: Stable Page Numbers toggle. When on, status bar shows book-wide
+    // "Stable page X of Y" derived from byte position. Fixed 1500-char divisor
+    // matches CrossInk / KOReader default. Persistence-only for stablePageChars
+    // (advanced setting via /api/save-reader-settings; not in on-device UI).
+    add(SettingInfo::Toggle(StrId::STR_STABLE_PAGE_NUMBERS, &CrossPointSettings::showStablePageNumbers,
+                            "showStablePageNumbers", StrId::STR_CAT_READER));
     // CrumBLE 4.4: persistence-only registration (no on-device Settings UI).
     // Diagnostic toggle to A/B test whether the v40 glyph atlas install path
     // is the source of the FT upload heap regression. Default ON keeps the
@@ -553,6 +688,14 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
         StrId::STR_TIME_TO_SLEEP, &CrossPointSettings::sleepTimeoutMinutes,
         {CrossPointSettings::MIN_SLEEP_TIMEOUT_MINUTES, CrossPointSettings::MAX_SLEEP_TIMEOUT_MINUTES, 1},
         "sleepTimeoutMinutes", StrId::STR_CAT_SYSTEM));
+    // v18.9.4/18.9.5.1: BT auto-disconnect. Slider UI matches Time to Sleep
+    // exactly (min 1, max 30, step 1) so the two related settings render
+    // identically. Runtime check lives in main.cpp loop() and disables BT
+    // when idle exceeds this window.
+    add(SettingInfo::Value(
+        StrId::STR_BT_AUTO_DISCONNECT, &CrossPointSettings::btAutoDisconnectMinutes,
+        {CrossPointSettings::MIN_SLEEP_TIMEOUT_MINUTES, CrossPointSettings::MAX_SLEEP_TIMEOUT_MINUTES, 1},
+        "btAutoDisconnectMinutes", StrId::STR_CAT_SYSTEM));
     add(SettingInfo::Toggle(StrId::STR_SHOW_HIDDEN_FILES, &CrossPointSettings::showHiddenFiles, "showHiddenFiles",
                             StrId::STR_CAT_SYSTEM));
     add(SettingInfo::Toggle(StrId::STR_REMOVE_READ_FROM_RECENTS, &CrossPointSettings::removeReadBooksFromRecents,
@@ -576,6 +719,10 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
     //     <book-hash>.zip dropped via the file manager into sections-prebake/
     add(SettingInfo::Toggle(StrId::STR_OPTIMIZE_CHAPTER_INDEXING, &CrossPointSettings::optimizeChapterIndexing,
                             "optimizeChapterIndexing", StrId::STR_CAT_SYSTEM));
+
+    // v18.9.9.172: toggle for the C2 "Indexing page X of Y" popup text.
+    add(SettingInfo::Toggle(StrId::STR_INDEXING_SHOW_PAGE_COUNT, &CrossPointSettings::showIndexingPageCount,
+                            "showIndexingPageCount", StrId::STR_CAT_SYSTEM));
 
     // --- KOReader Sync (web-only, uses KOReaderCredentialStore) ---
     add(SettingInfo::DynamicString(
@@ -613,6 +760,12 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
                             "statusBarChapterPageCount", StrId::STR_CUSTOMISE_STATUS_BAR));
     add(SettingInfo::Toggle(StrId::STR_BOOK_PROGRESS_PERCENTAGE, &CrossPointSettings::statusBarBookProgressPercentage,
                             "statusBarBookProgressPercentage", StrId::STR_CUSTOMISE_STATUS_BAR));
+    // v18.9.9.463 (CrossInk parity): estimated time-left in status bar.
+    // Needs per-book pace data (stats.avgSecondsPerForwardPage) to be
+    // meaningful; hidden by default until the book has enough page turns
+    // for a stable average.
+    add(SettingInfo::Toggle(StrId::STR_TIME_LEFT, &CrossPointSettings::statusBarTimeLeft, "statusBarTimeLeft",
+                            StrId::STR_CUSTOMISE_STATUS_BAR));
     add(SettingInfo::Enum(StrId::STR_PROGRESS_BAR, &CrossPointSettings::statusBarProgressBar,
                           {StrId::STR_BOOK, StrId::STR_CHAPTER, StrId::STR_HIDE}, "statusBarProgressBar",
                           StrId::STR_CUSTOMISE_STATUS_BAR));
@@ -631,6 +784,12 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
     // Range 0..104 = quarter-hour steps from UTC-12:00 to UTC+14:00, biased by 48.
     add(SettingInfo::Toggle(StrId::STR_CLOCK, &CrossPointSettings::statusBarClock, "statusBarClock",
                             StrId::STR_CUSTOMISE_STATUS_BAR));
+    // v18.9.9.343: Home header clock lives under Display>Theme&Layout,
+    // separate from the in-book status-bar clock above so users can enable
+    // one without the other (esp. on X4 where enabling either triggers
+    // an NTP-sync silent-restart at boot).
+    add(SettingInfo::Toggle(StrId::STR_HOME_CLOCK, &CrossPointSettings::homeClockShow, "homeClockShow",
+                            StrId::STR_CAT_DISPLAY));
     add(SettingInfo::Value(StrId::STR_CLOCK_UTC_OFFSET, &CrossPointSettings::clockUtcOffsetQ, {0, 104, 1},
                            "clockUtcOffsetQ", StrId::STR_CUSTOMISE_STATUS_BAR));
     add(SettingInfo::Enum(StrId::STR_CLOCK_FORMAT, &CrossPointSettings::clockFormat,
@@ -660,6 +819,32 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
   }();
 
   std::vector<SettingInfo> v = baseList;
+  // v18.9.9.318: baseList never added placeholders for STR_UI_FONT_FALLBACK
+  // or STR_UI_FONT_FALLBACK_SIZE, so the previous "replace via find_if"
+  // pattern silently no-op'd -- the settings never made it into
+  // allSettings, pushByName failed with "missing setting nameId=290/291",
+  // and the Reader > Font submenu rendered short (visible symptom: empty
+  // "Font" page after picking a new SD family). Now: replace if found,
+  // else push. Runs BEFORE the FONT_FAMILY block so both substitutions
+  // are in place even when registry is null.
+  {
+    auto it =
+        std::find_if(v.begin(), v.end(), [](const SettingInfo& s) { return s.nameId == StrId::STR_UI_FONT_FALLBACK; });
+    if (it != v.end()) {
+      *it = buildUiFontFallbackSetting(registry);
+    } else {
+      v.push_back(buildUiFontFallbackSetting(registry));
+    }
+  }
+  {
+    auto it = std::find_if(v.begin(), v.end(),
+                           [](const SettingInfo& s) { return s.nameId == StrId::STR_UI_FONT_FALLBACK_SIZE; });
+    if (it != v.end()) {
+      *it = buildUiFontFallbackSizeSetting(registry);
+    } else {
+      v.push_back(buildUiFontFallbackSizeSetting(registry));
+    }
+  }
   if (registry && registry->getFamilyCount() > 0) {
     auto it = std::find_if(v.begin(), v.end(), [](const SettingInfo& s) { return s.nameId == StrId::STR_FONT_FAMILY; });
     if (it != v.end()) {

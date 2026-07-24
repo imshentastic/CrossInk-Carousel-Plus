@@ -384,6 +384,19 @@ void usage(const char* argv0) {
                "                         which is the architectural fix for BT + SD-font\n"
                "                         heap fragmentation. No-op unless --sd-font-path\n"
                "                         is also supplied (built-in fonts don't benefit).\n"
+               "  --paragraph-alignment N\n"
+               "                         Lock paragraphAlignment in the bake (overrides the\n"
+               "                         settings file). 0=justified, 1=left, 2=center, 3=right,\n"
+               "                         4=book-style. Out-of-range values are ignored with a\n"
+               "                         warning; the settings-file value passes through.\n"
+               "  --extra-paragraph-spacing N\n"
+               "                         Lock extraParagraphSpacing in the bake. 0=tight,\n"
+               "                         1=normal, 2=wide.\n"
+               "  --line-compression FLOAT\n"
+               "                         Lock the lineCompression float in the bake (overrides\n"
+               "                         the settings file's derived value). Typical range is\n"
+               "                         0.85..1.20; values outside [0.5..2.0] are logged as a\n"
+               "                         likely typo but still applied.\n"
                "  --verbose              Per-step timing on stderr.\n"
                "  -h, --help             Show this help.\n",
                argv0);
@@ -438,6 +451,25 @@ struct Options {
   // font is large enough for AA to matter, else 1-bit. Explicit
   // --atlas-bit-depth wins over auto-pick.
   uint8_t atlasBitDepthOverride = 0;
+  // CrumBLE 4.5.5+: layout-setting overrides. Same pattern as --sd-font-*
+  // for fontId. The settings file the CLI loads is built from the dryRun
+  // /api/save-reader-settings response, which reflects whatever SETTINGS
+  // happened to hold when the modal was confirmed. When the caller wants
+  // to LOCK specific layout fields into this bake (independent of device-
+  // side drift), it passes the value here and the CLI overrides the
+  // settings-loaded value before fingerprinting + manifest emission.
+  //
+  // Sentinels:
+  //   paragraphAlignmentOverride = -1  -> no override
+  //   extraParagraphSpacingOverride = -1  -> no override
+  //   lineCompressionOverride = 0.0f  -> no override (valid range is > 0)
+  //
+  // Values, when set, are used verbatim; range checks below at the
+  // override site. JS optimizer is the expected caller, mirroring how
+  // --sd-font-family/--sd-font-size already get pushed.
+  int paragraphAlignmentOverride = -1;
+  int extraParagraphSpacingOverride = -1;
+  float lineCompressionOverride = 0.0f;
 };
 
 bool parseArgs(int argc, char** argv, Options& out) {
@@ -481,6 +513,21 @@ bool parseArgs(int argc, char** argv, Options& out) {
         return false;
       }
       out.atlasBitDepthOverride = static_cast<uint8_t>(v);
+    } else if (a == "--paragraph-alignment" && i + 1 < argc) {
+      // 0=justified, 1=left, 2=center, 3=right, 4=book-style. Matches
+      // CrossPointSettings::PARAGRAPH_ALIGNMENT. Range-check happens at
+      // the override site so we report once with full context.
+      out.paragraphAlignmentOverride = std::stoi(argv[++i]);
+    } else if (a == "--extra-paragraph-spacing" && i + 1 < argc) {
+      // 0=tight, 1=normal, 2=wide. Matches CrossPointSettings::
+      // EXTRA_PARAGRAPH_SPACING. Same range-check deferral as above.
+      out.extraParagraphSpacingOverride = std::stoi(argv[++i]);
+    } else if (a == "--line-compression" && i + 1 < argc) {
+      // The reader's lineCompression is a derived float (LINE_SPACING enum
+      // -> compression ratio), so the override is also a float. Typical
+      // range is roughly 0.85..1.20 -- a value <= 0 is treated as the
+      // "no override" sentinel.
+      out.lineCompressionOverride = std::stof(argv[++i]);
     } else if (a.rfind("--", 0) == 0) {
       std::fprintf(stderr, "Unknown option: %s\n", a.c_str());
       return false;
@@ -935,8 +982,8 @@ int prebakeSections(const std::string& epubPath, const std::string& realCacheDir
     const bool ok = section.createSectionFile(
         s.fontId, s.lineCompression, s.extraParagraphSpacing, s.forceParagraphIndents, s.paragraphAlignment,
         s.viewportWidth, s.viewportHeight, s.hyphenationEnabled, /*embeddedStyle=*/false, s.imageRendering,
-        s.bionicReadingEnabled, s.guideReadingEnabled, /*popupFn=*/nullptr, &imagesWereSuppressed,
-        &layoutAbortedForLowMemory);
+        s.bionicReadingEnabled, s.guideReadingEnabled, /*tableRendering=TABLES_DISPLAY=*/0,
+        /*popupFn=*/nullptr, &imagesWereSuppressed, &layoutAbortedForLowMemory);
     if (!ok) {
       LOG_ERR("PRE", "section %d FAILED", spineIdx);
       ++failures;
@@ -1298,7 +1345,7 @@ std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font, uint8_t bitDep
   // ~3-5 KB of contiguous post-BT space. Explicit --atlas-bit-depth still wins.
   constexpr uint8_t kAutoBitDepth2BitMinPointSize = 16;
   const bool autoPicks2Bit = anyStyleIs2Bit && sdFontPointSize >= kAutoBitDepth2BitMinPointSize;
-  const uint8_t outputBitDepth =
+  uint8_t outputBitDepth =
       bitDepthOverride != 0 ? bitDepthOverride
                             : (autoPicks2Bit ? glyphatlas::BIT_DEPTH_2 : glyphatlas::BIT_DEPTH_1);
   LOG_INF("PRE",
@@ -1306,6 +1353,13 @@ std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font, uint8_t bitDep
           static_cast<unsigned>(outputBitDepth), static_cast<unsigned>(bitDepthOverride),
           anyStyleIs2Bit ? 1 : 0, static_cast<unsigned>(sdFontPointSize),
           static_cast<unsigned>(kAutoBitDepth2BitMinPointSize));
+
+  // CrumBLE 4.5.5: v2 format lifted the per-section 64 KB cap by widening
+  // BlockHeader::bitmapBytes + GlyphEntry::bitmapOffset to uint32_t, so
+  // the previous "2-bit -> 1-bit" pre-flight downgrade (its only purpose
+  // was dodging the v1 cap when CJK 2-bit would overflow) is no longer
+  // needed. The auto bit-depth pick above is final; the build loop emits
+  // whatever fits naturally.
 
   // Pack each glyph to 1-bit. Build per-style GlyphEntry vectors and a
   // single shared output bitmap buffer; each entry's bitmapOffset points
@@ -1341,11 +1395,13 @@ std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font, uint8_t bitDep
         // "ghost stroke per character" rendering artifact we hit on first
         // device test of the atlas.
         const uint32_t outGlyphBytes = glyphatlas::glyphBytes(g.width, g.height, outputBitDepth);
-        if (bitmapData.size() + outGlyphBytes > 0xFFFFu) {
-          LOG_ERR("PRE", "atlas: bitmap payload would exceed 64 KB at cp U+%04X style %u; truncating", cp, s);
-          break;  // bitmapBytes field is uint16_t
-        }
-        const uint16_t bitmapOffset = static_cast<uint16_t>(bitmapData.size());
+        // CrumBLE 4.5.5: removed the per-glyph 64 KB cap check. v2 widened
+        // bitmapOffset/bitmapBytes to uint32_t, so the wire-format cap is
+        // 4 GB -- not a real concern for an SD-card prebake. The device-
+        // side install path still bails under heap pressure (Section.cpp
+        // pre-flights maxAllocHeap >= bitmapBytes + 512), so the upper
+        // bound that actually matters lives there, not here.
+        const uint32_t bitmapOffset = static_cast<uint32_t>(bitmapData.size());
         bitmapData.resize(bitmapData.size() + outGlyphBytes, 0);
         const uint8_t* srcGlyph = srcBitmap + g.dataOffset;
 
@@ -1425,7 +1481,7 @@ std::vector<uint8_t> buildGlyphAtlasBlock(const SdCardFont& font, uint8_t bitDep
   bh.styleMask = styleMask;
   bh.reserved = 0;
   bh.totalGlyphs = totalGlyphs;
-  bh.bitmapBytes = static_cast<uint16_t>(bitmapData.size());
+  bh.bitmapBytes = static_cast<uint32_t>(bitmapData.size());
   output.insert(output.end(), reinterpret_cast<const uint8_t*>(&bh),
                 reinterpret_cast<const uint8_t*>(&bh) + sizeof(bh));
 
@@ -1611,6 +1667,45 @@ bool emitEmbeddedGlyphSubsetForSection(const std::string& sectionPath, Section& 
             "miniIntervalCount=%u miniGlyphCount=%u miniBitmapSize=%u",
             spineIdx, static_cast<unsigned>(styleIdx), cpset.size(), missed, font.miniIntervalCount(styleIdx),
             font.miniGlyphCount(styleIdx), font.miniBitmapSize(styleIdx));
+
+    // CrumBLE 4.5.4 task #5 part A: coverage gate. If we missed more than
+    // half of the requested codepoints, the .cpfont effectively doesn't
+    // serve this section's working set. Suppress BOTH the embedded glyph
+    // subset emit AND the atlas emit for this style by clearing the
+    // codepoint set -- the downstream loops at "if (codepointsByStyle[s]
+    // .empty()) continue;" then skip this style. Device will fall back
+    // to live SD-font glyph lookup at section open, which (per field
+    // test) renders 90%+ of CJK content correctly via the runtime miss
+    // handler even when the WASM-side prewarm misses most codepoints.
+    // Failure mode prevented: a prebaked atlas with 5/81 glyphs that
+    // installs on device and intercepts every lookup with '?' for the
+    // 76 missing codepoints. Skipping the atlas means the runtime path
+    // is the source of truth, and it works.
+    //
+    // 50% is the elbow: typical-Latin-text books prewarm with <5% miss
+    // (well above 50% coverage), while the broken-WASM-lookup case in
+    // this report had 77/81 miss = 95% miss = ~5% coverage. Anything
+    // above 50% miss means the atlas is more wrong than right.
+    if (cpset.size() > 0) {
+      const double missRatio = static_cast<double>(missed) / static_cast<double>(cpset.size());
+      if (missRatio > 0.5) {
+        LOG_INF("PRE",
+                "  section %d style %u: SKIPPING atlas emit -- %u/%zu miss "
+                "(%.0f%%) is too low coverage; device will use live SD font lookup",
+                spineIdx, static_cast<unsigned>(styleIdx), missed, cpset.size(), missRatio * 100.0);
+        codepointsByStyle[styleIdx].clear();
+        // CrumBLE 4.5.4 task #5A hole-fix: clearing codepointsByStyle wasn't
+        // enough -- the atlas-emit branch (lines ~1000+ in spineLoop) calls
+        // buildGlyphAtlasBlock on the font's prewarmed mini-data, which the
+        // prewarm() call above has ALREADY populated with the 5 found-but-
+        // partial glyphs. So even after the EGS block emit skips, an atlas
+        // still emitted with those 5 glyphs and installed on device,
+        // intercepting every lookup with '?' for the 76 missing chars.
+        // Drop the mini-data too so the atlas builder has nothing to emit
+        // and the device falls through to the live SD font lookup path.
+        font.clearMiniDataForStyle(styleIdx);
+      }
+    }
   }
 
   // Stage 3: serialise the prewarmed mini-data into an EmbeddedGlyphSubset
@@ -1812,15 +1907,20 @@ int main(int argc, char** argv) {
   // computeFontId here mirrors the device's hash exactly, so the
   // manifest's fontId == reader's runtime fontId.
   std::unique_ptr<SdCardFont> sdFontKeepalive;
+  // 4.5.5+: lifted out of the if-scope so the post-settings-load override
+  // below can see it. Stays 0 when no SD font is provided -> override is
+  // a no-op, sectionSettings.fontId keeps whatever the settings file
+  // says (correct for built-in font bakes).
+  int sdFontId = 0;
   if (!opts.sdFontPath.empty() && !opts.sdFontFamilyName.empty() && opts.sdFontPointSize > 0) {
     auto font = std::make_unique<SdCardFont>();
     if (!font->load(opts.sdFontPath.c_str())) {
       LOG_ERR("CLI", "SD font load failed: %s -- aborting", opts.sdFontPath.c_str());
       return 4;
     }
-    const int sdFontId = SdCardFontManager::computeFontId(font->contentHash(),
-                                                          opts.sdFontFamilyName.c_str(),
-                                                          opts.sdFontPointSize);
+    sdFontId = SdCardFontManager::computeFontId(font->contentHash(),
+                                                opts.sdFontFamilyName.c_str(),
+                                                opts.sdFontPointSize);
     // insertFont puts the EpdFontFamily wrapper in the renderer's
     // fontMap so getData()/getKerning() lookups work. registerSdCardFont
     // separately puts the SdCardFont* in the sdCardFonts_ map so
@@ -1901,6 +2001,95 @@ int main(int argc, char** argv) {
       LOG_INF("CLI", "device target detected: %s", sectionSettings.device.c_str());
     }
     renderer.setViewport(sectionSettings.viewportWidth, sectionSettings.viewportHeight);
+
+    // 4.5.5+: when an SD font was supplied to the bake, override the
+    // settings-file fontId with the SD font's computed ID. The settings
+    // file came from the device's /api/save-reader-settings dryRun
+    // response, which skips SD-font ensureLoaded for heap reasons -- so
+    // when the user picks a NEW SD font in the optimizer modal, the
+    // dryRun's SETTINGS.getReaderFontId() falls through to the built-in
+    // BITTER fallback. The browser then writes BITTER into the settings
+    // file we just loaded.
+    //
+    // The CLI has the SD font in hand (loaded above at line ~1864) and
+    // already computed the correct sdFontId from the file's contentHash
+    // + family + point size -- this matches what the device's
+    // SdCardFontManager will compute at reader-runtime. Use it for the
+    // manifest + every section fingerprint so the prebake actually
+    // matches the runtime fingerprint, instead of always failing the
+    // mismatch check and falling back to slow on-device rebuild.
+    //
+    // No-op when no SD font was provided (built-in font bake) -- sdFontId
+    // stays 0 and we keep whatever the settings file said.
+    if (sdFontId != 0 && sectionSettings.fontId != sdFontId) {
+      LOG_INF("CLI",
+              "Overriding settings-file fontId %d with computed SD fontId %d "
+              "(family=%s pt=%u) -- prebake will now fingerprint-match the runtime",
+              sectionSettings.fontId, sdFontId, opts.sdFontFamilyName.c_str(),
+              opts.sdFontPointSize);
+      sectionSettings.fontId = sdFontId;
+    }
+
+    // CrumBLE 4.5.5+: layout-setting overrides. Same pattern, different
+    // root cause from the fontId case. The dryRun handler DOES apply
+    // paragraphAlignment / extraParagraphSpacing / lineSpacing -> line-
+    // Compression correctly when the modal sends them, so a settings file
+    // produced from a single round-trip should already match. But the
+    // CLI is also invoked outside the WASM/optimizer path (batch CI, ad-
+    // hoc command-line use, future browser flows that build a settings
+    // file from cached render-info rather than a live dryRun), and in
+    // those cases the loaded settings can lag the caller's intent. These
+    // overrides give every caller a uniform escape hatch -- pass the
+    // value you want LOCKED INTO THIS BAKE and the CLI will use it
+    // regardless of what the settings file says. Each is independent:
+    // omit any (leave the sentinel) and the settings-file value passes
+    // through unchanged.
+    if (opts.paragraphAlignmentOverride >= 0) {
+      const int v = opts.paragraphAlignmentOverride;
+      // CrossPointSettings::PARAGRAPH_ALIGNMENT_COUNT is the enum sentinel
+      // (5: justified, left, center, right, book-style). Reject out-of-
+      // range values rather than silently clipping -- a CLI typo
+      // shouldn't produce a manifest that looks valid but renders
+      // unexpectedly.
+      if (v > 4) {
+        LOG_ERR("CLI", "--paragraph-alignment %d out of range [0..4]; ignoring override", v);
+      } else if (sectionSettings.paragraphAlignment != static_cast<uint8_t>(v)) {
+        LOG_INF("CLI",
+                "Overriding settings-file paragraphAlignment %u with CLI-arg %d",
+                sectionSettings.paragraphAlignment, v);
+        sectionSettings.paragraphAlignment = static_cast<uint8_t>(v);
+      }
+    }
+    if (opts.extraParagraphSpacingOverride >= 0) {
+      const int v = opts.extraParagraphSpacingOverride;
+      if (v > 2) {
+        LOG_ERR("CLI", "--extra-paragraph-spacing %d out of range [0..2]; ignoring override", v);
+      } else if (sectionSettings.extraParagraphSpacing != static_cast<uint8_t>(v)) {
+        LOG_INF("CLI",
+                "Overriding settings-file extraParagraphSpacing %u with CLI-arg %d",
+                sectionSettings.extraParagraphSpacing, v);
+        sectionSettings.extraParagraphSpacing = static_cast<uint8_t>(v);
+      }
+    }
+    if (opts.lineCompressionOverride > 0.0f) {
+      // No hard upper bound — the device's runtime accepts any positive
+      // float here; weird values just produce weird layouts. Still log
+      // a wide range as a warning so a likely typo (e.g. 100.0 meant
+      // 1.00) doesn't ship silently.
+      const float v = opts.lineCompressionOverride;
+      if (v < 0.5f || v > 2.0f) {
+        LOG_INF("CLI",
+                "--line-compression %.3f is outside the typical [0.5..2.0] range; "
+                "using anyway (typos can cause this)", static_cast<double>(v));
+      }
+      if (sectionSettings.lineCompression != v) {
+        LOG_INF("CLI",
+                "Overriding settings-file lineCompression %.3f with CLI-arg %.3f",
+                static_cast<double>(sectionSettings.lineCompression),
+                static_cast<double>(v));
+        sectionSettings.lineCompression = v;
+      }
+    }
   } else {
     LOG_INF("CLI", "--skip-sections set; section generation disabled. Producing book.bin + thumbs only.");
   }

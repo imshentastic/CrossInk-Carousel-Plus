@@ -200,4 +200,37 @@ int regenerateAllCovers() {
   return removedThumbs;
 }
 
+int regenerateThumbsForBook(const std::string& cacheDir) {
+  auto dir = Storage.open(cacheDir.c_str());
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    return 0;
+  }
+  char fileNameBuf[128];
+  std::vector<std::string> toRemove;
+  const std::string thumbPrefix = "thumb_";
+  const std::string failedPrefix = "thumb_failed_";
+  const std::string bmpSuffix = ".bmp";
+  for (auto f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    f.getName(fileNameBuf, sizeof(fileNameBuf));
+    const std::string filename = fileNameBuf;
+    const bool matchesPrefix = filename.compare(0, thumbPrefix.size(), thumbPrefix) == 0;
+    const bool isFailedMarker = filename.compare(0, failedPrefix.size(), failedPrefix) == 0;
+    const bool isBmpThumb = matchesPrefix && !isFailedMarker &&
+                            filename.size() > bmpSuffix.size() &&
+                            filename.compare(filename.size() - bmpSuffix.size(), bmpSuffix.size(), bmpSuffix) == 0;
+    f.close();
+    // Sweep both cached bmps AND the failure markers for this book so the next
+    // render is unconditionally re-attempted.
+    if (isBmpThumb || isFailedMarker) toRemove.push_back(cacheDir + "/" + filename);
+  }
+  dir.close();
+  int removed = 0;
+  for (const auto& path : toRemove) {
+    if (Storage.remove(path.c_str())) ++removed;
+  }
+  LOG_INF("CTS", "Regenerate for %s: removed %d entr(y/ies)", cacheDir.c_str(), removed);
+  return removed;
+}
+
 }  // namespace CoverThumbStatus

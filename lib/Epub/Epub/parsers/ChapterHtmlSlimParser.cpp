@@ -10,6 +10,7 @@
 #include <XmlParserUtils.h>
 #include <expat.h>
 
+#include <array>
 #include <cstdlib>
 #include <iterator>
 #include <new>
@@ -19,11 +20,82 @@
 #include "Epub/converters/ImageDecoderFactory.h"
 #include "Epub/converters/ImageToFramebufferDecoder.h"
 #include "Epub/htmlEntities.h"
+#include "Epub/parsers/ChapterHtmlSlimParserGuards.h"
+
+// v18.9.3/v18.9.6: two independent sources for the table guard, ORed at
+// read time so either the BT loop or the reader's force-simple retry can
+// drive it. Default false so the parser behaves identically to pre-v18.9.3
+// until the runtime opts in.
+namespace {
+bool gSuppressTablesBt = false;
+bool gSuppressTablesSimple = false;
+bool gSuppressTables = false;  // cached OR; kept private so parser reads one bool
+void recomputeCombined() { gSuppressTables = gSuppressTablesBt || gSuppressTablesSimple; }
+}
+
+void setChapterParserSuppressTables(bool suppress) {
+  gSuppressTablesBt = suppress;
+  recomputeCombined();
+}
+void setChapterParserSuppressTablesForSimple(bool suppress) {
+  gSuppressTablesSimple = suppress;
+  recomputeCombined();
+}
+bool getChapterParserSuppressTables() { return gSuppressTables; }
 
 // Minimum file size (in bytes) to show indexing popup - smaller chapters don't benefit from it
 constexpr size_t MIN_SIZE_FOR_POPUP = 10 * 1024;  // 10KB
 constexpr size_t PARSE_BUFFER_SIZE = 1024;
 constexpr size_t IMAGE_EXTRACT_CHUNK_SIZE = 1024;
+// v18.9.9.165: image extract retries with shrinking chunk sizes. Post-BT tight
+// heap + concurrent SD activity occasionally starves readItemContentsToStream
+// on the first pass; smaller chunks succeed where 1024 didn't.
+constexpr std::array<size_t, 3> IMAGE_STREAM_CHUNK_SIZES = {1024, 768, 512};
+
+namespace {
+bool extractImageToCacheWithRetries(const Epub& epub, const std::string& resolvedPath,
+                                    const std::string& cachedImagePath) {
+  for (size_t attempt = 0; attempt < IMAGE_STREAM_CHUNK_SIZES.size(); ++attempt) {
+    if (Storage.exists(cachedImagePath.c_str())) {
+      Storage.remove(cachedImagePath.c_str());
+    }
+    FsFile cachedImageFile;
+    if (!Storage.openFileForWrite("EHP", cachedImagePath, cachedImageFile)) {
+      LOG_ERR("EHP", "Failed to open cached image for write: %s", cachedImagePath.c_str());
+      delay(20 * (attempt + 1));
+      continue;
+    }
+    const size_t chunkSize = IMAGE_STREAM_CHUNK_SIZES[attempt];
+    const bool extractSuccess =
+        epub.readItemContentsToStream(resolvedPath, cachedImageFile, chunkSize);
+    cachedImageFile.flush();
+    cachedImageFile.close();
+    if (extractSuccess) {
+      delay(20);  // SD sync before probing dimensions
+      return true;
+    }
+    LOG_ERR("EHP", "Image extract attempt %u failed for %s (chunk=%u)",
+            static_cast<unsigned>(attempt + 1), resolvedPath.c_str(),
+            static_cast<unsigned>(chunkSize));
+    delay(20 * (attempt + 1));
+  }
+  if (Storage.exists(cachedImagePath.c_str())) {
+    Storage.remove(cachedImagePath.c_str());
+  }
+  return false;
+}
+
+bool getImageDimensionsWithRetries(ImageToFramebufferDecoder& decoder,
+                                   const std::string& cachedImagePath, ImageDimensions& dims) {
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    if (decoder.getDimensions(cachedImagePath, dims)) {
+      return true;
+    }
+    delay(20 * (attempt + 1));
+  }
+  return false;
+}
+}  // namespace
 // CrumBLE: NimBLE eats ~50-58 KB once a remote is paired, pushing the reader
 // near upstream's text-layout floor. Layout works on tighter budgets (a paired
 // session dipped free heap to ~27 KB on a heavy chapter, still above OOM), so
@@ -638,6 +710,17 @@ void ChapterHtmlSlimParser::fallbackCurrentTableBufferIfNeeded(const char* stage
     return;
   }
 
+  // v18.9.3: BT-aware guard. Table buffering wants 64 KB free + 40 KB
+  // maxAlloc; NimBLE resident already burns ~58 KB of the free budget. Skip
+  // the structured table path entirely when BT is on (or user disabled it)
+  // and render as paragraphs -- same behavior CrossPoint/INX have for all
+  // tables. Runs BEFORE the heap probe so we don't gate on stale numbers
+  // when BT enable is imminent.
+  if (gSuppressTables) {
+    fallbackCurrentTableBufferToParagraphs(stage);
+    return;
+  }
+
   const auto heap = MemoryBudget::snapshot();
   if (!MemoryBudget::hasHeap(heap, MIN_FREE_HEAP_FOR_TABLE_BUFFERING, MIN_MAX_ALLOC_FOR_TABLE_BUFFERING)) {
     fallbackCurrentTableBufferToParagraphs(stage);
@@ -862,8 +945,12 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
         return;
       }
 
+      // v18.9.9.76: hoist imageRendering to a local. Checked twice below and
+      // could be re-read across the intervening resolveStyle + applyOver calls
+      // (self-> is a pointer chase).
       // imageRendering: 0=display, 1=placeholder (alt text only), 2=suppress entirely
-      if (self->imageRendering == 2) {
+      const uint8_t imgRender = self->imageRendering;
+      if (imgRender == 2) {
         self->skipUntilDepth = self->depth;
         self->depth += 1;
         return;
@@ -882,7 +969,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
         }
       }
 
-      if (!src.empty() && self->imageRendering != 1) {
+      if (!src.empty() && imgRender != 1) {
         LOG_DBG("EHP", "Found image: src=%s", src.c_str());
 
         {
@@ -941,16 +1028,11 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
               }
               std::string cachedImagePath = self->imageBasePath + std::to_string(self->imageCounter++) + ext;
 
-              // Extract image to cache file
-              FsFile cachedImageFile;
-              bool extractSuccess = false;
-              if (Storage.openFileForWrite("EHP", cachedImagePath, cachedImageFile)) {
-                extractSuccess =
-                    self->epub->readItemContentsToStream(resolvedPath, cachedImageFile, IMAGE_EXTRACT_CHUNK_SIZE);
-                cachedImageFile.flush();
-                cachedImageFile.close();
-                delay(50);  // Give SD card time to sync
-              }
+              // v18.9.9.165: retry extract with shrinking chunk sizes (1024/768/512)
+              // + 20ms SD sync on success. Handles transient SD/heap-pressure failures
+              // that plagued the single 1024-byte extract under BT + tight heap.
+              const bool extractSuccess =
+                  extractImageToCacheWithRetries(*self->epub, resolvedPath, cachedImagePath);
 
               if (extractSuccess) {
                 LOG_DBG("EHP", "Heap after image extraction: free=%u maxAlloc=%u path=%s", ESP.getFreeHeap(),
@@ -985,7 +1067,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                 // Get image dimensions
                 ImageDimensions dims = {0, 0};
                 ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(cachedImagePath);
-                if (decoder && decoder->getDimensions(cachedImagePath, dims)) {
+                if (decoder && getImageDimensionsWithRetries(*decoder, cachedImagePath, dims)) {
                   LOG_DBG("EHP", "Image dimensions: %dx%d", dims.width, dims.height);
 
                   if (!hasBundledPxc && !MemoryBudget::hasHeapForEpubInlineImage("EHP", cachedImagePath.c_str())) {
@@ -1163,7 +1245,8 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                   self->depth += 1;
                   return;
                 } else {
-                  LOG_ERR("EHP", "Failed to get image dimensions");
+                  LOG_ERR("EHP", "Failed to get image dimensions after retries: %s",
+                          cachedImagePath.c_str());
                   Storage.remove(cachedImagePath.c_str());
                 }
               } else {
@@ -1176,7 +1259,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                   LOG_ERR("EHP", "Disabling remaining image extraction after failure (%u free, %u max alloc)",
                           postFailureFreeHeap, postFailureMaxAllocHeap);
                 }
-                LOG_ERR("EHP", "Failed to extract image: %s", resolvedPath.c_str());
+                LOG_ERR("EHP", "Failed to extract image after retries: %s", resolvedPath.c_str());
               }
             }  // isFormatSupported
           }
@@ -1278,12 +1361,17 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
   const CssTextAlign requestedAlign = static_cast<CssTextAlign>(self->paragraphAlignment);
   auto userAlignmentBlockStyle = BlockStyle::fromCssStyle(cssStyle, emSize, requestedAlign, self->viewportWidth);
 
-  if (!self->embeddedStyle || requestedAlign != CssTextAlign::None) {
+  // v18.9.9.76: hoist embeddedStyle to a local. Called 5x in this function; the
+  // compiler can't prove self-> doesn't change across the fromCssStyle /
+  // emitHorizontalRule / start-block calls interleaved below without this hint.
+  const bool embedded = self->embeddedStyle;
+
+  if (!embedded || requestedAlign != CssTextAlign::None) {
     userAlignmentBlockStyle.textAlignDefined = true;
     userAlignmentBlockStyle.alignment = requestedAlign == CssTextAlign::None ? CssTextAlign::Justify : requestedAlign;
   }
 
-  if (!self->embeddedStyle) {
+  if (!embedded) {
     userAlignmentBlockStyle.marginLeft = 0;
     userAlignmentBlockStyle.marginRight = 0;
     userAlignmentBlockStyle.marginTop = 0;
@@ -1312,7 +1400,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
 
   if (strcmp(name, "hr") == 0) {
     auto hrBlockStyle = BlockStyle::fromCssStyle(cssStyle, emSize, CssTextAlign::Left, self->viewportWidth);
-    if (!self->embeddedStyle) {
+    if (!embedded) {
       hrBlockStyle.marginLeft = 0;
       hrBlockStyle.marginRight = 0;
       hrBlockStyle.marginTop = 0;
@@ -1334,10 +1422,10 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
     self->currentCssStyle = cssStyle;
     auto headerBlockStyle = BlockStyle::fromCssStyle(cssStyle, emSize, CssTextAlign::Center, self->viewportWidth);
     headerBlockStyle.textAlignDefined = true;
-    if (self->embeddedStyle && cssStyle.hasTextAlign()) {
+    if (embedded && cssStyle.hasTextAlign()) {
       headerBlockStyle.alignment = cssStyle.textAlign;
     }
-    if (!self->embeddedStyle) {
+    if (!embedded) {
       headerBlockStyle.marginLeft = 0;
       headerBlockStyle.marginRight = 0;
       headerBlockStyle.marginTop = 0;
@@ -2018,7 +2106,14 @@ void XMLCALL ChapterHtmlSlimParser::endElement(void* userData, const XML_Char* n
   }
 }
 
-bool ChapterHtmlSlimParser::parseAndBuildPages() {
+// v20 Phase B: split the one-shot parse into resumable begin/step/finish/abort,
+// with parseAndBuildPages retained as a wrapper that preserves all CrumBLE-
+// specific per-iter guards (popup tick, watchdog yield, per-iter DBG log,
+// lowMemoryAbort check). Incremental callers drive the state machine at their
+// own pacing without those guards -- Section::buildSomeMore adds a per-page
+// yield instead of a per-buffer one.
+
+bool ChapterHtmlSlimParser::beginParse() {
   // Initialize block style stack with a root entry representing "no ancestor block elements".
   // The user's paragraph alignment is set as the default so child elements without explicit
   // text-align inherit it correctly through getCombinedBlockStyle.
@@ -2038,115 +2133,87 @@ bool ChapterHtmlSlimParser::parseAndBuildPages() {
 
   ancestorStack_.reserve(32);
 
-  XML_Parser parser = XML_ParserCreate(nullptr);
-  int done;
-
-  if (!parser) {
+  xmlParser_ = XML_ParserCreate(nullptr);
+  if (!xmlParser_) {
     LOG_ERR("EHP", "Couldn't allocate memory for parser");
     return false;
   }
 
   // Handle HTML entities (like &nbsp;) that aren't in XML spec or DTD
   // Using DefaultHandlerExpand preserves normal entity expansion from DOCTYPE
-  XML_SetDefaultHandlerExpand(parser, defaultHandlerExpand);
+  XML_SetDefaultHandlerExpand(xmlParser_, defaultHandlerExpand);
 
-  FsFile file;
-  if (!Storage.openFileForRead("EHP", filepath, file)) {
-    destroyXmlParser(parser);
+  if (!Storage.openFileForRead("EHP", filepath, parseFile_)) {
+    destroyXmlParser(xmlParser_);
+    xmlParser_ = nullptr;
     return false;
   }
 
-  // Get file size to decide whether to show indexing popup.
-  if (popupFn && file.size() >= MIN_SIZE_FOR_POPUP) {
+  // Get file size to decide whether to show indexing popup. Callers drive
+  // the popup tick themselves during the step loop; we just fire once here
+  // so the popup appears before the first parseStep runs (giving the user
+  // instant feedback that indexing has begun).
+  if (popupFn && parseFile_.size() >= MIN_SIZE_FOR_POPUP) {
     popupFn();
   }
 
-  XML_SetUserData(parser, this);
-  XML_SetElementHandler(parser, startElement, endElement);
-  XML_SetCharacterDataHandler(parser, characterData);
+  XML_SetUserData(xmlParser_, this);
+  XML_SetElementHandler(xmlParser_, startElement, endElement);
+  XML_SetCharacterDataHandler(xmlParser_, characterData);
 
-  // Compute the time taken to parse and build pages
-  const uint32_t chapterStartTime = millis();
-  // CrumBLE: tick the popup callback every ~250 ms during the parse so
-  // the caller can animate (e.g. cycling "Indexing." / ".." / "...") and
-  // give the user feedback that the system is alive on long parses.
-  // The popup was previously drawn once at the start of the chapter and
-  // never updated, so the screen looked frozen for the whole 10+ second
-  // build on big chapters.
-  uint32_t lastPopupTick = millis();
-  constexpr uint32_t kPopupTickMs = 250;
-  // CrumBLE: diagnostics for chapters where the parser appears to hang.
-  // Log per-iteration progress so a serial monitor user can see exactly
-  // which chunk the parser stalls in (file offset, free heap, elapsed).
-  // Also call yield() each iteration to feed the FreeRTOS task watchdog
-  // — without it, a chapter whose handlers take >5 s per chunk would
-  // eventually trip a watchdog reset, which the user could perceive as
-  // "freeze then reboot".
-  uint32_t iterCount = 0;
-  do {
-    if (popupFn && (millis() - lastPopupTick) >= kPopupTickMs) {
-      popupFn();
-      lastPopupTick = millis();
-    }
-    void* const buf = XML_GetBuffer(parser, PARSE_BUFFER_SIZE);
-    if (!buf) {
-      LOG_ERR("EHP", "Couldn't allocate memory for buffer");
-      destroyXmlParser(parser);
-      file.close();
-      return false;
-    }
+  parseStartTime_ = millis();
+  return true;
+}
 
-    const uint32_t iterStart = millis();
-    const size_t len = file.read(buf, PARSE_BUFFER_SIZE);
-    const uint32_t afterReadMs = millis();
+ChapterHtmlSlimParser::ParseStatus ChapterHtmlSlimParser::parseStep() {
+  void* const buf = XML_GetBuffer(xmlParser_, PARSE_BUFFER_SIZE);
+  if (!buf) {
+    LOG_ERR("EHP", "Couldn't allocate memory for buffer");
+    return ParseStatus::Error;
+  }
 
-    if (len == 0 && file.available() > 0) {
-      LOG_ERR("EHP", "File read error");
-      destroyXmlParser(parser);
-      file.close();
-      return false;
-    }
+  const size_t len = parseFile_.read(buf, PARSE_BUFFER_SIZE);
+  if (len == 0 && parseFile_.available() > 0) {
+    LOG_ERR("EHP", "File read error");
+    return ParseStatus::Error;
+  }
 
-    done = file.available() == 0;
+  const int done = parseFile_.available() == 0;
 
-    if (XML_ParseBuffer(parser, static_cast<int>(len), done) == XML_STATUS_ERROR) {
-      LOG_ERR("EHP", "Parse error at line %lu:\n%s", XML_GetCurrentLineNumber(parser),
-              XML_ErrorString(XML_GetErrorCode(parser)));
-      destroyXmlParser(parser);
-      file.close();
-      return false;
-    }
-    const uint32_t afterParseMs = millis();
+  if (XML_ParseBuffer(xmlParser_, static_cast<int>(len), done) == XML_STATUS_ERROR) {
+    LOG_ERR("EHP", "Parse error at line %lu:\n%s", XML_GetCurrentLineNumber(xmlParser_),
+            XML_ErrorString(XML_GetErrorCode(xmlParser_)));
+    return ParseStatus::Error;
+  }
 
-    if (lowMemoryAbort) {
-      LOG_ERR("EHP", "Aborting section parse due to low heap");
-      destroyXmlParser(parser);
-      file.close();
-      return false;
-    }
+  // CrumBLE: honor lowMemoryAbort raised by handlers during this buffer.
+  // Incremental callers should treat this as fatal for the current parse.
+  if (lowMemoryAbort) {
+    LOG_ERR("EHP", "Aborting section parse due to low heap");
+    return ParseStatus::Error;
+  }
 
-    // Per-chunk progress log. DBG-level so it's compiled out at the
-    // production LOG_LEVEL=1 setting and only shows up in debug builds
-    // (LOG_LEVEL=2) when diagnosing a slow / hung parse. The fields
-    // (file offset, read/parse ms, free heap, elapsed) are enough to
-    // pinpoint which chunk stalls and what the heap looked like there.
-    LOG_DBG("EHP", "iter=%lu pos=%lu/%lu read_ms=%lu parse_ms=%lu free=%u maxAlloc=%u elapsed=%lu",
-            static_cast<unsigned long>(iterCount), static_cast<unsigned long>(file.position()),
-            static_cast<unsigned long>(file.size()), static_cast<unsigned long>(afterReadMs - iterStart),
-            static_cast<unsigned long>(afterParseMs - afterReadMs), ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
-            static_cast<unsigned long>(millis() - chapterStartTime));
-    iterCount++;
-    // Feed the task watchdog so a slow chunk doesn't trip a reset.
-    yield();
+  return done ? ParseStatus::Done : ParseStatus::More;
+}
 
-  } while (!done);
-  LOG_DBG("EHP", "Time to parse and build pages: %lu ms (free=%u, maxAlloc=%u)", millis() - chapterStartTime,
-          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+void ChapterHtmlSlimParser::abortParse() {
+  if (xmlParser_) {
+    destroyXmlParser(xmlParser_);
+    xmlParser_ = nullptr;
+  }
+  if (parseFile_) parseFile_.close();
+}
 
-  destroyXmlParser(parser);
-  file.close();
+bool ChapterHtmlSlimParser::finishParse() {
+  if (xmlParser_) {
+    LOG_DBG("EHP", "Time to parse and build pages: %lu ms (free=%u, maxAlloc=%u)", millis() - parseStartTime_,
+            ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    destroyXmlParser(xmlParser_);
+    xmlParser_ = nullptr;
+  }
+  if (parseFile_) parseFile_.close();
 
-  // Process last page if there is still text
+  // Process last page if there is still text (CrumBLE: with heap guard).
   if (currentTextBlock) {
     if (shouldAbortForLowMemory("final page layout")) {
       return false;
@@ -2166,6 +2233,49 @@ bool ChapterHtmlSlimParser::parseAndBuildPages() {
   }
 
   return true;
+}
+
+bool ChapterHtmlSlimParser::parseAndBuildPages() {
+  if (!beginParse()) {
+    return false;
+  }
+  // CrumBLE: per-iter popup animation + watchdog yield + progress log.
+  // The step method itself is cheap (one buffer read + parse) so we wrap it
+  // in this loop instead of stuffing per-iter side effects into parseStep().
+  uint32_t lastPopupTick = millis();
+  constexpr uint32_t kPopupTickMs = 250;
+  uint32_t iterCount = 0;
+  for (;;) {
+    if (popupFn && (millis() - lastPopupTick) >= kPopupTickMs) {
+      popupFn();
+      lastPopupTick = millis();
+    }
+    const uint32_t iterStart = millis();
+    const uint32_t posBefore = parseFile_ ? parseFile_.position() : 0;
+    const ParseStatus status = parseStep();
+    const uint32_t afterParseMs = millis();
+
+    if (status == ParseStatus::Error) {
+      abortParse();
+      return false;
+    }
+
+    LOG_DBG("EHP", "iter=%lu pos=%lu/%lu step_ms=%lu free=%u maxAlloc=%u elapsed=%lu",
+            static_cast<unsigned long>(iterCount), static_cast<unsigned long>(posBefore),
+            static_cast<unsigned long>(parseTotalBytes()),
+            static_cast<unsigned long>(afterParseMs - iterStart), ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
+            static_cast<unsigned long>(millis() - parseStartTime_));
+    iterCount++;
+
+    // Feed the task watchdog so a slow chunk doesn't trip a reset.
+    yield();
+
+    if (status == ParseStatus::Done) {
+      break;
+    }
+  }
+
+  return finishParse();
 }
 
 void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line) {

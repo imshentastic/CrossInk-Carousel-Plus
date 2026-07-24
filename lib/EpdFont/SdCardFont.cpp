@@ -76,15 +76,47 @@ const char* asCStr(const char* s) { return s; }
 
 SdCardFont::~SdCardFont() { freeAll(); }
 
+void SdCardFont::clearMiniDataForStyle(uint8_t styleIdx) {
+  if (styleIdx >= MAX_STYLES) return;
+  freeStyleMiniData(styles_[styleIdx]);
+}
+
 // --- Per-style free/cleanup ---
+
+// v18.9.9.135: shared failsafe buffer for the miniBitmap allocation. Under
+// BT-connected reads maxAlloc drops to ~1 KB and `new[]` for a ~3 KB
+// miniBitmap fails, forcing per-glyph SD reads that make page turns feel
+// sticky. When prewarmStyle's heap alloc fails, we fall back to this buffer
+// if the total size fits.
+// v18.9.9.139: LAZY-allocated instead of static BSS. The static form cost
+// 4 KB permanent boot heap and NimBLE's controller_init malloc started
+// failing silently right at the ~60 KB budget edge -- BT stopped
+// connecting. Lazy: we alloc on the FIRST failed prewarm (heap at that
+// point is what it is, but this only fires post-BT-connect when heap is
+// already tight; before then the normal `new[]` path succeeds). Once
+// allocated the buffer stays around for the session (releasing/re-acquiring
+// on every prewarm would defeat the purpose). Only ONE style at a time.
+static constexpr size_t kSdcfFailsafeBufferSize = 4096;
+static uint8_t* g_sdcfFailsafeBuffer = nullptr;
+static bool g_sdcfFailsafeBufferInUse = false;
 
 void SdCardFont::freeStyleMiniData(PerStyle& s) {
   delete[] s.miniIntervals;
   s.miniIntervals = nullptr;
   delete[] s.miniGlyphs;
   s.miniGlyphs = nullptr;
-  delete[] s.miniBitmap;
+  if (s.miniBitmap == g_sdcfFailsafeBuffer) {
+    g_sdcfFailsafeBufferInUse = false;
+  } else {
+    delete[] s.miniBitmap;
+  }
   s.miniBitmap = nullptr;
+  // v18.9.9.307: chunked bitmap storage. unique_ptr[] frees each chunk on
+  // vector clear; the position side-table is trivially released too.
+  s.miniBitmapChunks.clear();
+  s.miniBitmapChunks.shrink_to_fit();
+  s.miniBitmapChunkPos.clear();
+  s.miniBitmapChunkPos.shrink_to_fit();
   s.miniIntervalCount = 0;
   s.miniGlyphCount = 0;
   freeStyleMiniKern(s);
@@ -115,11 +147,12 @@ void SdCardFont::freeStyleKernLigatureData(PerStyle& s) {
 }
 
 void SdCardFont::freeStyleMiniKern(PerStyle& s) {
-  delete[] s.miniKernLeftClasses;
+  // v18.9.7: single owner. The three individual pointers are aliases into
+  // miniKernBlock -- do NOT delete[] them individually.
+  delete[] s.miniKernBlock;
+  s.miniKernBlock = nullptr;
   s.miniKernLeftClasses = nullptr;
-  delete[] s.miniKernRightClasses;
   s.miniKernRightClasses = nullptr;
-  delete[] s.miniKernMatrix;
   s.miniKernMatrix = nullptr;
   s.miniKernLeftEntryCount = 0;
   s.miniKernRightEntryCount = 0;
@@ -399,18 +432,27 @@ bool SdCardFont::buildMiniKernMatrix(PerStyle& s, const uint32_t* codepoints, ui
     if (miniLookupKernClass(s.kernRightClasses, s.header.kernRightEntryCount, codepoints[i]) != 0) miniRightCount++;
   }
 
-  // Step 4: allocate the three mini buffers. The matrix is <1KB in practice
-  // (<30 × <30 × 1 byte) so fragmentation is a non-issue.
+  // v18.9.7: one contiguous block sliced into three ranges. Fragmentation-
+  // resilient vs the previous three sequential news, which routinely failed
+  // under BT+reader (~16 KB maxAlloc, ~1.5 KB total need, but three separate
+  // holes couldn't be found reliably). One malloc for the whole
+  // (left + right + matrix) footprint only needs ONE hole of the total size.
+  // EpdKernClassEntry is packed to 3 bytes so no alignment padding is needed
+  // between the three sections; matrix is int8_t so it inherits alignment 1.
   const uint32_t matrixBytes = static_cast<uint32_t>(numLeft) * numRight;
-  s.miniKernLeftClasses = new (std::nothrow) EpdKernClassEntry[miniLeftCount];
-  s.miniKernRightClasses = new (std::nothrow) EpdKernClassEntry[miniRightCount];
-  s.miniKernMatrix = new (std::nothrow) int8_t[matrixBytes];
-  if (!s.miniKernLeftClasses || !s.miniKernRightClasses || !s.miniKernMatrix) {
-    LOG_ERR("SDCF", "Failed to allocate mini kern (%u+%u+%u bytes)", miniLeftCount * 3u, miniRightCount * 3u,
+  const uint32_t leftBytes = static_cast<uint32_t>(miniLeftCount) * sizeof(EpdKernClassEntry);
+  const uint32_t rightBytes = static_cast<uint32_t>(miniRightCount) * sizeof(EpdKernClassEntry);
+  const uint32_t totalBytes = leftBytes + rightBytes + matrixBytes;
+  s.miniKernBlock = new (std::nothrow) uint8_t[totalBytes];
+  if (!s.miniKernBlock) {
+    LOG_ERR("SDCF", "Failed to allocate mini kern block (%u bytes total: %u+%u+%u)", totalBytes, leftBytes, rightBytes,
             matrixBytes);
     freeStyleMiniKern(s);
     return false;
   }
+  s.miniKernLeftClasses = reinterpret_cast<EpdKernClassEntry*>(s.miniKernBlock);
+  s.miniKernRightClasses = reinterpret_cast<EpdKernClassEntry*>(s.miniKernBlock + leftBytes);
+  s.miniKernMatrix = reinterpret_cast<int8_t*>(s.miniKernBlock + leftBytes + rightBytes);
 
   // Step 5: populate mini class tables. `codepoints` is already sorted (see
   // prewarm()) so the output is sorted by codepoint — required for binary
@@ -807,6 +849,56 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
   }
   auto& s = styles_[styleIdx];
 
+  // v18.9.9.152: heap pre-flight. The prewarm pipeline attempts an EpdGlyph
+  // array sized cpCount*16 B (~10 KB for text-heavy pages). Under post-BT
+  // tight heap (maxAlloc~1 KB), the alloc fails but leaves ~800 B of
+  // fragmentation from the mappings/intervals sub-allocs that already
+  // succeeded -- and that fragmentation starves downstream PageLine allocs
+  // (which need maxAlloc>=256 to pass the shared_ptr ctrl-block safety
+  // check at Page.cpp:80). Skip cleanly here so heap stays untouched;
+  // rendering falls back to per-glyph reads, slower but functional.
+  const size_t worstCaseMiniGlyphs = static_cast<size_t>(cpCount) * sizeof(EpdGlyph);
+  const uint32_t maxAllocNow = ESP.getMaxAllocHeap();
+  if (maxAllocNow < worstCaseMiniGlyphs + 512) {
+    LOG_INF("SDCF",
+            "prewarmStyle %u pre-flight skip: maxAlloc=%u < needed=%u (cpCount=%u); "
+            "avoids fragmenting heap for downstream PageLine allocs",
+            styleIdx, maxAllocNow, static_cast<unsigned>(worstCaseMiniGlyphs + 512), cpCount);
+    return static_cast<int>(cpCount);
+  }
+
+  // CrumBLE 4.5.4 task #5 part B diag: one-shot dump of the first few
+  // intervals so we can verify WASM is parsing the .cpfont intervals
+  // correctly. Field report: section 1 of a CJK book finds 4/81
+  // codepoints in the same LXGW that the device finds 90% in. Strong
+  // hypothesis: the intervals in WASM's s.fullIntervals aren't the
+  // expected codepoint ranges -- either byte-swapped, off-by-N from
+  // the wrong file offset, or truncated. This log lets us see.
+  static bool dumpedStyle[MAX_STYLES] = {false, false, false, false};
+  if (styleIdx < MAX_STYLES && !dumpedStyle[styleIdx]) {
+    dumpedStyle[styleIdx] = true;
+    LOG_INF("SDCF-IV", "style=%u intervalCount=%u glyphCount=%u (first %u of %u intervals follow)",
+            styleIdx, s.header.intervalCount, s.header.glyphCount,
+            std::min<uint32_t>(s.header.intervalCount, 5u), s.header.intervalCount);
+    const uint32_t dumpN = std::min<uint32_t>(s.header.intervalCount, 5u);
+    for (uint32_t j = 0; j < dumpN; ++j) {
+      const auto& iv = s.fullIntervals[j];
+      LOG_INF("SDCF-IV", "  iv[%u]: first=0x%04X last=0x%04X offset=%u (span=%u)",
+              j, static_cast<unsigned>(iv.first), static_cast<unsigned>(iv.last),
+              iv.offset, iv.last - iv.first + 1);
+    }
+    // Also probe specific codepoints that the field report says fail:
+    // U+0041 'A', U+4E00 '一' (most common Han char), U+5929 '天' (sky/heaven,
+    // very common). Reports findGlobalGlyphIndex result for each.
+    for (uint32_t probe : {static_cast<uint32_t>(0x0041), static_cast<uint32_t>(0x4E00),
+                            static_cast<uint32_t>(0x5929), static_cast<uint32_t>(0x6708)}) {
+      const int32_t idx = findGlobalGlyphIndex(s, probe);
+      LOG_INF("SDCF-IV", "  probe U+%04X -> %s%d", static_cast<unsigned>(probe),
+              idx >= 0 ? "FOUND idx=" : "MISS (",
+              idx >= 0 ? idx : -1);
+    }
+  }
+
   // Map codepoints to global glyph indices for this style
   struct CpGlyphMapping {
     uint32_t codepoint;
@@ -819,15 +911,37 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
   }
 
   uint32_t validCount = 0;
+  // CrumBLE 4.5.4 diag: collect missed codepoints so we can log them when
+  // a high miss rate is suspicious. The prebake CJK report showed 77/81
+  // misses for chapter text on LXGW -- with this we can see whether the
+  // missed codepoints are actual CJK chars (would mean font coverage gap)
+  // or weird values like raw UTF-8 bytes (would mean a parser bug
+  // upstream of prewarm).
+  static uint32_t missedCps[64];
+  uint32_t missedCpsCount = 0;
   for (uint32_t i = 0; i < cpCount; i++) {
     int32_t idx = findGlobalGlyphIndex(s, codepoints[i]);
     if (idx >= 0) {
       mappings[validCount].codepoint = codepoints[i];
       mappings[validCount].globalIndex = idx;
       validCount++;
+    } else if (missedCpsCount < 64) {
+      missedCps[missedCpsCount++] = codepoints[i];
     }
   }
   int missed = static_cast<int>(cpCount - validCount);
+  if (missed > 4 && missed >= static_cast<int>(cpCount) * 3 / 4) {
+    // Log up to 32 missed codepoints in hex. If most or all are >= 0x80,
+    // they're real (or near-real) Unicode and the font genuinely lacks
+    // coverage. If a chunk are 0x80-0xFF (UTF-8 trail bytes), the caller
+    // gave us bytes instead of codepoints.
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf), "SDCF MISS DUMP style=%u missed=%u/%u: ", styleIdx, missedCpsCount, cpCount);
+    for (uint32_t i = 0; i < missedCpsCount && i < 32 && n < static_cast<int>(sizeof(buf)) - 10; i++) {
+      n += snprintf(buf + n, sizeof(buf) - n, "U+%04lX ", static_cast<unsigned long>(missedCps[i]));
+    }
+    LOG_INF("SDCF", "%s", buf);
+  }
 
   if (validCount == 0) {
     freeStyleMiniData(s);
@@ -936,11 +1050,156 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
 
     s.miniBitmap = new (std::nothrow) uint8_t[totalBitmapSize > 0 ? totalBitmapSize : 1];
     if (!s.miniBitmap) {
-      LOG_ERR("SDCF", "Failed to allocate mini bitmap (%u bytes) for style %u", totalBitmapSize, styleIdx);
-      delete[] readOrder;
-      delete[] mappings;
-      freeStyleMiniData(s);
-      return static_cast<int>(cpCount);
+      // v18.9.9.135/139: fallback to a lazy-allocated failsafe buffer.
+      // Lazy-alloc on first failure so the buffer doesn't consume boot heap
+      // when nothing has needed it yet (BT never enabled). Once allocated,
+      // it stays around for the session.
+      if (!g_sdcfFailsafeBuffer) {
+        g_sdcfFailsafeBuffer = new (std::nothrow) uint8_t[kSdcfFailsafeBufferSize];
+        if (g_sdcfFailsafeBuffer) {
+          LOG_INF("SDCF",
+                  "Allocated failsafe buffer (%u B) for tight-heap prewarm fallback",
+                  (unsigned)kSdcfFailsafeBufferSize);
+        }
+      }
+      if (g_sdcfFailsafeBuffer && totalBitmapSize <= kSdcfFailsafeBufferSize &&
+          !g_sdcfFailsafeBufferInUse) {
+        LOG_INF("SDCF",
+                "mini bitmap alloc (%u B) failed for style %u -- using failsafe buffer",
+                totalBitmapSize, styleIdx);
+        s.miniBitmap = g_sdcfFailsafeBuffer;
+        g_sdcfFailsafeBufferInUse = true;
+      }
+      // v18.9.9.307: chunked fallback. When totalBitmapSize is bigger than
+      // the 4 KB failsafe (typical for CJK pages, which need 15-25 KB), split
+      // the allocation into ~6 KB chunks and set the glyphBitmapFetch
+      // callback so getGlyphBitmap resolves per-glyph pointers into chunks.
+      // Each 6 KB chunk fits under the tight ~15 KB maxAlloc that BT
+      // leaves after NimBLE's ~90 KB tax. Skips if any single chunk alloc
+      // fails; caller falls through to freeStyleMiniData + bail below.
+      constexpr uint32_t kChunkSize = 6u * 1024u;
+      if (!s.miniBitmap) {
+        LOG_INF("SDCF",
+                "mini bitmap alloc (%u B) failed for style %u -- switching to chunked mode (%u B per chunk)",
+                totalBitmapSize, styleIdx, (unsigned)kChunkSize);
+        s.miniBitmapChunks.clear();
+        s.miniBitmapChunkPos.assign(validCount, UINT32_MAX);
+      }
+      if (!s.miniBitmap && !s.miniBitmapChunkPos.empty()) {
+        // Chunked mode: read glyphs sorted by file offset for sequential I/O,
+        // packing into 6 KB chunks. A glyph that would cross a chunk boundary
+        // starts a new chunk (glyphs always fit within one chunk since even
+        // the largest CJK glyph at 14pt is ~200 B, far below the 6 KB budget).
+        std::sort(readOrder, readOrder + validCount,
+                  [&](uint32_t a, uint32_t b) {
+                    return s.miniGlyphs[a].dataOffset < s.miniGlyphs[b].dataOffset;
+                  });
+
+        uint32_t curChunkIdx = 0;
+        uint32_t curChunkFill = 0;
+        std::unique_ptr<uint8_t[]> curChunk(new (std::nothrow) uint8_t[kChunkSize]);
+        if (!curChunk) {
+          LOG_ERR("SDCF", "Chunked prewarm: failed to allocate first %u B chunk for style %u",
+                  (unsigned)kChunkSize, styleIdx);
+          delete[] readOrder;
+          delete[] mappings;
+          freeStyleMiniData(s);
+          file.close();
+          return static_cast<int>(cpCount);
+        }
+        s.miniBitmapChunks.emplace_back(std::move(curChunk));
+
+        uint32_t lastBitmapEnd = UINT32_MAX;
+        for (uint32_t i = 0; i < validCount; i++) {
+          const uint32_t mapIdx = readOrder[i];
+          EpdGlyph& glyph = s.miniGlyphs[mapIdx];
+
+          if (glyph.dataLength == 0) {
+            // Zero-length glyph (e.g. space): position-table sentinel.
+            s.miniBitmapChunkPos[mapIdx] = UINT32_MAX;
+            continue;
+          }
+
+          if (glyph.dataLength > kChunkSize) {
+            // Pathological: a single glyph bigger than our chunk. Would
+            // require a special-case oversized chunk; not worth the code
+            // for a case that shouldn't happen at realistic point sizes.
+            LOG_ERR("SDCF",
+                    "Chunked prewarm: glyph %u dataLength %u exceeds chunk size %u -- bailing",
+                    mapIdx, glyph.dataLength, (unsigned)kChunkSize);
+            delete[] readOrder;
+            delete[] mappings;
+            freeStyleMiniData(s);
+            file.close();
+            return static_cast<int>(cpCount);
+          }
+
+          // Start a new chunk if this glyph won't fit in the current one.
+          if (curChunkFill + glyph.dataLength > kChunkSize) {
+            std::unique_ptr<uint8_t[]> nextChunk(new (std::nothrow) uint8_t[kChunkSize]);
+            if (!nextChunk) {
+              LOG_ERR("SDCF",
+                      "Chunked prewarm: failed to allocate chunk %u for style %u (had placed %u/%u glyphs)",
+                      (unsigned)(s.miniBitmapChunks.size() + 1), styleIdx, i, validCount);
+              delete[] readOrder;
+              delete[] mappings;
+              freeStyleMiniData(s);
+              file.close();
+              return static_cast<int>(cpCount);
+            }
+            s.miniBitmapChunks.emplace_back(std::move(nextChunk));
+            curChunkIdx = static_cast<uint32_t>(s.miniBitmapChunks.size() - 1);
+            curChunkFill = 0;
+          }
+
+          const uint32_t fileOff = s.bitmapFileOffset + glyph.dataOffset;
+          if (fileOff != lastBitmapEnd) {
+            if (!file.seekSet(fileOff)) {
+              LOG_ERR("SDCF", "Chunked prewarm: failed to seek to bitmap (style %u)", styleIdx);
+              delete[] readOrder;
+              delete[] mappings;
+              freeStyleMiniData(s);
+              file.close();
+              return static_cast<int>(cpCount);
+            }
+            seekCount++;
+          }
+          uint8_t* dst = s.miniBitmapChunks[curChunkIdx].get() + curChunkFill;
+          if (file.read(dst, glyph.dataLength) != static_cast<int>(glyph.dataLength)) {
+            LOG_ERR("SDCF", "Chunked prewarm: short bitmap read (style %u)", styleIdx);
+            delete[] readOrder;
+            delete[] mappings;
+            freeStyleMiniData(s);
+            file.close();
+            return static_cast<int>(cpCount);
+          }
+          lastBitmapEnd = fileOff + glyph.dataLength;
+
+          // Pack (chunkIdx << 20) | localOffset. dataOffset in glyph is
+          // meaningless in chunked mode (callback uses chunkPos), but we
+          // clear it to 0 to avoid confusing debugging.
+          s.miniBitmapChunkPos[mapIdx] = (curChunkIdx << 20) | curChunkFill;
+          glyph.dataOffset = 0;
+          curChunkFill += glyph.dataLength;
+        }
+
+        LOG_INF("SDCF",
+                "Chunked prewarm complete: style %u used %u chunks of %u B (%u B total)",
+                styleIdx, (unsigned)s.miniBitmapChunks.size(),
+                (unsigned)kChunkSize, totalBitmapSize);
+        // Jump past the contiguous-mode fill loop below.
+        file.close();
+        goto chunked_fill_done;
+      }
+      if (!s.miniBitmap) {
+        LOG_ERR("SDCF",
+                "Failed to allocate mini bitmap (%u bytes) for style %u",
+                totalBitmapSize, styleIdx);
+        delete[] readOrder;
+        delete[] mappings;
+        freeStyleMiniData(s);
+        return static_cast<int>(cpCount);
+      }
     }
 
     // Read bitmap data sorted by file offset
@@ -983,6 +1242,10 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
       miniBitmapOffset += glyph.dataLength;
     }
   }
+  // v18.9.9.307: chunked-mode path jumps here after filling chunks and
+  // closing the file. readOrder/mappings still need cleanup and stats
+  // still need to accumulate.
+chunked_fill_done:
 
   uint32_t sdTime = millis() - sdStart;
   delete[] readOrder;
@@ -1002,6 +1265,10 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
 
   // Populate miniData and swap
   memset(&s.miniData, 0, sizeof(s.miniData));
+  // v18.9.9.307: in chunked mode miniBitmap is nullptr and getGlyphBitmap
+  // must route through the chunkedBitmapFetch callback to resolve
+  // per-glyph pointers. In contiguous mode the callback is left null so
+  // getGlyphBitmap uses the fast `&bitmap[dataOffset]` path unchanged.
   s.miniData.bitmap = s.miniBitmap;
   s.miniData.glyph = s.miniGlyphs;
   s.miniData.intervals = s.miniIntervals;
@@ -1015,6 +1282,10 @@ int SdCardFont::prewarmStyle(uint8_t styleIdx, const uint32_t* codepoints, uint3
   }
   s.miniData.glyphMissHandler = &SdCardFont::onGlyphMiss;
   s.miniData.glyphMissCtx = &overflowCtx_[styleIdx];
+  if (!s.miniBitmapChunks.empty()) {
+    s.miniData.glyphBitmapFetch = &SdCardFont::chunkedBitmapFetch;
+    s.miniData.glyphBitmapCtx = &overflowCtx_[styleIdx];
+  }
 
   s.epdFont.data = &s.miniData;
 
@@ -1468,6 +1739,76 @@ const uint8_t* SdCardFont::getOverflowBitmap(const EpdGlyph* glyph) const {
 }
 
 SdCardFont* SdCardFont::fromMissCtx(void* ctx) { return static_cast<OverflowContext*>(ctx)->self; }
+
+// v18.9.9.311: cheap contentHash peek for the prebake-fontId-rescue path.
+// Mirrors the header + TOC hashing done in load() (see hash accumulation
+// around line 586 / 606) but stops before touching intervals / glyphs /
+// bitmap. Total read: 32 B header + (styleCount * 32 B) TOC entries. At
+// most 4 styles = 160 bytes. Uses HalStorage's tag-based path lookup
+// same as load().
+bool SdCardFont::peekContentHash(const char* path, uint32_t& outHash) {
+  if (!path || !*path) return false;
+  FsFile f;
+  if (!Storage.openFileForRead("SDCF", path, f)) return false;
+
+  uint8_t headerBuf[HEADER_SIZE];
+  if (f.read(headerBuf, HEADER_SIZE) != static_cast<int>(HEADER_SIZE)) {
+    f.close();
+    return false;
+  }
+  // Validate magic + version so a corrupt / wrong-format file produces false
+  // instead of a nonsense hash that could still spuriously match some other
+  // fontId in the search.
+  if (std::memcmp(headerBuf, CPFONT_MAGIC, 8) != 0) {
+    f.close();
+    return false;
+  }
+  const uint16_t fileVersion = readU16(headerBuf + 8);
+  if (fileVersion != CPFONT_VERSION) {
+    f.close();
+    return false;
+  }
+  const uint8_t styleCount = headerBuf[12];
+  if (styleCount == 0 || styleCount > MAX_STYLES) {
+    f.close();
+    return false;
+  }
+
+  uint32_t hash = fnv1a(headerBuf, HEADER_SIZE);
+  for (uint8_t i = 0; i < styleCount; i++) {
+    uint8_t tocBuf[STYLE_TOC_ENTRY_SIZE];
+    if (f.read(tocBuf, STYLE_TOC_ENTRY_SIZE) != static_cast<int>(STYLE_TOC_ENTRY_SIZE)) {
+      f.close();
+      return false;
+    }
+    hash = fnv1a(tocBuf, STYLE_TOC_ENTRY_SIZE, hash);
+  }
+  f.close();
+  outHash = hash;
+  return true;
+}
+
+// v18.9.9.307: per-glyph bitmap resolver for the chunked prewarm fallback.
+// ctx is an OverflowContext (same one used by onGlyphMiss); we recover the
+// SdCardFont and styleIdx, compute the glyph index (glyph ptr offset from
+// miniGlyphs base), and look up the packed (chunkIdx << 20) | localOffset
+// entry in miniBitmapChunkPos. Returns nullptr for zero-length glyphs
+// (dataLength=0 sentinel), out-of-range indices, or missing chunks --
+// matches the contract getGlyphBitmap already handles for other paths.
+const uint8_t* SdCardFont::chunkedBitmapFetch(void* ctx, const EpdGlyph* glyph) {
+  auto* oc = static_cast<OverflowContext*>(ctx);
+  if (!oc || !oc->self) return nullptr;
+  auto& s = oc->self->styles_[oc->styleIdx];
+  if (glyph < s.miniGlyphs) return nullptr;
+  const uint32_t glyphIndex = static_cast<uint32_t>(glyph - s.miniGlyphs);
+  if (glyphIndex >= s.miniBitmapChunkPos.size()) return nullptr;
+  const uint32_t packed = s.miniBitmapChunkPos[glyphIndex];
+  if (packed == UINT32_MAX) return nullptr;  // zero-length glyph sentinel
+  const uint32_t chunkIdx = packed >> 20;
+  const uint32_t localOffset = packed & 0xFFFFFu;
+  if (chunkIdx >= s.miniBitmapChunks.size()) return nullptr;
+  return s.miniBitmapChunks[chunkIdx].get() + localOffset;
+}
 
 // CrumBLE 4.3: prebake-CLI-facing read-only views into the prewarmed
 // per-style mini-data. Implementations are trivial -- they just return

@@ -149,18 +149,36 @@ std::string lastNameLower(const std::string& author) {
   if (l == std::string::npos) return {};
   size_t r = author.find_last_not_of(" \t\r\n");
   std::string s = author.substr(l, r - l + 1);
+
+  // v18.9.9.220: mirror the LibraryIndex fix -- split on ';' first
+  // (multi-author separator) so we only look at the primary author.
+  const size_t semi = s.find(';');
+  if (semi != std::string::npos) {
+    s = s.substr(0, semi);
+    size_t rr = s.find_last_not_of(" \t\r\n");
+    if (rr != std::string::npos) s.resize(rr + 1); else s.clear();
+  }
+
   // "Last, First" form -- everything before the first comma.
   const size_t comma = s.find(',');
   if (comma != std::string::npos) {
     s = s.substr(0, comma);
     // Re-trim in case the comma had leading spaces.
     size_t rr = s.find_last_not_of(" \t\r\n");
-    if (rr != std::string::npos) s = s.substr(0, rr + 1);
+    if (rr != std::string::npos) s.resize(rr + 1);
   } else {
     // "First Last" form -- last whitespace-separated token.
     const size_t sp = s.find_last_of(" \t");
     if (sp != std::string::npos) s = s.substr(sp + 1);
   }
+
+  // v18.9.9.220: strip trailing punctuation. See LibraryIndex.cpp.
+  while (!s.empty()) {
+    const char c = s.back();
+    if (c == '.' || c == ',' || c == ';' || c == ':' || c == '!' || c == '?') s.pop_back();
+    else break;
+  }
+
   // Lowercase for case-insensitive sort.
   std::transform(s.begin(), s.end(), s.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -642,12 +660,24 @@ std::vector<ShelfEntry> CollectionsStore::resolveShelfEntries(const std::string&
   // assignment doesn't poison its cache state).
   const uint32_t curMaxAlloc = ESP.getMaxAllocHeap();
   const uint32_t pathCount = static_cast<uint32_t>(paths.size());
-  const uint32_t neededForAnyBuild =
-      pathCount * (sizeof(ShelfEntry) + 128u) + 2048u;
-  if (pathCount > 0 && curMaxAlloc < neededForAnyBuild) {
+  // CrumBLE 4.5.4: the old single-threshold (~240 B/entry) lumped fast-path
+  // and series-collapse together and rejected at maxAlloc=9204 vs 9380
+  // needed for 39 books -- which on a fragmented-heap All Books / Recently
+  // Added shelf wedged the resolve in a render-after-render empty loop
+  // (the "Loading flash" symptom). The fast-path 1:1 build only needs one
+  // contiguous std::vector<ShelfEntry> grow (sizeof(ShelfEntry) ~60 B,
+  // grows to next power of 2 = pathCount*60*2 worst case) + a small safety
+  // margin. The per-iteration std::string for path is a SEPARATE small
+  // alloc that fragments free-heap but doesn't need contiguous headroom.
+  // Series-collapse needs more (~25 KB) and is gated by its own check
+  // below. Without the split, an All Books shelf with 30-50 books on a
+  // mildly fragmented heap (maxAlloc 8-10 KB) gets stuck empty.
+  const uint32_t neededForFastBuild =
+      pathCount * sizeof(ShelfEntry) * 2u + 1024u;
+  if (pathCount > 0 && curMaxAlloc < neededForFastBuild) {
     LOG_ERR("CLN",
             "resolveShelfEntries: maxAlloc=%u below %u needed for %u entries -- returning empty shelf this render",
-            curMaxAlloc, neededForAnyBuild, pathCount);
+            curMaxAlloc, neededForFastBuild, pathCount);
     // Signal the caller that this empty came from heap pressure, not from
     // a legitimately empty collection -- so it can skip cache commit + retry.
     lastResolveHitHeapPressure_ = true;
@@ -755,10 +785,22 @@ void CollectionsStore::setActiveId(const std::string& id) {
 }
 
 bool CollectionsStore::loadFromFile() {
-  if (!Storage.exists(COLLECTIONS_FILE)) return false;
+  // v18.9.9.331: try both primary and .bak. Was Storage.readFile()
+  // which failed hard on any parse error, wiping the user's collections
+  // whenever a crash-mid-save left the primary half-written. Now uses
+  // readFileWithFallback which promotes the .bak to primary on recovery,
+  // matching what CrossPointSettings did back in v311.
+  if (!Storage.exists(COLLECTIONS_FILE) &&
+      !Storage.exists((String(COLLECTIONS_FILE) + ".bak").c_str())) {
+    return false;
+  }
 
-  String json = Storage.readFile(COLLECTIONS_FILE);
+  bool fromBackup = false;
+  String json = Storage.readFileWithFallback(COLLECTIONS_FILE, fromBackup);
   if (json.isEmpty()) return false;
+  if (fromBackup) {
+    LOG_INF("CLN", "collections.json missing or corrupt; recovered from .bak");
+  }
 
   JsonDocument doc;
   auto err = deserializeJson(doc, json.c_str());
@@ -892,7 +934,122 @@ void CollectionsStore::rebuildScannedVirtualsIfNeeded() const {
   scannedVirtualsValid_ = true;
 }
 
+namespace {
+// v18.9.9.342: same defer-then-retry mechanism CrossPointSettings uses.
+// Set in saveToFile() when the heap pre-flight trips; cleared on the
+// first successful write. main.cpp's tick calls retryDeferredSaveIfNeeded
+// every loop so a transient heap dip doesn't lose the change; Home's
+// Cover heap-guard silentRestart also calls it right before reboot to
+// give the change one last chance to persist before the in-memory copy
+// gets wiped.
+bool gCollectionsSaveDeferred = false;
+// v18.9.9.363: debounce state (mirrors CrossPointSettings). saveToFile()
+// now marks pending; actual write happens after kDebounceMs of no
+// mutations OR at critical exit via flushDeferredSaveNowBypassGate().
+constexpr uint32_t kCollectionsSaveDebounceMs = 5000;
+uint32_t gCollectionsLastMutationMs = 0;
+bool gCollectionsPendingWrite = false;
+}  // namespace
+
+bool CollectionsStore::hasDeferredSave() { return gCollectionsSaveDeferred || gCollectionsPendingWrite; }
+
+void CollectionsStore::retryDeferredSaveIfNeeded() const {
+  // v18.9.9.363: fires on debounce elapsed OR heap-recovered retry.
+  const bool hasPending = gCollectionsPendingWrite || gCollectionsSaveDeferred;
+  if (!hasPending) return;
+  const uint32_t sinceLastMutation = millis() - gCollectionsLastMutationMs;
+  if (gCollectionsPendingWrite && sinceLastMutation < kCollectionsSaveDebounceMs) {
+    return;  // still batching burst-of-mutations
+  }
+  const bool ok = writeToDiskNow_();
+  if (ok) {
+    gCollectionsPendingWrite = false;
+    LOG_INF("CLN", "Debounced save committed (%u ms after last mutation)", sinceLastMutation);
+  }
+}
+
+void CollectionsStore::flushDeferredSaveNowBypassGate() const {
+  // v18.9.9.363: also flush pending-debounced writes, not just heap-deferred.
+  if (!gCollectionsSaveDeferred && !gCollectionsPendingWrite) return;
+  // v18.9.9.389: hard floor. JsonDocument construction + the doc[key] = value
+  // loop below both allocate; on extreme heap pressure one of those internal
+  // allocations can throw before the measureJson check at line ~1005 gets
+  // a chance to bail cleanly. Skip when maxAlloc is below a safe minimum so
+  // a silent-restart flush doesn't terminate. See CrossPointSettings::
+  // flushIfDirtyNow for the paired fix on the settings path.
+  {
+    constexpr uint32_t kFlushHardFloorMaxAlloc = 6u * 1024u;
+    const uint32_t maxAllocNow = ESP.getMaxAllocHeap();
+    if (maxAllocNow < kFlushHardFloorMaxAlloc) {
+      LOG_ERR("CLN",
+              "flushDeferredSaveNowBypassGate SKIPPED: maxAlloc=%u below hard floor %u -- collection change lost across restart",
+              maxAllocNow, static_cast<unsigned>(kFlushHardFloorMaxAlloc));
+      return;
+    }
+  }
+  // v18.9.9.344: measure the required output size first, then only
+  // attempt the write if maxAlloc can actually fit it (with a small
+  // safety margin for JSON build + realloc peaks). Refuses cleanly when
+  // heap is too low -- the write would truncate the String, corrupt
+  // primary, and force a next-boot fall-back to .bak.
+  //
+  // Measurement is cheap (no allocation) so we can call it even in the
+  // emergency path. If the write is possible, we attempt it directly
+  // via writeToDiskNow_(); tmp+rename bounds the mid-write downside.
+  Storage.mkdir("/.crosspoint");
+  JsonDocument doc;
+  doc["version"] = COLLECTIONS_FILE_VERSION;
+  doc["active"] = activeId;
+  JsonArray order = doc["displayOrder"].to<JsonArray>();
+  for (const auto& c : collections) order.add(c.id);
+  JsonArray arr = doc["collections"].to<JsonArray>();
+  for (const auto& c : collections) {
+    if (c.isVirtual) continue;
+    JsonObject entry = arr.add<JsonObject>();
+    entry["id"] = c.id;
+    entry["name"] = c.name;
+    entry["sort"] = static_cast<unsigned>(c.sortMode);
+    entry["collapseSeries"] = c.collapseSeries;
+    entry["twoRowShelf"] = c.twoRowShelf;
+    JsonArray books = entry["books"].to<JsonArray>();
+    for (const auto& path : c.bookPaths) books.add(path);
+  }
+  const size_t neededBytes = measureJson(doc);
+  // String reserve typically over-allocates by ~1.5x during realloc.
+  // Add a hard 1 KB minimum floor even for tiny outputs.
+  const uint32_t neededWithMargin = static_cast<uint32_t>(std::max<size_t>(neededBytes * 3U / 2U, 1024U));
+  const uint32_t maxAlloc = ESP.getMaxAllocHeap();
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  if (maxAlloc < neededWithMargin) {
+    LOG_ERR("CLN",
+            "Skipping bypass-gate flush: need %u contiguous but maxAlloc=%u (free=%u); change lost on restart",
+            neededWithMargin, maxAlloc, freeHeap);
+    return;
+  }
+  LOG_INF("CLN",
+          "Bypass-gate flush: measured=%u needed+margin=%u free=%u maxAlloc=%u",
+          static_cast<unsigned>(neededBytes), neededWithMargin, freeHeap, maxAlloc);
+  String json;
+  json.reserve(neededBytes + 32);  // + tiny header padding
+  serializeJson(doc, json);
+  const bool ok = Storage.writeFileWithBackup(COLLECTIONS_FILE, json);
+  gCollectionsSaveDeferred = !ok;
+  LOG_INF("CLN", "Bypass-gate flush result: %s (wrote %u bytes)",
+          ok ? "OK" : "FAILED", static_cast<unsigned>(json.length()));
+}
+
 bool CollectionsStore::saveToFile() const {
+  SET_CHECKPOINT("collections:save");
+  // v18.9.9.363: mark dirty + timestamp; actual write is deferred until
+  // debounce elapses. Critical exits (silentRestart, sleep) flush via
+  // flushDeferredSaveNowBypassGate. See CrossPointSettings for the
+  // same pattern rationale (reduce SD write contention).
+  gCollectionsPendingWrite = true;
+  gCollectionsLastMutationMs = millis();
+  return true;
+}
+
+bool CollectionsStore::writeToDiskNow_() const {
   Storage.mkdir("/.crosspoint");
 
   JsonDocument doc;
@@ -918,7 +1075,37 @@ bool CollectionsStore::saveToFile() const {
     for (const auto& path : c.bookPaths) books.add(path);
   }
 
+  // v18.9.9.351: measure BEFORE reserving the output String. Field crash:
+  // saveToFile preflight passed at free=38920/maxAlloc=18420 (both above
+  // the 25K/12K floor) but the serializeJson to String reserved beyond
+  // maxAlloc and threw bad_alloc -> std::terminate -> hard-restart to
+  // Home losing focus + the pending change. measureJson is allocation-
+  // free; compare against maxAlloc and defer if the write can't fit.
+  const size_t neededBytes = measureJson(doc);
+  const uint32_t neededWithMargin = static_cast<uint32_t>(std::max<size_t>(neededBytes * 3U / 2U, 2048U));
+  const uint32_t maxAllocNow = ESP.getMaxAllocHeap();
+  const uint32_t freeNow = ESP.getFreeHeap();
+  if (maxAllocNow < neededWithMargin) {
+    LOG_ERR("CLN",
+            "Skipping write: measured=%u needed+margin=%u exceeds maxAlloc=%u (free=%u); deferring",
+            static_cast<unsigned>(neededBytes), neededWithMargin, maxAllocNow, freeNow);
+    gCollectionsSaveDeferred = true;
+    return false;
+  }
+  LOG_INF("CLN", "Writing: measured=%u needed+margin=%u free=%u maxAlloc=%u",
+          static_cast<unsigned>(neededBytes), neededWithMargin, freeNow, maxAllocNow);
+
   String json;
+  json.reserve(neededBytes + 32);
   serializeJson(doc, json);
-  return Storage.writeFile(COLLECTIONS_FILE, json);
+  // v18.9.9.331: writeFileWithBackup does tmp+rename with retry and keeps a
+  // rolling .bak. Was Storage.writeFile() which had no atomicity -- a crash
+  // mid-write (or bad_alloc terminate during the SD I/O yield) left the
+  // primary corrupted with no fallback. Field symptom: user's collections
+  // wiped after a reader-side terminate cascade. Same pattern
+  // JsonSettingsIO uses since v311.
+  const bool ok = Storage.writeFileWithBackup(COLLECTIONS_FILE, json);
+  gCollectionsSaveDeferred = !ok;  // clear on success; a real write failure also queues a retry
+  if (ok) gCollectionsPendingWrite = false;
+  return ok;
 }
