@@ -2683,6 +2683,124 @@ async function showPreflightAndFontImport(renderInfo, fileName) {
 let crumblePrebakeModuleFactoryPromise = null;
 let crumblePrebakeModulePromise = null;
 
+// CrumBLE 4.7: the ~2.4 MB prebake .wasm is no longer embedded in firmware
+// flash (it was the single largest blob and pushed the app image past the
+// stock 6.25 MB slot). Resolution order:
+//   0. localStorage 'crumbleWasmUrl' -- manual/debug override
+//   1. device /js/crumble-prebake.wasm -- only debug builds embed it now
+//   2. IndexedDB -- bytes cached by a previous CDN fetch (offline/AP mode)
+//   3. jsDelivr pinned to the running firmware's release tag, falling back
+//      to @main for dev builds whose tag doesn't exist yet
+// A successful CDN fetch is written back to IndexedDB keyed by firmware
+// version so later AP-mode sessions work offline. Note IDB is per-origin
+// (the device's IP), so a changed device IP means one more online fetch.
+const WASM_CACHE_DB_NAME = 'crumble-wasm-cache';
+const WASM_CACHE_STORE = 'wasm';
+let prebakeWasmPromise = null;
+
+function openWasmCacheDb() {
+  if (typeof indexedDB === 'undefined') return Promise.reject(new Error('no indexedDB'));
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(WASM_CACHE_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(WASM_CACHE_STORE)) {
+        req.result.createObjectStore(WASM_CACHE_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('idb open failed'));
+  });
+}
+
+function wasmCacheGet(key) {
+  return openWasmCacheDb().then((db) => new Promise((resolve) => {
+    const tx = db.transaction(WASM_CACHE_STORE, 'readonly');
+    const req = tx.objectStore(WASM_CACHE_STORE).get(key);
+    req.onsuccess = () => { resolve(req.result || null); db.close(); };
+    req.onerror = () => { resolve(null); db.close(); };
+  })).catch(() => null);
+}
+
+function wasmCachePut(key, bytes) {
+  return openWasmCacheDb().then((db) => new Promise((resolve) => {
+    const tx = db.transaction(WASM_CACHE_STORE, 'readwrite');
+    tx.objectStore(WASM_CACHE_STORE).put(bytes, key);
+    tx.oncomplete = () => { resolve(true); db.close(); };
+    tx.onerror = () => { resolve(false); db.close(); };
+    tx.onabort = () => { resolve(false); db.close(); };
+  })).catch(() => false);
+}
+
+async function getFirmwareVersionForWasm() {
+  try {
+    const r = await fetch('/api/status', { cache: 'no-store' });
+    const j = await r.json();
+    const m = /CrumBLE (\d+\.\d+\.\d+)/.exec(j.version || '');
+    if (m) return m[1];
+  } catch (e) { /* fall through */ }
+  return null;
+}
+
+function wasmBlobUrl(bytes) {
+  // application/wasm type so instantiateStreaming stays on the fast path.
+  return URL.createObjectURL(new Blob([bytes], { type: 'application/wasm' }));
+}
+
+// Returns {url, identity}. url feeds emscripten's locateFile; identity is a
+// stable string naming the wasm build, used in the bake fingerprint.
+function resolvePrebakeWasm() {
+  if (prebakeWasmPromise) return prebakeWasmPromise;
+  prebakeWasmPromise = (async () => {
+    const override = (() => {
+      try { return localStorage.getItem('crumbleWasmUrl'); } catch (e) { return null; }
+    })();
+    if (override) return { url: override, identity: 'override' };
+
+    // 1. Device route -- 404s unless the firmware was built with
+    //    CRUMBLE_EMBED_WASM=1. Keeps debug builds and old firmware working.
+    try {
+      const head = await fetch('/js/crumble-prebake.wasm', { method: 'HEAD', cache: 'no-store' });
+      if (head.ok) {
+        return {
+          url: location.origin + '/js/crumble-prebake.wasm',
+          identity: head.headers.get('etag') || 'device',
+        };
+      }
+    } catch (e) { /* device route unavailable -- keep going */ }
+
+    const ver = await getFirmwareVersionForWasm();
+    const cacheKey = 'wasm-' + (ver || 'unknown');
+
+    // 2. IndexedDB bytes from a previous CDN fetch.
+    const cached = await wasmCacheGet(cacheKey);
+    if (cached) return { url: wasmBlobUrl(cached), identity: 'idb-' + (ver || 'unknown') };
+
+    // 3. jsDelivr. Tag first (immutable, matches this firmware); @main
+    //    covers dev builds between releases.
+    const candidates = [];
+    if (ver) candidates.push({ ref: 'crumble-v' + ver, id: 'cdn-' + ver });
+    candidates.push({ ref: 'main', id: 'cdn-main' });
+    for (const c of candidates) {
+      try {
+        const resp = await fetch(
+          'https://cdn.jsdelivr.net/gh/imshentastic/CrumBLE@' + c.ref + '/web-assets/crumble-prebake.wasm',
+          { cache: 'force-cache' });
+        if (!resp.ok) continue;
+        const bytes = await resp.arrayBuffer();
+        await wasmCachePut(cacheKey, bytes);  // best-effort
+        return { url: wasmBlobUrl(bytes), identity: c.id };
+      } catch (e) { /* try next candidate */ }
+    }
+
+    prebakeWasmPromise = null;  // allow retry once the network is back
+    throw new Error(
+      'Optimizer engine unavailable: this firmware does not embed it and it ' +
+      'could not be downloaded. Connect this browser to the internet once ' +
+      'and retry -- it is then cached for offline use.');
+  })();
+  return prebakeWasmPromise;
+}
+
 // CrumBLE 4.5.4 task #5C continuation: Web Worker host for the WASM
 // prebake. The user-facing problem this solves: callMain() blocks the
 // JS main thread for 5-10 minutes on Harry Potter-scale CJK books, so
@@ -2716,11 +2834,13 @@ const PREBAKE_WORKER_SOURCE = `
         Module = await self.CrumblePrebake({
           print: (line) => emit('stdout', { line }),
           printErr: (line) => emit('stderr', { line }),
-          // The factory needs to know where to fetch the .wasm. Same
-          // dir as the .js -- emscripten's default locateFile usually
-          // does the right thing, but be explicit so it can't pick up
-          // a stale cached path.
-          locateFile: (name) => msg.factoryUrl.replace(/\\/[^/]+$/, '/' + name),
+          // The factory needs to know where to fetch the .wasm. The main
+          // thread resolves it (device/IDB/CDN -- see resolvePrebakeWasm)
+          // and passes the final URL in; everything else stays same-dir
+          // as the .js.
+          locateFile: (name) => (name.endsWith('.wasm') && msg.wasmUrl)
+              ? msg.wasmUrl
+              : msg.factoryUrl.replace(/\\/[^/]+$/, '/' + name),
         });
         emit('ready', {});
         return;
@@ -2816,6 +2936,9 @@ async function ensurePrebakeWorker() {
     await prebakeWorkerReadyPromise;
     return prebakeWorker;
   }
+  // Resolve the wasm source before spinning up the worker so a fetch
+  // failure surfaces as its own message, not a generic worker-init error.
+  const wasm = await resolvePrebakeWasm();
   const blob = new Blob([PREBAKE_WORKER_SOURCE], { type: 'application/javascript' });
   const worker = new Worker(URL.createObjectURL(blob));
   prebakeWorker = worker;
@@ -2841,6 +2964,7 @@ async function ensurePrebakeWorker() {
     worker.postMessage({
       cmd: 'init',
       factoryUrl: location.origin + '/js/crumble-prebake.js',
+      wasmUrl: wasm.url,
     });
   });
   await prebakeWorkerReadyPromise;
@@ -2900,8 +3024,10 @@ let crumblePrebakeHeartbeat = null;
 async function loadCrumblePrebakeModule() {
   if (crumblePrebakeModulePromise) return crumblePrebakeModulePromise;
   crumblePrebakeModulePromise = (async () => {
+    const wasm = await resolvePrebakeWasm();
     const factory = await loadCrumblePrebakeFactory();
     return await factory({
+      locateFile: (name) => name.endsWith('.wasm') ? wasm.url : '/js/' + name,
       // Route emscripten stdout/stderr through three places:
       //   1. The optimizer log panel (per-line, prefixed by [prebake] /
       //      [prebake-err]) -- visible while the modal is open.
@@ -3189,17 +3315,17 @@ function computeFontIdJS(contentHash, family, pt) {
 // ~64 bits of collision resistance -- way more than we need for a
 // per-book-per-bake identity check.
 async function computeBakeFingerprint(renderInfo, epubBytes) {
-  // 1. WASM identity via the cache-busting ETag the firmware ships in its
-  //    asset-cache headers. HEAD bypasses the body and is essentially a
-  //    metadata round trip. If the header isn't available (older firmware,
-  //    proxy stripping), fall through to 'no-etag' so the fingerprint is
-  //    still stable for this session.
+  // 1. WASM identity from the resolver (device etag, idb-<ver>, or
+  //    cdn-<ver> -- see resolvePrebakeWasm). Field name stays wasmEtag so
+  //    fingerprints from embedded-wasm firmwares keep their shape; the
+  //    value changing across an upgrade just forces one re-bake, which is
+  //    the safe direction.
   let wasmEtag = 'no-etag';
   try {
-    const resp = await fetch('/js/crumble-prebake.wasm', { method: 'HEAD', cache: 'no-store' });
-    wasmEtag = resp.headers.get('etag') || 'no-etag';
+    wasmEtag = (await resolvePrebakeWasm()).identity;
   } catch (e) {
-    // Network blip -- proceed with the best-effort fingerprint.
+    // Resolver failed (offline, no cache) -- proceed with the best-effort
+    // fingerprint; the actual bake will surface the real error.
   }
 
   // 2. Cheap content fingerprint for the EPUB: size + sha256 over the

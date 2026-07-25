@@ -33,13 +33,17 @@ TARGETS = [
 
 
 def embed(src_path: Path, identifier: str) -> None:
-    # CRUMBLE_OMIT_WASM=1 forces stub generation even when the WASM is
-    # built. Used for release builds where we want the firmware binary
-    # to stay small enough to leave OTA headroom; the device-side
-    # /js/crumble-prebake.* handlers fall through to a 404 and the web
-    # optimizer falls back to its CDN-loaded variant.
-    if os.environ.get("CRUMBLE_OMIT_WASM") == "1":
-        print(f"[embed_wasm] skip {src_path.name}: CRUMBLE_OMIT_WASM=1")
+    # CrumBLE 4.7: the .wasm is no longer embedded by default -- at 1.34 MB
+    # gzipped it was the single largest blob in flash and pushed the app
+    # image past the stock 6.25 MB slot (blocking SD-card flashing from
+    # CrossInk). The optimizer JS now fetches it from jsDelivr (pinned to
+    # the firmware's release tag, cached in browser IndexedDB) and only
+    # uses the device route when a debug build re-embeds it via
+    # CRUMBLE_EMBED_WASM=1. The .js factory (~46 KB) stays embedded.
+    omit = identifier == "CrumblePrebakeWasm" and os.environ.get("CRUMBLE_EMBED_WASM") != "1"
+    if omit or os.environ.get("CRUMBLE_OMIT_WASM") == "1":
+        print(f"[embed_wasm] skip {src_path.name}: "
+              f"{'default (set CRUMBLE_EMBED_WASM=1 to embed)' if omit else 'CRUMBLE_OMIT_WASM=1'}")
         compressed = b""
         original_size = 0
     elif not src_path.exists():
