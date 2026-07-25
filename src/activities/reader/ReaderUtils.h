@@ -7,6 +7,7 @@
 
 #include "../../SilentRestart.h"  // CrumBLE 4.4: skip HALF refresh on first paint post-silent-reboot
 #include "../../components/UITheme.h"
+#include "../../fontIds.h"
 #include "MappedInputManager.h"
 
 namespace ReaderUtils {
@@ -119,13 +120,26 @@ inline void clearStatusBarBand(const GfxRenderer& renderer, int orientedMarginBo
     clearY = 0;
   }
   // v18.9.9.209: clear only the RIGHT-HAND zone, not the full width. The
-  // per-page-turn dynamic text (page counter, percent, time-left) is right
-  // aligned; the left side holds the static title, and the progress bar
-  // spans the width but doesn't ghost the way small glyphs do. Whiting the
-  // whole strip on every turn read as a distracting full-width flash.
-  // Right 40% covers "1234/5678  99%  2h 30 min" with margin to spare.
+  // per-page-turn dynamic text (page counter, percent, time-left, clock) is
+  // right aligned; the title and progress bar don't ghost the way small
+  // glyphs do, and whiting the whole strip read as a full-width flash.
+  // 4.7.1: zone width now mirrors drawStatusBar's own layout math instead
+  // of a flat 40% of screen -- the guess cut through the middle of the
+  // dynamic block when the clock was on, so the clock and leading page
+  // digits sat outside the zone and stayed ghosted (blurry) between HALF
+  // refreshes. Worst-case progress ref matches BaseTheme's preclear; the
+  // clock reserve matches its 10 px gap.
   const int screenW = renderer.getScreenWidth();
-  const int zoneW = screenW * 2 / 5;
+  const char* progressRef =
+      SETTINGS.statusBarTimeLeft ? "9999/9999  100%  99h 59m" : "9999/9999  100%";
+  int zoneW = UITheme::getInstance().getMetrics().statusBarHorizontalMargin + baseRight +
+              renderer.getTextWidth(SMALL_FONT_ID, progressRef);
+  if (SETTINGS.statusBarClock) {
+    zoneW += 10 + renderer.getTextWidth(SMALL_FONT_ID, "12:59 PM");
+  }
+  zoneW += 8;  // ghost bleed slack
+  if (zoneW < screenW * 2 / 5) zoneW = screenW * 2 / 5;
+  if (zoneW > screenW * 7 / 10) zoneW = screenW * 7 / 10;
   const int zoneX = screenW - zoneW;
   renderer.fillRect(zoneX, clearY, zoneW, renderer.getScreenHeight() - clearY, false);
 }
