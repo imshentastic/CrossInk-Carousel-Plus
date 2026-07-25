@@ -66,6 +66,7 @@ SOURCES=(
   # SdCardFont directly from main.cpp.
   "$REPO_ROOT/lib/EpdFont/SdCardFont.cpp"
   "$REPO_ROOT/lib/EpdFont/SdCardFontManager.cpp"
+  "$REPO_ROOT/lib/GfxRenderer/FontCacheManager.cpp"
   "$REPO_ROOT/lib/EpdFont/SdCardFontRegistry.cpp"
   "$REPO_ROOT/lib/Utf8/Utf8.cpp"
   "$SCRIPT_DIR/host_shim/GfxRenderer.cpp"

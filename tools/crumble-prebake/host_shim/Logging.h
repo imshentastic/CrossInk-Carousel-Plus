@@ -47,6 +47,10 @@ inline int level() {
     }                                                       \
   } while (0)
 
+// Crash-checkpoint beacon is firmware-only (RTC-persisted breadcrumbs);
+// a host/wasm run has real stack traces, so it compiles out entirely.
+#define SET_CHECKPOINT(name) ((void)0)
+
 // Some firmware code uses logSerial.printf for binary / raw output --
 // stub as a stderr passthrough. Not common in our compiled subset.
 struct LogSerialShim {

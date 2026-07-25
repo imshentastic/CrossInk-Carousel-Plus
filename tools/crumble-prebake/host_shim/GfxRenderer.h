@@ -48,6 +48,8 @@
 #include <string>
 #include <vector>
 
+class FontCacheManager;
+
 class GfxRenderer {
  public:
   // Enums + types pulled in by DirectPixelWriter.h (via ImageBlock.cpp).
@@ -87,6 +89,11 @@ class GfxRenderer {
   // Framebuffer pointer is only consumed by drawing code that we no-op.
   // Returning nullptr is safe because the layout chain doesn't deref it.
   uint8_t* getFrameBuffer() const { return nullptr; }
+  // nullptr = Section's streamed-render prewarm path (glyph-atlas scan)
+  // falls through to its single-pass branch, which is the documented
+  // host-sim behavior. The real class links in via FontCacheManager.cpp
+  // so the never-taken branch still resolves its symbols.
+  FontCacheManager* getFontCacheManager() const { return nullptr; }
 
   // --- Measurement (MUST produce device-identical values; not yet wired) ---
   int getTextWidth(int fontId, const char* text,
