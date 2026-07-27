@@ -478,12 +478,64 @@ bool Dictionary::extractFormOfBase(const std::string& def, std::string& outBase)
   return true;
 }
 
+// Accent folding: Latin diacritics transliterate to their base letters
+// instead of being deleted (the old isalpha() filter dropped the UTF-8
+// bytes entirely, so "café" became "caf" and could never match an
+// unaccented dictionary's "cafe"). Folding runs on BOTH the query and
+// the .idx headwords during search, so accented book text matches
+// unaccented dictionaries and vice versa; headwords differing only by
+// accent normalize to one key and surface as multiple entries, which
+// the definition card already cycles. Ordering caveat: the .idx is
+// sorted by raw bytes while search compares folded keys -- anomalies
+// are local (accented forms sit beside their base alphabetically) and
+// absorbed by the SPARSE_INTERVAL linear-scan window, same as the old
+// deletion behavior.
 std::string Dictionary::cleanWord(const std::string& word) {
+  // Base letters for U+00C0-U+00FF (index = codepoint - 0xC0). '.' = drop.
+  static const char kLatin1[64 + 1] =
+      "aaaaaa.ceeeeiiiidnooooo.ouuuuy.."
+      "aaaaaa.ceeeeiiiidnooooo.ouuuuy.y";
+  // Base letters for U+0100-U+017F (index = codepoint - 0x100).
+  static const char kLatinExtA[128 + 1] =
+      "aaaaaaccccccccddddeeeeeeeeeegggggggghhhhiiiiiiiiiijjjjkkkllllllllll"
+      "nnnnnnnnnoooooo..rrrrrrssssssssttttttuuuuuuuuuuuuwwyyyzzzzzzs";
   std::string clean;
-  for (char c : word) {
-    if (std::isalpha(c)) {
-      clean += std::tolower(c);
+  clean.reserve(word.size());
+  size_t i = 0;
+  const size_t n = word.size();
+  while (i < n) {
+    const unsigned char c = static_cast<unsigned char>(word[i]);
+    if (c < 0x80) {
+      if (std::isalpha(c)) clean += static_cast<char>(std::tolower(c));
+      ++i;
+      continue;
     }
+    if (i + 1 < n && (c == 0xC3 || c == 0xC4 || c == 0xC5)) {
+      const unsigned char c2 = static_cast<unsigned char>(word[i + 1]);
+      if (c2 >= 0x80 && c2 <= 0xBF) {
+        const uint32_t cp = (static_cast<uint32_t>(c & 0x1F) << 6) | (c2 & 0x3F);
+        if (cp == 0xC6 || cp == 0xE6) clean += "ae";        // AE ligature
+        else if (cp == 0xDE || cp == 0xFE) clean += "th";   // thorn
+        else if (cp == 0xDF) clean += "ss";                 // sharp s
+        else if (cp == 0x152 || cp == 0x153) clean += "oe"; // OE ligature
+        else if (cp == 0x132 || cp == 0x133) clean += "ij"; // IJ digraph
+        else if (cp >= 0xC0 && cp <= 0xFF) {
+          const char b = kLatin1[cp - 0xC0];
+          if (b != '.') clean += b;
+        } else if (cp >= 0x100 && cp <= 0x17F) {
+          const char b = kLatinExtA[cp - 0x100];
+          if (b != '.') clean += b;
+        }
+        i += 2;
+        continue;
+      }
+    }
+    // Other multi-byte sequences (CJK, symbols): skip the whole sequence,
+    // matching the old behavior of dropping non-Latin bytes.
+    if ((c & 0xE0) == 0xC0) i += 2;
+    else if ((c & 0xF0) == 0xE0) i += 3;
+    else if ((c & 0xF8) == 0xF0) i += 4;
+    else ++i;
   }
   return clean;
 }
