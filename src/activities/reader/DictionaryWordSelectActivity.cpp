@@ -840,6 +840,23 @@ void DictionaryWordSelectActivity::performDefinitionLookup() {
       }
     }
   }
+  // Form-of gloss expansion (casper, MIT): a hit whose whole definition
+  // is an inflection stub ("plural of missile") redirects to the base
+  // headword so the card shows a real definition. Raw-size pre-filter
+  // keeps normal lookups to zero extra reads; one hop, no recursion.
+  if (!handles.empty() && handles.front().size <= 256) {
+    const auto& h0 = handles.front();
+    const std::string snippet =
+        Dictionary::readDefinitionRange(h0.offset, h0.size, 0, h0.size < 160u ? h0.size : 160u);
+    std::string base;
+    if (Dictionary::extractFormOfBase(snippet, base) && base != defTargetWord_) {
+      auto baseHandles = Dictionary::lookupAllHandles(base);
+      if (!baseHandles.empty()) {
+        defTargetWord_ = base;
+        handles = std::move(baseHandles);
+      }
+    }
+  }
   Dictionary::freeMemory();
   defEntryStreams_.clear();
   for (const auto& h : handles) {

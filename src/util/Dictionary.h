@@ -10,7 +10,8 @@
 class Dictionary {
  public:
   // v18.9.9.259: multi-dictionary support. discoverAll() walks the same
-  // fixed candidate folders (SD root, /dict/, /dictionary/) but returns
+  // fixed candidate folders (SD root, /dict/, /dictionary/, /dictionaries/)
+  // and returns
   // EVERY *.dict + *.idx pair rather than just the first match. Callers
   // (Lookup entry) pick one via DictionaryPickerActivity or fall through
   // to the sole match if only one is found. Discovery is cheap (opendir
@@ -82,6 +83,11 @@ class Dictionary {
 
   // Generates basic English stem variants (e.g., "running" -> "run")
   static std::vector<std::string> getStemVariants(const std::string& word);
+
+  // Detects inflection-stub definitions ("plural of missile") and extracts
+  // the base headword so callers can redirect to the real definition.
+  // def must already be HTML-stripped. Returns false for normal definitions.
+  static bool extractFormOfBase(const std::string& def, std::string& outBase);
 
   // Finds similar words using Levenshtein distance (Did you mean?)
   static std::vector<std::string> findSimilar(const std::string& word, int maxResults);

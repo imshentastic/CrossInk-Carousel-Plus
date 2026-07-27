@@ -52,6 +52,7 @@ constexpr DictBase kDictCandidates[] = {
     {"/dictionary.dict", "/dictionary.idx"},
     {"/dict/dictionary.dict", "/dict/dictionary.idx"},
     {"/dictionary/dictionary.dict", "/dictionary/dictionary.idx"},
+    {"/dictionaries/dictionary.dict", "/dictionaries/dictionary.idx"},
 };
 
 const DictBase* resolvedDictBase_ = nullptr;
@@ -343,6 +344,7 @@ std::vector<Dictionary::DictInfo> Dictionary::discoverAll() {
   }
   enumerateDictFolder("/dict", out);
   enumerateDictFolder("/dictionary", out);
+  enumerateDictFolder("/dictionaries", out);  // casper-ecosystem convention
   return out;
 }
 
@@ -442,6 +444,40 @@ bool Dictionary::readQidxOffset(int sparseIndex, uint32_t* outOffset) {
   return true;
 }
 
+// Ported from casper's lookup fallback chain (MIT). Guards: short stubs
+// only (real definitions that merely CONTAIN "a type of fish" don't
+// match the marker list, and long text bails early); the base is the
+// text after the LAST standalone " of " so "past participle of go"
+// resolves to "go".
+bool Dictionary::extractFormOfBase(const std::string& def, std::string& outBase) {
+  if (def.empty() || def.size() > 120) return false;
+  static const char* kMarkers[] = {
+      "plural of ",      "participle of ", "gerund of ",     "past of ",
+      "form of ",        "tense of ",      "indicative of ", "comparative of ",
+      "superlative of ", "singular of ",   "adverb of ",
+  };
+  bool looksFormOf = false;
+  for (const char* m : kMarkers) {
+    if (def.find(m) != std::string::npos) {
+      looksFormOf = true;
+      break;
+    }
+  }
+  if (!looksFormOf) return false;
+  size_t ofEnd = std::string::npos;
+  for (size_t p = def.find(" of "); p != std::string::npos; p = def.find(" of ", p + 1)) {
+    ofEnd = p + 4;
+  }
+  if (ofEnd == std::string::npos || ofEnd >= def.size()) return false;
+  std::string base = def.substr(ofEnd);
+  const size_t cut = base.find_first_of(";.,([|/\n");
+  if (cut != std::string::npos) base.resize(cut);
+  base = cleanWord(base);
+  if (base.size() < 2 || base.size() > 40) return false;
+  outBase = std::move(base);
+  return true;
+}
+
 std::string Dictionary::cleanWord(const std::string& word) {
   std::string clean;
   for (char c : word) {
@@ -487,6 +523,21 @@ std::vector<std::string> Dictionary::getStemVariants(const std::string& word) {
   if (L >= 4 && word.substr(L - 3) == "ing") {
     variants.push_back(word.substr(0, L - 3));        // e.g., playing -> play
     variants.push_back(word.substr(0, L - 3) + "e");  // e.g., making -> make
+    // Doubled final consonant: gagging -> gag, running -> run.
+    if (L >= 6 && word[L - 4] == word[L - 5]) {
+      variants.push_back(word.substr(0, L - 4));
+    }
+  }
+  // Adverbs (ported from casper's fallback chain, MIT): longest first so
+  // -ily/-ably aren't shadowed by the plain -ly strip.
+  if (L >= 5 && word.substr(L - 3) == "ily") {
+    variants.push_back(word.substr(0, L - 3) + "y");  // happily -> happy
+  }
+  if (L >= 6 && (word.substr(L - 4) == "ably" || word.substr(L - 4) == "ibly")) {
+    variants.push_back(word.substr(0, L - 1) + "e");  // probably -> probable
+  }
+  if (L >= 5 && word.substr(L - 2) == "ly") {
+    variants.push_back(word.substr(0, L - 2));  // obsequiously -> obsequious
   }
   return variants;
 }
