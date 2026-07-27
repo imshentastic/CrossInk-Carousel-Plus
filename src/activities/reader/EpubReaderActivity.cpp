@@ -2644,7 +2644,12 @@ void EpubReaderActivity::loop() {
                            (pxcManifest_->imageRendering != SETTINGS.imageRendering));
 
     // Step 1: prompt if needed and not yet shown.
-    if (mismatch && pendingBleQuickConnectPromptStage_ == -1) {
+    // 4.7.2: also honour btManifestPromptAnsweredThisSession_. v187 wired that
+    // flag into the edge-detect site only, so answering at book open (or in a
+    // prior QC that silent-restarted) and then hitting Quick Connect asked the
+    // same question again. A surviving mismatch means the earlier answer was
+    // "use my settings", so skipping straight to Step 2 keeps that choice.
+    if (mismatch && !btManifestPromptAnsweredThisSession_ && pendingBleQuickConnectPromptStage_ == -1) {
       const std::string promptBody = buildManifestComparisonBody(
           *pxcManifest_, readerSettingsCache_,
           "This book was prepared for clearer images over Bluetooth.");
