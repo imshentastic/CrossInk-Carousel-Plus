@@ -397,8 +397,8 @@ EpdFontFamily ui12FontFamily(&ui12RegularFont, &ui12BoldFont);
 // Registered as EpdFontFamily's static CJK fallback in setupDisplayAndFonts;
 // never inserted into the renderer font map -- it has no fontId and is only
 // reached through the glyph-miss fallback chain.
-EpdFont cjk16RegularFont(&cjk_16_regular);
-EpdFontFamily cjk16FontFamily(&cjk16RegularFont);
+EpdFont cjk14RegularFont(&cjk_14_regular);
+EpdFontFamily cjk14FontFamily(&cjk14RegularFont);
 #endif
 
 // measurement of power button press duration calibration value
@@ -2502,7 +2502,7 @@ void setupDisplayAndFonts(bool seamless = false, bool leanForOta = false) {
   // tiny-cjk: arm the flash CJK fallback. Every family's glyph-miss chain
   // (reader text, UI labels, book titles) now resolves hanzi / kana / CJK
   // punctuation from the baked LXGW WenKai face -- zero heap, zero SD.
-  EpdFontFamily::setCjkFallbackFamily(&cjk16FontFamily);
+  EpdFontFamily::setCjkFallbackFamily(&cjk14FontFamily);
 #endif
 
   if (leanForOta) {

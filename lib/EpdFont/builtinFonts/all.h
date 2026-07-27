@@ -206,8 +206,9 @@
 // tiny-cjk variant: flash-resident CJK fallback face (LXGW WenKai, 2-bit,
 // UNCOMPRESSED so glyph bitmaps are memory-mapped straight from .rodata with
 // zero heap at draw time). GB2312 level 1+2 hanzi + kana + CJK punctuation +
-// fullwidth forms; one physical size shared by every reader font size.
+// fullwidth forms; one physical size shared by every reader font size, baked
+// at 14pt so its metrics line up with Bitter 14.
 // Regenerate with lib/EpdFont/scripts/build-cjk-flash-font.sh.
 #ifdef CJK_VARIANT
-#include <builtinFonts/cjk_16_regular.h>
+#include <builtinFonts/cjk_14_regular.h>
 #endif

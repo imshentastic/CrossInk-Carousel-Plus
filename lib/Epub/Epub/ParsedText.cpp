@@ -58,6 +58,47 @@ bool isCjkLeadingPunct(uint32_t cp) {
   }
 }
 
+#ifdef CJK_VARIANT
+// True for codepoints that are set solid in CJK typography -- ideographs,
+// kana, CJK punctuation and fullwidth forms. Mirrors isCjkCodepointForSplit
+// in ChapterHtmlSlimParser, which is what put each of these characters in a
+// word of its own to begin with.
+bool isCjkSolidSetCodepoint(uint32_t cp) {
+  if (cp >= 0x4E00 && cp <= 0x9FFF) return true;
+  if (cp >= 0x3400 && cp <= 0x4DBF) return true;
+  if (cp >= 0x3000 && cp <= 0x303F) return true;
+  if (cp >= 0x3040 && cp <= 0x309F) return true;
+  if (cp >= 0x30A0 && cp <= 0x30FF) return true;
+  if (cp >= 0xF900 && cp <= 0xFAFF) return true;
+  if (cp >= 0xFF00 && cp <= 0xFFEF) return true;
+  return false;
+}
+#endif
+
+// Width to insert between two adjacent words on the same line.
+//
+// The 4.5.3 CJK tokenizer emits every ideograph as its own word so the line
+// breaker can wrap between characters. That makes each of them look
+// space-separated to the breakers, which would insert a full space advance
+// between every pair -- but CJK is set solid, with no inter-character space.
+// Suppressing it here is both correct typography and ~17% less width per
+// line of Chinese. Runs of CJK only: a CJK/Latin boundary keeps its space,
+// which is the conventional treatment for mixed text.
+//
+// Every gap site in this file routes through this helper -- the DP, the
+// hyphenated breaker, and extractLine -- because the widths the breakers
+// measure and the x-positions extractLine bakes into the page must agree
+// exactly, or glyphs land in the wrong place.
+int interWordGap(const GfxRenderer& renderer, int fontId, uint32_t leftCp, uint32_t rightCp,
+                 EpdFontFamily::Style style) {
+#ifdef CJK_VARIANT
+  if (isCjkSolidSetCodepoint(leftCp) && isCjkSolidSetCodepoint(rightCp)) {
+    return renderer.getKerning(fontId, leftCp, rightCp, style);
+  }
+#endif
+  return renderer.getSpaceAdvance(fontId, leftCp, rightCp, style);
+}
+
 // Returns the last codepoint of a word by scanning backward for the start of the last UTF-8 sequence.
 uint32_t lastCodepoint(const std::string& word) {
   if (word.empty()) return 0;
@@ -436,7 +477,7 @@ std::vector<size_t> ParsedText::computeLineBreaks(const GfxRenderer& renderer, c
       int gap = 0;
       if (j > static_cast<size_t>(i) && !continuesVec[j]) {
         gap =
-            renderer.getSpaceAdvance(fontId, lastCodepoint(words[j - 1]), firstCodepoint(words[j]), wordStyles[j - 1]);
+            interWordGap(renderer, fontId, lastCodepoint(words[j - 1]), firstCodepoint(words[j]), wordStyles[j - 1]);
       } else if (j > static_cast<size_t>(i) && continuesVec[j]) {
         // Cross-boundary kerning for continuation words (e.g. nonbreaking spaces, attached punctuation)
         gap = renderer.getKerning(fontId, lastCodepoint(words[j - 1]), firstCodepoint(words[j]), wordStyles[j - 1]);
@@ -562,7 +603,7 @@ std::vector<size_t> ParsedText::computeHyphenatedLineBreaks(const GfxRenderer& r
       const bool isFirstWord = currentIndex == lineStart;
       int spacing = 0;
       if (!isFirstWord && !continuesVec[currentIndex]) {
-        spacing = renderer.getSpaceAdvance(fontId, lastCodepoint(words[currentIndex - 1]),
+        spacing = interWordGap(renderer, fontId, lastCodepoint(words[currentIndex - 1]),
                                            firstCodepoint(words[currentIndex]), wordStyles[currentIndex - 1]);
       } else if (!isFirstWord && continuesVec[currentIndex]) {
         // Cross-boundary kerning for continuation words (e.g. nonbreaking spaces, attached punctuation)
@@ -798,7 +839,7 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
     if (wordIdx > 0 && !continuesVec[lastBreakAt + wordIdx]) {
       actualGapCount++;
       totalNaturalGaps +=
-          renderer.getSpaceAdvance(fontId, lastCodepoint(words[lastBreakAt + wordIdx - 1]),
+          interWordGap(renderer, fontId, lastCodepoint(words[lastBreakAt + wordIdx - 1]),
                                    firstCodepoint(words[lastBreakAt + wordIdx]), wordStyles[lastBreakAt + wordIdx - 1]);
     } else if (wordIdx > 0 && continuesVec[lastBreakAt + wordIdx]) {
       if (words[lastBreakAt + wordIdx] == " ") {
@@ -853,7 +894,7 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
     } else {
       int gap = 0;
       if (wordIdx + 1 < lineWordCount) {
-        gap = renderer.getSpaceAdvance(fontId, lastCodepoint(words[lastBreakAt + wordIdx]),
+        gap = interWordGap(renderer, fontId, lastCodepoint(words[lastBreakAt + wordIdx]),
                                        firstCodepoint(words[lastBreakAt + wordIdx + 1]),
                                        wordStyles[lastBreakAt + wordIdx]);
       }
