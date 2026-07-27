@@ -31,6 +31,33 @@ uint32_t firstCodepoint(const std::string& word) {
   }
 }
 
+// CJK 避头尾: closing punctuation that must not START a line. The 4.5.3
+// parser emits each CJK char as its own word, so without this a wrap can
+// land 。or ，at a line head. Both breakers treat "break before one of
+// these" as illegal; the preceding character travels down with it.
+bool isCjkLeadingPunct(uint32_t cp) {
+  switch (cp) {
+    case 0x3001:  // 、
+    case 0x3002:  // 。
+    case 0x3009:  // 〉
+    case 0x300B:  // 》
+    case 0x300D:  // 」
+    case 0x300F:  // 』
+    case 0x3011:  // 】
+    case 0xFF01:  // ！
+    case 0xFF09:  // ）
+    case 0xFF0C:  // ，
+    case 0xFF1A:  // ：
+    case 0xFF1B:  // ；
+    case 0xFF1F:  // ？
+    case 0x2019:  // ’ (standalone only in CJK context; Latin quotes stay word-attached)
+    case 0x201D:  // ”
+      return true;
+    default:
+      return false;
+  }
+}
+
 // Returns the last codepoint of a word by scanning backward for the start of the last UTF-8 sequence.
 uint32_t lastCodepoint(const std::string& word) {
   if (word.empty()) return 0;
@@ -425,6 +452,12 @@ std::vector<size_t> ParsedText::computeLineBreaks(const GfxRenderer& renderer, c
         continue;
       }
 
+      // CJK 避头尾: an illegal break here makes the DP rebalance the
+      // paragraph so the punctuation's preceding character wraps with it.
+      if (j + 1 < totalWordCount && words[j + 1].size() <= 4 && isCjkLeadingPunct(firstCodepoint(words[j + 1]))) {
+        continue;
+      }
+
       int cost;
       if (j == totalWordCount - 1) {
         cost = 0;  // Last line
@@ -566,8 +599,13 @@ std::vector<size_t> ParsedText::computeHyphenatedLineBreaks(const GfxRenderer& r
     }
 
     // Don't break before a continuation word (e.g., orphaned "?" after "question").
-    // Backtrack to the start of the continuation group so the whole group moves to the next line.
-    while (currentIndex > lineStart + 1 && currentTokenAttaches(currentIndex)) {
+    // Backtrack to the start of the continuation group so the whole group moves
+    // to the next line. Same for CJK leading punctuation (避头尾): back up one
+    // so the preceding character carries it down.
+    while (currentIndex > lineStart + 1 &&
+           (currentTokenAttaches(currentIndex) ||
+            (currentIndex < words.size() && words[currentIndex].size() <= 4 &&
+             isCjkLeadingPunct(firstCodepoint(words[currentIndex]))))) {
       --currentIndex;
     }
 
