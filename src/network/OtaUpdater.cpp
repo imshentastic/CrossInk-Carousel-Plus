@@ -38,11 +38,24 @@ constexpr char latestReleaseUrl[] = CROSSINK_OTA_RELEASE_URL;
 // OTA-friendly) and "crumble-firmware-X.Y.Z-full-needs-USB-flash.bin"
 // (larger, USB-only). The matcher below treats only the slim variant as
 // an OTA target -- delivering the full to a 6.25 MB legacy OTA slot
-// would brick the device with "Firmware too large". The stem is just
-// "crumble-firmware" (no -tiny suffix) since CrumBLE has one shipping
-// variant per release.
+// would brick the device with "Firmware too large".
+//
+// tiny-cjk: the CJK variant ships as "crumble-firmware-cjk-X.Y.Z.bin". A
+// CJK device must only ever ingest -cjk- assets (a main image would
+// silently drop its CJK rendering), and a main device must never ingest a
+// -cjk- asset (different font/feature set the user didn't ask for). The
+// stem is variant-selected at compile time; the main build additionally
+// rejects cjk-marked names explicitly since they share the main stem's
+// prefix.
+#ifdef CJK_VARIANT
+constexpr char firmwareAssetStem[] = "crumble-firmware-cjk";
+constexpr char firmwareAssetName[] = "crumble-firmware-cjk.bin";
+#else
 constexpr char firmwareAssetStem[] = "crumble-firmware";
 constexpr char firmwareAssetName[] = "crumble-firmware.bin";
+constexpr char cjkVariantMarker[] = "-cjk-";
+constexpr char cjkVariantBinSuffix[] = "-cjk.bin";
+#endif
 constexpr char fullVariantMarker[] = "-full-needs-USB-flash";
 
 constexpr char binSuffix[] = ".bin";
@@ -147,6 +160,13 @@ bool isMatchingFirmwareAssetName(const char* assetName) {
   // matches our stem -- it intentionally overflows the legacy 6.25 MB
   // OTA partition and would brick devices on that layout.
   if (containsSubstring(assetName, fullVariantMarker)) return false;
+#ifndef CJK_VARIANT
+  // Main build: refuse CJK-variant assets. They share this stem's prefix
+  // ("crumble-firmware-cjk-..." starts with "crumble-firmware-"), so the
+  // generic stem match below would otherwise accept them.
+  if (containsSubstring(assetName, cjkVariantMarker)) return false;
+  if (endsWith(assetName, cjkVariantBinSuffix)) return false;
+#endif
   if (strcmp(assetName, firmwareAssetName) == 0) return true;
   if (!startsWith(assetName, firmwareAssetStem)) return false;
   if (assetName[strlen(firmwareAssetStem)] != '-') return false;

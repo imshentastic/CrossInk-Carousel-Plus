@@ -2279,7 +2279,44 @@ bool ChapterHtmlSlimParser::parseAndBuildPages() {
 }
 
 void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line) {
-  const int lineHeight = renderer.getLineHeight(fontId) * lineCompression;
+  int lineHeight = renderer.getLineHeight(fontId) * lineCompression;
+#ifdef CJK_VARIANT
+  // tiny-cjk: hanzi on this line render from the fixed-size flash CJK face,
+  // not the selected Latin family, so a line that contains CJK gets
+  // max(latin, cjk) vertical space. baselineShift then pushes the line's
+  // stored y down so the CJK ascender stays inside this line's box --
+  // drawText places the baseline at yPos + latin ascender, which for small
+  // Latin sizes would otherwise let a taller CJK glyph overdraw the line
+  // above. Pure-Latin lines take neither branch and lay out exactly as the
+  // main build does.
+  int baselineShift = 0;
+  if (const EpdFontFamily* cjkFb = EpdFontFamily::cjkFallbackFamily()) {
+    bool lineHasCjk = false;
+    const auto& fontMap = renderer.getFontMap();
+    const auto primaryIt = fontMap.find(fontId);
+    const EpdFontFamily* primary = primaryIt != fontMap.end() ? &primaryIt->second : nullptr;
+    const WordsView words = line->getWords();
+    for (size_t i = 0; i < words.size() && !lineHasCjk; ++i) {
+      const WordView word = words[i];
+      if (word.empty()) continue;
+      // The 4.5.3 parser emits every CJK char as its own single-char word,
+      // so probing the first codepoint of each word is exhaustive.
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(word.c_str());
+      const uint32_t cp = utf8NextCodepoint(&p);
+      if (cp != 0 && (primary == nullptr || primary->findGlyphData(cp, EpdFontFamily::REGULAR).glyph == nullptr) &&
+          cjkFb->findGlyphData(cp, EpdFontFamily::REGULAR).glyph != nullptr) {
+        lineHasCjk = true;
+      }
+    }
+    if (lineHasCjk) {
+      const EpdFontData* cjkData = cjkFb->getData(EpdFontFamily::REGULAR);
+      const int cjkLineHeight = static_cast<int>(cjkData->advanceY * lineCompression);
+      if (cjkLineHeight > lineHeight) lineHeight = cjkLineHeight;
+      const int ascenderDelta = cjkData->ascender - renderer.getFontAscenderSize(fontId);
+      if (ascenderDelta > 0) baselineShift = ascenderDelta;
+    }
+  }
+#endif
 
   if (!currentPage) {
     currentPage.reset(new Page());
@@ -2304,7 +2341,11 @@ void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line) {
 
   // Apply horizontal left inset (margin + padding) as x position offset
   const int16_t xOffset = line->getBlockStyle().leftInset();
+#ifdef CJK_VARIANT
+  currentPage->elements.push_back(std::make_unique<PageLine>(line, xOffset, currentPageNextY + baselineShift));
+#else
   currentPage->elements.push_back(std::make_unique<PageLine>(line, xOffset, currentPageNextY));
+#endif
   currentPageNextY += lineHeight;
 }
 

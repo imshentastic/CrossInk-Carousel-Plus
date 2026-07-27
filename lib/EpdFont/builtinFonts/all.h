@@ -202,3 +202,12 @@
 #include <builtinFonts/inter_12_bold.h>
 #include <builtinFonts/inter_12_regular.h>
 #include <builtinFonts/inter_8_regular.h>
+
+// tiny-cjk variant: flash-resident CJK fallback face (LXGW WenKai, 2-bit,
+// UNCOMPRESSED so glyph bitmaps are memory-mapped straight from .rodata with
+// zero heap at draw time). GB2312 level 1+2 hanzi + kana + CJK punctuation +
+// fullwidth forms; one physical size shared by every reader font size.
+// Regenerate with lib/EpdFont/scripts/build-cjk-flash-font.sh.
+#ifdef CJK_VARIANT
+#include <builtinFonts/cjk_16_regular.h>
+#endif

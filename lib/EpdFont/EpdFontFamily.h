@@ -93,6 +93,18 @@ class EpdFontFamily {
   static void setBuiltInFallbackFamily(const EpdFontFamily* family);
   static const EpdFontFamily* builtInFallbackFamily();
 
+#ifdef CJK_VARIANT
+  // tiny-cjk variant: flash-resident CJK fallback face. Consulted on glyph
+  // miss BEFORE the SD-card UI fallback -- the face lives in .rodata
+  // (memory-mapped, zero heap, zero SD reads), so preferring it over the SD
+  // path is both faster and BLE-safe (no SD contention, no heap churn).
+  // Points at the single baked LXGW WenKai family registered at boot by
+  // setupDisplayAndFonts. Set once, never cleared. All reader font sizes
+  // share this one physical face by construction.
+  static void setCjkFallbackFamily(const EpdFontFamily* family);
+  static const EpdFontFamily* cjkFallbackFamily();
+#endif
+
  private:
   const EpdFont* regular;
   const EpdFont* bold;

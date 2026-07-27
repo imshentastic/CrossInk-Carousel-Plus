@@ -126,14 +126,27 @@ static unsigned long allowSleepAt = 0;
 static bool gBluetoothReaderContext = false;
 
 // Fonts
+// tiny-cjk (OMIT_ITALIC_FONTS): drop the italic + bold-italic reader faces
+// from flash (~550 KB across the Bitter sizes). Families built via
+// READER_ITALIC_FONT(...) receive nullptr instead, and
+// EpdFontFamily::getFont resolves italic styles to regular/bold at draw
+// time. The unreferenced glyph arrays in the still-included headers are
+// discarded at compile time (internal linkage, unused).
+#ifndef OMIT_ITALIC_FONTS
+#define READER_ITALIC_FONT(obj) &obj
+#else
+#define READER_ITALIC_FONT(obj) nullptr
+#endif
 #ifndef OMIT_LEXENDDECA_FONT
 #ifndef OMIT_MEDIUM_FONT
 EpdFont lexenddeca14RegularFont(&lexenddeca_14_regular);
 EpdFont lexenddeca14BoldFont(&lexenddeca_14_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont lexenddeca14ItalicFont(&lexenddeca_14_italic);
 EpdFont lexenddeca14BoldItalicFont(&lexenddeca_14_bolditalic);
-EpdFontFamily lexenddeca14FontFamily(&lexenddeca14RegularFont, &lexenddeca14BoldFont, &lexenddeca14ItalicFont,
-                                     &lexenddeca14BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily lexenddeca14FontFamily(&lexenddeca14RegularFont, &lexenddeca14BoldFont, READER_ITALIC_FONT(lexenddeca14ItalicFont),
+                                     READER_ITALIC_FONT(lexenddeca14BoldItalicFont));
 #endif
 #endif  // OMIT_LEXENDDECA_FONT
 // CrumBLE: OMIT_CHAREINK_FONT drops the entire CharEink family (see all.h).
@@ -141,64 +154,80 @@ EpdFontFamily lexenddeca14FontFamily(&lexenddeca14RegularFont, &lexenddeca14Bold
 #ifndef OMIT_TEENSY_FONT
 EpdFont charein8RegularFont(&charein_8_regular);
 EpdFont charein8BoldFont(&charein_8_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont charein8ItalicFont(&charein_8_italic);
 EpdFont charein8BoldItalicFont(&charein_8_bolditalic);
-EpdFontFamily charein8FontFamily(&charein8RegularFont, &charein8BoldFont, &charein8ItalicFont, &charein8BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily charein8FontFamily(&charein8RegularFont, &charein8BoldFont, READER_ITALIC_FONT(charein8ItalicFont), READER_ITALIC_FONT(charein8BoldItalicFont));
 #endif
 #ifndef OMIT_ITTY_BITTY_FONT
 EpdFont charein9RegularFont(&charein_9_regular);
 EpdFont charein9BoldFont(&charein_9_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont charein9ItalicFont(&charein_9_italic);
 EpdFont charein9BoldItalicFont(&charein_9_bolditalic);
-EpdFontFamily charein9FontFamily(&charein9RegularFont, &charein9BoldFont, &charein9ItalicFont, &charein9BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily charein9FontFamily(&charein9RegularFont, &charein9BoldFont, READER_ITALIC_FONT(charein9ItalicFont), READER_ITALIC_FONT(charein9BoldItalicFont));
 #endif
 #ifndef OMIT_TINY_FONT
 EpdFont charein10RegularFont(&charein_10_regular);
 EpdFont charein10BoldFont(&charein_10_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont charein10ItalicFont(&charein_10_italic);
 EpdFont charein10BoldItalicFont(&charein_10_bolditalic);
-EpdFontFamily charein10FontFamily(&charein10RegularFont, &charein10BoldFont, &charein10ItalicFont,
-                                  &charein10BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily charein10FontFamily(&charein10RegularFont, &charein10BoldFont, READER_ITALIC_FONT(charein10ItalicFont),
+                                  READER_ITALIC_FONT(charein10BoldItalicFont));
 #endif
 #ifndef OMIT_SMALL_FONT
 EpdFont charein12RegularFont(&charein_12_regular);
 EpdFont charein12BoldFont(&charein_12_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont charein12ItalicFont(&charein_12_italic);
 EpdFont charein12BoldItalicFont(&charein_12_bolditalic);
-EpdFontFamily charein12FontFamily(&charein12RegularFont, &charein12BoldFont, &charein12ItalicFont,
-                                  &charein12BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily charein12FontFamily(&charein12RegularFont, &charein12BoldFont, READER_ITALIC_FONT(charein12ItalicFont),
+                                  READER_ITALIC_FONT(charein12BoldItalicFont));
 #endif
 #ifndef OMIT_MEDIUM_FONT
 EpdFont charein14RegularFont(&charein_14_regular);
 EpdFont charein14BoldFont(&charein_14_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont charein14ItalicFont(&charein_14_italic);
 EpdFont charein14BoldItalicFont(&charein_14_bolditalic);
-EpdFontFamily charein14FontFamily(&charein14RegularFont, &charein14BoldFont, &charein14ItalicFont,
-                                  &charein14BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily charein14FontFamily(&charein14RegularFont, &charein14BoldFont, READER_ITALIC_FONT(charein14ItalicFont),
+                                  READER_ITALIC_FONT(charein14BoldItalicFont));
 #endif
 #ifndef OMIT_LARGE_FONT
 EpdFont charein16RegularFont(&charein_16_regular);
 EpdFont charein16BoldFont(&charein_16_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont charein16ItalicFont(&charein_16_italic);
 EpdFont charein16BoldItalicFont(&charein_16_bolditalic);
-EpdFontFamily charein16FontFamily(&charein16RegularFont, &charein16BoldFont, &charein16ItalicFont,
-                                  &charein16BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily charein16FontFamily(&charein16RegularFont, &charein16BoldFont, READER_ITALIC_FONT(charein16ItalicFont),
+                                  READER_ITALIC_FONT(charein16BoldItalicFont));
 #endif
 #ifndef OMIT_XLARGE_FONT
 EpdFont charein18RegularFont(&charein_18_regular);
 EpdFont charein18BoldFont(&charein_18_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont charein18ItalicFont(&charein_18_italic);
 EpdFont charein18BoldItalicFont(&charein_18_bolditalic);
-EpdFontFamily charein18FontFamily(&charein18RegularFont, &charein18BoldFont, &charein18ItalicFont,
-                                  &charein18BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily charein18FontFamily(&charein18RegularFont, &charein18BoldFont, READER_ITALIC_FONT(charein18ItalicFont),
+                                  READER_ITALIC_FONT(charein18BoldItalicFont));
 #endif
 #ifndef OMIT_HUGE_FONT
 EpdFont charein20RegularFont(&charein_20_regular);
 EpdFont charein20BoldFont(&charein_20_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont charein20ItalicFont(&charein_20_italic);
 EpdFont charein20BoldItalicFont(&charein_20_bolditalic);
-EpdFontFamily charein20FontFamily(&charein20RegularFont, &charein20BoldFont, &charein20ItalicFont,
-                                  &charein20BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily charein20FontFamily(&charein20RegularFont, &charein20BoldFont, READER_ITALIC_FONT(charein20ItalicFont),
+                                  READER_ITALIC_FONT(charein20BoldItalicFont));
 #endif
 #endif  // OMIT_CHAREINK_FONT
 // CrumBLE: OMIT_LEXENDDECA_FONT drops the entire Lexend Deca family (see all.h).
@@ -206,58 +235,72 @@ EpdFontFamily charein20FontFamily(&charein20RegularFont, &charein20BoldFont, &ch
 #ifndef OMIT_TEENSY_FONT
 EpdFont lexenddeca8RegularFont(&lexenddeca_8_regular);
 EpdFont lexenddeca8BoldFont(&lexenddeca_8_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont lexenddeca8ItalicFont(&lexenddeca_8_italic);
 EpdFont lexenddeca8BoldItalicFont(&lexenddeca_8_bolditalic);
-EpdFontFamily lexenddeca8FontFamily(&lexenddeca8RegularFont, &lexenddeca8BoldFont, &lexenddeca8ItalicFont,
-                                    &lexenddeca8BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily lexenddeca8FontFamily(&lexenddeca8RegularFont, &lexenddeca8BoldFont, READER_ITALIC_FONT(lexenddeca8ItalicFont),
+                                    READER_ITALIC_FONT(lexenddeca8BoldItalicFont));
 #endif
 #ifndef OMIT_ITTY_BITTY_FONT
 EpdFont lexenddeca9RegularFont(&lexenddeca_9_regular);
 EpdFont lexenddeca9BoldFont(&lexenddeca_9_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont lexenddeca9ItalicFont(&lexenddeca_9_italic);
 EpdFont lexenddeca9BoldItalicFont(&lexenddeca_9_bolditalic);
-EpdFontFamily lexenddeca9FontFamily(&lexenddeca9RegularFont, &lexenddeca9BoldFont, &lexenddeca9ItalicFont,
-                                    &lexenddeca9BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily lexenddeca9FontFamily(&lexenddeca9RegularFont, &lexenddeca9BoldFont, READER_ITALIC_FONT(lexenddeca9ItalicFont),
+                                    READER_ITALIC_FONT(lexenddeca9BoldItalicFont));
 #endif
 #ifndef OMIT_TINY_FONT
 EpdFont lexenddeca10RegularFont(&lexenddeca_10_regular);
 EpdFont lexenddeca10BoldFont(&lexenddeca_10_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont lexenddeca10ItalicFont(&lexenddeca_10_italic);
 EpdFont lexenddeca10BoldItalicFont(&lexenddeca_10_bolditalic);
-EpdFontFamily lexenddeca10FontFamily(&lexenddeca10RegularFont, &lexenddeca10BoldFont, &lexenddeca10ItalicFont,
-                                     &lexenddeca10BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily lexenddeca10FontFamily(&lexenddeca10RegularFont, &lexenddeca10BoldFont, READER_ITALIC_FONT(lexenddeca10ItalicFont),
+                                     READER_ITALIC_FONT(lexenddeca10BoldItalicFont));
 #endif
 #ifndef OMIT_SMALL_FONT
 EpdFont lexenddeca12RegularFont(&lexenddeca_12_regular);
 EpdFont lexenddeca12BoldFont(&lexenddeca_12_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont lexenddeca12ItalicFont(&lexenddeca_12_italic);
 EpdFont lexenddeca12BoldItalicFont(&lexenddeca_12_bolditalic);
-EpdFontFamily lexenddeca12FontFamily(&lexenddeca12RegularFont, &lexenddeca12BoldFont, &lexenddeca12ItalicFont,
-                                     &lexenddeca12BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily lexenddeca12FontFamily(&lexenddeca12RegularFont, &lexenddeca12BoldFont, READER_ITALIC_FONT(lexenddeca12ItalicFont),
+                                     READER_ITALIC_FONT(lexenddeca12BoldItalicFont));
 #endif
 #ifndef OMIT_LARGE_FONT
 EpdFont lexenddeca16RegularFont(&lexenddeca_16_regular);
 EpdFont lexenddeca16BoldFont(&lexenddeca_16_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont lexenddeca16ItalicFont(&lexenddeca_16_italic);
 EpdFont lexenddeca16BoldItalicFont(&lexenddeca_16_bolditalic);
-EpdFontFamily lexenddeca16FontFamily(&lexenddeca16RegularFont, &lexenddeca16BoldFont, &lexenddeca16ItalicFont,
-                                     &lexenddeca16BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily lexenddeca16FontFamily(&lexenddeca16RegularFont, &lexenddeca16BoldFont, READER_ITALIC_FONT(lexenddeca16ItalicFont),
+                                     READER_ITALIC_FONT(lexenddeca16BoldItalicFont));
 #endif
 #ifndef OMIT_XLARGE_FONT
 EpdFont lexenddeca18RegularFont(&lexenddeca_18_regular);
 EpdFont lexenddeca18BoldFont(&lexenddeca_18_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont lexenddeca18ItalicFont(&lexenddeca_18_italic);
 EpdFont lexenddeca18BoldItalicFont(&lexenddeca_18_bolditalic);
-EpdFontFamily lexenddeca18FontFamily(&lexenddeca18RegularFont, &lexenddeca18BoldFont, &lexenddeca18ItalicFont,
-                                     &lexenddeca18BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily lexenddeca18FontFamily(&lexenddeca18RegularFont, &lexenddeca18BoldFont, READER_ITALIC_FONT(lexenddeca18ItalicFont),
+                                     READER_ITALIC_FONT(lexenddeca18BoldItalicFont));
 #endif
 #ifndef OMIT_HUGE_FONT
 EpdFont lexenddeca20RegularFont(&lexenddeca_20_regular);
 EpdFont lexenddeca20BoldFont(&lexenddeca_20_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont lexenddeca20ItalicFont(&lexenddeca_20_italic);
 EpdFont lexenddeca20BoldItalicFont(&lexenddeca_20_bolditalic);
-EpdFontFamily lexenddeca20FontFamily(&lexenddeca20RegularFont, &lexenddeca20BoldFont, &lexenddeca20ItalicFont,
-                                     &lexenddeca20BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily lexenddeca20FontFamily(&lexenddeca20RegularFont, &lexenddeca20BoldFont, READER_ITALIC_FONT(lexenddeca20ItalicFont),
+                                     READER_ITALIC_FONT(lexenddeca20BoldItalicFont));
 #endif
 #endif  // OMIT_LEXENDDECA_FONT
 
@@ -267,58 +310,74 @@ EpdFontFamily lexenddeca20FontFamily(&lexenddeca20RegularFont, &lexenddeca20Bold
 #ifndef OMIT_TEENSY_FONT
 EpdFont bitter8RegularFont(&bitter_8_regular);
 EpdFont bitter8BoldFont(&bitter_8_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont bitter8ItalicFont(&bitter_8_italic);
 EpdFont bitter8BoldItalicFont(&bitter_8_bolditalic);
-EpdFontFamily bitter8FontFamily(&bitter8RegularFont, &bitter8BoldFont, &bitter8ItalicFont, &bitter8BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily bitter8FontFamily(&bitter8RegularFont, &bitter8BoldFont, READER_ITALIC_FONT(bitter8ItalicFont), READER_ITALIC_FONT(bitter8BoldItalicFont));
 #endif
 #ifndef OMIT_ITTY_BITTY_FONT
 EpdFont bitter9RegularFont(&bitter_9_regular);
 EpdFont bitter9BoldFont(&bitter_9_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont bitter9ItalicFont(&bitter_9_italic);
 EpdFont bitter9BoldItalicFont(&bitter_9_bolditalic);
-EpdFontFamily bitter9FontFamily(&bitter9RegularFont, &bitter9BoldFont, &bitter9ItalicFont, &bitter9BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily bitter9FontFamily(&bitter9RegularFont, &bitter9BoldFont, READER_ITALIC_FONT(bitter9ItalicFont), READER_ITALIC_FONT(bitter9BoldItalicFont));
 #endif
 #ifndef OMIT_TINY_FONT
 EpdFont bitter10RegularFont(&bitter_10_regular);
 EpdFont bitter10BoldFont(&bitter_10_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont bitter10ItalicFont(&bitter_10_italic);
 EpdFont bitter10BoldItalicFont(&bitter_10_bolditalic);
-EpdFontFamily bitter10FontFamily(&bitter10RegularFont, &bitter10BoldFont, &bitter10ItalicFont, &bitter10BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily bitter10FontFamily(&bitter10RegularFont, &bitter10BoldFont, READER_ITALIC_FONT(bitter10ItalicFont), READER_ITALIC_FONT(bitter10BoldItalicFont));
 #endif
 #ifndef OMIT_SMALL_FONT
 EpdFont bitter12RegularFont(&bitter_12_regular);
 EpdFont bitter12BoldFont(&bitter_12_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont bitter12ItalicFont(&bitter_12_italic);
 EpdFont bitter12BoldItalicFont(&bitter_12_bolditalic);
-EpdFontFamily bitter12FontFamily(&bitter12RegularFont, &bitter12BoldFont, &bitter12ItalicFont, &bitter12BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily bitter12FontFamily(&bitter12RegularFont, &bitter12BoldFont, READER_ITALIC_FONT(bitter12ItalicFont), READER_ITALIC_FONT(bitter12BoldItalicFont));
 #endif
 #ifndef OMIT_MEDIUM_FONT
 EpdFont bitter14RegularFont(&bitter_14_regular);
 EpdFont bitter14BoldFont(&bitter_14_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont bitter14ItalicFont(&bitter_14_italic);
 EpdFont bitter14BoldItalicFont(&bitter_14_bolditalic);
-EpdFontFamily bitter14FontFamily(&bitter14RegularFont, &bitter14BoldFont, &bitter14ItalicFont, &bitter14BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily bitter14FontFamily(&bitter14RegularFont, &bitter14BoldFont, READER_ITALIC_FONT(bitter14ItalicFont), READER_ITALIC_FONT(bitter14BoldItalicFont));
 #endif
 #ifndef OMIT_LARGE_FONT
 EpdFont bitter16RegularFont(&bitter_16_regular);
 EpdFont bitter16BoldFont(&bitter_16_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont bitter16ItalicFont(&bitter_16_italic);
 EpdFont bitter16BoldItalicFont(&bitter_16_bolditalic);
-EpdFontFamily bitter16FontFamily(&bitter16RegularFont, &bitter16BoldFont, &bitter16ItalicFont, &bitter16BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily bitter16FontFamily(&bitter16RegularFont, &bitter16BoldFont, READER_ITALIC_FONT(bitter16ItalicFont), READER_ITALIC_FONT(bitter16BoldItalicFont));
 #endif
 #ifndef OMIT_XLARGE_FONT
 EpdFont bitter18RegularFont(&bitter_18_regular);
 EpdFont bitter18BoldFont(&bitter_18_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont bitter18ItalicFont(&bitter_18_italic);
 EpdFont bitter18BoldItalicFont(&bitter_18_bolditalic);
-EpdFontFamily bitter18FontFamily(&bitter18RegularFont, &bitter18BoldFont, &bitter18ItalicFont, &bitter18BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily bitter18FontFamily(&bitter18RegularFont, &bitter18BoldFont, READER_ITALIC_FONT(bitter18ItalicFont), READER_ITALIC_FONT(bitter18BoldItalicFont));
 #endif
 #ifndef OMIT_HUGE_FONT
 EpdFont bitter20RegularFont(&bitter_20_regular);
 EpdFont bitter20BoldFont(&bitter_20_bold);
+#ifndef OMIT_ITALIC_FONTS
 EpdFont bitter20ItalicFont(&bitter_20_italic);
 EpdFont bitter20BoldItalicFont(&bitter_20_bolditalic);
-EpdFontFamily bitter20FontFamily(&bitter20RegularFont, &bitter20BoldFont, &bitter20ItalicFont, &bitter20BoldItalicFont);
+#endif  // OMIT_ITALIC_FONTS
+EpdFontFamily bitter20FontFamily(&bitter20RegularFont, &bitter20BoldFont, READER_ITALIC_FONT(bitter20ItalicFont), READER_ITALIC_FONT(bitter20BoldItalicFont));
 #endif
 #endif  // OMIT_BITTER_FONT
 
@@ -332,6 +391,15 @@ EpdFontFamily ui10FontFamily(&ui10RegularFont, &ui10BoldFont);
 EpdFont ui12RegularFont(&inter_12_regular);
 EpdFont ui12BoldFont(&inter_12_bold);
 EpdFontFamily ui12FontFamily(&ui12RegularFont, &ui12BoldFont);
+
+#ifdef CJK_VARIANT
+// tiny-cjk: single flash-resident CJK fallback face (see builtinFonts/all.h).
+// Registered as EpdFontFamily's static CJK fallback in setupDisplayAndFonts;
+// never inserted into the renderer font map -- it has no fontId and is only
+// reached through the glyph-miss fallback chain.
+EpdFont cjk16RegularFont(&cjk_16_regular);
+EpdFontFamily cjk16FontFamily(&cjk16RegularFont);
+#endif
 
 // measurement of power button press duration calibration value
 unsigned long t1 = 0;
@@ -2429,6 +2497,13 @@ void setupDisplayAndFonts(bool seamless = false, bool leanForOta = false) {
   renderer.insertFont(UI_10_FONT_ID, ui10FontFamily);
   renderer.insertFont(UI_12_FONT_ID, ui12FontFamily);
   renderer.insertFont(SMALL_FONT_ID, smallFontFamily);
+
+#ifdef CJK_VARIANT
+  // tiny-cjk: arm the flash CJK fallback. Every family's glyph-miss chain
+  // (reader text, UI labels, book titles) now resolves hanzi / kana / CJK
+  // punctuation from the baked LXGW WenKai face -- zero heap, zero SD.
+  EpdFontFamily::setCjkFallbackFamily(&cjk16FontFamily);
+#endif
 
   if (leanForOta) {
     LOG_INF("MEM", "Boot step setupDisplayAndFonts post-font-register: free=%u maxAlloc=%u", ESP.getFreeHeap(),
