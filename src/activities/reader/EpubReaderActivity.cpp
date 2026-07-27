@@ -2644,7 +2644,19 @@ void EpubReaderActivity::loop() {
                            (pxcManifest_->imageRendering != SETTINGS.imageRendering));
 
     // Step 1: prompt if needed and not yet shown.
-    if (mismatch && pendingBleQuickConnectPromptStage_ == -1) {
+    //
+    // btManifestPromptAnsweredThisSession_ is the cross-restart half of "not
+    // yet shown": pendingBleQuickConnectPromptStage_ is per-boot state and the
+    // boot dispatch re-arms it to -1 on every silent restart, so on its own it
+    // re-prompts once per restart hop. The BT-enable pre-flight can hop
+    // several times before the heap clears, which is how a single Quick
+    // Connect produced three identical "Use prepared layout?" prompts in the
+    // field. The answered flag is RTC-backed (rehydrated in onEnter, written
+    // by this callback and by the prebake-decline branch), so consulting it
+    // here collapses those repeats to one -- and honours a decline the user
+    // already gave to the open-book prompt, which is what the v18.9.9.187
+    // edge-detect suppression does for the other prompt site.
+    if (mismatch && !btManifestPromptAnsweredThisSession_ && pendingBleQuickConnectPromptStage_ == -1) {
       const std::string promptBody = buildManifestComparisonBody(
           *pxcManifest_, readerSettingsCache_,
           "This book was prepared for clearer images over Bluetooth.");
@@ -2715,6 +2727,13 @@ void EpubReaderActivity::loop() {
             requestUpdate();
           });
       return;
+    }
+
+    // Answered on an earlier hop (or by the open-book prompt) but the stage
+    // was re-armed by the boot dispatch: adopt "use my settings" so step 2
+    // proceeds instead of falling through with stage still -1.
+    if (mismatch && btManifestPromptAnsweredThisSession_ && pendingBleQuickConnectPromptStage_ == -1) {
+      pendingBleQuickConnectPromptStage_ = 0;
     }
 
     // Step 2: drop section if a re-layout is needed, then wait for it.
