@@ -244,15 +244,21 @@ void ActivityManager::goToBluetoothSettings() {
     // + connectToDevice + HID subscribe sequence against a fresh heap.
     // disableOnExit=false is now cosmetic (the reboot ends NimBLE either
     // way) but kept for clarity of intent.
+    // 4.7.2: fromReader=true so a SECOND restart from inside this session
+    // (scan pre-flight) re-arms returnToReaderAfterBtMagic instead of
+    // clearing it -- Back must keep leading to the book however many
+    // heap-recovery hops the session takes. The prewarm gate skips the
+    // post-restart case via g_postBtSilentReboot, preserving the 4.5.5
+    // enable-floor fix.
     replaceActivity(std::make_unique<BluetoothSettingsActivity>(
         renderer, mappedInput,
         [] { silentRestartToReaderWithAction(ReaderPostBootAction::EnableBt); },
-        /*exitOnSuccessfulConnect=*/false,
+        /*fromReader=*/true,
         /*disableOnExit=*/false));
     return;
   }
   replaceActivity(std::make_unique<BluetoothSettingsActivity>(
-      renderer, mappedInput, [this] { popActivity(); }, /*exitOnSuccessfulConnect=*/false));
+      renderer, mappedInput, [this] { popActivity(); }, /*fromReader=*/false));
 }
 
 void ActivityManager::goToKoreaderAuth() {

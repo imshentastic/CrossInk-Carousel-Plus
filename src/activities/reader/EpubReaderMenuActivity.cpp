@@ -414,14 +414,14 @@ void EpubReaderMenuActivity::loop() {
 
     if (selectedAction == MenuAction::BLUETOOTH) {
 #ifndef SIMULATOR
-      // CrumBLE 4.5.5: exitOnSuccessfulConnect=FALSE so the in-book BT entry
+      // CrumBLE 4.5.5: fromReader=FALSE so the in-book BT entry
       // behaves like the Main Settings BT entry. The user gets the full menu
       // (scan, pair, map buttons, etc) and explicitly backs out when done.
       // The drawer's BT Quick Connect path is the one-tap silent reconnect
       // affordance; this menu entry is the configuration affordance.
       startActivityForResult(
           std::make_unique<BluetoothSettingsActivity>(renderer, mappedInput, [] { activityManager.popActivity(); },
-                                                      /*exitOnSuccessfulConnect=*/false,
+                                                      /*fromReader=*/false,
                                                       /*disableOnExit=*/false),
           [this](const ActivityResult& result) {
             const auto* menu = std::get_if<MenuResult>(&result.data);

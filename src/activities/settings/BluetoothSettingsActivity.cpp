@@ -47,7 +47,7 @@ constexpr uint8_t kMapFnCount = sizeof(kMapFns) / sizeof(kMapFns[0]);
 // (Free-Ink/freeink-sdk) BluetoothSettingsActivity. See the .h for view/action
 // model. CrumBLE-specific additions kept: checkScanHeapOrBanner pre-flight,
 // learn-keys wizard sub-view, optional debug monitor sub-view, ctor params
-// (onComplete, exitOnSuccessfulConnect) that all call sites depend on.
+// (onComplete, fromReader) that all call sites depend on.
 
 namespace {
 constexpr unsigned long kBannerMs = 2000;
@@ -110,7 +110,10 @@ void BluetoothSettingsActivity::onEnter() {
     // same floor -> BT stayed off after the "screen flash", forcing a
     // second manual toggle. The reader's own onEnter will re-prewarm next
     // time we open a book.
-    if (exitOnSuccessfulConnect) {
+    // 4.7.2: !g_postBtSilentReboot keeps the 4.5.5 fix intact now that the
+    // post-restart recover path also carries fromReader=true -- prewarming
+    // right before enable() on a recover boot tripped the maxAlloc floor.
+    if (fromReader && !g_postBtSilentReboot) {
       EpubReaderActivity::prewarmReaderTextBuffer(renderer);
     }
     if (btMgr->enable()) {
@@ -240,20 +243,12 @@ void BluetoothSettingsActivity::handleMenuConfirm() {
             // Persist intent so the post-boot auto-restore brings BT up.
             SETTINGS.bluetoothEnabled = 1;
             SETTINGS.saveToFile();
-            // 4.5.5: when this activity was opened from the in-book BT
-            // quick-connect entry, restart back into the reader (not into
-            // BT settings) so the user lands on their book with BT auto-
-            // re-enabled. The reader-side dispatch (EnableBt action) does
-            // the actual btMgr->enable() + connectToDevice on the bonded
-            // address after boot. Without this branch, exiting BT settings
-            // would push the user back to Home.
-            if (exitOnSuccessfulConnect) {
-              silentRestartToReaderWithAction(ReaderPostBootAction::EnableBt);
-            } else {
-              // v18.9.9.367: fromReader=false so Back-from-BT after the
-              // restart pops to Settings (parent), not to the last book.
-              silentRestartToBluetoothSettings(/*fromReader=*/false);
-            }
+            // 4.7.2: always restart back INTO BT settings. The old
+            // from-reader branch restarted into the READER, which
+            // stranded users mid-setup with BT on but nothing paired;
+            // fromReader now only routes where Back lands (book vs
+            // Settings) via returnToReaderAfterBtMagic.
+            silentRestartToBluetoothSettings(fromReader);
             // never returns
           }
           setBanner(btMgr->lastError.empty() ? "Failed to enable" : btMgr->lastError.c_str(), 4000);
@@ -364,20 +359,11 @@ bool BluetoothSettingsActivity::checkScanHeapOrBanner() {
   if (!g_postBtSilentReboot) {
     LOG_INF("BT", "BT scan pre-flight low (free=%u maxAlloc=%u) -- silent-restart to recover heap",
             freeHeap, maxAlloc);
-    // 4.5.5: route to the right post-restart target so back-from-BT lands
-    // where the user came from. exitOnSuccessfulConnect signals "opened
-    // from in-book"; without this branch, silentRestartToBluetoothSettings
-    // makes BT-settings the ROOT activity and a Back press jumps the user
-    // out to Home instead of back to their book.
-    if (exitOnSuccessfulConnect) {
-      silentRestartToReaderWithAction(ReaderPostBootAction::EnableBt);
-    } else {
-      // v18.9: preserve scan-intent across the restart so the user isn't
-      // dropped on menu row 0 and forced to tap "Scan & Pair" a second time.
-      // v18.9.9.367: fromReader=false -- came from Settings, Back must
-      // return to Settings, not the last book.
-      silentRestartToBluetoothSettingsWithScanIntent(/*fromReader=*/false);
-    }
+    // 4.7.2: both origins restart into BT settings WITH scan intent so
+    // the user lands straight back in the scan view instead of being
+    // bounced into the book; fromReader keeps Back returning to the
+    // book rather than Home.
+    silentRestartToBluetoothSettingsWithScanIntent(fromReader);
     // never returns
   }
   LOG_ERR("BT", "BT scan pre-flight refused even after silent-restart: free=%u maxAlloc=%u (need %u/%u)",
@@ -510,13 +496,8 @@ void BluetoothSettingsActivity::loop() {
       setBanner(buf);
       pendingConnectAddress.clear();
       pendingConnectName.clear();
-      if (exitOnSuccessfulConnect) {
-        MenuResult result;
-        result.autoExitParent = true;
-        setResult(ActivityResult{result});
-        finish();
-        return;
-      }
+      // 4.7.2: no auto-exit on connect. The user stays in the BT menu for
+      // scan / button-mapping follow-ups and leaves with an explicit Back.
       view = View::Menu;
       rebuildMenuRows();
       requestUpdate();

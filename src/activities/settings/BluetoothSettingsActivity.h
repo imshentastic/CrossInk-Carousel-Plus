@@ -94,7 +94,7 @@ class BluetoothSettingsActivity : public Activity {
   // When true, the activity auto-finishes once a connect succeeds. Used by
   // the in-book reader's quick-connect entry point so the user is dropped
   // back into the book the instant the remote links.
-  bool exitOnSuccessfulConnect = false;
+  bool fromReader = false;
   // 4.5.5: tear BT down on exit. Default true matches the historical
   // Main-Settings-entry behavior (NimBLE holds ~60 KB; Home/Bookshelf
   // OOM'd if left running). Reader entry points pass false because the
@@ -108,10 +108,10 @@ class BluetoothSettingsActivity : public Activity {
  public:
   explicit BluetoothSettingsActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                      const std::function<void()>& onComplete,
-                                     const bool exitOnSuccessfulConnect = false,
+                                     const bool fromReader = false,
                                      const bool disableOnExit = true)
       : Activity("BluetoothSettings", renderer, mappedInput),
-        exitOnSuccessfulConnect(exitOnSuccessfulConnect),
+        fromReader(fromReader),
         disableOnExit(disableOnExit),
         onComplete(onComplete) {}
 

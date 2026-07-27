@@ -4847,7 +4847,7 @@ void EpubReaderActivity::executeReaderQuickAction(CrossPointSettings::LONG_PRESS
                                  startActivityForResult(
                                      std::make_unique<BluetoothSettingsActivity>(
                                          renderer, mappedInput, [] { activityManager.popActivity(); },
-                                         /*exitOnSuccessfulConnect=*/true,
+                                         /*fromReader=*/true,
                                          /*disableOnExit=*/false),
                                      [this](const ActivityResult&) { requestUpdate(); });
                                  return;
