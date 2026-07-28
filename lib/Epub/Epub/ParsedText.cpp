@@ -9,6 +9,7 @@
 #include <limits>
 #include <vector>
 
+#include "IndexProfile.h"
 #include "hyphenation/Hyphenator.h"
 
 constexpr int MAX_COST = std::numeric_limits<int>::max();
@@ -358,6 +359,7 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
 void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fontId, const uint16_t viewportWidth,
                                        const std::function<void(std::shared_ptr<TextBlock>)>& processLine,
                                        const bool includeLastLine) {
+  IXPROF_SCOPE(LAYOUT);
   if (words.empty()) {
     return;
   }
@@ -411,6 +413,8 @@ void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
 }
 
 std::vector<uint16_t> ParsedText::calculateWordWidths(const GfxRenderer& renderer, const int fontId) {
+  IXPROF_SCOPE(MEASURE);
+  IXPROF_ADD_WORDS(words.size());
   std::vector<uint16_t> wordWidths;
   wordWidths.reserve(words.size());
 
@@ -423,6 +427,7 @@ std::vector<uint16_t> ParsedText::calculateWordWidths(const GfxRenderer& rendere
 
 std::vector<size_t> ParsedText::computeLineBreaks(const GfxRenderer& renderer, const int fontId, const int pageWidth,
                                                   std::vector<uint16_t>& wordWidths, std::vector<bool>& continuesVec) {
+  IXPROF_SCOPE(LINEBRK);
   if (words.empty()) {
     return {};
   }
@@ -572,6 +577,7 @@ void ParsedText::applyParagraphIndent() {
 std::vector<size_t> ParsedText::computeHyphenatedLineBreaks(const GfxRenderer& renderer, const int fontId,
                                                             const int pageWidth, std::vector<uint16_t>& wordWidths,
                                                             std::vector<bool>& continuesVec) {
+  IXPROF_SCOPE(LINEBRK);
   // Calculate first line indent (only for left/justified text).
   // Positive text-indent is normally suppressed when extraParagraphSpacing is on,
   // unless forceParagraphIndents overrides that behavior.
@@ -809,6 +815,7 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
                              const std::vector<bool>& continuesVec, const std::vector<size_t>& lineBreakIndices,
                              const std::function<void(std::shared_ptr<TextBlock>)>& processLine,
                              const GfxRenderer& renderer, const int fontId) {
+  IXPROF_SCOPE(EXTRACT);
   const size_t lineBreak = lineBreakIndices[breakIndex];
   const size_t lastBreakAt = breakIndex > 0 ? lineBreakIndices[breakIndex - 1] : 0;
   const size_t lineWordCount = lineBreak - lastBreakAt;

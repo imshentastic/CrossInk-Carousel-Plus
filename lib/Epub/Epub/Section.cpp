@@ -1,5 +1,7 @@
 #include "Section.h"
 
+#include "IndexProfile.h"
+
 #include <Arduino.h>
 #include <FontCacheManager.h>  // v18.9.9.13: prewarm scope for streamed render
 #include <GfxRenderer.h>       // v18.9.9.13: full type for prewarm-scope integration
@@ -937,6 +939,9 @@ bool Section::buildSomeMore(const int maxPages) {
       // v18.9.9.76: snapshot bytes consumed at yield so estimatedTotalPages()
       // has fresh input for the "page X of ~Y" popup between ticks.
       build_->bytesConsumed = static_cast<uint32_t>(build_->parser->parseBytesConsumed());
+      // Yield boundary == one page at the default kBuildPagesPerTick, so the
+      // accumulated buckets describe exactly the work that page cost.
+      IXPROF_DUMP(pageCount);
       return true;
     }
   }

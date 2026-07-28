@@ -20,6 +20,7 @@
 #include "Epub/converters/ImageDecoderFactory.h"
 #include "Epub/converters/ImageToFramebufferDecoder.h"
 #include "Epub/htmlEntities.h"
+#include "Epub/IndexProfile.h"
 #include "Epub/parsers/ChapterHtmlSlimParserGuards.h"
 
 // v18.9.3/v18.9.6: two independent sources for the table guard, ORed at
@@ -1067,6 +1068,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                 // Get image dimensions
                 ImageDimensions dims = {0, 0};
                 ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(cachedImagePath);
+                IXPROF_SCOPE(IMAGE);
                 if (decoder && getImageDimensionsWithRetries(*decoder, cachedImagePath, dims)) {
                   LOG_DBG("EHP", "Image dimensions: %dx%d", dims.width, dims.height);
 
@@ -2166,6 +2168,7 @@ bool ChapterHtmlSlimParser::beginParse() {
 }
 
 ChapterHtmlSlimParser::ParseStatus ChapterHtmlSlimParser::parseStep() {
+  IXPROF_SCOPE(TOTAL);
   void* const buf = XML_GetBuffer(xmlParser_, PARSE_BUFFER_SIZE);
   if (!buf) {
     LOG_ERR("EHP", "Couldn't allocate memory for buffer");
@@ -2324,7 +2327,10 @@ void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line) {
   }
 
   if (currentPageNextY + lineHeight > viewportHeight) {
-    completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex);
+    {
+      IXPROF_SCOPE(PAGEOUT);
+      completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex);
+    }
     completedPageCount++;
     currentPage.reset(new Page());
     currentPageNextY = 0;
