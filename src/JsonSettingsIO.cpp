@@ -247,6 +247,9 @@ bool JsonSettingsIO::saveSettings(const CrossPointSettings& s, const char* path)
   // Cursor advanced by SleepActivity when sleepScreenCycleMode is on; uint16_t
   // so the SettingInfo (uint8_t-only) loop does not cover it.
   doc["sleepScreenCycleIndex"] = s.sleepScreenCycleIndex;
+  doc["sleepCycleDoubleTapBack"] = s.sleepCycleDoubleTapBack;
+  doc["sleepCycleDailyMode"] = s.sleepCycleDailyMode;
+  doc["sleepCycleLastChangeDay"] = s.sleepCycleLastChangeDay;
 
   // Language -- managed by LanguageSelectActivity, not in SettingsList.
   // Stored as ISO code string ("EN", "DE", ...) for stability across enum reorders.
@@ -469,6 +472,9 @@ bool JsonSettingsIO::loadSettings(CrossPointSettings& s, const char* json, bool*
 
   // Sleep screen cycle cursor (uint16_t, not in SettingInfo loop).
   s.sleepScreenCycleIndex = doc["sleepScreenCycleIndex"] | s.sleepScreenCycleIndex;
+  s.sleepCycleDoubleTapBack = doc["sleepCycleDoubleTapBack"] | s.sleepCycleDoubleTapBack;
+  s.sleepCycleDailyMode = doc["sleepCycleDailyMode"] | s.sleepCycleDailyMode;
+  s.sleepCycleLastChangeDay = doc["sleepCycleLastChangeDay"] | s.sleepCycleLastChangeDay;
 
   // Font family — uses dynamic getter/setter in SettingsList so the generic loop skips it.
   s.fontFamily = clamp(doc["fontFamily"] | (uint8_t)0, CrossPointSettings::BUILTIN_FONT_COUNT, 0);

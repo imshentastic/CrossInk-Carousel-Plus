@@ -2139,6 +2139,36 @@ bool pollForCycleTapDuringSleepEntry() {
   return false;
 }
 
+// 4.7.2: opt-in second-tap probe. Only runs when the user enabled
+// sleepCycleDoubleTapBack, so the default path keeps its exact pre-4.7.2
+// timing (no added window, no extra delay before deep sleep). Called right
+// after a tap has been recognised: a second tap inside the window means
+// "go back" instead of forward.
+constexpr unsigned long DOUBLE_TAP_WINDOW_MS = 400;
+
+bool pollForSecondCycleTap() {
+  if (!SETTINGS.sleepCycleDoubleTapBack) return false;
+  const auto start = millis();
+  while (millis() - start < DOUBLE_TAP_WINDOW_MS) {
+    if (digitalRead(InputManager::POWER_BUTTON_PIN) == LOW) {
+      const auto pressStart = millis();
+      while (digitalRead(InputManager::POWER_BUTTON_PIN) == LOW &&
+             (millis() - pressStart) < SCREENSAVER_TAP_MAX_MS) {
+        delay(5);
+      }
+      const bool tapped = digitalRead(InputManager::POWER_BUTTON_PIN) == HIGH;
+      // Consume the ISR flag this press raised so the outer loop doesn't
+      // also count it as a fresh forward cycle.
+      noInterrupts();
+      sleepEntryTapPending = false;
+      interrupts();
+      return tapped;
+    }
+    delay(10);
+  }
+  return false;
+}
+
 // Set by an ISR while a sleep-screen render is in progress. Lets us detect taps that land
 // during the (uninterruptible) e-ink refresh + greyscale pass — the chip is awake the whole
 // time, but no main-loop polling runs, so a flag-on-falling-edge ISR is the only way to
@@ -2173,6 +2203,7 @@ bool consumeCompletedSleepEntryTap() {
 // off in the sim, so these are never actually reached).
 bool detectScreensaverCycleTap() { return false; }
 bool pollForCycleTapDuringSleepEntry() { return false; }
+bool pollForSecondCycleTap() { return false; }
 void armSleepEntryTapIsr() {}
 void disarmSleepEntryTapIsr() {}
 bool consumeCompletedSleepEntryTap() { return false; }
@@ -2211,7 +2242,7 @@ static bool loadSleepFrameBuffer() {
 
   armSleepEntryTapIsr();
   while (true) {
-    SleepActivity::cycleScreensaverFromDeepSleep(renderer);
+    SleepActivity::cycleScreensaverFromDeepSleep(renderer, pollForSecondCycleTap());
     if (consumeCompletedSleepEntryTap()) continue;
     if (pollForCycleTapDuringSleepEntry()) continue;
     break;
@@ -2285,11 +2316,11 @@ void enterDeepSleep(bool fromTimeout) {
     activityManager.goToSleep(fromTimeout);
     while (true) {
       if (consumeCompletedSleepEntryTap()) {
-        SleepActivity::cycleScreensaverFromDeepSleep(renderer);
+        SleepActivity::cycleScreensaverFromDeepSleep(renderer, pollForSecondCycleTap());
         continue;
       }
       if (pollForCycleTapDuringSleepEntry()) {
-        SleepActivity::cycleScreensaverFromDeepSleep(renderer);
+        SleepActivity::cycleScreensaverFromDeepSleep(renderer, pollForSecondCycleTap());
         continue;
       }
       break;

@@ -20,7 +20,8 @@ class SleepActivity final : public Activity {
   // Used by the deep-sleep tap-to-cycle path: APP_STATE must already be loaded; the renderer
   // and display must already be initialized; fonts are not required because only a BMP is drawn.
   // No-op if no usable image is found — the existing on-screen image stays visible.
-  static void cycleScreensaverFromDeepSleep(GfxRenderer& renderer);
+  // backward=true steps to the previous image (opt-in double-tap gesture).
+  static void cycleScreensaverFromDeepSleep(GfxRenderer& renderer, bool backward = false);
 
   // Snapshot the current framebuffer to SD so the cycle path can re-use it as
   // the background behind a transparent sleep PNG without needing fonts or the

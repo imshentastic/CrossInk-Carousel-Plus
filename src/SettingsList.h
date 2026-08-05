@@ -477,6 +477,12 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
     add(SettingInfo::Toggle(StrId::STR_SLEEP_CYCLE_SKIP_GRAYSCALE,
                             &CrossPointSettings::sleepCycleSkipGrayscale,
                             "sleepCycleSkipGrayscale", StrId::STR_CAT_DISPLAY));
+    add(SettingInfo::Toggle(StrId::STR_SLEEP_CYCLE_DOUBLE_TAP_BACK,
+                            &CrossPointSettings::sleepCycleDoubleTapBack,
+                            "sleepCycleDoubleTapBack", StrId::STR_CAT_DISPLAY));
+    add(SettingInfo::Toggle(StrId::STR_SLEEP_CYCLE_DAILY_MODE,
+                            &CrossPointSettings::sleepCycleDailyMode,
+                            "sleepCycleDailyMode", StrId::STR_CAT_DISPLAY));
     add(SettingInfo::Enum(StrId::STR_SLEEP_SCREEN_ORDER, &CrossPointSettings::sleepScreenOrder,
                           {StrId::STR_SLEEP_ORDER_RANDOM, StrId::STR_SLEEP_ORDER_ALPHABETICAL}, "sleepScreenOrder",
                           StrId::STR_CAT_DISPLAY));

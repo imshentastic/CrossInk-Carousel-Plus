@@ -591,6 +591,15 @@ void SettingsActivity::toggleCurrentSetting() {
     // user wants a working clock now, not "next reboot". Push
     // ClockSyncActivity inline; requestUpdate on return keeps the user
     // in Settings.
+    // 4.7.2: Daily Mode needs a real date to compare days against, so
+    // turning it on with no valid clock gets the same inline sync the Home
+    // clock toggle uses. X3 has an RTC and normally skips this.
+    if (setting.nameId == StrId::STR_SLEEP_CYCLE_DAILY_MODE && !currentValue && !halClock.hasValidTime()) {
+      SETTINGS.saveToFile();
+      startActivityForResult(std::make_unique<ClockSyncActivity>(renderer, mappedInput),
+                             [this](const ActivityResult&) { requestUpdate(); });
+      return;
+    }
     if (setting.nameId == StrId::STR_HOME_CLOCK && !currentValue && !halClock.hasValidTime()) {
       SETTINGS.saveToFile();
       startActivityForResult(std::make_unique<ClockSyncActivity>(renderer, mappedInput),

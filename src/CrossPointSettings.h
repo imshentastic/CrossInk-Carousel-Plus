@@ -360,6 +360,19 @@ class CrossPointSettings {
   // each cycle and is taken modulo the current image count, so adds/removes
   // degrade gracefully without needing a reset. Unused when order=Random.
   uint16_t sleepScreenCycleIndex = 0;
+  // 4.7.2 sleep-cycle options. Both default OFF so the existing one-tap
+  // behaviour -- including its tap-detection timing -- is untouched unless
+  // the user opts in.
+  //   doubleTapBack: a second Power tap inside the detection window steps
+  //     BACKWARD instead of forward. Only when enabled does the cycle path
+  //     wait for that window; off, taps resolve exactly as before.
+  //   dailyMode: the screensaver advances at most once per calendar day on
+  //     automatic sleeps. Manual taps always advance and re-stamp the day.
+  //     Needs a valid clock; without one we fall back to per-sleep cycling.
+  uint8_t sleepCycleDoubleTapBack = 0;
+  uint8_t sleepCycleDailyMode = 0;
+  // YYYYMMDD of the last automatic advance; compared for equality only.
+  uint32_t sleepCycleLastChangeDay = 0;
   // Selection order applied when the Custom sleep mode falls back to the
   // /.sleep/ rotation (no pinned image, or pinned image missing) and to the
   // deep-sleep tap-to-cycle path. Default RANDOM preserves prior behavior.

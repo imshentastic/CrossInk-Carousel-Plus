@@ -3,6 +3,7 @@
 #include <Epub.h>
 #include <FsHelpers.h>
 #include <GfxRenderer.h>
+#include <HalClock.h>
 #include <HalGPIO.h>
 #include <HalStorage.h>
 #include <I18n.h>
@@ -673,7 +674,22 @@ void writeCycleIndexSidecar(uint16_t v) {
 // Cycle through /.sleep/ in alphabetical order, picking by the persisted cursor
 // in SETTINGS.sleepScreenCycleIndex and advancing it. Returns false if the
 // directory is absent or empty so the caller falls through to pinned/random.
-bool selectCycleSleepImage(SleepImageSelection& selection) {
+// 4.7.2: YYYYMMDD key for Daily Mode. Compared for equality only, so no
+// epoch math is needed. Returns 0 when the clock isn't trustworthy, which
+// the caller treats as "Daily Mode inactive" (falls back to per-sleep
+// cycling rather than freezing on one image forever).
+uint32_t currentDayKeyOrZero() {
+  if (!halClock.hasValidTime()) return 0;
+  uint16_t year = 0;
+  uint8_t dayOfWeek = 0, day = 0, month = 0;
+  if (!halClock.getDate(dayOfWeek, day, month, year)) return 0;
+  if (year < 2020 || month < 1 || month > 12 || day < 1 || day > 31) return 0;
+  return static_cast<uint32_t>(year) * 10000u + static_cast<uint32_t>(month) * 100u + day;
+}
+
+// manual: a user tap (always advances, and re-stamps the Daily Mode day).
+// backward: step to the previous image instead of the next.
+bool selectCycleSleepImage(SleepImageSelection& selection, bool manual, bool backward) {
   FsFile dir;
   const char* sleepDir = nullptr;
   if (!openPreferredSleepDirectory(dir, sleepDir)) {
@@ -734,11 +750,32 @@ bool selectCycleSleepImage(SleepImageSelection& selection) {
   const uint16_t sidecarIndex = readCycleIndexSidecar();
   const uint16_t storedIndex =
       (sidecarIndex != UINT16_MAX) ? sidecarIndex : SETTINGS.sleepScreenCycleIndex;
-  const uint16_t idx = static_cast<uint16_t>(storedIndex % fileCount);
+  // The cursor stores the NEXT image to show, so a forward step displays it
+  // as-is. Stepping back must display the one BEFORE the last-shown image,
+  // i.e. cursor-2, so that back-after-forward returns to the previous
+  // picture rather than repeating the current one.
+  const uint16_t idx = backward
+                           ? static_cast<uint16_t>((storedIndex + fileCount - 2) % fileCount)
+                           : static_cast<uint16_t>(storedIndex % fileCount);
   selection.path = std::string(sleepDir) + "/" + files[idx];
   selection.isPng = FsHelpers::hasPngExtension(selection.path);
 
+  // 4.7.2 Daily Mode: on an AUTOMATIC sleep, hold the current image until
+  // the calendar day rolls over. Manual taps ignore this and always move.
+  // dayKey == 0 means no trustworthy clock -> behave exactly as before.
+  const uint32_t dayKey = SETTINGS.sleepCycleDailyMode ? currentDayKeyOrZero() : 0u;
+  if (!manual && dayKey != 0u && SETTINGS.sleepCycleLastChangeDay == dayKey) {
+    selection.advanceKind = SleepImageSelection::AdvanceKind::None;
+    LOG_INF("SLP", "Cycle: daily mode holding index=%u for day=%lu", idx,
+            static_cast<unsigned long>(dayKey));
+    return true;
+  }
+
+  // Cursor invariant holds in both directions: always one past what we show.
   const uint16_t nextIndex = static_cast<uint16_t>((idx + 1) % fileCount);
+  if (dayKey != 0u) {
+    SETTINGS.sleepCycleLastChangeDay = dayKey;
+  }
   // v18.9.9.257: defer cursor advance to post-decode (see AdvanceKind
   // comment on SleepImageSelection). Under tight heap, PNG decode of the
   // picked image can fail after we've already stamped the sidecar +
@@ -859,7 +896,7 @@ void SleepActivity::renderCustomSleepScreen() const {
   const bool alphabetical =
       SETTINGS.sleepScreenOrder == CrossPointSettings::SLEEP_ORDER_ALPHABETICAL;
   auto trySelectFallback = [&]() -> bool {
-    return alphabetical ? selectCycleSleepImage(selection)
+    return alphabetical ? selectCycleSleepImage(selection, /*manual=*/false, /*backward=*/false)
                         : selectRandomSleepImage(SleepImageMode::Custom, selection);
   };
   if (selectPinnedSleepImage(SleepImageMode::Custom, selection) || trySelectFallback()) {
@@ -989,11 +1026,13 @@ void SleepActivity::snapshotFramebufferForCycle() {
   }
 }
 
-void SleepActivity::cycleScreensaverFromDeepSleep(GfxRenderer& renderer) {
+void SleepActivity::cycleScreensaverFromDeepSleep(GfxRenderer& renderer, bool backward) {
   SleepImageSelection selection;
   const bool alphabetical =
       SETTINGS.sleepScreenOrder == CrossPointSettings::SLEEP_ORDER_ALPHABETICAL;
-  const bool selected = alphabetical ? selectCycleSleepImage(selection)
+  // This entry point is only ever reached from a user tap, so manual=true:
+  // Daily Mode never suppresses a deliberate cycle.
+  const bool selected = alphabetical ? selectCycleSleepImage(selection, /*manual=*/true, backward)
                                      : selectRandomSleepImage(SleepImageMode::Custom, selection);
   if (!selected) {
     LOG_INF("SLP", "Cycle skipped: no sleep image available");
