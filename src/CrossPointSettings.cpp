@@ -478,7 +478,13 @@ bool CrossPointSettings::flushIfDirtyNow() const {
   // std::terminate + hard-restart. v440 preserves the armed target on
   // terminate so UX-wise even a terminated flush lands the user right,
   // but we still want to prevent the terminate itself when we can.
-  constexpr uint32_t kFlushHardFloorMaxAlloc = 12u * 1024u;
+  // v4.7.3: floor raised 12 KB -> 20 KB. Field crash on X4: power-button hold
+  // at maxAlloc=15860 cleared the 12 KB floor, then bad_alloc inside the JSON
+  // build -> terminate at the cps:serialize checkpoint -> hard-restart. The user
+  // sees the device reboot instead of powering off, and has to hold power again.
+  // 20 KB sits above that observed peak and still well under the 28 KB the
+  // non-bypass path requires, so the "try anyway on the way out" intent holds.
+  constexpr uint32_t kFlushHardFloorMaxAlloc = 20u * 1024u;
   const uint32_t maxAllocNow = ESP.getMaxAllocHeap();
   if (maxAllocNow < kFlushHardFloorMaxAlloc) {
     LOG_ERR("CPS",
