@@ -124,43 +124,75 @@ void loadFromCrumbleLegacyV3(const uint8_t* data, GlobalReadingStats& out) {
   }
 }
 
-bool loadFromFile(const char* path, GlobalReadingStats& out) {
+// Highest version byte we'd accept as "a future build of OUR format". Above it
+// the file is something else entirely (another fork, or corruption) and is not
+// worth blocking saves forever over. v4.7.3: a device in the field carried
+// version=46, which is not a plausible successor to 3.
+constexpr uint8_t GLOBAL_STATS_MAX_PLAUSIBLE_VERSION = 15;
+
+enum class StatsFileVerdict : uint8_t {
+  Parsed,     // known layout, loaded into `out`
+  Absent,     // no file, empty, or unreadable
+  NewerOurs,  // plausibly a future version of this format -- preserve, block saves
+  Foreign,    // not our format at all -- safe to set aside and start fresh
+};
+
+StatsFileVerdict loadFromFile(const char* path, GlobalReadingStats& out) {
   FsFile f;
-  if (!Storage.openFileForRead("GSTATS", path, f)) return false;
+  if (!Storage.openFileForRead("GSTATS", path, f)) return StatsFileVerdict::Absent;
+  // Real length, not the read cap: `n` below is clamped to GLOBAL_STATS_FILE_SIZE,
+  // so the old `n > GLOBAL_STATS_FILE_SIZE` test could never fire and a longer
+  // file looked exactly like a well-formed one.
+  const uint32_t fileSize = static_cast<uint32_t>(f.size());
   uint8_t data[GLOBAL_STATS_FILE_SIZE] = {};
   const int n = f.read(data, GLOBAL_STATS_FILE_SIZE);
   f.close();
-  if (n <= 0) return false;
+  if (n <= 0) return StatsFileVerdict::Absent;
+  const uint8_t ver = data[0];
 
-  // NewerFormat guard: if version byte > 3 OR file bigger than we know
-  // about, refuse to save so we don't clobber a future format.
-  if (data[0] > GLOBAL_STATS_VERSION || n > GLOBAL_STATS_FILE_SIZE) {
-    s_blockDestructiveSave = true;
-    LOG_ERR("GSTATS", "Newer format detected (version=%u size=%d); save blocked to preserve data",
-            static_cast<unsigned>(data[0]), n);
-    return false;
+  // Something a later CrumBLE might write: a version just past ours, or one of
+  // our versions with a longer record. Keep it and stop saving.
+  const bool newerVersion = ver > GLOBAL_STATS_VERSION && ver <= GLOBAL_STATS_MAX_PLAUSIBLE_VERSION;
+  const bool knownVersionLongerRecord = ver >= 1 && ver <= GLOBAL_STATS_VERSION && fileSize > GLOBAL_STATS_FILE_SIZE;
+  if (newerVersion || knownVersionLongerRecord) {
+    LOG_ERR("GSTATS", "Newer format detected (version=%u size=%lu); save blocked to preserve data",
+            static_cast<unsigned>(ver), static_cast<unsigned long>(fileSize));
+    return StatsFileVerdict::NewerOurs;
   }
 
-  if (n == GLOBAL_STATS_FILE_SIZE_V1 && data[0] == 1) {
+  if (n == GLOBAL_STATS_FILE_SIZE_V1 && ver == 1) {
     loadCommonFieldsV1V2(data, out);
-    return true;
+    return StatsFileVerdict::Parsed;
   }
-  if (n == GLOBAL_STATS_FILE_SIZE_V2 && data[0] == 2) {
+  if (n == GLOBAL_STATS_FILE_SIZE_V2 && ver == 2) {
     loadCommonFieldsV1V2(data, out);
     out.completedBooks = readLe32(data, 13);
-    return true;
+    return StatsFileVerdict::Parsed;
   }
-  if (n == GLOBAL_STATS_FILE_SIZE && data[0] == GLOBAL_STATS_VERSION) {
+  if (n == GLOBAL_STATS_FILE_SIZE && ver == GLOBAL_STATS_VERSION) {
     loadFromCrossInkV3(data, out);
-    return true;
+    return StatsFileVerdict::Parsed;
   }
-  if (n == GLOBAL_STATS_FILE_SIZE_CRUMBLE_LEGACY_V3 && data[0] == GLOBAL_STATS_VERSION) {
+  if (n == GLOBAL_STATS_FILE_SIZE_CRUMBLE_LEGACY_V3 && ver == GLOBAL_STATS_VERSION) {
     loadFromCrumbleLegacyV3(data, out);
-    LOG_INF("GSTATS", "Migrated CrumBLE legacy v3 (149 B) → CrossInk v3 (159 B) — bitfield seeded from lastRead");
-    return true;
+    LOG_INF("GSTATS", "Migrated CrumBLE legacy v3 (149 B) -> CrossInk v3 (159 B) -- bitfield seeded from lastRead");
+    return StatsFileVerdict::Parsed;
   }
-  LOG_ERR("GSTATS", "Unrecognised global_stats format: size=%d version=%u", n, static_cast<unsigned>(data[0]));
-  return false;
+  LOG_ERR("GSTATS", "Unrecognised global_stats: version=%u size=%lu", static_cast<unsigned>(ver),
+          static_cast<unsigned long>(fileSize));
+  return StatsFileVerdict::Foreign;
+}
+
+// Move a file we cannot read out of the way, preserving it, so stats can start
+// fresh instead of being blocked forever. Returns false if the file could not
+// be moved -- in which case the caller must keep blocking rather than clobber.
+bool setAsideForeign(const char* path) {
+  char aside[96];
+  snprintf(aside, sizeof(aside), "%s.foreign", path);
+  if (Storage.exists(aside) && !Storage.remove(aside)) return false;
+  if (!Storage.rename(path, aside)) return false;
+  LOG_INF("GSTATS", "Set aside unrecognised stats file: %s -> %s", path, aside);
+  return true;
 }
 }  // namespace
 
@@ -168,28 +200,47 @@ bool GlobalReadingStats::isSaveBlocked() { return s_blockDestructiveSave; }
 
 GlobalReadingStats GlobalReadingStats::load() {
   GlobalReadingStats stats;
-  if (loadFromFile(GLOBAL_STATS_PATH, stats)) return stats;
-  if (loadFromFile(GLOBAL_STATS_BAK_PATH, stats)) {
+  const StatsFileVerdict primary = loadFromFile(GLOBAL_STATS_PATH, stats);
+  if (primary == StatsFileVerdict::Parsed) return stats;
+
+  GlobalReadingStats fromBak;
+  const StatsFileVerdict bak = loadFromFile(GLOBAL_STATS_BAK_PATH, fromBak);
+  if (bak == StatsFileVerdict::Parsed) {
     LOG_DBG("GSTATS", "Recovered global stats from backup");
+    return fromBak;
+  }
+
+  // v18.9.9.208: a file that EXISTS but didn't parse must not be overwritten --
+  // that turns a transient read failure into permanent all-time data loss.
+  // v4.7.3 splits that into two cases, because treating them the same left
+  // devices with stats silently disabled forever:
+  //
+  //   NewerOurs -- plausibly written by a later CrumBLE. Keep blocking; a future
+  //                build can still read it.
+  //   Foreign   -- not our format at all (another fork, or corruption). Move it
+  //                aside once, keeping the bytes, and start fresh with saves on.
+  //                Only if the move succeeds; otherwise keep blocking.
+  if (primary == StatsFileVerdict::NewerOurs || bak == StatsFileVerdict::NewerOurs) {
+    s_blockDestructiveSave = true;
+    LOG_ERR("GSTATS", "Newer stats format present (primary=%d bak=%d); save blocked to preserve data",
+            primary == StatsFileVerdict::NewerOurs ? 1 : 0, bak == StatsFileVerdict::NewerOurs ? 1 : 0);
     return stats;
   }
-  // v18.9.9.208: if a stats file EXISTS but neither copy parsed, refuse
-  // destructive saves for this boot. The old behavior started fresh and
-  // the next session-commit overwrote the unreadable-but-present file —
-  // turning a transient read failure (truncated write, FAT hiccup) into
-  // permanent all-time data loss. Blocking keeps the bytes on disk for
-  // recovery (auto-backups in /.crossink-stats-backup, or manual repair).
-  // A genuinely missing/empty file (fresh install, explicit reset) still
-  // starts fresh with saves enabled.
-  const bool primaryPresent = Storage.exists(GLOBAL_STATS_PATH);
-  const bool bakPresent = Storage.exists(GLOBAL_STATS_BAK_PATH);
-  if (primaryPresent || bakPresent) {
-    s_blockDestructiveSave = true;
-    LOG_ERR("GSTATS", "Stats file present but unreadable (primary=%d bak=%d); save blocked to preserve data",
-            primaryPresent ? 1 : 0, bakPresent ? 1 : 0);
-  } else {
-    LOG_DBG("GSTATS", "Global stats missing, starting fresh");
+
+  if (primary == StatsFileVerdict::Foreign || bak == StatsFileVerdict::Foreign) {
+    bool allMoved = true;
+    if (primary == StatsFileVerdict::Foreign && !setAsideForeign(GLOBAL_STATS_PATH)) allMoved = false;
+    if (bak == StatsFileVerdict::Foreign && !setAsideForeign(GLOBAL_STATS_BAK_PATH)) allMoved = false;
+    if (!allMoved) {
+      s_blockDestructiveSave = true;
+      LOG_ERR("GSTATS", "Unreadable stats file could not be set aside; save blocked to preserve data");
+    } else {
+      LOG_INF("GSTATS", "Unrecognised stats file set aside; starting fresh with saves enabled");
+    }
+    return stats;
   }
+
+  LOG_DBG("GSTATS", "Global stats missing, starting fresh");
   return stats;
 }
 

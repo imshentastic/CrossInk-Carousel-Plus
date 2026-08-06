@@ -55,6 +55,12 @@ constexpr DictBase kDictCandidates[] = {
     {"/dictionaries/dictionary.dict", "/dictionaries/dictionary.idx"},
 };
 
+// Every folder scanned for user-added dictionaries. discoverAll() and the
+// exists() probe MUST both iterate this list -- gating the menu off a smaller
+// set than the picker enumerates is exactly the v18.9.9.264 bug ("Dictionary
+// not installed" for a user whose only dicts had arbitrary basenames).
+constexpr const char* kDictFolders[] = {"/dict", "/dictionary", "/dictionaries"};
+
 const DictBase* resolvedDictBase_ = nullptr;
 
 // v18.9.9.259: runtime-settable active dict (populated by
@@ -217,19 +223,6 @@ static uint32_t swap32(uint32_t val) {
          ((val >> 24) & 0x000000FF);
 }
 
-bool Dictionary::exists() {
-  // v18.9.9.264: fall back to discoverAll() when the legacy hardcoded
-  // name lookup misses. Pre-v259 the only valid names were
-  // {/,/dict/,/dictionary/}/dictionary.{dict,idx}; multi-dict support
-  // (v259) allows arbitrary basenames under /dict/ and /dictionary/,
-  // but this exists() gate was still checking only the hardcoded list,
-  // so a user with e.g. /dict/wiktionary.dict + wiktionary.idx would
-  // hit "Dictionary not installed" in the Lookup pre-check before
-  // discoverAll ran. discoverAll is cheap (walks 2 small folders +
-  // a couple stat probes at root) so calling it here is fine.
-  if (resolveDictBase() != nullptr) return true;
-  return !discoverAll().empty();
-}
 
 // v18.9.9.259: multi-dict discovery + active-pointer persistence.
 
@@ -329,6 +322,80 @@ void enumerateDictFolder(const char* folder, std::vector<Dictionary::DictInfo>& 
 }
 }  // namespace
 
+namespace {
+// True as soon as ONE usable .dict/.idx pair is found. Same two-pass shape as
+// enumerateDictFolder -- names are collected with the dir handle open, .idx is
+// probed only after it closes, because a Storage.exists() mid-iteration
+// confuses the SdFat iterator (v18.9.9.261). Unlike enumerateDictFolder this
+// builds no DictInfo, no display names, and logs nothing per entry.
+bool folderHasAnyDictionary(const char* folder) {
+  FsFile dir = Storage.open(folder);
+  bool dirOk = (bool)dir && dir.isDirectory();
+  if (!dirOk) {
+    if (dir) dir.close();
+    std::string withSlash(folder);
+    if (withSlash.empty() || withSlash.back() != '/') withSlash += '/';
+    dir = Storage.open(withSlash.c_str());
+    dirOk = (bool)dir && dir.isDirectory();
+    if (!dirOk) {
+      if (dir) dir.close();
+      return false;
+    }
+  }
+  std::vector<std::string> candidates;
+  candidates.reserve(4);
+  char name[256];
+  for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
+    const bool isDir = file.isDirectory();
+    file.getName(name, sizeof(name));
+    file.close();
+    if (isDir || name[0] == '\0' || name[0] == '.') continue;
+    std::string full(folder);
+    if (full.empty() || full.back() != '/') full += '/';
+    full += name;
+    if (idxPathFromDict(full).empty()) continue;  // not a .dict
+    candidates.push_back(std::move(full));
+  }
+  dir.close();
+  for (const auto& dictPath : candidates) {
+    if (Storage.exists(idxPathFromDict(dictPath).c_str())) return true;
+  }
+  return false;
+}
+
+// v4.7.3: exists() answer for this boot. 0 = unknown, 1 = yes, 2 = no.
+uint8_t s_existsCache = 0;
+}  // namespace
+
+void Dictionary::invalidateExistsCache() { s_existsCache = 0; }
+
+bool Dictionary::exists() {
+  // v18.9.9.264: the legacy hardcoded names miss whenever a user's dictionaries
+  // have arbitrary basenames, which multi-dict support (v259) allows -- so this
+  // has to consider the folders too, or Lookup reports "Dictionary not
+  // installed" for a perfectly valid install.
+  //
+  // v4.7.3: it used to do that via discoverAll(), whose comment claimed it was
+  // cheap ("2 small folders + a couple stat probes"). It is not: it enumerates
+  // every folder, heap-allocates three std::strings per entry, and LOG_INFs each
+  // one. EpubReaderActivity calls exists() to gate the reader menu's Lookup
+  // entries, so opening in-book settings paid a full scan of every installed
+  // dictionary -- seconds of SD I/O and ~1 KB of serial, while the reader is at
+  // its tightest for heap. Now: stop at the first hit, and remember the answer.
+  if (s_existsCache != 0) return s_existsCache == 1;
+  bool found = resolveDictBase() != nullptr;
+  if (!found) {
+    for (const char* folder : kDictFolders) {
+      if (folderHasAnyDictionary(folder)) {
+        found = true;
+        break;
+      }
+    }
+  }
+  s_existsCache = found ? 1 : 2;
+  return found;
+}
+
 std::vector<Dictionary::DictInfo> Dictionary::discoverAll() {
   std::vector<DictInfo> out;
   out.reserve(4);
@@ -342,13 +409,12 @@ std::vector<Dictionary::DictInfo> Dictionary::discoverAll() {
     root.displayName = "dictionary";
     out.push_back(std::move(root));
   }
-  enumerateDictFolder("/dict", out);
-  enumerateDictFolder("/dictionary", out);
-  enumerateDictFolder("/dictionaries", out);  // casper-ecosystem convention
+  for (const char* folder : kDictFolders) enumerateDictFolder(folder, out);
   return out;
 }
 
 void Dictionary::setActive(const DictInfo& dict) {
+  invalidateExistsCache();  // the installed set may have changed under us
   if (dict.dictPath.empty() || dict.idxPath.empty()) {
     // Clear override.
     s_activeDict.set = false;

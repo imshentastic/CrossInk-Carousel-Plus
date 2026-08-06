@@ -2379,6 +2379,22 @@ void enterDeepSleep(bool fromTimeout) {
   display.deepSleep();
   LOG_DBG("MAIN", "Entering deep sleep");
 
+  // v4.7.3: last-chance settings flush. The flush above runs before the sleep
+  // screen is drawn, so it can be skipped for lack of contiguous heap -- after a
+  // long reading session maxAlloc sits in the 15-25 KB band and the write needs
+  // more, which is how a power-button hold ended up rebooting instead of
+  // powering off. Here the panel is already asleep and nothing renders again, so
+  // the framebuffer is dead weight: lending its ~48 KB makes the write fit.
+  // Deliberately placed AFTER display.deepSleep() -- releasing it any earlier
+  // blanks the sleep screen (goToSleep renders) or the silent-restart snapshot.
+  // No realloc: startDeepSleep() below does not return.
+  if (SETTINGS.hasDeferredSave()) {
+    LOG_INF("MAIN", "Deferred settings still pending at sleep; lending framebuffer to complete the write");
+    display.releaseFrameBuffers();
+    SETTINGS.flushIfDirtyNow();
+    CollectionsStore::getInstance().flushDeferredSaveNowBypassGate();
+  }
+
   powerManager.startDeepSleep(gpio);
 }
 
