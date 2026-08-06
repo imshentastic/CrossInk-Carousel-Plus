@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Reading stats save again on devices that had run another firmware.** A stats file left behind by a different fork could not be read, and rather than risk overwriting it CrumBLE stopped saving stats entirely — silently, and permanently, with only a serial-log error to show for it. Two things were wrong: the check meant to spot an over-long file could never actually fire, and any unreadable file was treated as "written by a newer CrumBLE" no matter how implausible its contents. A file that really might come from a later version is still preserved and still blocks saving. One that clearly is not ours is now moved aside once, keeping every byte, and stats start accruing again from that boot.
+- **Powering off no longer risks losing a setting you just changed.** Saving settings on the way into sleep needs a chunk of free memory, and after a long reading session there may not be enough — in which case the save was skipped and the change lost. If that happens, CrumBLE now retries once more after the screen has gone to sleep, when the display's memory is free to borrow, which is nearly always enough for the write to succeed.
+
+### Changed
+- **Saving and loading settings uses far less memory.** The settings list was being copied in full every time settings were written or read — dozens of allocations before a single value was stored. Both paths now read the list in place. This removes the most likely cause of the out-of-memory restart that could happen when holding the power button, and makes a low-memory save fail cleanly instead of writing a truncated settings file.
+
 ## [crumble-v4.7.3] - 2026-08-06
 
 Single firmware: `crumble-v4.7.3-tiny-bitter.bin` (Bitter built-in, fits the stock 6.25 MB slot for SD-card flashing).
