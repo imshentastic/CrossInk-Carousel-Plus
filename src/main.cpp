@@ -1,5 +1,8 @@
 #include <Arduino.h>
 #include <BluetoothHIDManager.h>
+#include <BoardConfig.h>   // CrumBLE 4.7.2: panel-controller profile selection
+#include <Preferences.h>   // CrumBLE 4.7.2: cached panel-controller verdict
+#include <XteinkDetect.h>  // CrumBLE 4.7.2: pre-SD panel-controller probe
 
 // v18.9.9.245: for BT-off-by-default boot-time memory release. Same header
 // used by CrossPointWebServerActivity's FT-enter release path.
@@ -2860,6 +2863,65 @@ void setup() {
   LOG_INF("BOOT", "Post-GPIO diagnostic: device=%s usb=%d silentReboot=%d silentTarget=%lu",
           gpio.deviceIsX3() ? "X3" : "X4", gpio.isUsbConnected() ? 1 : 0, isSilentReboot ? 1 : 0,
           static_cast<unsigned long>(snapshotTarget));
+
+  // v4.7.2: resolve the X3 panel controller before the SD card is mounted.
+#ifndef CRUMBLE_DISABLE_PANEL_PROBE
+  if (gpio.deviceIsX3()) {
+    // Probe once, cache in NVS, reboot -- never probe again on this device.
+    //
+    // Bit-banging the display bus leaves it unusable for whatever touches it
+    // next: SD (which shares SCLK/MOSI) fails to mount, or the panel stops
+    // answering. Four boot positions were tried and all of them hung. Rather
+    // than keep hunting for a placement that survives, do what
+    // detectDeviceTypeWithFingerprint() already does for the X3/X4 fingerprint:
+    // probe on a cold device, persist the answer, then ESP.restart(). The reset
+    // clears whatever the probe wedged, and every later boot reads NVS and never
+    // goes near the bus. Costs one extra reboot, once, on first boot after flash.
+    constexpr char kPanelNs[] = "cphw";
+    constexpr char kPanelKey[] = "panel_ctl";  // 0=unprobed, 1=UC8253, 2=UC8279
+    uint8_t cachedPanel = 0;
+    {
+      Preferences prefs;
+      if (prefs.begin(kPanelNs, true)) {
+        cachedPanel = prefs.getUChar(kPanelKey, 0);
+        prefs.end();
+      }
+    }
+    if (cachedPanel == 0) {
+      uint8_t ver[5] = {0};
+      uint8_t flg = 0;
+      const bool isUc8279 = freeink::detectX3DisplayController(ver, &flg) == freeink::X3DisplayVerdict::Uc8279Confirmed;
+      LOG_INF("DISPLAY", "X3 panel probe: VER=%02X %02X %02X %02X %02X FLG=%02X -> %s (caching, rebooting)", ver[0],
+              ver[1], ver[2], ver[3], ver[4], flg, isUc8279 ? "UC8279" : "UC8253");
+      // Only restart once the verdict is definitely persisted -- read it back.
+      // Restarting on a failed write would probe/reboot forever.
+      uint8_t verify = 0;
+      Preferences prefs;
+      if (prefs.begin(kPanelNs, false)) {
+        prefs.putUChar(kPanelKey, isUc8279 ? 2 : 1);
+        prefs.end();
+      }
+      if (prefs.begin(kPanelNs, true)) {
+        verify = prefs.getUChar(kPanelKey, 0);
+        prefs.end();
+      }
+      if (verify != 0) {
+        logSerial.flush();
+        delay(50);
+        ESP.restart();
+      }
+      // NVS unavailable: carry on with the in-memory verdict rather than loop.
+      LOG_ERR("DISPLAY", "panel verdict not persisted; continuing unrebooted");
+      cachedPanel = isUc8279 ? 2 : 1;
+    }
+    display.setX3IsUc8279(cachedPanel == 2);
+    LOG_INF("DISPLAY", "X3 panel controller: %s (cached)", cachedPanel == 2 ? "UC8279" : "UC8253");
+  } else {
+    BoardConfig::selectDevice(BoardConfig::Board::XteinkX4);
+    LOG_INF("DISPLAY", "X4: SSD1677 (default); battery latch asserted");
+  }
+#endif
+
 
   // SD Card Initialization
   // We need 6 open files concurrently when parsing a new chapter

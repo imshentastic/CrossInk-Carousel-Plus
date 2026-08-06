@@ -28,6 +28,9 @@
     }
   ],
   "palette": [
+    {"component": "header", "category": "layout", "file": "freeinkui-components/header.svg"},
+    {"component": "footer", "category": "layout", "file": "freeinkui-components/footer.svg"},
+    {"component": "spacer", "category": "layout", "file": "freeinkui-components/spacer.svg"},
     {"component": "button", "category": "controls", "file": "freeinkui-components/button.svg"},
     {"component": "checkbox", "category": "controls", "file": "freeinkui-components/checkbox.svg"},
     {"component": "slider", "category": "controls", "file": "freeinkui-components/slider.svg"},
@@ -40,6 +43,7 @@
     {"component": "table", "category": "data", "file": "freeinkui-components/table.svg"},
     {"component": "tabBar", "category": "navigation", "file": "freeinkui-components/tab-bar.svg"},
     {"component": "textField", "category": "input", "file": "freeinkui-components/text-field.svg"},
+    {"component": "textArea", "category": "input", "file": "freeinkui-components/text-area.svg"},
     {"component": "keyGrid", "category": "input", "file": "freeinkui-components/key-grid.svg"},
     {"component": "qwertyKeyboard", "category": "input", "file": "freeinkui-components/qwerty-keyboard.svg"},
     {"component": "gestureBar", "category": "navigation", "file": "freeinkui-components/gesture-bar.svg"},

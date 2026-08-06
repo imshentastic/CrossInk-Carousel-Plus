@@ -151,7 +151,7 @@ def keyboard_layout_expr(value):
 
 
 def emit_header(child, lines):
-    if child.get("borderEdges") is not None:
+    if child.get("borderEdges") is not None or child.get("centered") is not None:
         name = "headerProps"
         lines.append(f"  freeink::ui::HeaderProps {name};")
         if child.get("title") is not None:
@@ -160,7 +160,10 @@ def emit_header(child, lines):
             lines.append(f"  {name}.subtitle = {cstr(child.get('subtitle'))};")
         if child.get("rightLabel") is not None:
             lines.append(f"  {name}.rightLabel = {cstr(child.get('rightLabel'))};")
-        lines.append(f"  {name}.borderEdges = {edge_mask_expr(child.get('borderEdges'))};")
+        if child.get("borderEdges") is not None:
+            lines.append(f"  {name}.borderEdges = {edge_mask_expr(child.get('borderEdges'))};")
+        if child.get("centered") is not None:
+            lines.append(f"  {name}.centered = {bool_literal(child.get('centered'))};")
         lines.append(f"  screen.header({name}{anchor_arg(child)});")
         return
     args = [cstr(child.get("title")), cstr(child.get("subtitle")), cstr(child.get("rightLabel"))]
@@ -224,6 +227,15 @@ def emit_footer(child, lines, actions, index):
         lines.append(f"  screen.footer({name}, {len(buttons)}{anchor_arg(child, default='bottom')});")
 
 
+def selection_marker_expr(value):
+    key = re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+    if key == "underline":
+        return "freeink::ui::SelectionMarker::Underline"
+    if key == "triangle":
+        return "freeink::ui::SelectionMarker::Triangle"
+    return "freeink::ui::SelectionMarker::None"
+
+
 def emit_list(child, lines, actions, index):
     items = child.get("items", [])
     name = f"listItems{index}"
@@ -244,7 +256,12 @@ def emit_list(child, lines, actions, index):
     selected = int(child.get("selectedIndex", -1))
     top = int(child.get("topIndex", 0))
     height = int(child.get("height", 0))
-    if child.get("rowRadius") is not None or child.get("sidePadding") is not None or child.get("rowGap") is not None:
+    if (
+        child.get("rowRadius") is not None
+        or child.get("sidePadding") is not None
+        or child.get("rowGap") is not None
+        or child.get("selectionMarker") is not None
+    ):
         props = f"listProps{index}"
         lines.append(f"  freeink::ui::ListProps {props};")
         lines.append(f"  {props}.items = {name};")
@@ -258,6 +275,8 @@ def emit_list(child, lines, actions, index):
             lines.append(f"  {props}.sidePadding = {int(child.get('sidePadding'))};")
         if child.get("rowGap") is not None:
             lines.append(f"  {props}.rowGap = {int(child.get('rowGap'))};")
+        if child.get("selectionMarker") is not None:
+            lines.append(f"  {props}.selectionMarker = {selection_marker_expr(child.get('selectionMarker'))};")
         if height or child.get("anchor") is not None:
             lines.append(f"  screen.list({props}, {height}, {anchor_expr(child)});")
         else:
@@ -463,7 +482,8 @@ def emit_radio_group(child, lines, actions, index):
 
 
 def emit_popup(child, lines, index):
-    if child.get("padding") is None and child.get("align") is None and child.get("maxWidth") is None:
+    styled_keys = ("padding", "align", "maxWidth", "showProgress", "progress", "progressMax", "progressHeight")
+    if all(child.get(key) is None for key in styled_keys):
         lines.append(f"  screen.popup({cstr(child.get('message'))});")
         return
     name = f"popup{index}"
@@ -475,6 +495,14 @@ def emit_popup(child, lines, index):
         lines.append(f"  {name}.text.align = {text_align_expr(child.get('align'))};")
     if child.get("maxWidth") is not None:
         lines.append(f"  {name}.maxWidth = {int(child.get('maxWidth'))};")
+    if child.get("showProgress") is not None:
+        lines.append(f"  {name}.showProgress = {bool_literal(child.get('showProgress'))};")
+    if child.get("progress") is not None:
+        lines.append(f"  {name}.progress.value = {int(child.get('progress'))};")
+    if child.get("progressMax") is not None:
+        lines.append(f"  {name}.progress.max = {int(child.get('progressMax'))};")
+    if child.get("progressHeight") is not None:
+        lines.append(f"  {name}.progressHeight = {int(child.get('progressHeight'))};")
     emit_insets_assignment(lines, name, "padding", child.get("padding"))
     lines.append(f"  screen.popup({name});")
 
@@ -551,6 +579,93 @@ def emit_qwerty_keyboard(child, lines, actions, index):
         lines.append(f"  screen.qwertyKeyboard({name});")
 
 
+def emit_status_bar(child, lines, index):
+    name = f"statusBar{index}"
+    lines.append(f"  freeink::ui::StatusBarProps {name};")
+    if child.get("title") is not None:
+        lines.append(f"  {name}.title = {cstr(child.get('title'))};")
+    if child.get("leading") is not None:
+        lines.append(f"  {name}.leading = {cstr(child.get('leading'))};")
+    if child.get("leadingSecondary") is not None:
+        lines.append(f"  {name}.leadingSecondary = {cstr(child.get('leadingSecondary'))};")
+    if child.get("trailing") is not None:
+        lines.append(f"  {name}.trailing = {cstr(child.get('trailing'))};")
+    if child.get("trailingSecondary") is not None:
+        lines.append(f"  {name}.trailingSecondary = {cstr(child.get('trailingSecondary'))};")
+    if child.get("horizontalPadding") is not None:
+        lines.append(f"  {name}.horizontalPadding = {int(child.get('horizontalPadding'))};")
+    if child.get("gap") is not None:
+        lines.append(f"  {name}.gap = {int(child.get('gap'))};")
+    if child.get("showProgress") is not None:
+        lines.append(f"  {name}.showProgress = {bool_literal(child.get('showProgress'))};")
+    if child.get("progress") is not None:
+        lines.append(f"  {name}.progress.value = {int(child.get('progress'))};")
+    if child.get("progressMax") is not None:
+        lines.append(f"  {name}.progress.max = {int(child.get('progressMax'))};")
+    if child.get("progressHeight") is not None:
+        lines.append(f"  {name}.progressHeight = {int(child.get('progressHeight'))};")
+    lines.append(f"  {name}.text = screen.theme().smallText;")
+    lines.append(f"  screen.status({name}{anchor_arg(child)});")
+
+
+def emit_book_card(child, lines, actions, index):
+    name = f"bookCard{index}"
+    lines.append(f"  freeink::ui::BookCardProps {name};")
+    if child.get("title") is not None:
+        lines.append(f"  {name}.title = {cstr(child.get('title'))};")
+    if child.get("author") is not None:
+        lines.append(f"  {name}.author = {cstr(child.get('author'))};")
+    if child.get("meta") is not None:
+        lines.append(f"  {name}.meta = {cstr(child.get('meta'))};")
+    if child.get("progress") is not None:
+        lines.append(f"  {name}.progress = {int(child.get('progress'))};")
+    if child.get("progressMax") is not None:
+        lines.append(f"  {name}.progressMax = {int(child.get('progressMax'))};")
+    if child.get("action") is not None:
+        lines.append(f"  {name}.action = {action_expr(child.get('action'), actions)};")
+    if child.get("value") is not None:
+        lines.append(f"  {name}.value = {int(child.get('value'))};")
+    if child.get("gap") is not None:
+        lines.append(f"  {name}.gap = {int(child.get('gap'))};")
+    if child.get("textGap") is not None:
+        lines.append(f"  {name}.textGap = {int(child.get('textGap'))};")
+    emit_insets_assignment(lines, name, "padding", child.get("padding"))
+    lines.append(f"  {name}.titleText = screen.theme().bodyText;")
+    lines.append(f"  {name}.authorText = screen.theme().smallText;")
+    lines.append(f"  {name}.metaText = screen.theme().smallText;")
+    height = child.get("height")
+    if height is not None:
+        lines.append(f"  screen.bookCard({name}, {int(height)}{anchor_arg(child)});")
+    elif child.get("anchor") is not None:
+        lines.append(f"  screen.bookCard({name}, 0, {anchor_expr(child)});")
+    else:
+        lines.append(f"  screen.bookCard({name});")
+
+
+def emit_text_area(child, lines, index):
+    name = f"textArea{index}"
+    lines.append(f"  freeink::ui::TextAreaProps {name};")
+    if child.get("text") is not None:
+        lines.append(f"  {name}.text = {cstr(child.get('text'))};")
+    if child.get("cursor") is not None:
+        lines.append(f"  {name}.cursor = {int(child.get('cursor'))};")
+    if child.get("topLine") is not None:
+        lines.append(f"  {name}.topLine = {int(child.get('topLine'))};")
+    if child.get("showCaret") is not None:
+        lines.append(f"  {name}.showCaret = {bool_literal(child.get('showCaret'))};")
+    if child.get("selStart") is not None:
+        lines.append(f"  {name}.selStart = {int(child.get('selStart'))};")
+    if child.get("selEnd") is not None:
+        lines.append(f"  {name}.selEnd = {int(child.get('selEnd'))};")
+    height = child.get("height")
+    if height is not None:
+        lines.append(f"  screen.textArea({name}, {int(height)}{anchor_arg(child)});")
+    elif child.get("anchor") is not None:
+        lines.append(f"  screen.textArea({name}, 0, {anchor_expr(child)});")
+    else:
+        lines.append(f"  screen.textArea({name});")
+
+
 def generate(schema):
     actions = {}
     collect_actions(schema, actions)
@@ -613,6 +728,12 @@ def generate(schema):
             emit_option_dialog(child, lines, actions, index)
         elif kind == "qwertyKeyboard":
             emit_qwerty_keyboard(child, lines, actions, index)
+        elif kind == "statusBar":
+            emit_status_bar(child, lines, index)
+        elif kind == "bookCard":
+            emit_book_card(child, lines, actions, index)
+        elif kind == "textArea":
+            emit_text_area(child, lines, index)
         else:
             raise SystemExit(f"unsupported component type: {kind!r}")
     lines.append("}")

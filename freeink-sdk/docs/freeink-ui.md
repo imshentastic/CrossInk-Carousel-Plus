@@ -97,32 +97,31 @@ function returns.
 Wire the app to your display target and input layer:
 
 ```cpp
-freeink::ui::DisplayTarget target(display.getFrameBuffer(), display.getDisplayWidth(),
-                                  display.getDisplayHeight(), display.getDisplayWidthBytes());
 AppState state;
-App app(target, target.deviceContext());
+freeink::ui::DisplayTarget* target = nullptr;
+App* app = nullptr;
 
 void setup() {
-  app.setScreen(homeScreen, &state);
-  app.on(ActionOpen, handleOpen, &state);
+  display.begin();
+
+  static freeink::ui::DisplayTarget targetInstance(display.getFrameBuffer(), display.getDisplayWidth(),
+                                                   display.getDisplayHeight(), display.getDisplayWidthBytes());
+  static App appInstance(targetInstance, targetInstance.deviceContext());
+  target = &targetInstance;
+  app = &appInstance;
+  app->setClearColor(freeink::ui::Color::White);  // start each paint from a blank canvas
+  app->setScreen(homeScreen, &state);
+  app->on(ActionOpen, handleOpen, &state);
 }
 
 void loop() {
   freeink::ui::InputSnapshot input = readInputSnapshot();
-  freeink::ui::ActionEvent event = app.render(input);
-  switch (app.lastRenderRefreshHint()) {
-    case freeink::ui::RefreshHint::Full:
-    case freeink::ui::RefreshHint::Clean:
-      display.displayBuffer(FreeInkDisplay::FULL_REFRESH);
-      break;
-    case freeink::ui::RefreshHint::Fast:
-      display.displayBuffer(FreeInkDisplay::FAST_REFRESH);
-      break;
-    case freeink::ui::RefreshHint::None:
-      break;
-  }
+  freeink::ui::ActionEvent event = app->render(input);
+  // present() maps the frame's RefreshHint to the panel's refresh modes
+  // (Full/Clean -> FULL_REFRESH, Fast -> FAST_REFRESH, None -> no push).
+  freeink::ui::present(display, app->lastRenderRefreshHint());
 
-  if (app.invalidated()) {
+  if (app->invalidated()) {
     // An action handler changed state after this render pass. Render again on
     // the next loop iteration, or immediately if your firmware wants synchronous
     // UI updates.
@@ -130,9 +129,45 @@ void loop() {
 }
 ```
 
+`FreeInkDisplay` owns the framebuffer, and on PSRAM-backed boards it allocates
+that memory in `display.begin()`. Construct `DisplayTarget` and `FreeInkApp`
+after `display.begin()`; `display.getFrameBuffer()` is not valid at static-init
+time.
+
+The loop task gets room automatically: the render pipeline (screen builders +
+text layout) runs deeper than Arduino's default 8 KB `loopTask` stack (the
+overflow is a `Stack canary watchpoint triggered (loopTask)` panic and a
+reboot mid-interaction), so on ESP32 FreeInkUI ships a weak 16 KB default for
+`getArduinoLoopTaskStackSize()`. An app that needs a different size overrides
+it the standard way — `SET_LOOP_TASK_STACK_SIZE(24 * 1024);` at global scope
+in the sketch beats the SDK's weak default.
+
 `FreeInkApp` does not own your display refresh policy. `lastRenderRefreshHint()`
 describes the frame just drawn, while `invalidated()` / `refreshHint()` describe
 whether an action handler changed state and a follow-up render is needed.
+`present()` (from `FreeInkUIDisplayTarget.h`, compiled only when
+`EInkDisplay.h` is on the include path) is the standard hint-to-panel mapping;
+firmware with its own refresh policy can keep switching on the hint instead.
+
+For interactive apps prefer `presentAsync()` + `display.refreshBusy()`:
+`present()` blocks on the panel's BUSY pin for the whole waveform (~0.3–2 s),
+during which the loop can't poll input — typing feels sluggish and taps get
+lost. `presentAsync()` starts the refresh and returns (~25 ms); the panel
+refreshes from its own RAM copy, so the loop keeps polling input and rendering
+into the framebuffer, and pushes the newest frame once `refreshBusy()` goes
+false. Accumulate the strongest `RefreshHint` across renders between presents.
+
+Pair it with buffered input: `InputManager::beginAsync()` samples touch on its
+own task and queues completed taps (`popTouchTap`), so taps that land during a
+~200 ms render are never lost, and `FreeInkApp::route()` dispatches each
+queued tap against the last rendered frame without drawing — a fast typing
+burst costs one repaint, not one render per key.
+
+Frames do not clear the target on their own — without `setClearColor()` (or an
+app-side clear) the previous screen shows through wherever the new one doesn't
+draw. For screen changes, `invalidateTransition()` requests a fast partial
+refresh with a periodic full refresh (every 6th by default, see
+`setTransitionFullEvery()`) to clear accumulated ghosting.
 
 #### Input Snapshot
 
@@ -331,7 +366,8 @@ The output contains an inline `settingsScreen(...)`-style function plus
 generated `ActionId` constants. Supported schema component types currently
 include `header`, `footer`, `list`, `button`, `settingRow`, `toggleRow`,
 `stepperRow`, `checkbox`, `slider`, `dropdown`, `table`, `radioGroup`,
-`qwertyKeyboard`, `spacer`, `popup`, and `optionDialog`. Components that consume
+`qwertyKeyboard`, `spacer`, `popup`, `optionDialog`, `statusBar`, `bookCard`,
+and `textArea`. Components that consume
 layout space can set `"anchor": "top"` or `"anchor": "bottom"`; omitted anchors use the
 component default (`footer` defaults bottom, most others default top). Modal
 overlays such as `popup` and `optionDialog` render centered over the screen. The
@@ -349,7 +385,8 @@ freeink::ui::InteractionBuffer<32> interactions;
 freeink::ui::InputSnapshot input = readInput();
 
 // Native render path — no external graphics library. Draws into the
-// framebuffer FreeInkDisplay already owns (FreeInkUIDisplayTarget.h).
+// framebuffer FreeInkDisplay already owns (FreeInkUIDisplayTarget.h). Construct
+// this after display.begin(), when getFrameBuffer() is valid.
 freeink::ui::DisplayTarget draw(display.getFrameBuffer(), display.getDisplayWidth(),
                                 display.getDisplayHeight(), display.getDisplayWidthBytes());
 freeink::ui::DeviceContext device = draw.deviceContext();
@@ -414,6 +451,7 @@ FreeInkUI draws through a `DrawTarget` — an interface of primitives (`fill`,
   panel with an ordered dither. Construct it over `FreeInkDisplay`'s buffer:
 
   ```cpp
+  // Construct after display.begin(), when getFrameBuffer() is valid.
   freeink::ui::DisplayTarget draw(display.getFrameBuffer(), display.getDisplayWidth(),
                                   display.getDisplayHeight(), display.getDisplayWidthBytes());
   ```
@@ -437,8 +475,9 @@ default, so text works with zero setup.
 
 ### Swapping the font
 
-Fonts are plain data (`freeink::ui::BitmapFont`): a concatenated 1-bit glyph
-bitmap plus a per-glyph metrics table. To use your own typeface:
+Fonts are plain data (`freeink::ui::BitmapFont`): a concatenated glyph bitmap
+plus a per-glyph metrics table. Glyphs come in two depths (`BitmapFont::bpp`):
+a 1-bit on/off mask, or anti-aliased 4-bit coverage. To use your own typeface:
 
 1. **Generate a font header from any TTF/OTF** with the bundled tool:
 
@@ -453,6 +492,14 @@ bitmap plus a per-glyph metrics table. To use your own typeface:
    pixel height you want; the tool prints the resulting line height and flash
    cost. Covers printable ASCII (`U+0020..U+007E`) by default — widen with
    `--first`/`--last`. Confirm the source font's license permits embedding.
+
+   Add `--alpha` to rasterize anti-aliased: glyphs are stored as 4-bit
+   coverage (~4x the flash of the 1-bit form) and `DisplayTarget` reproduces
+   the edge coverage on 1-bit panels through its ordered Bayer dither, so
+   diagonals and curves render noticeably smoother. Grayscale-capable targets
+   can blend the same coverage directly. The dither also lands on
+   partially-covered stem pixels, so anti-aliased fonts look best at title and
+   display sizes (roughly 16px and up); keep small body text on 1-bit fonts.
 
 2. **Point the target at it** — globally, or per slot so titles differ from body
    text:
@@ -623,7 +670,38 @@ keyboard.modeAction = ActionKeyboardMode;
 keyboard.deleteAction = ActionKeyboardDelete;
 keyboard.okAction = ActionKeyboardOk;
 keyboard.selectedIndex = focusedKey;
+keyboard.shifted = state.shifted;
+keyboard.symbols = state.symbols;
 qwertyKeyboard(ui, keyboardRect, keyboard);
+```
+
+The keyboard is stateless like every component: Shift and mode ("?123"/"ABC")
+keys only report their actions. With `symbols` set, `shifted` selects the
+second symbols page — the shift slot reads "#+=" on page one and "123" on page
+two. The two pages plus the letter layers cover every printable ASCII
+character.
+
+`KeyboardEntry` owns the editing state so apps don't hand-roll it: the
+shift/symbol layer flags, layout-correct UTF-8 append, and multi-byte-aware
+backspace over a caller-owned buffer. Note that keys report stable ids in
+`ActionEvent::value` — ASCII keys their code point, localized keys (é, ñ, ß)
+ids above 1000 — so casting the value to `char` corrupts non-ASCII layouts;
+`KeyboardEntry::key()` (or the `keyboardOutputFor()` lookup) inserts the
+layout's real output.
+
+```cpp
+freeink::ui::KeyboardEntry kb;               // in app state
+kb.attach(state.name, sizeof state.name,     // bind the field being edited
+          /*startShifted=*/true);
+
+// Route the four keyboard actions:
+kb.key(event.value);  // insert; Shift auto-releases, symbol pages stay sticky
+kb.backspace();       // removes one code point, not one byte
+kb.shift();           // letter case, or symbol page one/two
+kb.mode();            // enter/leave the symbol layers
+
+// Each frame, mirror the layer flags into the props:
+freeink::ui::applyEntry(keys, kb);
 ```
 
 For custom or app-provided layouts, pass `KeyboardProps` directly:
@@ -1104,3 +1182,33 @@ component set:
   with `minFill` so tiny nonzero values stay visible
 - pill tab bars, hug-content menus, per-corner rounded cards, and the
   `Underline`/`Triangle` selection markers
+
+## Recent additions
+
+- **`flatButtonStyles(radius)`** — the borderless sibling of
+  `outlinedButtonStyles`: nothing drawn at rest, a light fill for
+  selected/pressed feedback. Assign once (`theme.button =
+  ui::flatButtonStyles(8)`) for the "just text on paper" look.
+- **Dropdown upgrades** — `DropdownProps` gained a leading `icon`
+  (settingRow-style), a `subtitle` two-line layout (label over current
+  selection), and a legible default chevron (10 px, 2 px stroke — the old
+  8 px/1 px indicator was invisible on e-paper).
+- **`ButtonProps.iconSize`** — scales a button icon to any square size via
+  nearest-neighbor `Contain`, so one asset serves several button sizes.
+- **`DisplayTarget::setOrientation()`** — runtime portrait/landscape (and
+  flipped) switching; refresh your `DeviceContext` via `deviceContext()`
+  and repaint. Touch mapping follows automatically.
+- **Runtime glyph fallback** — `DisplayTarget::setGlyphFallback(...)` takes
+  a `RuntimeGlyphSource` consulted whenever the bitmap font lacks a glyph,
+  sized per slot and dithered like the alpha fonts. This is how UI chrome
+  renders scripts too large to pre-bake (Hangul, CJK) from a TTF on the
+  card.
+- **Opt-in bridges** (compilable only when the paired library is present,
+  like `FreeInkUIGfxRenderer.h`):
+  - `FreeInkUIBookFont.h` — `BitmapBookFont` lets FreeInkBook read books
+    with the bundled bitmap font (typographic punctuation normalized to
+    ASCII equivalents), and `TtfGlyphSource` adapts a FreeInkBook `TtfFont`
+    as the chrome glyph fallback above.
+  - `FreeInkUIIcon.h` — `bitmapFromIcon()` adapts `freeink::Icon` assets
+    (generated at any size by `libs/assets/Icons/tools/gen_icons.py`) to
+    the `BitmapRef` every component takes.

@@ -1,7 +1,10 @@
+#include <BoardConfig.h>
 #include <HalDisplay.h>
 #include <HalGPIO.h>
+#include <XteinkDetect.h>
 
 #include "HalSpiBus.h"
+#include "Logging.h"
 
 // Global HalDisplay instance
 HalDisplay display;
@@ -17,9 +20,15 @@ void HalDisplay::begin(bool seamless) {
 
   // Set X3-specific panel mode before initializing.
   if (gpio.deviceIsX3()) {
+    // Apply the boot probe's verdict here, after SD is mounted: selecting the
+    // X3 profile earlier repoints sd.powerEnable at GPIO13 and hangs the mount.
+    // setDisplayX3() preserves an already-selected XteinkX3Uc8279, so first.
+    if (_x3IsUc8279) BoardConfig::selectDevice(BoardConfig::Board::XteinkX3Uc8279);
     einkDisplay.setDisplayX3();
   }
 
+  // No panel-controller probe here: bit-banging the display bus at this point
+  // hung X4 boot (SD shares SCLK/MOSI and is already mounted). See setup().
   einkDisplay.begin();
 
   if (seamless) {

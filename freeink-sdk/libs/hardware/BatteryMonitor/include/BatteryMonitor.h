@@ -62,8 +62,12 @@ public:
     // Read the battery voltage in volts (accounts for divider)
     double readVolts() const;
 
-    // True when the charger reports an active charge (charge-status pin LOW).
-    // Always false when no charge-status pin is configured.
+    // True when the battery is actively charging. Sources by backend:
+    //   * ADC boards: the MCP73832-style charge-status pin (LOW = charging);
+    //     always false when no charge-status pin is configured.
+    //   * Gauge boards: a charger IC's status (BQ25896 CHRG_STAT) when present,
+    //     else the gauge's own Current() sign (BQ27220, positive = charging), so
+    //     a board with a gauge but no charger IC (e.g. X3) still reports it.
     bool isCharging() const;
 
     // Percentage (0-100) from a millivolt value
