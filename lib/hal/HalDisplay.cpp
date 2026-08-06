@@ -1,7 +1,9 @@
 #include <HalDisplay.h>
 #include <HalGPIO.h>
+#include <XteinkDetect.h>
 
 #include "HalSpiBus.h"
+#include "Logging.h"
 
 // Global HalDisplay instance
 HalDisplay display;
@@ -20,6 +22,8 @@ void HalDisplay::begin(bool seamless) {
     einkDisplay.setDisplayX3();
   }
 
+  // No panel-controller probe here: bit-banging the display bus at this point
+  // hung X4 boot (SD shares SCLK/MOSI and is already mounted). See setup().
   einkDisplay.begin();
 
   if (seamless) {
