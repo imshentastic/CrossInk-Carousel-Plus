@@ -40,7 +40,7 @@ constexpr char latestReleaseUrl[] = CROSSINK_OTA_RELEASE_URL;
 // an OTA target -- delivering the full to a 6.25 MB legacy OTA slot
 // would brick the device with "Firmware too large".
 //
-// tiny-bitter-chinese-fallback ships as "crumble-firmware-chinese-fallback-X.Y.Z.bin". A
+// tiny-bitter-chinese-fallback ships as "crumble-firmware-chinese-X.Y.Z.bin". A
 // CJK device must only ever ingest -cjk- assets (a main image would
 // silently drop its CJK rendering), and a main device must never ingest a
 // -cjk- asset (different font/feature set the user didn't ask for). The
@@ -48,13 +48,13 @@ constexpr char latestReleaseUrl[] = CROSSINK_OTA_RELEASE_URL;
 // rejects cjk-marked names explicitly since they share the main stem's
 // prefix.
 #ifdef CJK_VARIANT
-constexpr char firmwareAssetStem[] = "crumble-firmware-chinese-fallback";
+constexpr char firmwareAssetStem[] = "crumble-firmware-chinese";
 constexpr char firmwareAssetName[] = "crumble-firmware-cjk.bin";
 #else
 constexpr char firmwareAssetStem[] = "crumble-firmware";
 constexpr char firmwareAssetName[] = "crumble-firmware.bin";
-constexpr char cjkVariantMarker[] = "-chinese-fallback-";
-constexpr char cjkVariantBinSuffix[] = "-chinese-fallback.bin";
+constexpr char cjkVariantMarker[] = "-chinese-";
+constexpr char cjkVariantBinSuffix[] = "-chinese.bin";
 #endif
 constexpr char fullVariantMarker[] = "-full-needs-USB-flash";
 
@@ -162,7 +162,7 @@ bool isMatchingFirmwareAssetName(const char* assetName) {
   if (containsSubstring(assetName, fullVariantMarker)) return false;
 #ifndef CJK_VARIANT
   // Main build: refuse Chinese-fallback variant assets. They share this stem's
-  // prefix ("crumble-firmware-chinese-fallback-..." starts with
+  // prefix ("crumble-firmware-chinese-..." starts with
   // "crumble-firmware-"), so the generic stem match below would otherwise
   // accept them. These markers MUST track firmwareAssetStem above: if the
   // variant is renamed and these are not, the main build silently starts
