@@ -191,6 +191,7 @@ uint32_t Section::onPageComplete(std::unique_ptr<Page> page) {
   // BEFORE this function returns, so `file` is never left holding unwritten
   // bytes across a position()/seek()/close() by anyone else. Do not move this
   // read, and do not let the writer outlive the scope below.
+  SET_CHECKPOINT("section:pageWrite");
   const uint32_t position = file.position();
   {
     // v18.9.9.479: one SdFat write per serialized field cost ~500 ms per page
@@ -960,6 +961,16 @@ bool Section::buildSomeMore(const int maxPages) {
       build_->popupFn();
       build_->lastPopupTickMs = millis();
     }
+    // v18.9.9.479: name the phase AND the page so a hard freeze during chapter
+    // indexing identifies itself on the next boot. Chapter builds previously
+    // set no checkpoint at all, so a freeze in here reported whatever stale
+    // value was left over (typically "section:loadPage"), pointing at the wrong
+    // code. setLastCheckpoint is a bounded copy into RTC_NOINIT -- no
+    // allocation, safe from any task -- so per-page cost is negligible against
+    // a page that takes ~1 s to lay out.
+    char cp[32];
+    snprintf(cp, sizeof(cp), "section:build-p%d", pageCount);
+    SET_CHECKPOINT(cp);
     const auto status = build_->parser->parseStep();
     if (status == ChapterHtmlSlimParser::ParseStatus::Error) {
       LOG_ERR("SCT", "Parse error during incremental build");
@@ -1024,6 +1035,7 @@ uint16_t Section::estimatedTotalPages() const {
 }
 
 bool Section::finalizeBuild() {
+  SET_CHECKPOINT("section:finalizeBuild");
   if (!build_) return false;
 
   // Flush the trailing page (parser finishParse fires the completePageFn
