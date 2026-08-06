@@ -152,29 +152,47 @@ const SettingInfo* findByNameId(const std::vector<SettingInfo>& all, StrId nameI
   return it == all.end() ? nullptr : &*it;
 }
 
-// Same as findByNameId but matches on the JSON key. Required because the
-// "Orientation Aware" entries for front buttons vs side buttons share a
-// nameId (STR_ORIENTATION_AWARE) -- the key disambiguates them.
-const SettingInfo* findByKey(const std::vector<SettingInfo>& all, const char* key) {
+SettingInfo* findByNameIdMutable(std::vector<SettingInfo>& all, StrId nameId) {
+  const auto it = std::find_if(all.begin(), all.end(),
+                               [nameId](const SettingInfo& s) { return s.nameId == nameId; });
+  return it == all.end() ? nullptr : &*it;
+}
+
+// Matches on the JSON key rather than nameId. Required because the "Orientation
+// Aware" entries for front buttons vs side buttons share a nameId
+// (STR_ORIENTATION_AWARE) -- the key disambiguates them.
+SettingInfo* findByKeyMutable(std::vector<SettingInfo>& all, const char* key) {
   const auto it = std::find_if(all.begin(), all.end(), [key](const SettingInfo& s) {
     return s.key != nullptr && std::strcmp(s.key, key) == 0;
   });
   return it == all.end() ? nullptr : &*it;
 }
 
-// Convenience: copy the row found by nameId into the children vector, or
-// log an error if missing. Keeps the submenu builder readable.
-void pushByName(std::vector<SettingInfo>& children, const std::vector<SettingInfo>& all, StrId nameId) {
-  if (const auto* s = findByNameId(all, nameId)) {
-    children.push_back(*s);
+// v4.7.3: MOVE the row out of `all` instead of copying it. rebuildSettingsLists
+// previously held two full copies of the settings data at once -- `allSettings`
+// plus the tree built from it -- which is what pushed the rebuild peak to the
+// 15-25 KB that the onEnter() pre-flight guards against. `all` is a local
+// temporary discarded at the end of the rebuild, so nothing needs the original.
+//
+// Safe because no setting is pushed into more than one submenu (verified by
+// audit). To keep it that way, the moved-from row is stamped STR_NONE_OPT with
+// a null key so a second lookup MISSES and hits the error log below, rather than
+// silently pushing a hollowed-out row with empty enum labels.
+void pushByName(std::vector<SettingInfo>& children, std::vector<SettingInfo>& all, StrId nameId) {
+  if (auto* s = findByNameIdMutable(all, nameId)) {
+    children.push_back(std::move(*s));
+    s->nameId = StrId::STR_NONE_OPT;
+    s->key = nullptr;
   } else {
     LOG_ERR("SET", "Submenu builder: missing setting nameId=%d", static_cast<int>(nameId));
   }
 }
 
-void pushByKey(std::vector<SettingInfo>& children, const std::vector<SettingInfo>& all, const char* key) {
-  if (const auto* s = findByKey(all, key)) {
-    children.push_back(*s);
+void pushByKey(std::vector<SettingInfo>& children, std::vector<SettingInfo>& all, const char* key) {
+  if (auto* s = findByKeyMutable(all, key)) {
+    children.push_back(std::move(*s));
+    s->nameId = StrId::STR_NONE_OPT;
+    s->key = nullptr;
   } else {
     LOG_ERR("SET", "Submenu builder: missing setting key=%s", key);
   }
@@ -188,7 +206,7 @@ void SettingsActivity::rebuildSettingsLists() {
   // reader activity ran -- otherwise the font-family picker shows stale list.
   sdFontSystem.refreshIfDirty();
 
-  const auto allSettings = getSettingsList(&sdFontSystem.registry());
+  auto allSettings = getSettingsList(&sdFontSystem.registry());
 
   // === Display submenu ============================================
   // v18.9.9.306: sleep configuration split into two submenus. The prior
@@ -265,6 +283,11 @@ void SettingsActivity::rebuildSettingsLists() {
   pushByName(readerStyle, allSettings, StrId::STR_EMBEDDED_STYLE);
   pushByName(readerStyle, allSettings, StrId::STR_HYPHENATION);
   pushByName(readerStyle, allSettings, StrId::STR_TEXT_AA);
+  // v4.7.3: opt-in single-pass page turn (v18.9.9.405). Registered under
+  // STR_CAT_READER since it landed but never pushed into a device submenu, so
+  // it was reachable only from the web UI. Sits next to Text AA because it only
+  // changes behaviour on pages that get grayscale AA. Defaults off.
+  pushByName(readerStyle, allSettings, StrId::STR_SINGLE_PASS_PAGE_TURN);
   pushByName(readerStyle, allSettings, StrId::STR_READER_DARK_MODE);
   pushByName(readerStyle, allSettings, StrId::STR_BIONIC_READING);
   pushByName(readerStyle, allSettings, StrId::STR_GUIDE_READING);
@@ -448,7 +471,17 @@ void SettingsActivity::onEnter() {
   // typically sits at 8-15 KB, so this is a common bad state. Silent-
   // restart to Settings gives fresh 60+ KB maxAlloc where rebuild fits.
   // isContinuingFromSilentReboot() guard prevents loop.
-  constexpr uint32_t kSettingsMinFree = 55U * 1024U;
+  // v4.7.3: free-heap gate 55 KB -> 45 KB. The 55 KB bar had drifted above the
+  // steady-state free heap on Home (measured 55.0 KB on X4, 56.0 KB on X3), so
+  // it tripped on essentially every Home -> Settings entry and the silent
+  // restart became the normal path rather than the exception. maxAlloc is the
+  // gate that actually matters: the field crash this pre-flight was written for
+  // had free=50756 (which 55 KB would catch only by accident) but maxAlloc=23540
+  // -- the 30 KB contiguous bar catches that on its own, and is left untouched.
+  // The rebuild peak also roughly halved this release (submenu builders now move
+  // rows out of allSettings instead of copying them), so 45 KB keeps more real
+  // margin than 55 KB did before.
+  constexpr uint32_t kSettingsMinFree = 45U * 1024U;
   constexpr uint32_t kSettingsMinMaxAlloc = 30U * 1024U;
   const uint32_t freeHeap = ESP.getFreeHeap();
   const uint32_t maxAlloc = ESP.getMaxAllocHeap();
@@ -476,7 +509,15 @@ void SettingsActivity::onEnter() {
   armSilentRestartTarget(/*SILENT_REBOOT_TARGET_SETTINGS=*/8);
 
   SET_CHECKPOINT("settings:rebuildLists");
+  const uint32_t freeBeforeRebuild = ESP.getFreeHeap();
+  const uint32_t maxAllocBeforeRebuild = ESP.getMaxAllocHeap();
   rebuildSettingsLists();
+  // Measured cost of the rebuild, so the pre-flight bars above can be derived
+  // from real numbers instead of inferred from crash reports.
+  LOG_INF("SET", "rebuildSettingsLists cost: free %u->%u (%d) maxAlloc %u->%u", freeBeforeRebuild,
+          static_cast<unsigned>(ESP.getFreeHeap()),
+          static_cast<int>(ESP.getFreeHeap()) - static_cast<int>(freeBeforeRebuild), maxAllocBeforeRebuild,
+          static_cast<unsigned>(ESP.getMaxAllocHeap()));
   SET_CHECKPOINT("settings:onEnter-done");
   LOG_INF("SET", "SettingsActivity onEnter done: free=%u maxAlloc=%u",
           static_cast<unsigned>(ESP.getFreeHeap()),
