@@ -38,8 +38,14 @@ class Dictionary {
   // Caller falls back to discoverAll() + picker in either case.
   static DictInfo getActive();
 
-  // Checks if the required StarDict files exist on the SD card
+  // Checks if the required StarDict files exist on the SD card. Stops at the
+  // first usable pair and caches the answer for the boot -- the reader menu
+  // calls this on every open to gate its Lookup entries.
   static bool exists();
+
+  // Drop the cached exists() answer. Call after the installed dictionary set
+  // may have changed (file transfer, SD remount); setActive() does it already.
+  static void invalidateExistsCache();
 
   // Looks up a word and returns its definition. Supports progress callbacks.
   // v18.9.9.198: returns the FIRST matching entry only; kept for callers that
