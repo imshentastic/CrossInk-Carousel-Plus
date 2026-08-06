@@ -375,6 +375,14 @@ constexpr uint32_t kSettingsSaveMinFree = 25U * 1024U;
 // v18.9.9.333: bumped 12 KB -> 20 KB for the same transient-consumption
 // race as kSettingsSaveMinFree above.
 constexpr uint32_t kSettingsSaveMinMaxAlloc = 20U * 1024U;
+// Hard floor re-checked immediately before the serialize, after the mkdir/FS
+// churn (see writeSettingsToDiskNow_). Hoisted to namespace scope so the retry
+// admission gate can use the SAME number: v18.9.9.209 raised this 20 KB -> 28 KB
+// but left kSettingsSaveMinMaxAlloc at 20 KB, which opened a 20-28 KB dead band
+// where the outer gate admits the save every main-loop tick, the FS work runs,
+// the floor below rejects it, and it logs an ERR -- forever, several times a
+// second, for as long as the reader holds maxAlloc in that window.
+constexpr uint32_t kSerializeHardFloorMaxAlloc = 28U * 1024U;
 bool gSettingsSaveDeferred = false;
 // v18.9.9.363: debounced save state. Mutation callsites call saveToFile()
 // which now just marks pending + timestamp. Actual disk write happens
@@ -417,7 +425,6 @@ bool writeSettingsToDiskNow_(const CrossPointSettings& s, bool bypassHeapGate = 
     // seconds after accepting a prepared layout. 28 KB leaves ~8 KB of
     // drift headroom; below it the save stays deferred and retries when
     // the reader settles.
-    constexpr uint32_t kSerializeHardFloorMaxAlloc = 28u * 1024u;
     const uint32_t maxAllocNow = ESP.getMaxAllocHeap();
     if (maxAllocNow < kSerializeHardFloorMaxAlloc) {
       LOG_ERR("CPS",
@@ -500,7 +507,14 @@ void CrossPointSettings::retryDeferredSaveIfNeeded() const {
   if (gPendingWrite && sinceLastMutation < kSaveDebounceMs) {
     return;  // still batching burst-of-mutations
   }
-  if (!MemoryBudget::hasHeap(MemoryBudget::snapshot(), kSettingsSaveMinFree, kSettingsSaveMinMaxAlloc)) return;
+  // Admit only when maxAlloc clears the SAME floor the pre-serialize re-check
+  // uses. Gating on the lower kSettingsSaveMinMaxAlloc let every tick run the
+  // mkdir/FS churn and then fail the 28 KB floor, logging an ERR each time
+  // (observed in-book at maxAlloc=25588: hundreds of identical lines/second).
+  // The save stays deferred either way -- this just stops the futile retry.
+  constexpr uint32_t kRetryMinMaxAlloc =
+      kSettingsSaveMinMaxAlloc > kSerializeHardFloorMaxAlloc ? kSettingsSaveMinMaxAlloc : kSerializeHardFloorMaxAlloc;
+  if (!MemoryBudget::hasHeap(MemoryBudget::snapshot(), kSettingsSaveMinFree, kRetryMinMaxAlloc)) return;
   SET_CHECKPOINT("cps:retryDeferredSave");
   const bool ok = writeSettingsToDiskNow_(*this);
   if (ok) {
