@@ -1,6 +1,7 @@
 #include "TextBlock.h"
 
 #include <Arduino.h>  // ESP.getMaxAllocHeap() for deserialize pre-flight
+#include <BufferedFileWriter.h>
 #include <GfxRenderer.h>
 #include <Logging.h>
 #include <Serialization.h>
@@ -285,7 +286,7 @@ void TextBlock::render(const GfxRenderer& renderer, const int fontId, const int 
   }
 }
 
-bool TextBlock::serialize(FsFile& file) const {
+bool TextBlock::serialize(BufferedFileWriter& file) const {
   const bool hasBionic = wordBionicBoundary_ != nullptr;
   const bool hasGuideDots = wordGuideDotXOffset_ != nullptr;
 
@@ -297,7 +298,7 @@ bool TextBlock::serialize(FsFile& file) const {
   for (uint16_t i = 0; i < wordCount_; ++i) {
     const WordView w = words[i];
     if (!serialization::tryWritePod(file, static_cast<uint32_t>(w.size()))) return false;
-    if (w.size() > 0 && file.write(reinterpret_cast<const uint8_t*>(w.data()), w.size()) != static_cast<int>(w.size())) {
+    if (w.size() > 0 && file.write(reinterpret_cast<const uint8_t*>(w.data()), w.size()) != w.size()) {
       LOG_ERR("TXB", "Serialization failed: could not write word payload");
       return false;
     }

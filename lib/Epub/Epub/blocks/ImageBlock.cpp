@@ -1,5 +1,6 @@
 #include "ImageBlock.h"
 
+#include <BufferedFileWriter.h>
 #include <GfxRenderer.h>
 #include <Logging.h>
 #include <Serialization.h>
@@ -226,7 +227,7 @@ bool ImageBlock::renderIfCached(GfxRenderer& renderer, const int x, const int y)
   return renderFromCache(renderer, getCachePath(imagePath), x, y, width, height);
 }
 
-bool ImageBlock::serialize(FsFile& file) {
+bool ImageBlock::serialize(BufferedFileWriter& file) {
   return serialization::tryWriteString(file, imagePath) && serialization::tryWritePod(file, width) &&
          serialization::tryWritePod(file, height);
 }

@@ -1,6 +1,7 @@
 #include "Page.h"
 
 #include <Arduino.h>  // ESP.getMaxAllocHeap() for footnote.resize() pre-flight
+#include <BufferedFileWriter.h>
 #include <GfxRenderer.h>
 #include <Logging.h>
 #include <Serialization.h>
@@ -33,7 +34,7 @@ void PageLine::render(GfxRenderer& renderer, const int fontId, const int xOffset
   block->render(renderer, fontId, xPos + xOffset, yPos + yOffset, foregroundBlack);
 }
 
-bool PageLine::serialize(FsFile& file) {
+bool PageLine::serialize(BufferedFileWriter& file) {
   if (!serialization::tryWritePod(file, xPos) || !serialization::tryWritePod(file, yPos)) {
     LOG_ERR("PGE", "Serialization failed: could not write PageLine coordinates");
     return false;
@@ -102,7 +103,7 @@ void PageImage::renderIfCached(GfxRenderer& renderer, const int xOffset, const i
   imageBlock->renderIfCached(renderer, xPos + xOffset, yPos + yOffset);
 }
 
-bool PageImage::serialize(FsFile& file) {
+bool PageImage::serialize(BufferedFileWriter& file) {
   if (!serialization::tryWritePod(file, xPos) || !serialization::tryWritePod(file, yPos)) {
     LOG_ERR("PGE", "Serialization failed: could not write PageImage coordinates");
     return false;
@@ -145,7 +146,7 @@ void PageHorizontalRule::render(GfxRenderer& renderer, const int fontId, const i
                     foregroundBlack);
 }
 
-bool PageHorizontalRule::serialize(FsFile& file) {
+bool PageHorizontalRule::serialize(BufferedFileWriter& file) {
   return serialization::tryWritePod(file, xPos) && serialization::tryWritePod(file, yPos) &&
          serialization::tryWritePod(file, width) && serialization::tryWritePod(file, thickness);
 }
@@ -175,7 +176,7 @@ std::unique_ptr<PageHorizontalRule> PageHorizontalRule::deserialize(FsFile& file
   return std::unique_ptr<PageHorizontalRule>(rule);
 }
 
-bool TableFragmentCell::serialize(FsFile& file) const {
+bool TableFragmentCell::serialize(BufferedFileWriter& file) const {
   if (lines.size() > MAX_TABLE_LINES_PER_CELL) {
     LOG_ERR("PTB", "Serialization failed: cell line count %u exceeds maximum", static_cast<uint32_t>(lines.size()));
     return false;
@@ -219,7 +220,7 @@ bool TableFragmentCell::deserialize(FsFile& file, TableFragmentCell& outCell) {
   return true;
 }
 
-bool TableFragmentRow::serialize(FsFile& file) const {
+bool TableFragmentRow::serialize(BufferedFileWriter& file) const {
   if (cells.size() > MAX_TABLE_CELLS_PER_ROW) {
     LOG_ERR("PTB", "Serialization failed: row cell count %u exceeds maximum", static_cast<uint32_t>(cells.size()));
     return false;
@@ -349,7 +350,7 @@ void PageTableFragment::renderContentOnly(GfxRenderer& renderer, const int fontI
   }
 }
 
-bool PageTableFragment::serialize(FsFile& file) {
+bool PageTableFragment::serialize(BufferedFileWriter& file) {
   if (rows.size() > MAX_TABLE_ROWS_PER_FRAGMENT) {
     LOG_ERR("PTB", "Serialization failed: fragment row count %u exceeds maximum", static_cast<uint32_t>(rows.size()));
     return false;
@@ -456,7 +457,7 @@ void Page::blankImageRects(GfxRenderer& renderer, const int xOffset, const int y
   }
 }
 
-bool Page::serialize(FsFile& file, uint8_t fileVersion) const {
+bool Page::serialize(BufferedFileWriter& file, uint8_t fileVersion) const {
   const uint16_t count = elements.size();
   if (elements.size() > MAX_PAGE_ELEMENTS) {
     LOG_ERR("PGE", "Serialization failed: element count %u exceeds maximum", static_cast<unsigned>(elements.size()));
@@ -508,8 +509,8 @@ bool Page::serialize(FsFile& file, uint8_t fileVersion) const {
   }
   for (uint16_t i = 0; i < fnCount; i++) {
     const auto& fn = footnotes[i];
-    if (file.write(fn.number, sizeof(fn.number)) != sizeof(fn.number) ||
-        file.write(fn.href, sizeof(fn.href)) != sizeof(fn.href)) {
+    if (file.write(reinterpret_cast<const uint8_t*>(fn.number), sizeof(fn.number)) != sizeof(fn.number) ||
+        file.write(reinterpret_cast<const uint8_t*>(fn.href), sizeof(fn.href)) != sizeof(fn.href)) {
       LOG_ERR("PGE", "Failed to write footnote");
       return false;
     }

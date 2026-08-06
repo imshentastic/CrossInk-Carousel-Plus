@@ -6,6 +6,10 @@
 
 #include "Block.h"
 
+// v18.9.9.479: serialize() writes through a small RAM buffer (see
+// <BufferedFileWriter.h>) instead of one SdFat call per field.
+class BufferedFileWriter;
+
 class ImageBlock final : public Block {
  public:
   ImageBlock(const std::string& imagePath, int16_t width, int16_t height);
@@ -27,7 +31,7 @@ class ImageBlock final : public Block {
   // placeholder rect. Returns true iff something was drawn (cache hit or
   // placeholder); false iff the image was silently skipped.
   bool renderIfCached(GfxRenderer& renderer, const int x, const int y);
-  bool serialize(FsFile& file);
+  bool serialize(BufferedFileWriter& file);
   static std::unique_ptr<ImageBlock> deserialize(FsFile& file);
 
  private:

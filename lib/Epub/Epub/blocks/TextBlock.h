@@ -12,6 +12,10 @@
 #include "Block.h"
 #include "BlockStyle.h"
 
+// v18.9.9.479: serialize() writes through a small RAM buffer (see
+// <BufferedFileWriter.h>) instead of one SdFat call per field.
+class BufferedFileWriter;
+
 // CrumBLE 4.4 post-bisect: lightweight view types so callers can access
 // TextBlock's compact storage without materializing per-word std::strings.
 // WordView is a string-like reference into the TextBlock's owned data
@@ -112,7 +116,7 @@ class TextBlock final : public Block {
   // given a renderer works out where to break the words into lines
   void render(const GfxRenderer& renderer, int fontId, int x, int y, bool foregroundBlack = true) const;
   BlockType getType() override { return TEXT_BLOCK; }
-  bool serialize(FsFile& file) const;
+  bool serialize(BufferedFileWriter& file) const;
   static std::unique_ptr<TextBlock> deserialize(FsFile& file);
 
   // Diagnostic: size of the owned compact data block, or 0 if alloc failed.

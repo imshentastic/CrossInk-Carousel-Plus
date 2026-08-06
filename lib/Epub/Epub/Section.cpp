@@ -3,10 +3,12 @@
 #include "IndexProfile.h"
 
 #include <Arduino.h>
+#include <BufferedFileWriter.h>
 #include <FontCacheManager.h>  // v18.9.9.13: prewarm scope for streamed render
 #include <GfxRenderer.h>       // v18.9.9.13: full type for prewarm-scope integration
 #include <HalStorage.h>
 #include <Logging.h>
+#include <Memory.h>
 #include <MemoryBudget.h>
 #include <Serialization.h>
 
@@ -170,12 +172,36 @@ uint32_t Section::onPageComplete(std::unique_ptr<Page> page) {
     return 0;
   }
 
+  // Page offsets are recorded BEFORE any of this page's bytes are emitted, and
+  // they are what the LUT stores / loadPageFromSectionFile seeks to. The
+  // BufferedFileWriter below is constructed AFTER this read and is flushed
+  // BEFORE this function returns, so `file` is never left holding unwritten
+  // bytes across a position()/seek()/close() by anyone else. Do not move this
+  // read, and do not let the writer outlive the scope below.
   const uint32_t position = file.position();
-  // v18.9.9.19: emit at SECTION_FILE_VERSION (currently 42) so on-device
-  // rebuilt sections carry the payloadSize prefix on table fragments.
-  if (!page->serialize(file, SECTION_FILE_VERSION)) {
-    LOG_ERR("SCT", "Failed to serialize page %d", pageCount);
-    return 0;
+  {
+    // v18.9.9.479: one SdFat write per serialized field cost ~500 ms per page
+    // (a ~250-word page issues ~2000 of them). Route the page through a 2 KB
+    // write-through buffer allocated once per build. Same bytes, same order,
+    // same on-disk format -- only the call granularity changes.
+    // build_ is always set while the parser is emitting pages; the nullptr
+    // buffer case (OOM at startBuild, or a page written outside a build)
+    // degrades to the old unbuffered behaviour rather than failing.
+    uint8_t* const scratch = build_ ? build_->pageWriteBuffer.get() : nullptr;
+    BufferedFileWriter writer(file, scratch, scratch ? BuildContext::PAGE_WRITE_BUFFER_BYTES : 0);
+    // v18.9.9.19: emit at SECTION_FILE_VERSION (currently 42) so on-device
+    // rebuilt sections carry the payloadSize prefix on table fragments.
+    if (!page->serialize(writer, SECTION_FILE_VERSION)) {
+      LOG_ERR("SCT", "Failed to serialize page %d", pageCount);
+      return 0;
+    }
+    // Explicit flush: the destructor also flushes, but it cannot report a
+    // short write, and a silently truncated page would corrupt every later
+    // page offset in this section.
+    if (!writer.flush()) {
+      LOG_ERR("SCT", "Failed to flush page %d to SD", pageCount);
+      return 0;
+    }
   }
   LOG_DBG("SCT", "Page %d processed (pos=%lu, free=%u, maxAlloc=%u)", pageCount, static_cast<unsigned long>(position),
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
@@ -828,6 +854,15 @@ bool Section::startBuild(const int fontId, const float lineCompression, const ui
   ctx->tablesGuardArmed = tablesGuardArmed;
   ctx->popupFn = popupFn;
   ctx->lastPopupTickMs = millis();
+  // v18.9.9.479: 2 KB page-serialization write buffer, allocated once here and
+  // reused by every onPageComplete for the life of this build. Best-effort:
+  // indexing runs with free heap around 40-60 KB, so this should always land,
+  // but a nullptr just means page writes stay unbuffered (slow, still correct).
+  ctx->pageWriteBuffer = makeUniqueNoThrow<uint8_t[]>(BuildContext::PAGE_WRITE_BUFFER_BYTES);
+  if (!ctx->pageWriteBuffer) {
+    LOG_ERR("SCT", "Page write buffer alloc failed (%u B); falling back to unbuffered page writes",
+            static_cast<unsigned>(BuildContext::PAGE_WRITE_BUFFER_BYTES));
+  }
 
   // Derive the content base directory and image cache path prefix for the parser.
   // These live in the BuildContext because ChapterHtmlSlimParser stores them by
