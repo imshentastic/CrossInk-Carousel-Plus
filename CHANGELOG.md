@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [crumble-v4.7.3] - 2026-08-06
+
+Single firmware: `crumble-v4.7.3-tiny-bitter.bin` (Bitter built-in, fits the stock 6.25 MB slot for SD-card flashing).
+
+### Added
+- **Newer X3 units are now detected.** Xteink changed the X3's display controller (UC8253 to UC8279) in units shipped from around late July 2026, and firmware built for the old one leaves those panels unusable. CrumBLE now works out which controller a unit carries and loads the matching driver. The check runs once, on the first boot after installing this version — that boot restarts itself part-way through, which is normal and happens only that once; the answer is remembered from then on. Existing X3s keep the driver they run today.
+
+### Fixed
+- **Holding the power button switches the device off instead of restarting it.** On a device that had been running a while, powering off could save your settings, run out of memory mid-write, and reboot to the home screen — so it took a second press to actually turn off. The save now steps aside when memory is too tight for it to complete. In that rare case a settings change made just before powering off may not be kept, which is better than the restart.
+
 ## [crumble-v4.7.2] - 2026-08-05
 
 Single firmware: `crumble-v4.7.2-tiny-bitter.bin` (Bitter built-in, fits the stock 6.25 MB slot for SD-card flashing).
