@@ -40,7 +40,7 @@ constexpr char latestReleaseUrl[] = CROSSINK_OTA_RELEASE_URL;
 // an OTA target -- delivering the full to a 6.25 MB legacy OTA slot
 // would brick the device with "Firmware too large".
 //
-// tiny-cjk: the CJK variant ships as "crumble-firmware-cjk-X.Y.Z.bin". A
+// tiny-bitter-chinese-fallback ships as "crumble-firmware-chinese-fallback-X.Y.Z.bin". A
 // CJK device must only ever ingest -cjk- assets (a main image would
 // silently drop its CJK rendering), and a main device must never ingest a
 // -cjk- asset (different font/feature set the user didn't ask for). The
@@ -48,13 +48,13 @@ constexpr char latestReleaseUrl[] = CROSSINK_OTA_RELEASE_URL;
 // rejects cjk-marked names explicitly since they share the main stem's
 // prefix.
 #ifdef CJK_VARIANT
-constexpr char firmwareAssetStem[] = "crumble-firmware-cjk";
+constexpr char firmwareAssetStem[] = "crumble-firmware-chinese-fallback";
 constexpr char firmwareAssetName[] = "crumble-firmware-cjk.bin";
 #else
 constexpr char firmwareAssetStem[] = "crumble-firmware";
 constexpr char firmwareAssetName[] = "crumble-firmware.bin";
-constexpr char cjkVariantMarker[] = "-cjk-";
-constexpr char cjkVariantBinSuffix[] = "-cjk.bin";
+constexpr char cjkVariantMarker[] = "-chinese-fallback-";
+constexpr char cjkVariantBinSuffix[] = "-chinese-fallback.bin";
 #endif
 constexpr char fullVariantMarker[] = "-full-needs-USB-flash";
 
@@ -161,9 +161,12 @@ bool isMatchingFirmwareAssetName(const char* assetName) {
   // OTA partition and would brick devices on that layout.
   if (containsSubstring(assetName, fullVariantMarker)) return false;
 #ifndef CJK_VARIANT
-  // Main build: refuse CJK-variant assets. They share this stem's prefix
-  // ("crumble-firmware-cjk-..." starts with "crumble-firmware-"), so the
-  // generic stem match below would otherwise accept them.
+  // Main build: refuse Chinese-fallback variant assets. They share this stem's
+  // prefix ("crumble-firmware-chinese-fallback-..." starts with
+  // "crumble-firmware-"), so the generic stem match below would otherwise
+  // accept them. These markers MUST track firmwareAssetStem above: if the
+  // variant is renamed and these are not, the main build silently starts
+  // accepting variant images.
   if (containsSubstring(assetName, cjkVariantMarker)) return false;
   if (endsWith(assetName, cjkVariantBinSuffix)) return false;
 #endif

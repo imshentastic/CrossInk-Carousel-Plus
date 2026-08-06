@@ -74,14 +74,34 @@ constexpr uint8_t SECTION_FILE_VERSION = 44;
 // cleanly; their embedded glyph subset offsets default to 0 (no subset).
 // v39 sections similarly default the v40 atlas trailer to 0/0/0. Older
 // versions trigger a rebuild as before.
-// v18.9.9.479: window closed to 44. Bumping SECTION_FILE_VERSION alone does
-// NOT invalidate anything -- the gate accepts [MIN_READABLE, CURRENT], so v38-43
-// files kept loading with their pre-fix justification geometry. Every layout fix
-// from here needs BOTH constants moved, or it silently does nothing for anyone
-// who already has a cache. Cost: one re-index per book on first open after
-// upgrade, including Latin books whose geometry was never wrong (nothing in the
-// file records whether its content was affected, so we cannot be selective).
+// v18.9.9.479: the readable window is variant-dependent, because the layout fix
+// that forced this bump can only have affected CJK content.
+//
+// Note first: bumping SECTION_FILE_VERSION alone invalidates NOTHING. The gate
+// accepts [MIN_READABLE, CURRENT], so raising only the ceiling leaves old files
+// loading happily. A layout fix needs this floor moved, or it silently does
+// nothing for anyone who already has a cache.
+//
+// The pre-fix bug stretched justified lines at boundaries that were never
+// counted. Those boundaries are only ever created by the CJK run-splitter in
+// ParsedText (wordNoSpaceBefore is set true nowhere else), so Latin-only text
+// laid out identically before and after the fix -- byte-for-byte, since the
+// other half of the fix suppressed a stretch applied after a line's last word,
+// which is never recorded as a glyph position.
+//
+// So: the CJK variant closes the window and rebuilds once, because its users are
+// the ones holding bad geometry. Everyone else keeps their caches and sees no
+// re-index at all.
+//
+// Known gap: a non-CJK build reading a CJK book through an SD .cpfont keeps a
+// pre-fix cache and its overflow. Narrow (that combination is what the CJK
+// variant exists to replace) and self-healing -- any font or layout setting
+// change re-fingerprints the section and rebuilds it.
+#ifdef CJK_VARIANT
 constexpr uint8_t MIN_READABLE_SECTION_FILE_VERSION = 44;
+#else
+constexpr uint8_t MIN_READABLE_SECTION_FILE_VERSION = 38;
+#endif
 // How much the largest free block must have grown since a degraded build before
 // we bother rebuilding it for images (avoids rebuild churn on tiny variations).
 constexpr uint32_t SECTION_DEGRADED_REBUILD_MARGIN = 12 * 1024;
