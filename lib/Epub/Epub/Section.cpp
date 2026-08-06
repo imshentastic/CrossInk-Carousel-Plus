@@ -62,13 +62,26 @@ constexpr uint32_t SECTION_CACHE_MAGIC = 0x535843FF;  // bytes: 0xFF, "CXS"
 // alt-atlas trailer so the fingerprint check can invalidate cached sections
 // when the user toggles the Tables setting. v42 and earlier files default
 // to TABLES_DISPLAY on load (that's how they were built, so it round-trips).
-constexpr uint8_t SECTION_FILE_VERSION = 43;
+// v18.9.9.479: bump to 44. No format change -- the LAYOUT changed. Justified
+// lines were stretched at boundaries that were never counted, and PageElement
+// stores the resulting xPos, so the bad geometry is baked into every section
+// built before the fix. New firmware replaying an old cache reproduces the
+// overflow exactly, which is what "jumped instantly and still overflowed"
+// looked like in the field.
+constexpr uint8_t SECTION_FILE_VERSION = 44;
 // Oldest section file version this firmware can still read (forward-compat
 // window). v38 sections produced by v4.2.x prebakes / live caches still load
 // cleanly; their embedded glyph subset offsets default to 0 (no subset).
 // v39 sections similarly default the v40 atlas trailer to 0/0/0. Older
 // versions trigger a rebuild as before.
-constexpr uint8_t MIN_READABLE_SECTION_FILE_VERSION = 38;
+// v18.9.9.479: window closed to 44. Bumping SECTION_FILE_VERSION alone does
+// NOT invalidate anything -- the gate accepts [MIN_READABLE, CURRENT], so v38-43
+// files kept loading with their pre-fix justification geometry. Every layout fix
+// from here needs BOTH constants moved, or it silently does nothing for anyone
+// who already has a cache. Cost: one re-index per book on first open after
+// upgrade, including Latin books whose geometry was never wrong (nothing in the
+// file records whether its content was affected, so we cannot be selective).
+constexpr uint8_t MIN_READABLE_SECTION_FILE_VERSION = 44;
 // How much the largest free block must have grown since a degraded build before
 // we bother rebuilding it for images (avoids rebuild churn on tiny variations).
 constexpr uint32_t SECTION_DEGRADED_REBUILD_MARGIN = 12 * 1024;
