@@ -388,7 +388,13 @@ bool Section::tryLoadFromPath(const std::string& path, const int fontId, const f
     if (version < MIN_READABLE_SECTION_FILE_VERSION || version > SECTION_FILE_VERSION) {
       // Explicit close() required: member variable persists beyond function scope
       file.close();
-      LOG_ERR("SCT", "Deserialization failed: Unknown version %u (%s)", version, path.c_str());
+      // Informational, not an error: a cache written by different firmware is
+      // the expected state after any upgrade that moves the version window, and
+      // the only consequence is one rebuild. Logging it at ERR made a healthy
+      // post-upgrade boot look like a failure and sent at least one debugging
+      // session chasing it.
+      LOG_INF("SCT", "Cache rebuild needed: version %u outside readable range %u-%u (%s)", version,
+              MIN_READABLE_SECTION_FILE_VERSION, SECTION_FILE_VERSION, path.c_str());
       return false;
     }
     fileVersion_ = version;
