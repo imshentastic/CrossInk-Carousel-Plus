@@ -157,7 +157,12 @@ bool JsonSettingsIO::loadState(CrossPointState& s, const char* json) {
 bool JsonSettingsIO::saveSettings(const CrossPointSettings& s, const char* path) {
   JsonDocument doc;
 
-  for (const auto& info : getSettingsList()) {
+  // v4.7.3: iterate the base list by reference. getSettingsList() returns a deep
+  // copy of ~64 entries (each with its own enum-string vectors) -- dozens of
+  // allocations before a single setting is written, and a failed one aborts.
+  // The registry-aware entries it substitutes are all dynamic getter/setter
+  // entries, which the loop below skips anyway.
+  for (const auto& info : getSettingsListBase()) {
     if (!info.key) continue;
     // Dynamic entries (KOReader etc.) are stored in their own files — skip.
     if (!info.valuePtr && !info.stringOffset) continue;
@@ -165,7 +170,11 @@ bool JsonSettingsIO::saveSettings(const CrossPointSettings& s, const char* path)
     if (info.stringOffset) {
       const char* strPtr = (const char*)&s + info.stringOffset;
       if (info.obfuscated) {
-        doc[std::string(info.key) + "_obf"] = obfuscation::obfuscateToBase64(strPtr);
+        // Stack-built key: std::string(info.key) + "_obf" allocated a temporary
+        // per obfuscated setting. ArduinoJson copies char* keys, so this is safe.
+        char obfKey[64];
+        snprintf(obfKey, sizeof(obfKey), "%s_obf", info.key);
+        doc[obfKey] = obfuscation::obfuscateToBase64(strPtr);
       } else {
         doc[info.key] = strPtr;
       }
@@ -256,6 +265,16 @@ bool JsonSettingsIO::saveSettings(const CrossPointSettings& s, const char* path)
   // in serializeJson->String::reserve. Field crash: preflight passed
   // (free=38k/maxAlloc=18k) but serialize threw because output needed
   // more contiguous than maxAlloc.
+  // v4.7.3: ArduinoJson allocates through malloc and, on failure, silently marks
+  // the document overflowed rather than failing the assignment -- measureJson()
+  // would then report the truncated size and we would write a settings file
+  // missing whatever did not fit. Refuse instead; the caller keeps the save
+  // pending and retries when there is room.
+  if (doc.overflowed()) {
+    LOG_ERR("JSI", "Settings write skipped: JSON document overflowed (free=%u maxAlloc=%u)",
+            static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
+    return false;
+  }
   const size_t neededBytes = measureJson(doc);
   const uint32_t neededWithMargin = static_cast<uint32_t>(std::max<size_t>(neededBytes * 3U / 2U, 4096U));
   const uint32_t maxAllocNow = ESP.getMaxAllocHeap();
@@ -314,7 +333,8 @@ bool JsonSettingsIO::loadSettings(CrossPointSettings& s, const char* json, bool*
   if (doc["statusBarChapterPageCount"].isNull()) {
     applyLegacyStatusBarSettings(s);
   }
-  for (const auto& info : getSettingsList()) {
+  // v4.7.3: base list by reference, same rationale as saveSettings above.
+  for (const auto& info : getSettingsListBase()) {
     if (!info.key) continue;
     // Dynamic entries (KOReader etc.) are stored in their own files — skip.
     if (!info.valuePtr && !info.stringOffset) continue;
@@ -325,7 +345,9 @@ bool JsonSettingsIO::loadSettings(CrossPointSettings& s, const char* json, bool*
       std::string val;
       if (info.obfuscated) {
         obfuscation::DecodeStatus status = obfuscation::DecodeStatus::INVALID;
-        val = obfuscation::deobfuscateFromBase64(doc[std::string(info.key) + "_obf"] | "", &status);
+        char obfKey[64];
+        snprintf(obfKey, sizeof(obfKey), "%s_obf", info.key);
+        val = obfuscation::deobfuscateFromBase64(doc[obfKey] | "", &status);
         if (status == obfuscation::DecodeStatus::LEGACY && !val.empty() && needsResave) {
           *needsResave = true;
         }

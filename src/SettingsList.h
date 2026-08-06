@@ -459,7 +459,12 @@ inline SettingInfo buildSleepScreenSetting() {
 // SdCardFontRegistry is supplied AND has SD card fonts installed, the
 // font-family entry is replaced in a per-call copy with a registry-aware
 // version. Callers without SD fonts pay only a vector copy.
-inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* registry = nullptr) {
+// v4.7.3: the immutable base list, by reference -- no copy, no allocation after
+// first use. Callers that only read key / valuePtr / stringOffset (persistence)
+// must use this: getSettingsList() deep-copies ~64 entries, each with its own
+// enum-string vectors, and on ESP32 a failed allocation in that copy aborts the
+// process rather than failing. That copy ran on every settings write.
+inline const std::vector<SettingInfo>& getSettingsListBase() {
   static const std::vector<SettingInfo> baseList = [] {
     std::vector<SettingInfo> v;
     v.reserve(64);
@@ -817,8 +822,11 @@ inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* regist
     }
     return v;
   }();
+  return baseList;
+}
 
-  std::vector<SettingInfo> v = baseList;
+inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* registry = nullptr) {
+  std::vector<SettingInfo> v = getSettingsListBase();
   // v18.9.9.318: baseList never added placeholders for STR_UI_FONT_FALLBACK
   // or STR_UI_FONT_FALLBACK_SIZE, so the previous "replace via find_if"
   // pattern silently no-op'd -- the settings never made it into
