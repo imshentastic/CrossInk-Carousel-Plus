@@ -2,7 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+- **Two settings that were only reachable from the browser now appear on the device.** "Show Indexing Page Count" is in Settings > System, and "Single-Pass Page Turn" is in Reader > Style next to Text Anti-Aliasing. Both were already saved and honoured, and both are still off by default — they simply had no on-device row, because the device menus are assembled by hand rather than from the same category list the web page uses. A sweep of all 65 settings found these were the only two affected.
+- **Dictionaries can now live in a `/dictionaries` folder**, alongside the existing `/dict` and `/dictionary` locations.
+
 ### Fixed
+- **Opening the in-book menu no longer stalls while the dictionary folder is scanned.** Deciding whether to show the Lookup entries re-scanned every installed dictionary each time the menu opened — seconds of card reading with a large collection, right when the reader is shortest on memory. The check now stops at the first dictionary it finds and remembers the answer.
+- **Going from Home into Settings no longer restarts the device first.** Settings checked for a chunk of free memory before opening and quietly rebooted to get it. The amount it asked for had drifted above what a normal Home screen leaves free, so the restart had gone from a rare safeguard to something that happened nearly every time. Opening Settings also uses about half the memory it used to, so the safeguard is both less likely to fire and has more room behind it when it does.
 - **Reading stats save again on devices that had run another firmware.** A stats file left behind by a different fork could not be read, and rather than risk overwriting it CrumBLE stopped saving stats entirely — silently, and permanently, with only a serial-log error to show for it. Two things were wrong: the check meant to spot an over-long file could never actually fire, and any unreadable file was treated as "written by a newer CrumBLE" no matter how implausible its contents. A file that really might come from a later version is still preserved and still blocks saving. One that clearly is not ours is now moved aside once, keeping every byte, and stats start accruing again from that boot.
 - **Powering off no longer risks losing a setting you just changed.** Saving settings on the way into sleep needs a chunk of free memory, and after a long reading session there may not be enough — in which case the save was skipped and the change lost. If that happens, CrumBLE now retries once more after the screen has gone to sleep, when the display's memory is free to borrow, which is nearly always enough for the write to succeed.
 
