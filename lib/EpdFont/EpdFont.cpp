@@ -101,6 +101,13 @@ static uint8_t lookupKernClass(const EpdKernClassEntry* entries, const uint16_t 
 }
 
 int8_t EpdFont::getKerning(const uint32_t leftCp, const uint32_t rightCp) const {
+  // Upstream #2288: CJK is set solid -- no pair kerning on either side. In
+  // practice the class tables never carry CJK codepoints so this usually
+  // short-circuits an already-zero result, but it makes the intent explicit
+  // and keeps a CJK-bearing kern table from introducing spurious gaps.
+  if (utf8IsCjkBreakable(leftCp) || utf8IsCjkBreakable(rightCp)) {
+    return 0;
+  }
   if (!data->kernMatrix) {
     return 0;
   }
