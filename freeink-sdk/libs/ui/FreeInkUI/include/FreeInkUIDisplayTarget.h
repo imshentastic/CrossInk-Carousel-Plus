@@ -14,7 +14,9 @@
 // Text uses the bundled Noto Sans bitmap font (FreeInkUIFont.h). Every font
 // slot defaults to it; call setFont() to swap in your own BitmapFont (see
 // docs/freeink-ui.md and tools/gen_font.py for generating one from any TTF).
-// Gray paints are reproduced on the 1-bit panel with an ordered Bayer dither.
+// Gray paints are reproduced on the 1-bit panel with an ordered Bayer dither;
+// anti-aliased fonts (gen_font.py --alpha, BitmapFont::bpp == 4) reuse the
+// same dither to reproduce glyph edge coverage.
 //
 // Orientation: the target draws in LOGICAL coordinates and rotates each pixel
 // into the panel's native framebuffer at draw time, so apps lay out a screen in
@@ -31,6 +33,27 @@
 
 namespace freeink {
 namespace ui {
+
+// Runtime glyph provider consulted when the active BitmapFont has no glyph
+// for a codepoint — the path that lets UI chrome render scripts too large to
+// pre-bake (Hangul, CJK) from a TTF on the card. `pixelSize` is the slot's
+// line height so fallback glyphs match each slot's size. Coverage is 8-bit;
+// the target dithers it exactly like its 4-bpp alpha fonts. See
+// FreeInkUIBookFont.h for the TtfFont-backed implementation.
+class RuntimeGlyphSource {
+ public:
+  struct Glyph {
+    const uint8_t* coverage;
+    uint16_t width;
+    uint16_t height;
+    int16_t xoff;
+    int16_t yoff;     // from baseline, negative = above
+    int16_t advance;
+  };
+  virtual ~RuntimeGlyphSource() = default;
+  virtual bool glyph(uint32_t codepoint, uint16_t pixelSize, Glyph* out) = 0;
+  virtual int16_t advance(uint32_t codepoint, uint16_t pixelSize) = 0;
+};
 
 class DisplayTarget final : public DrawTarget {
  public:
@@ -58,6 +81,18 @@ class DisplayTarget final : public DrawTarget {
       : DisplayTarget(framebuffer, panelWidth, panelHeight, panelWidthBytes,
                       panelWidth > panelHeight ? Orientation::Portrait : Orientation::LandscapeCounterClockwise) {}
 
+  // Runtime orientation change (a reader's portrait/landscape setting):
+  // swaps the logical frame; callers must refresh their DeviceContext
+  // (deviceContext()) and fully repaint.
+  void setOrientation(Orientation orientation) {
+    orientation_ = orientation;
+    w_ = isPortrait(orientation) ? ph_ : pw_;
+    h_ = isPortrait(orientation) ? pw_ : ph_;
+  }
+
+  // Fallback for codepoints missing from the bitmap fonts (nullptr = off).
+  void setGlyphFallback(RuntimeGlyphSource* source) { fallback_ = source; }
+
   // Point one slot, or every slot, at a different BitmapFont.
   void setFont(const FontId slot, const BitmapFont& font) {
     if (slot < FONT_SLOTS) fonts_[slot] = &font;
@@ -74,13 +109,21 @@ class DisplayTarget final : public DrawTarget {
     device.width = w_;
     device.height = h_;
     device.orientation = orientation_;
+    device.touchOrientation = touchOrientation();
     device.hasButtons = true;
     return device;
   }
 
+  // The touchToLogical() transform that inverts this target's render rotation.
+  // pixel() maps logical->panel as Portrait = 90° CW, PortraitInverted = 90°
+  // CCW, LandscapeClockwise = 180°, LandscapeCounterClockwise = native; touch
+  // arrives panel-native and must go the other way.
+  Orientation touchOrientation() const { return touchOrientationFor(orientation_); }
+
   Orientation orientation() const { return orientation_; }
   int16_t logicalWidth() const { return w_; }
   int16_t logicalHeight() const { return h_; }
+  bool ready() const { return fb_ != nullptr; }
 
   Size measureText(const FontId font, const char* text, const TextStyle) const override {
     const BitmapFont& f = fontFor(font);
@@ -190,6 +233,7 @@ class DisplayTarget final : public DrawTarget {
   int16_t w_;  // logical width (pw_/ph_ swapped under portrait)
   int16_t h_;  // logical height
   const BitmapFont* fonts_[FONT_SLOTS];
+  RuntimeGlyphSource* fallback_ = nullptr;
 
   static bool isPortrait(const Orientation o) {
     return o == Orientation::Portrait || o == Orientation::PortraitInverted;
@@ -198,16 +242,21 @@ class DisplayTarget final : public DrawTarget {
   const BitmapFont& fontFor(const FontId slot) const { return *fonts_[slot < FONT_SLOTS ? slot : 0]; }
 
   // 4x4 ordered Bayer matrix (0..15) — reproduces gray levels on a 1-bit panel.
-  static bool inkForColor(const Color color, const int16_t x, const int16_t y) {
+  // Sampled in logical coordinates so the pattern stays stable per UI.
+  static uint8_t bayerAt(const int16_t x, const int16_t y) {
     static constexpr uint8_t kBayer[4][4] = {
         {0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5}};
+    return kBayer[y & 3][x & 3];
+  }
+
+  static bool inkForColor(const Color color, const int16_t x, const int16_t y) {
     switch (color) {
       case Color::Black:
         return true;
       case Color::DarkGray:
-        return kBayer[y & 3][x & 3] < 12;  // ~75% ink
+        return bayerAt(x, y) < 12;  // ~75% ink
       case Color::LightGray:
-        return kBayer[y & 3][x & 3] < 4;  // ~25% ink
+        return bayerAt(x, y) < 4;  // ~25% ink
       case Color::White:
       case Color::Transparent:
       default:
@@ -216,6 +265,7 @@ class DisplayTarget final : public DrawTarget {
   }
 
   void plot(const int16_t x, const int16_t y, const Color color) {
+    if (!fb_) return;
     if (x < 0 || y < 0 || x >= w_ || y >= h_ || color == Color::Transparent) return;
     // Rotate the logical pixel into panel-native space. Transforms match
     // CrossPoint's GfxRenderer::rotateCoordinates so "up" agrees across stacks.
@@ -298,22 +348,66 @@ class DisplayTarget final : public DrawTarget {
     return &f.glyphs[cp - f.first];
   }
 
+  int16_t missingGlyphAdvance(const BitmapFont& f) const {
+    const int16_t adv = static_cast<int16_t>(f.yAdvance / 2);
+    return adv > 6 ? adv : 6;
+  }
+
+  void drawMissingGlyph(const BitmapFont& f, const int16_t penX, const int16_t baseline,
+                        const bool ink) {
+    const Color color = ink ? Color::Black : Color::White;
+    const int16_t w = missingGlyphAdvance(f);
+    int16_t h = static_cast<int16_t>((f.yAdvance * 2) / 3);
+    if (h < 8) h = 8;
+    const int16_t x = penX;
+    const int16_t y = static_cast<int16_t>(baseline - h + 2);
+    for (int16_t dx = 0; dx < w; ++dx) {
+      plot(static_cast<int16_t>(x + dx), y, color);
+      plot(static_cast<int16_t>(x + dx), static_cast<int16_t>(y + h - 1), color);
+    }
+    for (int16_t dy = 0; dy < h; ++dy) {
+      plot(x, static_cast<int16_t>(y + dy), color);
+      plot(static_cast<int16_t>(x + w - 1), static_cast<int16_t>(y + dy), color);
+    }
+  }
+
   // Pen advance for a codepoint, mapping the ellipsis to three dots and unknown
-  // codepoints to a space — consistent with how drawRun() renders them.
-  static int16_t runAdvance(const BitmapFont& f, const uint32_t cp) {
+  // codepoints to a visible missing-glyph box — consistent with drawRun().
+  int16_t runAdvance(const BitmapFont& f, const uint32_t cp) const {
     if (cp == 0x2026) {  // U+2026 HORIZONTAL ELLIPSIS -> "..."
       const FontGlyph* dot = glyphFor(f, '.');
       return static_cast<int16_t>(dot ? dot->xAdvance * 3 : 0);
     }
     const FontGlyph* g = glyphFor(f, cp);
     if (g) return g->xAdvance;
-    const FontGlyph* sp = glyphFor(f, ' ');
-    return static_cast<int16_t>(sp ? sp->xAdvance : 0);
+    if (fallback_ != nullptr) {
+      const int16_t adv = fallback_->advance(cp, f.yAdvance);
+      if (adv > 0) return adv;
+    }
+    return missingGlyphAdvance(f);
   }
 
   void drawGlyph(const BitmapFont& f, const FontGlyph& g, const int16_t penX, const int16_t baseline,
                  const bool ink) {
     const Color color = ink ? Color::Black : Color::White;
+    if (f.bpp == 4) {
+      // Anti-aliased glyph: 4-bit coverage per pixel, thresholded against the
+      // Bayer matrix so edge coverage becomes an ordered dither on the 1-bit
+      // panel. Coverage 15 always plots (a plain a > bayer would drop 1 in 16
+      // interior pixels); coverage 0 never does, leaving the background as-is.
+      for (int gy = 0; gy < g.height; ++gy) {
+        for (int gx = 0; gx < g.width; ++gx) {
+          const int idx = gy * g.width + gx;
+          const uint8_t byte = f.bitmap[g.bitmapOffset + (idx >> 1)];
+          const uint8_t a = (idx & 1) ? (byte & 0x0F) : (byte >> 4);
+          if (a == 0) continue;
+          const int16_t px = static_cast<int16_t>(penX + g.xOffset + gx);
+          const int16_t py = static_cast<int16_t>(baseline + g.yOffset + gy);
+          if (a == 15 || a > bayerAt(px, py)) plot(px, py, color);
+        }
+      }
+      return;
+    }
     for (int gy = 0; gy < g.height; ++gy) {
       for (int gx = 0; gx < g.width; ++gx) {
         const int bit = gy * g.width + gx;
@@ -336,7 +430,30 @@ class DisplayTarget final : public DrawTarget {
       }
       const FontGlyph* g = glyphFor(f, cp);
       if (g) { drawGlyph(f, *g, penX, baseline, ink); penX = static_cast<int16_t>(penX + g->xAdvance); }
-      else { penX = static_cast<int16_t>(penX + runAdvance(f, cp)); }
+      else if (fallback_ != nullptr) {
+        RuntimeGlyphSource::Glyph rg;
+        if (fallback_->glyph(cp, f.yAdvance, &rg)) {
+          const Color color = ink ? Color::Black : Color::White;
+          for (uint16_t gy = 0; gy < rg.height; ++gy) {
+            const uint8_t* row = rg.coverage + static_cast<uint32_t>(gy) * rg.width;
+            for (uint16_t gx = 0; gx < rg.width; ++gx) {
+              const uint8_t a = row[gx];
+              if (a == 0) continue;
+              const int16_t px = static_cast<int16_t>(penX + rg.xoff + gx);
+              const int16_t py = static_cast<int16_t>(baseline + rg.yoff + gy);
+              if (a >= 240 || (a >> 4) > bayerAt(px, py)) plot(px, py, color);
+            }
+          }
+          penX = static_cast<int16_t>(penX + rg.advance);
+        } else {
+          drawMissingGlyph(f, penX, baseline, ink);
+          penX = static_cast<int16_t>(penX + runAdvance(f, cp));
+        }
+      }
+      else {
+        drawMissingGlyph(f, penX, baseline, ink);
+        penX = static_cast<int16_t>(penX + runAdvance(f, cp));
+      }
     }
   }
 
@@ -364,3 +481,52 @@ class DisplayTarget final : public DrawTarget {
 
 }  // namespace ui
 }  // namespace freeink
+
+// Optional glue for the SDK's own display driver: push the frame FreeInkApp
+// just rendered with the panel refresh its RefreshHint asks for. Compiled only
+// when FreeInkDisplay's EInkDisplay.h is on the include path, mirroring the
+// GfxRenderer adapter's opt-in pattern; host builds skip it.
+#if __has_include(<EInkDisplay.h>)
+#include <EInkDisplay.h>
+#include <FreeInkApp.h>
+
+namespace freeink {
+namespace ui {
+
+inline void present(EInkDisplay& display, const RefreshHint hint) {
+  switch (hint) {
+    case RefreshHint::Full:
+    case RefreshHint::Clean:
+      display.displayBuffer(EInkDisplay::FULL_REFRESH);
+      break;
+    case RefreshHint::Fast:
+      display.displayBuffer(EInkDisplay::FAST_REFRESH);
+      break;
+    case RefreshHint::None:
+      break;
+  }
+}
+
+// Non-blocking present: starts the refresh and returns immediately — the
+// panel refreshes from its own RAM copy, so keep rendering into the
+// framebuffer while it runs. Pair with display.refreshBusy(): push the next
+// frame once the panel goes idle. This is what keeps touch and typing
+// responsive: a blocking present() is a 0.3-2 s blind window in which the
+// loop can't poll input.
+inline void presentAsync(EInkDisplay& display, const RefreshHint hint) {
+  switch (hint) {
+    case RefreshHint::Full:
+    case RefreshHint::Clean:
+      display.displayBufferAsync(EInkDisplay::FULL_REFRESH);
+      break;
+    case RefreshHint::Fast:
+      display.displayBufferAsync(EInkDisplay::FAST_REFRESH);
+      break;
+    case RefreshHint::None:
+      break;
+  }
+}
+
+}  // namespace ui
+}  // namespace freeink
+#endif  // __has_include(<EInkDisplay.h>)

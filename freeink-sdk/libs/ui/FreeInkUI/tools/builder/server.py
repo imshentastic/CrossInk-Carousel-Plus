@@ -24,13 +24,9 @@ GEN_SCREEN = ROOT / "libs/ui/FreeInkUI/tools/gen_screen.py"
 UI_INCLUDE = ROOT / "libs/ui/FreeInkUI/include"
 UI_SRC = ROOT / "libs/ui/FreeInkUI/src/FreeInkUI.cpp"
 CACHE_DIR = Path(tempfile.gettempdir()) / "freeinkui-builder-render"
-RENDER_INPUTS = [
-    Path(__file__).resolve(),
-    UI_SRC,
-    UI_INCLUDE / "FreeInkUI.h",
-    UI_INCLUDE / "FreeInkApp.h",
-    UI_INCLUDE / "FreeInkUIDisplayTarget.h",
-]
+def render_inputs():
+    """Files whose changes must invalidate cached preview renderers."""
+    return [Path(__file__).resolve(), UI_SRC, *sorted(UI_INCLUDE.rglob("*.h"))]
 
 
 def load_generator():
@@ -60,7 +56,7 @@ def build_renderer(schema: dict) -> Path:
     function_name = match.group(1)
     max_match = re.search(r"freeink::ui::Screen<(\d+)>", generated)
     max_interactions = int(max_match.group(1)) if max_match else 64
-    cache_key = generated + "".join(f"{path}:{path.stat().st_mtime_ns}" for path in RENDER_INPUTS)
+    cache_key = generated + "".join(f"{path}:{path.stat().st_mtime_ns}" for path in render_inputs())
     digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:24]
     work = CACHE_DIR / digest
     exe = work / "render_screen"
@@ -91,8 +87,11 @@ struct Canvas {{
   std::vector<uint8_t> fb;
   DisplayTarget target;
 
+  // The framebuffer is already the logical canvas, so force the native
+  // (identity) orientation: the default 4-arg constructor auto-rotates
+  // landscape panels into Portrait, which broke landscape previews.
   Canvas(int16_t w, int16_t h) : width(w), height(h), widthBytes((w + 7) / 8), fb(widthBytes * h, 0xFF),
-                                 target(fb.data(), w, h, widthBytes) {{}}
+                                 target(fb.data(), w, h, widthBytes, Orientation::LandscapeCounterClockwise) {{}}
 
   bool inkAt(int16_t x, int16_t y) const {{
     const uint8_t byte = fb[static_cast<int32_t>(y) * widthBytes + (x >> 3)];

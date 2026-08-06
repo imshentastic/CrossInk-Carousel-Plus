@@ -125,11 +125,16 @@ void testRect() {
 // GfxRenderer. Convention: set bit = white, clear bit = black ink.
 void testDisplayTarget() {
   constexpr int16_t W = 64, H = 32, WB = W / 8;
+  DisplayTarget unbound(nullptr, W, H, WB, Orientation::LandscapeCounterClockwise);
+  CHECK(!unbound.ready());
+  unbound.fill(Rect{0, 0, 4, 4}, Paint::solid(Color::Black));
+
   uint8_t fb[WB * H];
   std::memset(fb, 0xFF, sizeof(fb));  // white page
   // Native orientation so the raw-framebuffer reads below use logical == panel
   // coordinates (the default would rotate this landscape buffer to portrait).
   DisplayTarget target(fb, W, H, WB, Orientation::LandscapeCounterClockwise);
+  CHECK(target.ready());
 
   const auto pixelInk = [&](int16_t x, int16_t y) {
     return ((fb[y * WB + (x >> 3)] >> (7 - (x & 7))) & 0x01) == 0;  // clear bit = ink
@@ -180,6 +185,82 @@ void testDisplayTarget() {
   // (Re-pointing at the same font is a no-op; just exercise the API.)
   target.setFont(2, kNotoSansFont);
   CHECK_EQ(target.lineHeight(2), kNotoSansFont.yAdvance);
+}
+
+// Anti-aliased fonts (bpp == 4) store 4-bit coverage per pixel; DisplayTarget
+// reproduces partial coverage through its ordered Bayer dither.
+void testDisplayTargetAlphaFont() {
+  constexpr int16_t W = 32, H = 16, WB = W / 8;
+  uint8_t fb[WB * H];
+  DisplayTarget target(fb, W, H, WB, Orientation::LandscapeCounterClockwise);
+
+  const auto pixelInk = [&](int16_t x, int16_t y) {
+    return ((fb[y * WB + (x >> 3)] >> (7 - (x & 7))) & 0x01) == 0;  // clear bit = ink
+  };
+  const auto inkCount = [&] {
+    size_t count = 0;
+    for (int16_t y = 0; y < H; ++y)
+      for (int16_t x = 0; x < W; ++x)
+        if (pixelInk(x, y)) ++count;
+    return count;
+  };
+
+  // One 8x8 glyph mapped to 'A'; 64 pixels = 32 bytes of packed nibbles.
+  static constexpr FontGlyph glyphs8x8[] = {{0, 8, 8, 9, 0, -8}};
+  const TextStyle style{};
+
+  // Full coverage (15) plots every glyph pixel, exactly like a 1-bit glyph.
+  static constexpr uint8_t solid[32] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                                        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  static constexpr BitmapFont solidFont = {solid, glyphs8x8, 'A', 'A', 10, 8, 8, 8, 4};
+  target.setFont(0, solidFont);
+  std::memset(fb, 0xFF, sizeof(fb));
+  target.text(Rect{0, 0, W, H}, "A", style);
+  CHECK_EQ(inkCount(), 64u);
+
+  // Half coverage (8) dithers to exactly 8 of every 16 pixels: an 8x8 glyph
+  // spans each Bayer cell four times regardless of where it lands.
+  static constexpr uint8_t half[32] = {0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88,
+                                       0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88,
+                                       0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88};
+  static constexpr BitmapFont halfFont = {half, glyphs8x8, 'A', 'A', 10, 8, 8, 8, 4};
+  target.setFont(0, halfFont);
+  std::memset(fb, 0xFF, sizeof(fb));
+  target.text(Rect{0, 0, W, H}, "A", style);
+  CHECK_EQ(inkCount(), 32u);
+
+  // Zero coverage leaves the background untouched.
+  static constexpr uint8_t clear[32] = {};
+  static constexpr BitmapFont clearFont = {clear, glyphs8x8, 'A', 'A', 10, 8, 8, 8, 4};
+  target.setFont(0, clearFont);
+  std::memset(fb, 0xFF, sizeof(fb));
+  target.text(Rect{0, 0, W, H}, "A", style);
+  CHECK_EQ(inkCount(), 0u);
+
+  // Nibble order is high-first: a 2x1 glyph with coverage [15, 0] inks only
+  // its left pixel.
+  static constexpr uint8_t pair[] = {0xF0};
+  static constexpr FontGlyph glyphs2x1[] = {{0, 2, 1, 3, 0, -1}};
+  static constexpr BitmapFont pairFont = {pair, glyphs2x1, 'A', 'A', 3, 2, 2, 1, 4};
+  target.setFont(0, pairFont);
+  std::memset(fb, 0xFF, sizeof(fb));
+  target.text(Rect{0, 0, W, H}, "A", style);
+  CHECK_EQ(inkCount(), 1u);
+
+  // Inverted (white) alpha text plots white onto a black page.
+  target.setFont(0, solidFont);
+  std::memset(fb, 0x00, sizeof(fb));
+  TextStyle white = style;
+  white.color = Color::White;
+  target.text(Rect{0, 0, W, H}, "A", white);
+  size_t whiteCount = 0;
+  for (int16_t y = 0; y < H; ++y)
+    for (int16_t x = 0; x < W; ++x)
+      if (!pixelInk(x, y)) ++whiteCount;
+  CHECK_EQ(whiteCount, 64u);
+
+  target.setFont(kNotoSansFont);  // restore for any later use
 }
 
 void testStackFillsExactly() {
@@ -267,6 +348,40 @@ void testDisabledSkipsTouch() {
   tap.touchX = 10;
   tap.touchY = 10;
   CHECK(!buffer.route(tap));
+}
+
+void testLongPressRouting() {
+  InteractionBuffer<8> buffer;
+  buffer.addInteraction(Interaction{Rect{0, 0, 100, 100}, 1, 5,
+                                    static_cast<uint16_t>(InputTouch | InputLongPress | InputConfirm), StateNormal, 0});
+  buffer.addInteraction(Interaction{Rect{100, 0, 100, 100}, 2, 0, InputTouch, StateNormal, 0});
+
+  InputSnapshot tap;
+  tap.touchReleased = true;
+  tap.touchX = 10;
+  tap.touchY = 10;
+  ActionEvent event = buffer.route(tap);
+  CHECK_EQ(event.action, 1);
+  CHECK(!event.longPress);
+
+  InputSnapshot hold = tap;
+  hold.longPress = true;
+  event = buffer.route(hold);
+  CHECK_EQ(event.action, 1);
+  CHECK_EQ(event.value, 5);
+  CHECK(event.longPress);
+
+  // A touch-only interaction never receives long-press releases.
+  hold.touchX = 110;
+  CHECK(!buffer.route(hold));
+
+  // Non-touch dispatch paths report longPress false.
+  buffer.setFocusedIndex(0);
+  InputSnapshot confirm;
+  confirm.confirm = true;
+  event = buffer.route(confirm);
+  CHECK_EQ(event.action, 1);
+  CHECK(!event.longPress);
 }
 
 void testFocusNavigationWrapsAndSkips() {
@@ -439,6 +554,39 @@ void testListClampsBadTopIndex() {
   CHECK_EQ(interactions.count(), 4u);
   CHECK_EQ(interactions.data()[0].value, 2);  // clamped to count - visible
   CHECK_EQ(interactions.data()[3].value, 5);
+}
+
+void testListCanUseFullTitleWidthWithShortValue() {
+  ListItem item{};
+  item.label = "This filename is deliberately long enough to require a two-line wrapped title";
+  item.value = ".epub";
+
+  ListProps props;
+  props.items = &item;
+  props.count = 1;
+  props.rowHeight = 48;
+  props.labelText.maxLines = 2;
+
+  FakeDrawTarget balancedDraw;
+  DeviceContext device = makeDevice();
+  InputSnapshot input;
+  InteractionBuffer<4> balancedInteractions;
+  Frame<4> balancedFrame(balancedDraw, device, input, balancedInteractions);
+  list(balancedFrame, Rect{0, 0, 480, 48}, props);
+
+  // Fill, value, then label. The default balanced layout limits a wrapping
+  // title to 60% of the row's text band.
+  CHECK_EQ(balancedDraw.ops[2].rect.width, 278);
+
+  props.balanceWrappedLabelWithValue = false;
+  FakeDrawTarget fullWidthDraw;
+  InteractionBuffer<4> fullWidthInteractions;
+  Frame<4> fullWidthFrame(fullWidthDraw, device, input, fullWidthInteractions);
+  list(fullWidthFrame, Rect{0, 0, 480, 48}, props);
+
+  // Only the extension and its normal gap are reserved, so the title can use
+  // the remaining width before the value.
+  CHECK_EQ(fullWidthDraw.ops[2].rect.width, 424);
 }
 
 void testButtonRegistersExpandedHit() {
@@ -1356,20 +1504,21 @@ void testLayoutTextWrapping() {
 
 
 void testTouchToLogical() {
-  // Panel-native normalized portrait coords -> logical frame, per orientation.
+  // Panel-native normalized coords -> logical frame, per the device's
+  // touchOrientation transform selector (default Portrait = identity).
   DeviceContext portrait = makeDevice(480, 800);
   Point p = touchToLogical(portrait, 0.5f, 0.25f);
   CHECK_EQ(p.x, 240);
   CHECK_EQ(p.y, 200);
 
-  portrait.orientation = Orientation::PortraitInverted;
+  portrait.touchOrientation = Orientation::PortraitInverted;
   p = touchToLogical(portrait, 0.0f, 0.0f);
   CHECK_EQ(p.x, 479);
   CHECK_EQ(p.y, 799);
 
-  // The WakeInk case: 416x240 landscape CCW — fbX = ny*W, fbY = (1-nx)*H.
+  // The WakeInk case: 416x240, CCW transform — fbX = ny*W, fbY = (1-nx)*H.
   DeviceContext landscape = makeDevice(416, 240);
-  landscape.orientation = Orientation::LandscapeCounterClockwise;
+  landscape.touchOrientation = Orientation::LandscapeCounterClockwise;
   p = touchToLogical(landscape, 0.0f, 0.0f);
   CHECK_EQ(p.x, 0);
   CHECK_EQ(p.y, 239);
@@ -1380,13 +1529,13 @@ void testTouchToLogical() {
   CHECK_EQ(p.x, 208);
   CHECK_EQ(p.y, 180);
 
-  landscape.orientation = Orientation::LandscapeClockwise;
+  landscape.touchOrientation = Orientation::LandscapeClockwise;
   p = touchToLogical(landscape, 0.0f, 0.0f);
   CHECK_EQ(p.x, 415);
   CHECK_EQ(p.y, 0);
 
   // Mounting mirrors apply in panel space, before the rotation.
-  landscape.orientation = Orientation::LandscapeCounterClockwise;
+  landscape.touchOrientation = Orientation::LandscapeCounterClockwise;
   p = touchToLogical(landscape, 0.0f, 0.0f, /*flipX=*/true, /*flipY=*/false);
   CHECK_EQ(p.x, 0);
   CHECK_EQ(p.y, 0);
@@ -1395,6 +1544,14 @@ void testTouchToLogical() {
   p = touchToLogical(landscape, 1.0f, 1.0f);
   CHECK(p.x <= 415);
   CHECK(p.y <= 239);
+
+  // touchOrientationFor() picks the transform that inverts a target's render
+  // rotation (DisplayTarget's Portrait render rotates 90 CW, so touch maps
+  // back through LandscapeClockwise, and so on).
+  CHECK(touchOrientationFor(Orientation::Portrait) == Orientation::LandscapeClockwise);
+  CHECK(touchOrientationFor(Orientation::PortraitInverted) == Orientation::LandscapeCounterClockwise);
+  CHECK(touchOrientationFor(Orientation::LandscapeClockwise) == Orientation::PortraitInverted);
+  CHECK(touchOrientationFor(Orientation::LandscapeCounterClockwise) == Orientation::Portrait);
 }
 
 
@@ -1628,7 +1785,10 @@ void testEReaderSettingsComponents() {
   bool sawInsetStepperPlus = false;
   for (size_t i = 0; i < draw.opCount; ++i) {
     if (draw.ops[i].kind == FakeDrawTarget::Op::Stroke && draw.ops[i].radius == 3) sawToggleRadius = true;
-    if (draw.ops[i].kind == FakeDrawTarget::Op::Fill && draw.ops[i].rect.x == 200 && draw.ops[i].rect.width == 32) {
+    // Stepper sizes derive from the value font (lineH 12): buttons 22h/30w,
+    // value slot measure("12") + 12 = 24. Plus button: 240 - 8 - 30 - 6 - 24
+    // - 6 - 30... i.e. controlsX 136 + 30 + 6 + 24 + 6 = 202.
+    if (draw.ops[i].kind == FakeDrawTarget::Op::Fill && draw.ops[i].rect.x == 202 && draw.ops[i].rect.width == 30) {
       sawInsetStepperPlus = true;
     }
   }
@@ -1731,6 +1891,265 @@ void testLocalizedKeyboardLayout() {
   CHECK_EQ(interactions.data()[28].action, 412);
   CHECK_EQ(interactions.data()[31].action, 413);
   CHECK_EQ(draw.countKind(FakeDrawTarget::Op::Stroke), 0u);
+}
+
+void testSymbolKeyboardPages() {
+  // `shifted` pages the symbols layers: page one ("?123") and page two ("#+=").
+  const KeyboardLayout& page1 = builtinKeyboardLayout(KeyboardLayoutId::QwertyEn, false, true);
+  const KeyboardLayout& page2 = builtinKeyboardLayout(KeyboardLayoutId::QwertyEn, true, true);
+  CHECK(&page1 != &page2);
+  CHECK(std::strcmp(page1.rows[2].keys[0].label, "#+=") == 0);   // shift slot pages forward
+  CHECK(std::strcmp(page2.rows[2].keys[0].label, "123") == 0);   // ...and back
+  CHECK(std::strcmp(page1.rows[3].keys[0].label, "ABC") == 0);   // mode slot exits to letters
+  CHECK(std::strcmp(page2.rows[3].keys[0].label, "ABC") == 0);
+
+  // The four English layers together cover every printable ASCII character.
+  bool covered[128] = {};
+  covered[' '] = true;  // the space key emits value 32 (QWERTY_KEY_SPACE)
+  const KeyboardLayout* layers[] = {
+      &builtinKeyboardLayout(KeyboardLayoutId::QwertyEn, false, false),
+      &builtinKeyboardLayout(KeyboardLayoutId::QwertyEn, true, false),
+      &page1,
+      &page2,
+  };
+  for (const KeyboardLayout* layout : layers) {
+    for (uint8_t row = 0; row < layout->rowCount; ++row) {
+      for (uint8_t col = 0; col < layout->rows[row].count; ++col) {
+        const char* out = layout->rows[row].keys[col].output;
+        if (out && out[0] > 0 && out[1] == 0) covered[static_cast<int>(out[0])] = true;
+      }
+    }
+  }
+  for (int c = 0x20; c <= 0x7E; ++c) CHECK(covered[c]);
+}
+
+void testKeyboardEntry() {
+  char buf[12] = "";
+  KeyboardEntry kb;
+  kb.attach(buf, sizeof buf, /*startShifted=*/true);
+
+  // Shift auto-releases after one letter.
+  CHECK(kb.key('H'));
+  CHECK(!kb.shifted);
+  CHECK(kb.key('i'));
+  CHECK(std::strcmp(buf, "Hi") == 0);
+  CHECK_EQ(kb.length(), 2u);
+
+  // Space keys carry KeyKind::Space with a null layout output (they draw a
+  // glyph, not a label) but must still insert a space.
+  CHECK(kb.key(QWERTY_KEY_SPACE));
+  CHECK(std::strcmp(buf, "Hi ") == 0);
+  CHECK(kb.backspace());
+  CHECK(std::strcmp(buf, "Hi") == 0);
+
+  // Symbols: mode() enters, shift() pages, layers stay sticky across keys.
+  kb.mode();
+  CHECK(kb.symbols);
+  CHECK(kb.key('1'));
+  CHECK(kb.symbols);
+  kb.shift();  // page two ("#+=")
+  CHECK(kb.key('['));
+  CHECK(std::strcmp(buf, "Hi1[") == 0);
+  kb.mode();  // back to letters
+  CHECK(!kb.symbols);
+  CHECK(!kb.shifted);
+
+  // Localized keys insert the layout's UTF-8 output, and backspace removes
+  // the whole code point — the (char)value cast this replaces corrupted both.
+  kb.layout = KeyboardLayoutId::SpanishEs;
+  CHECK(kb.key(1201));  // ñ
+  CHECK(std::strcmp(buf, "Hi1[\xc3\xb1") == 0);
+  CHECK(kb.backspace());
+  CHECK(std::strcmp(buf, "Hi1[") == 0);
+
+  // Full buffer: append fails, contents stay intact and terminated.
+  kb.attach(buf, 3);  // resumes from "Hi1[" truncated view: len clamps to cap-1
+  CHECK_EQ(kb.length(), 2u);
+  CHECK(!kb.key('x'));
+  CHECK_EQ(kb.length(), 2u);
+
+  // Unknown ids (shift/mode/delete key values) insert nothing.
+  kb.attach(buf, sizeof buf);
+  CHECK(!kb.key(QWERTY_KEY_MODE));
+}
+
+void testNumberRowLayouts() {
+  // numberRow prepends a digit row to every letter layer; symbols ignore it.
+  const KeyboardLayout& en = builtinKeyboardLayout(KeyboardLayoutId::QwertyEn, false, false, true);
+  CHECK_EQ(en.rowCount, 5);
+  CHECK(std::strcmp(en.rows[0].keys[0].output, "1") == 0);
+  CHECK(std::strcmp(en.rows[0].keys[0].alt, "!") == 0);
+  CHECK(std::strcmp(en.rows[1].keys[0].output, "q") == 0);
+
+  // Shifted English swaps the digit/symbol pairs (symbol primary, digit alt).
+  const KeyboardLayout& enShift = builtinKeyboardLayout(KeyboardLayoutId::QwertyEn, true, false, true);
+  CHECK_EQ(enShift.rowCount, 5);
+  CHECK(std::strcmp(enShift.rows[0].keys[0].output, "!") == 0);
+  CHECK(std::strcmp(enShift.rows[0].keys[0].alt, "1") == 0);
+  CHECK(std::strcmp(enShift.rows[1].keys[0].output, "Q") == 0);
+
+  // Localized letter layers gain the same digit row.
+  const KeyboardLayout& fr = builtinKeyboardLayout(KeyboardLayoutId::AzertyFr, false, false, true);
+  CHECK_EQ(fr.rowCount, 5);
+  CHECK(std::strcmp(fr.rows[1].keys[0].output, "a") == 0);
+
+  // Symbols pages already carry digits: numberRow is a no-op there.
+  CHECK_EQ(builtinKeyboardLayout(KeyboardLayoutId::QwertyEn, false, true, true).rowCount, 4);
+
+  // Alt lookup: digit ids resolve to their long-press symbol; letters flip
+  // case (see testKeyboardAltCaseFlip); non-normal keys return nullptr.
+  CHECK(std::strcmp(keyboardAltOutputFor(en, '1'), "!") == 0);
+  CHECK(std::strcmp(keyboardAltOutputFor(en, 'q'), "Q") == 0);
+  CHECK(keyboardAltOutputFor(en, QWERTY_KEY_BACKSPACE) == nullptr);
+}
+
+void testKeyboardEntryLongPressAlt() {
+  char buf[8] = "";
+  KeyboardEntry kb;
+  kb.numberRow = true;
+  kb.attach(buf, sizeof buf);
+
+  CHECK(kb.key('1'));
+  CHECK(kb.key('1', /*longPress=*/true));  // alt output
+  CHECK(std::strcmp(buf, "1!") == 0);
+
+  // Letters without an explicit alt flip case on long-press.
+  CHECK(kb.key('q', /*longPress=*/true));
+  CHECK(std::strcmp(buf, "1!Q") == 0);
+}
+
+void testKeyboardAltCaseFlip() {
+  const KeyboardLayout& en = builtinKeyboardLayout(KeyboardLayoutId::QwertyEn);
+  CHECK(std::strcmp(keyboardAltOutputFor(en, 'q'), "Q") == 0);
+  const KeyboardLayout& enShift = builtinKeyboardLayout(KeyboardLayoutId::QwertyEn, true);
+  CHECK(std::strcmp(keyboardAltOutputFor(enShift, 'Q'), "q") == 0);
+  // Non-letters without an explicit alt still have none; special keys never do.
+  const KeyboardLayout& sym = builtinKeyboardLayout(KeyboardLayoutId::QwertyEn, false, true);
+  CHECK(keyboardAltOutputFor(sym, '/') == nullptr);
+  CHECK(keyboardAltOutputFor(en, QWERTY_KEY_BACKSPACE) == nullptr);
+}
+
+void testTouchHoldRouter() {
+  InteractionBuffer<8> interactions;
+  const auto rebuild = [&] {
+    interactions.clear();
+    interactions.addInteraction(Interaction{Rect{10, 10, 40, 40}, 1, 'q',
+                                            static_cast<uint16_t>(InputTouch | InputLongPress), StateNormal, 0});
+    interactions.addInteraction(Interaction{Rect{60, 10, 40, 40}, 1, QWERTY_KEY_BACKSPACE,
+                                            static_cast<uint16_t>(InputTouch | InputLongPress), StateNormal, 0});
+  };
+  rebuild();
+
+  TouchHoldRouter router;
+
+  // Quick tap: no hold event while down, tap release dispatches once.
+  auto r = router.update(interactions, true, 20, 20, false, 0, 0, true, 1000);
+  CHECK(!r.event);
+  CHECK(r.activeChanged);
+  r = router.update(interactions, false, 0, 0, true, 20, 20, false, 1100);
+  CHECK_EQ(r.event.value, 'q');
+  CHECK(!r.event.longPress);
+
+  // Hold past the threshold: long-press fires exactly once at threshold and
+  // the timer must NOT re-arm on later frames (the repeat bug), and the real
+  // release is swallowed.
+  r = router.update(interactions, true, 20, 20, false, 0, 0, true, 2000);
+  CHECK(!r.event);
+  r = router.update(interactions, true, 20, 20, false, 0, 0, true, 2360);
+  CHECK_EQ(r.event.value, 'q');
+  CHECK(r.event.longPress);
+  r = router.update(interactions, true, 20, 20, false, 0, 0, true, 2800);
+  CHECK(!r.event);
+  r = router.update(interactions, true, 20, 20, false, 0, 0, true, 3300);
+  CHECK(!r.event);
+  r = router.update(interactions, false, 0, 0, true, 20, 20, false, 3400);
+  CHECK(!r.event);  // swallowed
+
+  // Delete key uses the longer threshold.
+  r = router.update(interactions, true, 70, 20, false, 0, 0, true, 4000);
+  r = router.update(interactions, true, 70, 20, false, 0, 0, true, 4500);
+  CHECK(!r.event);  // 500ms < 900ms override
+  r = router.update(interactions, true, 70, 20, false, 0, 0, true, 4950);
+  CHECK_EQ(r.event.value, QWERTY_KEY_BACKSPACE);
+  CHECK(r.event.longPress);
+  router.reset();
+
+  // Sliding onto another key restarts the hold timer.
+  r = router.update(interactions, true, 20, 20, false, 0, 0, true, 6000);
+  r = router.update(interactions, true, 70, 20, false, 0, 0, true, 6300);
+  CHECK(r.activeChanged);
+  r = router.update(interactions, true, 70, 20, false, 0, 0, true, 6500);
+  CHECK(!r.event);  // only 200ms on the new key
+  router.reset();
+
+  // Contact drifting into a swipe clears the active highlight.
+  r = router.update(interactions, true, 20, 20, false, 0, 0, true, 7000);
+  CHECK(interactions.activeIndex() >= 0);
+  r = router.update(interactions, false, 0, 0, false, 0, 0, false, 7100);
+  CHECK(r.activeChanged);
+  CHECK(interactions.activeIndex() < 0);
+
+  // Release drifting off the pressed key (within tap slop) still dispatches
+  // the key the press landed on — finger occlusion drops releases low.
+  r = router.update(interactions, true, 20, 20, false, 0, 0, true, 8000);
+  r = router.update(interactions, false, 0, 0, true, 20, 55, false, 8100);  // below the key
+  CHECK_EQ(r.event.value, 'q');
+  CHECK(!r.event.longPress);
+}
+
+void testKeyboardBottomHitOverflow() {
+  FakeDrawTarget draw;
+  DeviceContext device = makeDevice();
+  InputSnapshot input;
+
+  const auto hitBottomFor = [&](const int16_t overflow, const int16_t value) {
+    InteractionBuffer<48> interactions;
+    Frame<48> frame(draw, device, input, interactions);
+    KeyboardProps props;
+    props.layout = &builtinKeyboardLayout(KeyboardLayoutId::QwertyEn);
+    props.keyAction = 77;
+    props.bottomHitOverflow = overflow;
+    keyboard(frame, Rect{0, 0, 480, 200}, props);
+    for (size_t i = 0; i < interactions.count(); ++i) {
+      const Interaction& it = interactions.data()[i];
+      if (it.value == value) return it.rect.bottom();
+    }
+    return static_cast<int16_t>(-1);
+  };
+
+  // The overflow extends only the last row's hit band.
+  CHECK_EQ(hitBottomFor(20, QWERTY_KEY_ENTER), hitBottomFor(0, QWERTY_KEY_ENTER) + 20);
+  CHECK_EQ(hitBottomFor(20, 'q'), hitBottomFor(0, 'q'));
+}
+
+void testHeaderLeadingButton() {
+  FakeDrawTarget draw;
+  DeviceContext device = makeDevice();
+  InputSnapshot input;
+  InteractionBuffer<8> interactions;
+  Frame<8> frame(draw, device, input, interactions);
+
+  HeaderProps props;
+  props.title = "Settings";
+  props.centered = true;
+  props.borderEdges = EdgeBottom;
+  props.leadingIcon = lucideDeleteIcon16();  // any bitmap works as the icon
+  props.leadingAction = 500;
+  header(frame, Rect{0, 0, 240, 44}, props);
+
+  // The leading button registers its action and draws the icon.
+  CHECK_EQ(interactions.count(), 1u);
+  CHECK_EQ(interactions.data()[0].action, 500);
+  CHECK(interactions.data()[0].rect.width >= 36);
+  CHECK(draw.countKind(FakeDrawTarget::Op::Bitmap) >= 1u);
+
+  // Without a leading action the header registers nothing.
+  InteractionBuffer<8> plain;
+  Frame<8> plainFrame(draw, device, input, plain);
+  HeaderProps bare;
+  bare.title = "Settings";
+  header(plainFrame, Rect{0, 0, 240, 44}, bare);
+  CHECK_EQ(plain.count(), 0u);
 }
 
 void testScreenKeyboardUsesResponsiveHeight() {
@@ -1900,8 +2319,10 @@ void testHeaderBorderEdges() {
   theme.headerHeight = 20;
   Screen<8> screen(frame, theme);
 
+  // The themed header supplies a 1px divider when the theme's popup style has
+  // no border of its own, so default headers match the documented divider.
   screen.header("Top");
-  CHECK_EQ(draw.countKind(FakeDrawTarget::Op::Line), 0u);
+  CHECK_EQ(draw.countKind(FakeDrawTarget::Op::Line), 1u);
   CHECK_EQ(draw.countKind(FakeDrawTarget::Op::Stroke), 0u);
 
   FakeDrawTarget boxedDraw;
@@ -2116,12 +2537,14 @@ void testTextArea() {
 int main() {
   testRect();
   testDisplayTarget();
+  testDisplayTargetAlphaFont();
   testStackFillsExactly();
   testStackFlexRemainderWithTrailingFixed();
   testStackGaps();
   testEnsureMinTouchRect();
   testTouchRouting();
   testDisabledSkipsTouch();
+  testLongPressRouting();
   testFocusNavigationWrapsAndSkips();
   testConfirmIgnoresStaleFocus();
   testConfirmRespectsInputMask();
@@ -2129,6 +2552,7 @@ int main() {
   testListHelpers();
   testListVirtualization();
   testListClampsBadTopIndex();
+  testListCanUseFullTitleWidthWithShortValue();
   testButtonRegistersExpandedHit();
   testProgressBarClamps();
   testBatteryIndicator();
@@ -2156,6 +2580,14 @@ int main() {
   testLvglParityControls();
   testQwertyKeyboardComponent();
   testLocalizedKeyboardLayout();
+  testSymbolKeyboardPages();
+  testKeyboardEntry();
+  testNumberRowLayouts();
+  testKeyboardEntryLongPressAlt();
+  testKeyboardAltCaseFlip();
+  testTouchHoldRouter();
+  testKeyboardBottomHitOverflow();
+  testHeaderLeadingButton();
   testScreenKeyboardUsesResponsiveHeight();
   testEReaderChromeMenusAndPanels();
   testEReaderBookSurfaces();
