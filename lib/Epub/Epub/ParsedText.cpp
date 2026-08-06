@@ -1042,7 +1042,16 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
                                              firstCodepoint(words[lastBreakAt + wordIdx + 1]),
                                              wordStyles[lastBreakAt + wordIdx]);
       }
-      if (blockStyle.alignment == CssTextAlign::Justify && !isLastLine) {
+      // Stretch only the boundaries the gap-count loop above actually counted.
+      // Counting and applying MUST use the same set: justifyExtra is
+      // spareSpace/actualGapCount, so applying it at boundaries that were not
+      // counted overshoots the line by (applied - counted) * justifyExtra. A
+      // CJK boundary carries no space and is not counted, so it gets no stretch
+      // either. Also requires a following word -- adding stretch after the last
+      // word on the line spends a gap that does not exist.
+      const bool nextGapIsStretchable =
+          wordIdx + 1 < lineWordCount && !noSpaceBeforeVec[lastBreakAt + wordIdx + 1];
+      if (blockStyle.alignment == CssTextAlign::Justify && !isLastLine && nextGapIsStretchable) {
         gap += justifyExtra;
       }
       xpos += wordWidths[lastBreakAt + wordIdx] + gap;
