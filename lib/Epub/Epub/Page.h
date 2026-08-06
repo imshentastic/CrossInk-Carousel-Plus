@@ -10,6 +10,11 @@
 #include "blocks/ImageBlock.h"
 #include "blocks/TextBlock.h"
 
+// v18.9.9.479: serialization writes go through a small RAM buffer instead of one
+// SdFat call per field. Only a reference is needed here; the full definition
+// lives in <BufferedFileWriter.h>, included by the .cpp files that write.
+class BufferedFileWriter;
+
 enum PageElementTag : uint8_t {
   TAG_PageLine = 1,
   TAG_PageImage = 2,  // New tag
@@ -25,7 +30,7 @@ class PageElement {
   explicit PageElement(const int16_t xPos, const int16_t yPos) : xPos(xPos), yPos(yPos) {}
   virtual ~PageElement() = default;
   virtual void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset, bool foregroundBlack = true) = 0;
-  virtual bool serialize(FsFile& file) = 0;
+  virtual bool serialize(BufferedFileWriter& file) = 0;
   virtual PageElementTag getTag() const = 0;  // Add type identification
 };
 
@@ -38,7 +43,7 @@ class PageLine final : public PageElement {
       : PageElement(xPos, yPos), block(std::move(block)) {}
   const std::shared_ptr<TextBlock>& getBlock() const { return block; }
   void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset, bool foregroundBlack = true) override;
-  bool serialize(FsFile& file) override;
+  bool serialize(BufferedFileWriter& file) override;
   PageElementTag getTag() const override { return TAG_PageLine; }
   static std::unique_ptr<PageLine> deserialize(FsFile& file);
 };
@@ -55,7 +60,7 @@ class PageImage final : public PageElement {
   // BT when the caller has verified prebake fingerprint + .pxc manifest are
   // safe. Delegates to ImageBlock::renderIfCached (no decoder fallback).
   void renderIfCached(GfxRenderer& renderer, int xOffset, int yOffset);
-  bool serialize(FsFile& file) override;
+  bool serialize(BufferedFileWriter& file) override;
   PageElementTag getTag() const override { return TAG_PageImage; }
   static std::unique_ptr<PageImage> deserialize(FsFile& file);
   const ImageBlock& getImageBlock() const { return *imageBlock; }
@@ -70,7 +75,7 @@ class PageHorizontalRule final : public PageElement {
       : PageElement(xPos, yPos), width(width), thickness(thickness) {}
 
   void render(GfxRenderer& renderer, int fontId, int xOffset, int yOffset, bool foregroundBlack = true) override;
-  bool serialize(FsFile& file) override;
+  bool serialize(BufferedFileWriter& file) override;
   PageElementTag getTag() const override { return TAG_PageHorizontalRule; }
   static std::unique_ptr<PageHorizontalRule> deserialize(FsFile& file);
 };
@@ -80,7 +85,7 @@ struct TableFragmentCell {
   bool isHeader = false;
   std::vector<std::shared_ptr<TextBlock>> lines;
 
-  bool serialize(FsFile& file) const;
+  bool serialize(BufferedFileWriter& file) const;
   static bool deserialize(FsFile& file, TableFragmentCell& outCell);
 };
 
@@ -90,7 +95,7 @@ struct TableFragmentRow {
   bool headerSeparator = false;
   std::vector<TableFragmentCell> cells;
 
-  bool serialize(FsFile& file) const;
+  bool serialize(BufferedFileWriter& file) const;
   static bool deserialize(FsFile& file, TableFragmentRow& outRow);
 };
 
@@ -125,7 +130,7 @@ class PageTableFragment final : public PageElement {
   // as tables in the first place.
   void renderContentOnly(GfxRenderer& renderer, int fontId, int xOffset, int yOffset,
                          bool foregroundBlack = true);
-  bool serialize(FsFile& file) override;
+  bool serialize(BufferedFileWriter& file) override;
   PageElementTag getTag() const override { return TAG_PageTableFragment; }
   static std::unique_ptr<PageTableFragment> deserialize(FsFile& file);
   uint16_t getHeight() const;
@@ -161,7 +166,7 @@ class Page {
   // streamed reader can cheap-skip the whole fragment (v18.9.9.20 lands the
   // skip). v41 and earlier files stay unchanged -- readers must gate the
   // size read on the file's version. Writers always pass SECTION_FILE_VERSION.
-  bool serialize(FsFile& file, uint8_t fileVersion) const;
+  bool serialize(BufferedFileWriter& file, uint8_t fileVersion) const;
   static std::unique_ptr<Page> deserialize(FsFile& file, uint8_t fileVersion);
 
   // Check if page contains any images (used to force full refresh)

@@ -20,6 +20,7 @@
 #include "Epub/converters/ImageDecoderFactory.h"
 #include "Epub/converters/ImageToFramebufferDecoder.h"
 #include "Epub/htmlEntities.h"
+#include "Epub/IndexProfile.h"
 #include "Epub/parsers/ChapterHtmlSlimParserGuards.h"
 
 // v18.9.3/v18.9.6: two independent sources for the table guard, ORed at
@@ -121,30 +122,26 @@ static constexpr const char* const SKIP_TAGS[] = {"head"};
 
 bool isWhitespace(const char c) { return c == ' ' || c == '\r' || c == '\n' || c == '\t'; }
 
-// CrumBLE 4.5.3 CJK: identifies Unicode codepoints that should be emitted
-// as standalone word tokens by the parser, so the existing word-based
-// line-breaker wraps at every CJK character (matching standard typography).
-// Without this, paragraphs without ASCII whitespace -- the norm for
-// Chinese / Japanese / Korean -- hit only the MAX_WORD_SIZE-driven flush
-// and wrap at ~64-char chunks instead of per-character.
-//
-// Ranges follow aBER0724/crosspoint-reader-cjk:
-//   U+3000..303F   CJK Punctuation
-//   U+3040..309F   Hiragana
-//   U+30A0..30FF   Katakana
-//   U+3400..4DBF   CJK Unified Ideographs Extension A
-//   U+4E00..9FFF   CJK Unified Ideographs (the big block)
-//   U+F900..FAFF   CJK Compatibility Ideographs
-//   U+FF00..FFEF   Fullwidth Forms (includes fullwidth ASCII + Halfwidth Katakana)
-bool isCjkCodepointForSplit(const uint32_t cp) {
-  if (cp >= 0x4E00 && cp <= 0x9FFF) return true;
-  if (cp >= 0x3400 && cp <= 0x4DBF) return true;
-  if (cp >= 0x3000 && cp <= 0x303F) return true;
-  if (cp >= 0x3040 && cp <= 0x309F) return true;
-  if (cp >= 0x30A0 && cp <= 0x30FF) return true;
-  if (cp >= 0xF900 && cp <= 0xFAFF) return true;
-  if (cp >= 0xFF00 && cp <= 0xFFEF) return true;
-  return false;
+// Last *complete* UTF-8 codepoint in buf[0, len), or 0 when the buffer is empty
+// or ends mid-sequence. Never reads past `len`.
+uint32_t lastCompleteCodepoint(const char* buf, const int len) {
+  if (len <= 0) return 0;
+  int i = len - 1;
+  while (i > 0 && (static_cast<uint8_t>(buf[i]) & 0xC0) == 0x80) {
+    --i;
+  }
+  const uint8_t b0 = static_cast<uint8_t>(buf[i]);
+  int seqLen = 1;
+  if ((b0 & 0xE0) == 0xC0) {
+    seqLen = 2;
+  } else if ((b0 & 0xF0) == 0xE0) {
+    seqLen = 3;
+  } else if ((b0 & 0xF8) == 0xF0) {
+    seqLen = 4;
+  }
+  if (i + seqLen != len) return 0;  // truncated tail, not a usable codepoint
+  const auto* ptr = reinterpret_cast<const unsigned char*>(buf + i);
+  return utf8NextCodepoint(&ptr);
 }
 
 bool matches(const char* tag_name, const char* const* possible_tags, size_t count) {
@@ -1067,6 +1064,7 @@ void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char*
                 // Get image dimensions
                 ImageDimensions dims = {0, 0};
                 ImageToFramebufferDecoder* decoder = ImageDecoderFactory::getDecoder(cachedImagePath);
+                IXPROF_SCOPE(IMAGE);
                 if (decoder && getImageDimensionsWithRetries(*decoder, cachedImagePath, dims)) {
                   LOG_DBG("EHP", "Image dimensions: %dx%d", dims.width, dims.height);
 
@@ -1743,62 +1741,24 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
       continue;
     }
 
-    // CrumBLE 4.5.3 CJK: detect Han / kana / fullwidth codepoints and emit
-    // each as its own word token. The smart-quote / em-dash substitution
-    // below covers U+2010..2027 (Latin range, not CJK) so they don't
-    // collide. Fullwidth ASCII variants (U+FF01..FF5E) DO fall in the CJK
-    // range and are intentionally kept as-is here so they render with the
-    // CJK font's glyph instead of being ASCII-substituted (only relevant
-    // when reading a mixed CJK book).
-    {
-      const unsigned char b0 = static_cast<unsigned char>(s[i]);
-      int charLen = 0;
-      if ((b0 & 0x80) == 0) charLen = 1;
-      else if ((b0 & 0xE0) == 0xC0) charLen = 2;
-      else if ((b0 & 0xF0) == 0xE0) charLen = 3;
-      else if ((b0 & 0xF8) == 0xF0) charLen = 4;
-      if (charLen >= 2 && i + charLen <= len) {
-        uint32_t cp = 0;
-        if (charLen == 2) {
-          cp = (static_cast<uint32_t>(b0 & 0x1F) << 6) |
-               (static_cast<uint32_t>(static_cast<unsigned char>(s[i + 1])) & 0x3Fu);
-        } else if (charLen == 3) {
-          cp = (static_cast<uint32_t>(b0 & 0x0F) << 12) |
-               ((static_cast<uint32_t>(static_cast<unsigned char>(s[i + 1])) & 0x3Fu) << 6) |
-               (static_cast<uint32_t>(static_cast<unsigned char>(s[i + 2])) & 0x3Fu);
-        } else {
-          cp = (static_cast<uint32_t>(b0 & 0x07) << 18) |
-               ((static_cast<uint32_t>(static_cast<unsigned char>(s[i + 1])) & 0x3Fu) << 12) |
-               ((static_cast<uint32_t>(static_cast<unsigned char>(s[i + 2])) & 0x3Fu) << 6) |
-               (static_cast<uint32_t>(static_cast<unsigned char>(s[i + 3])) & 0x3Fu);
-        }
-        // Ideographic space (U+3000) is a real word boundary -- same shape
-        // as the ASCII whitespace branch above.
-        if (cp == 0x3000) {
-          if (self->partWordBufferIndex > 0) {
-            self->flushPartWordBuffer();
-          }
-          self->nextWordContinues = false;
-          i += charLen - 1;  // outer i++ consumes the last byte
-          continue;
-        }
-        if (isCjkCodepointForSplit(cp)) {
-          // Flush any buffered Latin (mixed-run case), then emit this CJK
-          // char through partWordBuffer + flushPartWordBuffer so the
-          // active CSS font style (italic/bold/etc) is preserved -- the
-          // flush helper reads currentCssStyle. Calling addWord() directly
-          // would lose that and force REGULAR.
-          if (self->partWordBufferIndex > 0) {
-            self->flushPartWordBuffer();
-          }
-          for (int j = 0; j < charLen; j++) {
-            self->partWordBuffer[self->partWordBufferIndex++] = s[i + j];
-          }
-          self->flushPartWordBuffer();
-          i += charLen - 1;
-          continue;
-        }
+    // Ideographic space (U+3000, UTF-8 E3 80 80) is a real word boundary — the
+    // CJK analogue of the ASCII whitespace branch above.
+    //
+    // Every other CJK character is deliberately left in partWordBuffer so the
+    // whole run reaches ParsedText::addWord intact. addWord (upstream #2288) is
+    // what splits a run into per-character tokens, and it is the only place that
+    // can also mark each joint "breakable but no synthetic space" and apply the
+    // kinsoku no-break rules. Re-introducing a parser-level per-character split
+    // here would hide those runs from addWord and bring back a full space
+    // advance between every ideograph.
+    if (i + 2 < len && static_cast<uint8_t>(s[i]) == 0xE3 && static_cast<uint8_t>(s[i + 1]) == 0x80 &&
+        static_cast<uint8_t>(s[i + 2]) == 0x80) {
+      if (self->partWordBufferIndex > 0) {
+        self->flushPartWordBuffer();
       }
+      self->nextWordContinues = false;
+      i += 2;  // outer i++ consumes the third byte
+      continue;
     }
 
     // CrumBLE 4.4 task #28: typographic punctuation -> ASCII substitution.
@@ -1904,6 +1864,15 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
     if (self->partWordBufferIndex >= MAX_WORD_SIZE) {
       int safeLen = utf8SafeTruncateBuffer(self->partWordBuffer, self->partWordBufferIndex);
 
+      // This cut is an artifact of the fixed buffer, not a real word boundary.
+      // For a CJK run that matters: flushPartWordBuffer() clears nextWordContinues,
+      // so without this the next chunk would arrive at addWord detached and pick up
+      // a full space advance every ~66 ideographs. Re-arming the flag lets addWord
+      // classify the joint (breakable-but-solid, or no-break in front of a closer)
+      // exactly as it does inside a single run. Latin tokens are left alone so the
+      // long-token behaviour is unchanged.
+      const bool cjkJoint = utf8IsCjkBreakable(lastCompleteCodepoint(self->partWordBuffer, safeLen));
+
       if (safeLen < self->partWordBufferIndex && safeLen > 0) {
         // Incomplete UTF-8 sequence at the end — save it before flushing
         int overflow = self->partWordBufferIndex - safeLen;
@@ -1919,6 +1888,10 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
         self->partWordBufferIndex = overflow;
       } else {
         self->flushPartWordBuffer();
+      }
+
+      if (cjkJoint) {
+        self->nextWordContinues = true;
       }
     }
 
@@ -2166,6 +2139,7 @@ bool ChapterHtmlSlimParser::beginParse() {
 }
 
 ChapterHtmlSlimParser::ParseStatus ChapterHtmlSlimParser::parseStep() {
+  IXPROF_SCOPE(TOTAL);
   void* const buf = XML_GetBuffer(xmlParser_, PARSE_BUFFER_SIZE);
   if (!buf) {
     LOG_ERR("EHP", "Couldn't allocate memory for buffer");
@@ -2279,7 +2253,44 @@ bool ChapterHtmlSlimParser::parseAndBuildPages() {
 }
 
 void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line) {
-  const int lineHeight = renderer.getLineHeight(fontId) * lineCompression;
+  int lineHeight = renderer.getLineHeight(fontId) * lineCompression;
+#ifdef CJK_VARIANT
+  // tiny-cjk: hanzi on this line render from the fixed-size flash CJK face,
+  // not the selected Latin family, so a line that contains CJK gets
+  // max(latin, cjk) vertical space. baselineShift then pushes the line's
+  // stored y down so the CJK ascender stays inside this line's box --
+  // drawText places the baseline at yPos + latin ascender, which for small
+  // Latin sizes would otherwise let a taller CJK glyph overdraw the line
+  // above. Pure-Latin lines take neither branch and lay out exactly as the
+  // main build does.
+  int baselineShift = 0;
+  if (const EpdFontFamily* cjkFb = EpdFontFamily::cjkFallbackFamily()) {
+    bool lineHasCjk = false;
+    const auto& fontMap = renderer.getFontMap();
+    const auto primaryIt = fontMap.find(fontId);
+    const EpdFontFamily* primary = primaryIt != fontMap.end() ? &primaryIt->second : nullptr;
+    const WordsView words = line->getWords();
+    for (size_t i = 0; i < words.size() && !lineHasCjk; ++i) {
+      const WordView word = words[i];
+      if (word.empty()) continue;
+      // The 4.5.3 parser emits every CJK char as its own single-char word,
+      // so probing the first codepoint of each word is exhaustive.
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(word.c_str());
+      const uint32_t cp = utf8NextCodepoint(&p);
+      if (cp != 0 && (primary == nullptr || primary->findGlyphData(cp, EpdFontFamily::REGULAR).glyph == nullptr) &&
+          cjkFb->findGlyphData(cp, EpdFontFamily::REGULAR).glyph != nullptr) {
+        lineHasCjk = true;
+      }
+    }
+    if (lineHasCjk) {
+      const EpdFontData* cjkData = cjkFb->getData(EpdFontFamily::REGULAR);
+      const int cjkLineHeight = static_cast<int>(cjkData->advanceY * lineCompression);
+      if (cjkLineHeight > lineHeight) lineHeight = cjkLineHeight;
+      const int ascenderDelta = cjkData->ascender - renderer.getFontAscenderSize(fontId);
+      if (ascenderDelta > 0) baselineShift = ascenderDelta;
+    }
+  }
+#endif
 
   if (!currentPage) {
     currentPage.reset(new Page());
@@ -2287,7 +2298,10 @@ void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line) {
   }
 
   if (currentPageNextY + lineHeight > viewportHeight) {
-    completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex);
+    {
+      IXPROF_SCOPE(PAGEOUT);
+      completePageFn(std::move(currentPage), xpathParagraphIndex, xpathListItemIndex);
+    }
     completedPageCount++;
     currentPage.reset(new Page());
     currentPageNextY = 0;
@@ -2304,7 +2318,11 @@ void ChapterHtmlSlimParser::addLineToPage(std::shared_ptr<TextBlock> line) {
 
   // Apply horizontal left inset (margin + padding) as x position offset
   const int16_t xOffset = line->getBlockStyle().leftInset();
+#ifdef CJK_VARIANT
+  currentPage->elements.push_back(std::make_unique<PageLine>(line, xOffset, currentPageNextY + baselineShift));
+#else
   currentPage->elements.push_back(std::make_unique<PageLine>(line, xOffset, currentPageNextY));
+#endif
   currentPageNextY += lineHeight;
 }
 

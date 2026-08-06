@@ -627,10 +627,26 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
   // SD-card fonts can measure from their persistent advance table during layout.
   auto sdIt = sdCardFonts_.find(fontId);
   if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
+    // Upstream #2288: SdCardFont::getAdvance returns 0 for any codepoint the
+    // font lacks, and this fast path otherwise bypasses the whole glyph
+    // fallback chain -- so a CJK book on a Latin-only SD font measured every
+    // ideograph as zero width. That both stacks the glyphs at a single x AND
+    // degenerates the line breaker's DP to O(n^2), because a line made of
+    // zero-width words never overflows the page. Fall back to the family
+    // lookup (which reaches the flash CJK face under CJK_VARIANT, and the SD
+    // miss handler otherwise) whenever the table has no advance. Combining
+    // marks legitimately advance by zero, so they keep the table's answer.
     int32_t widthFP = 0;
     const uint8_t styleIdx = resolveSdCardStyle(*sdIt->second, style);
+    const auto advFontIt = fontMap.find(fontId);
+    const EpdFontFamily* advFamily = advFontIt != fontMap.end() ? &advFontIt->second : nullptr;
     while (uint32_t cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text))) {
-      widthFP += sdIt->second->getAdvance(cp, styleIdx);
+      int32_t advFP = sdIt->second->getAdvance(cp, styleIdx);
+      if (advFP == 0 && advFamily != nullptr && !utf8IsCombiningMark(cp)) {
+        const EpdGlyph* glyph = advFamily->getGlyph(cp, style);
+        advFP = glyph ? glyph->advanceX : 0;
+      }
+      widthFP += advFP;
     }
     return fp4::toPixel(widthFP);
   }
@@ -3117,10 +3133,19 @@ int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, EpdFontFami
   // where kern/lig data was not loaded.
   auto sdIt = sdCardFonts_.find(fontId);
   if (sdIt != sdCardFonts_.end() && sdIt->second->hasAdvanceTable()) {
+    // Same zero-advance fallback as getTextWidth above -- see the note there.
+    // Upstream fixed only this site; both share the fast path and the bug.
     int32_t widthFP = 0;
     const uint8_t styleIdx = resolveSdCardStyle(*sdIt->second, style);
+    const auto advFontIt = fontMap.find(fontId);
+    const EpdFontFamily* advFamily = advFontIt != fontMap.end() ? &advFontIt->second : nullptr;
     while (uint32_t cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text))) {
-      widthFP += sdIt->second->getAdvance(cp, styleIdx);
+      int32_t advFP = sdIt->second->getAdvance(cp, styleIdx);
+      if (advFP == 0 && advFamily != nullptr && !utf8IsCombiningMark(cp)) {
+        const EpdGlyph* glyph = advFamily->getGlyph(cp, style);
+        advFP = glyph ? glyph->advanceX : 0;
+      }
+      widthFP += advFP;
     }
     return fp4::toPixel(widthFP);
   }

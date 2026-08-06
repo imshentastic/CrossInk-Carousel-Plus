@@ -248,6 +248,52 @@ EpdFontFamily::GlyphData EpdFontFamily::getGlyphData(const uint32_t cp, const St
     return glyphData;
   }
 
+#ifdef CJK_VARIANT
+  // tiny-cjk: consult the flash CJK face BEFORE the SD miss handler below.
+  // Two reasons, both load-bearing:
+  //
+  //  1. Correctness. EpdFont::getGlyph falls back to getGlyph(REPLACEMENT_GLYPH)
+  //     when the miss handler comes up empty, and most SD fonts ship U+FFFD --
+  //     so for a Latin-only SD font every hanzi returned that font's tofu box
+  //     as a *valid* glyph and the chain terminated before ever reaching the
+  //     CJK face. Field symptom: a full page of boxes with "Built-in fallback
+  //     HIT" in the log.
+  //  2. Cost. The miss handler is an SD read per glyph, and for CJK on a Latin
+  //     font it is always a futile one. The flash face answers from .rodata.
+  //
+  // Trade-off: a CJK-capable SD font now loses to the baked face for hanzi it
+  // also covers. That is the variant's whole point -- flash costs no heap and
+  // no SD contention, which is what lets Bluetooth stay up.
+  if (cp != REPLACEMENT_GLYPH) {
+    const EpdFontFamily* cjkEarly = cjkFallbackFamily();
+    if (cjkEarly != nullptr && cjkEarly != this) {
+      if (const GlyphData cjkData = cjkEarly->findGlyphData(cp, REGULAR); cjkData.glyph) {
+        return cjkData;
+      }
+      // Field puzzle: a log showed "Built-in fallback HIT cp=U+6211" even though
+      // U+6211 is covered by the baked face's 0x620A-0x6212 interval, which
+      // means this probe either did not run or did not resolve. One-shot per
+      // style, and only for codepoints the CJK tokenizer treats as CJK, so a
+      // Latin-only session stays silent.
+      static bool dumpedCjkMiss[4] = {false, false, false, false};
+      const uint8_t cjkStyleIdx = static_cast<uint8_t>(style) & 0x03;
+      if (!dumpedCjkMiss[cjkStyleIdx] && cp >= 0x2E80 && cp <= 0xFFEF) {
+        dumpedCjkMiss[cjkStyleIdx] = true;
+        LOG_INF("CJKFB", "CJK flash face MISS cp=U+%04lX style=%u this=%p cjk=%p",
+                static_cast<unsigned long>(cp), cjkStyleIdx, static_cast<const void*>(this),
+                static_cast<const void*>(cjkEarly));
+      }
+    } else {
+      static bool dumpedCjkSkip = false;
+      if (!dumpedCjkSkip && cp >= 0x2E80 && cp <= 0xFFEF) {
+        dumpedCjkSkip = true;
+        LOG_INF("CJKFB", "CJK flash face SKIPPED cp=U+%04lX (null:%d self:%d)",
+                static_cast<unsigned long>(cp), (cjkEarly == nullptr) ? 1 : 0, (cjkEarly == this) ? 1 : 0);
+      }
+    }
+  }
+#endif
+
   // CrumBLE 4.2 Option 2: SD-card lazy-load fallback. findGlyphData
   // failed for `style` -- for SD-card fonts that's the expected case for
   // BOLD / ITALIC / BOLDITALIC under lazy prewarm (only REGULAR is
@@ -334,6 +380,20 @@ EpdFontFamily::GlyphData EpdFontFamily::getGlyphData(const uint32_t cp, const St
   // fallback family (avoid infinite recursion) and when the codepoint
   // is the replacement itself (would loop on REPLACEMENT_GLYPH miss).
   if (cp != REPLACEMENT_GLYPH) {
+#ifdef CJK_VARIANT
+    // tiny-cjk: flash-resident CJK face, consulted before the SD-card UI
+    // fallback. findGlyphData on the baked family is a pure interval
+    // binary search into .rodata -- no heap, no SD, safe under BLE. The
+    // face ships REGULAR only; the style argument is deliberately not
+    // forwarded so bold/italic hanzi resolve too (visually regular, same
+    // trade-off as the SD regular-only fallback below).
+    const EpdFontFamily* cjkFb = cjkFallbackFamily();
+    if (cjkFb != nullptr && cjkFb != this) {
+      if (const GlyphData cjkData = cjkFb->findGlyphData(cp, REGULAR); cjkData.glyph) {
+        return cjkData;
+      }
+    }
+#endif
     const EpdFontFamily* fb = uiFallbackFamily();
     if (fb != nullptr && fb != this) {
       // Two-step lookup: cheap in-memory findGlyphData first, then if
@@ -466,6 +526,19 @@ void EpdFontFamily::setBuiltInFallbackFamily(const EpdFontFamily* family) {
 
 const EpdFontFamily* EpdFontFamily::builtInFallbackFamily() { return gBuiltInFallback; }
 
+#ifdef CJK_VARIANT
+namespace {
+const EpdFontFamily* gCjkFallback = nullptr;
+}
+
+void EpdFontFamily::setCjkFallbackFamily(const EpdFontFamily* family) {
+  gCjkFallback = family;
+  LOG_INF("UIFB", "CJK flash fallback %s", family ? "REGISTERED" : "CLEARED");
+}
+
+const EpdFontFamily* EpdFontFamily::cjkFallbackFamily() { return gCjkFallback; }
+#endif
+
 const EpdFontFamily* EpdFontFamily::uiFallbackFamily() {
   // CrumBLE 4.5.4 task #5C: first-miss lazy load. If a loader has been
   // armed (SdCardFontSystem::registerLazyFallback was called at boot
@@ -539,6 +612,15 @@ uint32_t EpdFontFamily::getFallbackCodepoint(const uint32_t cp, const Style styl
   // -- NOT via family-level getGlyphData, which would recurse through
   // typography substitutions back into the same REPLACEMENT_GLYPH path.
   if (cp != REPLACEMENT_GLYPH) {
+#ifdef CJK_VARIANT
+    // tiny-cjk: keep the width-probe in lockstep with getGlyphData's flash
+    // CJK fallback, mirroring the UI/built-in probes below. Without this,
+    // drawText would short-circuit hanzi to the synthetic '?' box.
+    const EpdFontFamily* cjkFb = cjkFallbackFamily();
+    if (cjkFb != nullptr && cjkFb != this) {
+      if (cjkFb->findGlyphData(cp, REGULAR).glyph) return cp;
+    }
+#endif
     const EpdFontFamily* fb = uiFallbackFamily();
     if (fb != nullptr && fb != this) {
       if (const EpdFont* fbFont = fb->getFont(style); fbFont && fbFont->getGlyph(cp)) return cp;

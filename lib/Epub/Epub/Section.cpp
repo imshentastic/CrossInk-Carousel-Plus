@@ -1,10 +1,14 @@
 #include "Section.h"
 
+#include "IndexProfile.h"
+
 #include <Arduino.h>
+#include <BufferedFileWriter.h>
 #include <FontCacheManager.h>  // v18.9.9.13: prewarm scope for streamed render
 #include <GfxRenderer.h>       // v18.9.9.13: full type for prewarm-scope integration
 #include <HalStorage.h>
 #include <Logging.h>
+#include <Memory.h>
 #include <MemoryBudget.h>
 #include <Serialization.h>
 
@@ -58,13 +62,46 @@ constexpr uint32_t SECTION_CACHE_MAGIC = 0x535843FF;  // bytes: 0xFF, "CXS"
 // alt-atlas trailer so the fingerprint check can invalidate cached sections
 // when the user toggles the Tables setting. v42 and earlier files default
 // to TABLES_DISPLAY on load (that's how they were built, so it round-trips).
-constexpr uint8_t SECTION_FILE_VERSION = 43;
+// v18.9.9.479: bump to 44. No format change -- the LAYOUT changed. Justified
+// lines were stretched at boundaries that were never counted, and PageElement
+// stores the resulting xPos, so the bad geometry is baked into every section
+// built before the fix. New firmware replaying an old cache reproduces the
+// overflow exactly, which is what "jumped instantly and still overflowed"
+// looked like in the field.
+constexpr uint8_t SECTION_FILE_VERSION = 44;
 // Oldest section file version this firmware can still read (forward-compat
 // window). v38 sections produced by v4.2.x prebakes / live caches still load
 // cleanly; their embedded glyph subset offsets default to 0 (no subset).
 // v39 sections similarly default the v40 atlas trailer to 0/0/0. Older
 // versions trigger a rebuild as before.
+// v18.9.9.479: the readable window is variant-dependent, because the layout fix
+// that forced this bump can only have affected CJK content.
+//
+// Note first: bumping SECTION_FILE_VERSION alone invalidates NOTHING. The gate
+// accepts [MIN_READABLE, CURRENT], so raising only the ceiling leaves old files
+// loading happily. A layout fix needs this floor moved, or it silently does
+// nothing for anyone who already has a cache.
+//
+// The pre-fix bug stretched justified lines at boundaries that were never
+// counted. Those boundaries are only ever created by the CJK run-splitter in
+// ParsedText (wordNoSpaceBefore is set true nowhere else), so Latin-only text
+// laid out identically before and after the fix -- byte-for-byte, since the
+// other half of the fix suppressed a stretch applied after a line's last word,
+// which is never recorded as a glyph position.
+//
+// So: the CJK variant closes the window and rebuilds once, because its users are
+// the ones holding bad geometry. Everyone else keeps their caches and sees no
+// re-index at all.
+//
+// Known gap: a non-CJK build reading a CJK book through an SD .cpfont keeps a
+// pre-fix cache and its overflow. Narrow (that combination is what the CJK
+// variant exists to replace) and self-healing -- any font or layout setting
+// change re-fingerprints the section and rebuilds it.
+#ifdef CJK_VARIANT
+constexpr uint8_t MIN_READABLE_SECTION_FILE_VERSION = 44;
+#else
 constexpr uint8_t MIN_READABLE_SECTION_FILE_VERSION = 38;
+#endif
 // How much the largest free block must have grown since a degraded build before
 // we bother rebuilding it for images (avoids rebuild churn on tiny variations).
 constexpr uint32_t SECTION_DEGRADED_REBUILD_MARGIN = 12 * 1024;
@@ -168,12 +205,37 @@ uint32_t Section::onPageComplete(std::unique_ptr<Page> page) {
     return 0;
   }
 
+  // Page offsets are recorded BEFORE any of this page's bytes are emitted, and
+  // they are what the LUT stores / loadPageFromSectionFile seeks to. The
+  // BufferedFileWriter below is constructed AFTER this read and is flushed
+  // BEFORE this function returns, so `file` is never left holding unwritten
+  // bytes across a position()/seek()/close() by anyone else. Do not move this
+  // read, and do not let the writer outlive the scope below.
+  SET_CHECKPOINT("section:pageWrite");
   const uint32_t position = file.position();
-  // v18.9.9.19: emit at SECTION_FILE_VERSION (currently 42) so on-device
-  // rebuilt sections carry the payloadSize prefix on table fragments.
-  if (!page->serialize(file, SECTION_FILE_VERSION)) {
-    LOG_ERR("SCT", "Failed to serialize page %d", pageCount);
-    return 0;
+  {
+    // v18.9.9.479: one SdFat write per serialized field cost ~500 ms per page
+    // (a ~250-word page issues ~2000 of them). Route the page through a 2 KB
+    // write-through buffer allocated once per build. Same bytes, same order,
+    // same on-disk format -- only the call granularity changes.
+    // build_ is always set while the parser is emitting pages; the nullptr
+    // buffer case (OOM at startBuild, or a page written outside a build)
+    // degrades to the old unbuffered behaviour rather than failing.
+    uint8_t* const scratch = build_ ? build_->pageWriteBuffer.get() : nullptr;
+    BufferedFileWriter writer(file, scratch, scratch ? BuildContext::PAGE_WRITE_BUFFER_BYTES : 0);
+    // v18.9.9.19: emit at SECTION_FILE_VERSION (currently 42) so on-device
+    // rebuilt sections carry the payloadSize prefix on table fragments.
+    if (!page->serialize(writer, SECTION_FILE_VERSION)) {
+      LOG_ERR("SCT", "Failed to serialize page %d", pageCount);
+      return 0;
+    }
+    // Explicit flush: the destructor also flushes, but it cannot report a
+    // short write, and a silently truncated page would corrupt every later
+    // page offset in this section.
+    if (!writer.flush()) {
+      LOG_ERR("SCT", "Failed to flush page %d to SD", pageCount);
+      return 0;
+    }
   }
   LOG_DBG("SCT", "Page %d processed (pos=%lu, free=%u, maxAlloc=%u)", pageCount, static_cast<unsigned long>(position),
           ESP.getFreeHeap(), ESP.getMaxAllocHeap());
@@ -346,7 +408,13 @@ bool Section::tryLoadFromPath(const std::string& path, const int fontId, const f
     if (version < MIN_READABLE_SECTION_FILE_VERSION || version > SECTION_FILE_VERSION) {
       // Explicit close() required: member variable persists beyond function scope
       file.close();
-      LOG_ERR("SCT", "Deserialization failed: Unknown version %u (%s)", version, path.c_str());
+      // Informational, not an error: a cache written by different firmware is
+      // the expected state after any upgrade that moves the version window, and
+      // the only consequence is one rebuild. Logging it at ERR made a healthy
+      // post-upgrade boot look like a failure and sent at least one debugging
+      // session chasing it.
+      LOG_INF("SCT", "Cache rebuild needed: version %u outside readable range %u-%u (%s)", version,
+              MIN_READABLE_SECTION_FILE_VERSION, SECTION_FILE_VERSION, path.c_str());
       return false;
     }
     fileVersion_ = version;
@@ -826,6 +894,15 @@ bool Section::startBuild(const int fontId, const float lineCompression, const ui
   ctx->tablesGuardArmed = tablesGuardArmed;
   ctx->popupFn = popupFn;
   ctx->lastPopupTickMs = millis();
+  // v18.9.9.479: 2 KB page-serialization write buffer, allocated once here and
+  // reused by every onPageComplete for the life of this build. Best-effort:
+  // indexing runs with free heap around 40-60 KB, so this should always land,
+  // but a nullptr just means page writes stay unbuffered (slow, still correct).
+  ctx->pageWriteBuffer = makeUniqueNoThrow<uint8_t[]>(BuildContext::PAGE_WRITE_BUFFER_BYTES);
+  if (!ctx->pageWriteBuffer) {
+    LOG_ERR("SCT", "Page write buffer alloc failed (%u B); falling back to unbuffered page writes",
+            static_cast<unsigned>(BuildContext::PAGE_WRITE_BUFFER_BYTES));
+  }
 
   // Derive the content base directory and image cache path prefix for the parser.
   // These live in the BuildContext because ChapterHtmlSlimParser stores them by
@@ -910,6 +987,16 @@ bool Section::buildSomeMore(const int maxPages) {
       build_->popupFn();
       build_->lastPopupTickMs = millis();
     }
+    // v18.9.9.479: name the phase AND the page so a hard freeze during chapter
+    // indexing identifies itself on the next boot. Chapter builds previously
+    // set no checkpoint at all, so a freeze in here reported whatever stale
+    // value was left over (typically "section:loadPage"), pointing at the wrong
+    // code. setLastCheckpoint is a bounded copy into RTC_NOINIT -- no
+    // allocation, safe from any task -- so per-page cost is negligible against
+    // a page that takes ~1 s to lay out.
+    char cp[32];
+    snprintf(cp, sizeof(cp), "section:build-p%d", pageCount);
+    SET_CHECKPOINT(cp);
     const auto status = build_->parser->parseStep();
     if (status == ChapterHtmlSlimParser::ParseStatus::Error) {
       LOG_ERR("SCT", "Parse error during incremental build");
@@ -937,6 +1024,9 @@ bool Section::buildSomeMore(const int maxPages) {
       // v18.9.9.76: snapshot bytes consumed at yield so estimatedTotalPages()
       // has fresh input for the "page X of ~Y" popup between ticks.
       build_->bytesConsumed = static_cast<uint32_t>(build_->parser->parseBytesConsumed());
+      // Yield boundary == one page at the default kBuildPagesPerTick, so the
+      // accumulated buckets describe exactly the work that page cost.
+      IXPROF_DUMP(pageCount);
       return true;
     }
   }
@@ -971,6 +1061,7 @@ uint16_t Section::estimatedTotalPages() const {
 }
 
 bool Section::finalizeBuild() {
+  SET_CHECKPOINT("section:finalizeBuild");
   if (!build_) return false;
 
   // Flush the trailing page (parser finishParse fires the completePageFn

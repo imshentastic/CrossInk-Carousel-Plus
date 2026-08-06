@@ -20,6 +20,9 @@ parser.add_argument("size", type=int, help="font size to use.")
 parser.add_argument("fontstack", action="store", nargs='+', help="list of font files, ordered by descending priority.")
 parser.add_argument("--2bit", dest="is2Bit", action="store_true", help="generate 2-bit greyscale bitmap instead of 1-bit black and white.")
 parser.add_argument("--additional-intervals", dest="additional_intervals", action="append", help="Additional code point intervals to export as min,max. This argument can be repeated.")
+parser.add_argument("--codepoints-file", dest="codepoints_file", help="UTF-8 text file listing extra codepoints to export. Each non-comment line is either a hex codepoint (0x4E2D or U+4E2D) or literal characters (every non-whitespace char on the line is added). Consecutive codepoints are merged into intervals.")
+parser.add_argument("--no-default-intervals", dest="no_default_intervals", action="store_true", help="Start from an empty interval set instead of the built-in Latin/Cyrillic/math intervals. Use with --additional-intervals / --codepoints-file to build subset-only faces (e.g. a CJK fallback face).")
+parser.add_argument("--no-kern-liga", dest="no_kern_liga", action="store_true", help="Skip kerning and ligature table extraction. Recommended for large CJK faces where both are useless and the class-based GPOS scan is O(n^2) in glyph count.")
 parser.add_argument("--font-include-intervals", dest="font_include_intervals", action="append", help="Restrict a font-stack entry to specific intervals. Format: faceIndex:min,max . This argument can be repeated.")
 parser.add_argument("--compress", dest="compress", action="store_true", help="Compress glyph bitmaps using DEFLATE with group-based compression.")
 parser.add_argument("--force-autohint", dest="force_autohint", action="store_true", help="Force FreeType auto-hinter instead of native font hinting. Improves stem width consistency for fonts with weak or no native TrueType hints.")
@@ -138,9 +141,47 @@ intervals = [
     (0xFFFD, 0xFFFD),
 ]
 
+if args.no_default_intervals:
+    intervals = []
+
 add_ints = []
 if args.additional_intervals:
     add_ints = [tuple([int(n, base=0) for n in i.split(",")]) for i in args.additional_intervals]
+
+if args.codepoints_file:
+    file_codepoints = set()
+    hex_re = re.compile(r'^(0[xX]|[uU]\+)([0-9A-Fa-f]{1,6})$')
+    with open(args.codepoints_file, encoding='utf-8') as cpf:
+        for line in cpf:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            m = hex_re.match(line)
+            if m:
+                file_codepoints.add(int(m.group(2), 16))
+            else:
+                for ch in line:
+                    if not ch.isspace():
+                        file_codepoints.add(ord(ch))
+    # Merge consecutive codepoints into run intervals. The generic interval
+    # merger below only coalesces overlaps, not adjacency, so a scattered
+    # 6000-char hanzi subset passed as single-codepoint intervals would emit
+    # thousands of 12-byte EpdUnicodeInterval entries. Pre-merging runs here
+    # keeps the emitted interval table minimal.
+    run_start = None
+    prev_cp = None
+    for cp in sorted(file_codepoints):
+        if run_start is None:
+            run_start = prev_cp = cp
+            continue
+        if cp == prev_cp + 1:
+            prev_cp = cp
+            continue
+        add_ints.append((run_start, prev_cp))
+        run_start = prev_cp = cp
+    if run_start is not None:
+        add_ints.append((run_start, prev_cp))
+    print(f"codepoints-file: {len(file_codepoints)} codepoints from {args.codepoints_file}", file=sys.stderr)
 
 font_include_intervals = {}
 if args.font_include_intervals:
@@ -271,7 +312,7 @@ unmerged_intervals = sorted(intervals + add_ints)
 intervals = []
 unvalidated_intervals = []
 for i_start, i_end in unmerged_intervals:
-    if len(unvalidated_intervals) > 0 and i_start + 1 <= unvalidated_intervals[-1][1]:
+    if len(unvalidated_intervals) > 0 and i_start <= unvalidated_intervals[-1][1] + 1:
         unvalidated_intervals[-1] = (unvalidated_intervals[-1][0], max(unvalidated_intervals[-1][1], i_end))
         continue
     unvalidated_intervals.append((i_start, i_end))
@@ -419,6 +460,10 @@ COMBINING_MARKS_END = 0x036F
 all_codepoints = [g.code_point for g in glyph_props]
 kernable_codepoints = set(cp for cp in all_codepoints
                           if not (COMBINING_MARKS_START <= cp <= COMBINING_MARKS_END))
+if args.no_kern_liga:
+    # Empty set -> face_idx_cps stays empty -> no extraction calls run and
+    # kern_map stays {} (no kern tables emitted).
+    kernable_codepoints = set()
 
 # Map each kernable codepoint to the font-stack index that serves it
 # (same priority logic as load_glyph).
@@ -755,6 +800,9 @@ def extract_ligatures_fonttools(font_path, codepoints):
 
 ligature_codepoints = set(cp for cp in all_codepoints
                           if not (COMBINING_MARKS_START <= cp <= COMBINING_MARKS_END))
+if args.no_kern_liga:
+    # Empty set -> no ligature extraction; ligature_pairs stays [].
+    ligature_codepoints = set()
 
 # Map ligature codepoints to the font-stack index that serves them
 lig_cp_to_face_idx = {}

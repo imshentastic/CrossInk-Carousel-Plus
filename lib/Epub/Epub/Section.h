@@ -1,5 +1,7 @@
 #pragma once
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -309,6 +311,15 @@ class Section {
     uint32_t totalBytes = 0;
     float smoothedEstimate = 0.0f;
     uint32_t smoothedAtConsumed = 0;
+
+    // v18.9.9.479: scratch buffer that onPageComplete wraps in a
+    // BufferedFileWriter so page serialization coalesces its ~2000
+    // per-field SdFat writes into a handful of block writes. Allocated
+    // ONCE per build (not per page) and released with the BuildContext.
+    // nullptr is a supported state: under heap pressure the allocation is
+    // skipped and page writes fall back to the old unbuffered path.
+    static constexpr size_t PAGE_WRITE_BUFFER_BYTES = 2048;
+    std::unique_ptr<uint8_t[]> pageWriteBuffer;
   };
   std::unique_ptr<BuildContext> build_;
   bool buildComplete_ = false;
