@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <BluetoothHIDManager.h>
 #include <BoardConfig.h>   // CrumBLE 4.7.2: panel-controller profile selection
+#include <Preferences.h>   // CrumBLE 4.7.2: cached panel-controller verdict
 #include <XteinkDetect.h>  // CrumBLE 4.7.2: pre-SD panel-controller probe
 
 // v18.9.9.245: for BT-off-by-default boot-time memory release. Same header
@@ -2832,42 +2833,64 @@ void setup() {
           gpio.deviceIsX3() ? "X3" : "X4", gpio.isUsbConnected() ? 1 : 0, isSilentReboot ? 1 : 0,
           static_cast<unsigned long>(snapshotTarget));
 
-  // CrumBLE 4.7.2: resolve which panel controller this unit carries, BEFORE the
-  // SD card is mounted. Xteink switched newer X4/X3 runs from SSD1677/UC8253 to
-  // the UltraChip UC8179/UC8279 on the same board, so the driver can only be
-  // picked by asking the silicon -- but the probe bit-bangs the display pins as
-  // raw GPIO, and SD shares SCLK/MOSI on this hardware. Running it after
-  // Storage.begin() hung X4 boot (the disturbed card clamps the shared bus and
-  // the panel never hears CMD_SOFT_RESET); XteinkDetect.h's contract is to call
-  // it before SDCardManager::begin(), which is what this placement honors.
-  //
-  // The probe reads its pins from BoardConfig::ACTIVE, so the X3/X4 profile has
-  // to be chosen first. ACTIVE defaults to XTEINK_X4; point it at the X3 sibling
-  // when our own fingerprint says X3, so the promotion lands on UC8253->UC8279
-  // rather than SSD1677->UC8179. On a confirmed X3 promotion, switch to the
-  // XteinkX3Uc8279 profile: HalDisplay::begin()'s setDisplayX3() re-selects
-  // XteinkX3 otherwise, which would reset displayController back to UC8253.
-  //
-  // Fail-safe: promotion needs two independent passes to both match the UC81xx
-  // VER/FLG signature AND agree byte-for-byte. An original SSD1677/UC8253 does
-  // not answer register 0x70 at all, so the bus floats, both passes fail, and
-  // the profile default stands -- existing units keep today's driver.
+  // v4.7.2: resolve the X3 panel controller before the SD card is mounted.
 #ifndef CRUMBLE_DISABLE_PANEL_PROBE
-  // v4.7.2: assert the X4 battery-MOSFET latch (GPIO13) via holdPowerRails().
-  // No-op on self-latching X4s; the revision that doesn't self-latch stays
-  // powered only while the button is held without it.
-  //
-  // X4 only, and nothing here on X3 -- both learned on hardware. Probing the X4
-  // display bus hung display init; calling selectDevice(XteinkX3) here switched
-  // sd.powerEnable to GPIO13 and hung Storage.begin(). X3 must keep ACTIVE on the
-  // XTEINK_X4 default until setDisplayX3(), as every release before this one.
-  if (!gpio.deviceIsX3()) {
+  if (gpio.deviceIsX3()) {
+    // Probe once, cache in NVS, reboot -- never probe again on this device.
+    //
+    // Bit-banging the display bus leaves it unusable for whatever touches it
+    // next: SD (which shares SCLK/MOSI) fails to mount, or the panel stops
+    // answering. Four boot positions were tried and all of them hung. Rather
+    // than keep hunting for a placement that survives, do what
+    // detectDeviceTypeWithFingerprint() already does for the X3/X4 fingerprint:
+    // probe on a cold device, persist the answer, then ESP.restart(). The reset
+    // clears whatever the probe wedged, and every later boot reads NVS and never
+    // goes near the bus. Costs one extra reboot, once, on first boot after flash.
+    constexpr char kPanelNs[] = "cphw";
+    constexpr char kPanelKey[] = "panel_ctl";  // 0=unprobed, 1=UC8253, 2=UC8279
+    uint8_t cachedPanel = 0;
+    {
+      Preferences prefs;
+      if (prefs.begin(kPanelNs, true)) {
+        cachedPanel = prefs.getUChar(kPanelKey, 0);
+        prefs.end();
+      }
+    }
+    if (cachedPanel == 0) {
+      uint8_t ver[5] = {0};
+      uint8_t flg = 0;
+      const bool isUc8279 = freeink::detectX3DisplayController(ver, &flg) == freeink::X3DisplayVerdict::Uc8279Confirmed;
+      LOG_INF("DISPLAY", "X3 panel probe: VER=%02X %02X %02X %02X %02X FLG=%02X -> %s (caching, rebooting)", ver[0],
+              ver[1], ver[2], ver[3], ver[4], flg, isUc8279 ? "UC8279" : "UC8253");
+      // Only restart once the verdict is definitely persisted -- read it back.
+      // Restarting on a failed write would probe/reboot forever.
+      uint8_t verify = 0;
+      Preferences prefs;
+      if (prefs.begin(kPanelNs, false)) {
+        prefs.putUChar(kPanelKey, isUc8279 ? 2 : 1);
+        prefs.end();
+      }
+      if (prefs.begin(kPanelNs, true)) {
+        verify = prefs.getUChar(kPanelKey, 0);
+        prefs.end();
+      }
+      if (verify != 0) {
+        logSerial.flush();
+        delay(50);
+        ESP.restart();
+      }
+      // NVS unavailable: carry on with the in-memory verdict rather than loop.
+      LOG_ERR("DISPLAY", "panel verdict not persisted; continuing unrebooted");
+      cachedPanel = isUc8279 ? 2 : 1;
+    }
+    display.setX3IsUc8279(cachedPanel == 2);
+    LOG_INF("DISPLAY", "X3 panel controller: %s (cached)", cachedPanel == 2 ? "UC8279" : "UC8253");
+  } else {
     BoardConfig::selectDevice(BoardConfig::Board::XteinkX4);
     LOG_INF("DISPLAY", "X4: SSD1677 (default); battery latch asserted");
-  } else {
-    LOG_INF("DISPLAY", "X3: UC8253 (default); profile deferred to setDisplayX3()");
   }
 #endif
+
 
   // SD Card Initialization
   // We need 6 open files concurrently when parsing a new chapter
