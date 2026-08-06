@@ -5,6 +5,8 @@ const devices = [
   { id: "x3", label: "X3 792x528", width: 792, height: 528 },
   { id: "papercolor", label: "PaperColor 400x600", width: 400, height: 600 },
   { id: "murphy", label: "Murphy 240x416", width: 240, height: 416 },
+  { id: "delink", label: "de-link 800x480", width: 800, height: 480 },
+  { id: "sticky", label: "Sticky 800x480", width: 800, height: 480 },
   { id: "m5paper", label: "M5Paper 540x960", width: 540, height: 960 },
   { id: "lilygo", label: "LilyGo 960x540", width: 960, height: 540 },
 ];
@@ -26,6 +28,9 @@ const supported = new Set([
   "popup",
   "optionDialog",
   "qwertyKeyboard",
+  "statusBar",
+  "bookCard",
+  "textArea",
 ]);
 
 const state = {
@@ -159,6 +164,9 @@ function rowHeight(child) {
   if (child.type === "list") return 132;
   if (child.type === "footer") return 44;
   if (child.type === "header") return 40;
+  if (child.type === "statusBar") return 40;
+  if (child.type === "bookCard") return 88;
+  if (child.type === "textArea") return 132;
   return 44;
 }
 
@@ -207,6 +215,9 @@ function defaultChild(type) {
       width: 320,
     },
     qwertyKeyboard: { type, anchor: "bottom", layout: "qwerty_en", action: "keyboardKey", shiftAction: "keyboardShift", modeAction: "keyboardMode", deleteAction: "keyboardDelete", okAction: "keyboardOk" },
+    statusBar: { type, title: "Chapter 3", leading: "12:04", trailing: "42 / 180", anchor: "top" },
+    bookCard: { type, title: "The Time Machine", author: "H. G. Wells", meta: "EPUB - 214 KB", progress: 42, progressMax: 100, action: "openBook" },
+    textArea: { type, text: "Write here...", showCaret: true, height: 132 },
   };
   return defaults[type] ? structuredClone(defaults[type]) : null;
 }
@@ -225,6 +236,9 @@ function componentSummary(child) {
   if (child.type === "radioGroup") return `${(child.options || []).length} options`;
   if (child.type === "optionDialog") return `${(child.options || []).length} options`;
   if (child.type === "footer") return `${(child.buttons || []).length} actions`;
+  if (child.type === "bookCard") return child.title || child.author || "";
+  if (child.type === "statusBar") return child.title || child.leading || "";
+  if (child.type === "textArea") return child.text || "";
   return child.value || child.author || child.message || child.action || "";
 }
 
@@ -476,22 +490,25 @@ function fieldSpec(child) {
     ["height", "number"],
   ];
   const specs = {
-    header: [["type", "text", true], ["anchor", "select"], ["title", "text"], ["subtitle", "text"], ["rightLabel", "text"], ["borderEdges", "edgeMask"]],
+    header: [["type", "text", true], ["anchor", "select"], ["title", "text"], ["subtitle", "text"], ["rightLabel", "text"], ["centered", "checkbox"], ["borderEdges", "edgeMask"]],
     footer: [["type", "text", true], ["anchor", "select"], ["sidePadding", "number"], ["gap", "number"], ["buttonBorderEdges", "edgeMask"], ["buttons", "json"]],
     button: [["type", "text", true], ["anchor", "select"], ["label", "text"], ["action", "text"], ["value", "number"], ["radius", "number"]],
-    settingRow: [["type", "text", true], ["anchor", "select"], ["label", "text"], ["subtitle", "text"], ["value", "text"], ["action", "text"], ["radius", "number"], ["sidePadding", "number"], ["textGap", "number"]],
-    toggleRow: [["type", "text", true], ["anchor", "select"], ["label", "text"], ["subtitle", "text"], ["checked", "checkbox"], ["action", "text"], ["radius", "number"], ["knobRadius", "number"], ["rowRadius", "number"], ["sidePadding", "number"], ["textGap", "number"]],
+    settingRow: [["type", "text", true], ["anchor", "select"], ["label", "text"], ["subtitle", "text"], ["value", "text"], ["action", "text"], ["actionValue", "number"], ["chevron", "checkbox"], ["radius", "number"], ["sidePadding", "number"], ["textGap", "number"]],
+    toggleRow: [["type", "text", true], ["anchor", "select"], ["label", "text"], ["subtitle", "text"], ["checked", "checkbox"], ["action", "text"], ["value", "number"], ["radius", "number"], ["knobRadius", "number"], ["rowRadius", "number"], ["sidePadding", "number"], ["textGap", "number"]],
     stepperRow: [["type", "text", true], ["anchor", "select"], ["label", "text"], ["value", "text"], ["decrement", "text"], ["increment", "text"], ["controlSize", "number"], ["controlStroke", "number"], ["buttonRadius", "number"], ["rowRadius", "number"], ["sidePadding", "number"], ["textGap", "number"], ["gap", "number"]],
-    checkbox: [["type", "text", true], ["anchor", "select"], ["label", "text"], ["checked", "checkbox"], ["action", "text"], ["radius", "number"], ["sidePadding", "number"], ["gap", "number"]],
+    checkbox: [["type", "text", true], ["anchor", "select"], ["label", "text"], ["checked", "checkbox"], ["action", "text"], ["value", "number"], ["radius", "number"], ["sidePadding", "number"], ["gap", "number"]],
     slider: [["type", "text", true], ["anchor", "select"], ["value", "number"], ["max", "number"], ["action", "text"], ["radius", "number"], ["height", "number"]],
     dropdown: [["type", "text", true], ["anchor", "select"], ["label", "text"], ["value", "text"], ["action", "text"], ["radius", "number"], ["indicatorWidth", "number"], ["indicatorSize", "number"], ["indicatorStroke", "number"], ["padding", "insets"]],
     radioGroup: [["type", "text", true], ["anchor", "select"], ["selectedValue", "number"], ["action", "text"], ["radius", "number"], ["options", "json"]],
-    list: [["type", "text", true], ["anchor", "select"], ["height", "number"], ["action", "text"], ["selectedIndex", "number"], ["rowRadius", "number"], ["sidePadding", "number"], ["rowGap", "number"], ["items", "json"]],
+    list: [["type", "text", true], ["anchor", "select"], ["height", "number"], ["action", "text"], ["selectedIndex", "number"], ["topIndex", "number"], ["selectionMarker", "selectionMarker"], ["rowRadius", "number"], ["sidePadding", "number"], ["rowGap", "number"], ["items", "json"]],
     table: [["type", "text", true], ["anchor", "select"], ["height", "number"], ["rowHeight", "number"], ["headerRow", "checkbox"], ["cellRadius", "number"], ["padding", "number"], ["rows", "json"]],
-    popup: [["type", "text", true], ["message", "text"], ["align", "textAlign"], ["maxWidth", "number"], ["padding", "insets"]],
+    popup: [["type", "text", true], ["message", "text"], ["align", "textAlign"], ["maxWidth", "number"], ["showProgress", "checkbox"], ["progress", "number"], ["progressMax", "number"], ["progressHeight", "number"], ["padding", "insets"]],
     optionDialog: [["type", "text", true], ["title", "text"], ["headline", "text"], ["message", "text"], ["width", "number"], ["buttonHeight", "number"], ["gap", "number"], ["verticalOptions", "checkbox"], ["dimBackground", "checkbox"], ["padding", "insets"], ["options", "json"]],
     spacer: [["type", "text", true], ["anchor", "select"], ["height", "number"]],
     qwertyKeyboard: [["type", "text", true], ["anchor", "select"], ["layout", "keyboardLayout"], ["action", "text"], ["shiftAction", "text"], ["modeAction", "text"], ["deleteAction", "text"], ["okAction", "text"], ["selectedIndex", "number"], ["shifted", "checkbox"], ["symbols", "checkbox"], ["keyRadius", "number"], ["gap", "number"], ["padding", "insets"], ["height", "number"]],
+    statusBar: [["type", "text", true], ["anchor", "select"], ["title", "text"], ["leading", "text"], ["leadingSecondary", "text"], ["trailing", "text"], ["trailingSecondary", "text"], ["horizontalPadding", "number"], ["gap", "number"], ["showProgress", "checkbox"], ["progress", "number"], ["progressMax", "number"], ["progressHeight", "number"]],
+    bookCard: [["type", "text", true], ["anchor", "select"], ["title", "text"], ["author", "text"], ["meta", "text"], ["progress", "number"], ["progressMax", "number"], ["action", "text"], ["value", "number"], ["gap", "number"], ["textGap", "number"], ["padding", "insets"], ["height", "number"]],
+    textArea: [["type", "text", true], ["anchor", "select"], ["text", "text"], ["cursor", "number"], ["topLine", "number"], ["showCaret", "checkbox"], ["selStart", "number"], ["selEnd", "number"], ["height", "number"]],
   };
   return specs[child.type] || common;
 }
@@ -567,6 +584,15 @@ function renderInspector() {
         input.appendChild(option);
       }
       input.value = child[name] || "top";
+    } else if (kind === "selectionMarker") {
+      input = document.createElement("select");
+      for (const [value, label] of [["none", "None"], ["underline", "Underline"], ["triangle", "Triangle"]]) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        input.appendChild(option);
+      }
+      input.value = child[name] || "none";
     } else if (kind === "textAlign") {
       input = document.createElement("select");
       for (const [value, label] of [["left", "Left"], ["center", "Center"], ["right", "Right"]]) {

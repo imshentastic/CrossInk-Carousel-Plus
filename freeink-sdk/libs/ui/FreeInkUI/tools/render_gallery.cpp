@@ -1,6 +1,8 @@
 #include <FreeInkUI.h>
 #include <FreeInkUIDisplayTarget.h>
 
+#include "gallery_font.h"   // kNotoSansSmallFont — a compact font for thumbnails
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -19,8 +21,16 @@ struct Canvas {
   std::vector<uint8_t> fb;
   DisplayTarget target;
 
+  // Render at native landscape orientation (no rotation). The 4-arg DisplayTarget
+  // ctor now auto-rotates a landscape panel (width > height) to Portrait for
+  // held-tall readers; the gallery wants the panel drawn as-is, so pin it. And
+  // render with a compact font (~18px line) — the components' default metrics
+  // (e.g. TableProps.rowHeight = 24) are tuned for a small UI font, so the 34px
+  // device font would overflow every cell/row in these thumbnails.
   Canvas(int16_t w, int16_t h) : width(w), height(h), widthBytes((w + 7) / 8), fb(widthBytes * h, 0xFF),
-                                 target(fb.data(), w, h, widthBytes) {}
+                                 target(fb.data(), w, h, widthBytes, Orientation::LandscapeCounterClockwise) {
+    target.setFont(kNotoSansSmallFont);
+  }
 
   void clear() {
     for (uint8_t& b : fb) b = 0xFF;
@@ -98,6 +108,9 @@ void writeManifest(const char* path) {
       "    }\n"
       "  ],\n"
       "  \"palette\": [\n"
+      "    {\"component\": \"header\", \"category\": \"layout\", \"file\": \"freeinkui-components/header.svg\"},\n"
+      "    {\"component\": \"footer\", \"category\": \"layout\", \"file\": \"freeinkui-components/footer.svg\"},\n"
+      "    {\"component\": \"spacer\", \"category\": \"layout\", \"file\": \"freeinkui-components/spacer.svg\"},\n"
       "    {\"component\": \"button\", \"category\": \"controls\", \"file\": \"freeinkui-components/button.svg\"},\n"
       "    {\"component\": \"checkbox\", \"category\": \"controls\", \"file\": \"freeinkui-components/checkbox.svg\"},\n"
       "    {\"component\": \"slider\", \"category\": \"controls\", \"file\": \"freeinkui-components/slider.svg\"},\n"
@@ -110,6 +123,7 @@ void writeManifest(const char* path) {
       "    {\"component\": \"table\", \"category\": \"data\", \"file\": \"freeinkui-components/table.svg\"},\n"
       "    {\"component\": \"tabBar\", \"category\": \"navigation\", \"file\": \"freeinkui-components/tab-bar.svg\"},\n"
       "    {\"component\": \"textField\", \"category\": \"input\", \"file\": \"freeinkui-components/text-field.svg\"},\n"
+      "    {\"component\": \"textArea\", \"category\": \"input\", \"file\": \"freeinkui-components/text-area.svg\"},\n"
       "    {\"component\": \"keyGrid\", \"category\": \"input\", \"file\": \"freeinkui-components/key-grid.svg\"},\n"
       "    {\"component\": \"qwertyKeyboard\", \"category\": \"input\", \"file\": \"freeinkui-components/qwerty-keyboard.svg\"},\n"
       "    {\"component\": \"gestureBar\", \"category\": \"navigation\", \"file\": \"freeinkui-components/gesture-bar.svg\"},\n"
@@ -278,7 +292,7 @@ void renderPalette(const std::string& dir) {
   });
 
   renderComponent(dir, "tab-bar.svg", "tabBar", [](auto& frame, Rect rect) {
-    const TabItem tabs[3] = {{"Books", 1, true}, {"Authors", 2, false}, {"Tags", 3, false}};
+    const TabItem tabs[3] = {{"Books", {}, {}, 1, true}, {"Authors", {}, {}, 2, false}, {"Tags", {}, {}, 3, false}};
     TabBarProps props;
     props.tabs = tabs;
     props.count = 3;
@@ -498,6 +512,48 @@ void renderPalette(const std::string& dir) {
     props.progress.track = Paint::dither(Color::LightGray);
     popup(frame, centeredRect(rect, Size{180, 80}), props);
   });
+
+  renderComponent(dir, "header.svg", "header", [](auto& frame, Rect rect) {
+    HeaderProps props;
+    props.title = "Settings";
+    props.rightLabel = "Back";
+    props.titleText = text(0, TextAlign::Left, 1);
+    props.subtitleText = text();
+    props.borderEdges = EdgeBottom;
+    header(frame, Rect{rect.x, static_cast<int16_t>(rect.y + 26), rect.width, 44}, props);
+  });
+
+  renderComponent(dir, "footer.svg", "footer", [](auto& frame, Rect rect) {
+    const char* labels[2] = {"Back", "Apply"};
+    const int16_t gap = 8;
+    const int16_t slotW = static_cast<int16_t>((rect.width - gap) / 2);
+    for (int i = 0; i < 2; ++i) {
+      ButtonProps props;
+      props.label = labels[i];
+      props.action = static_cast<ActionId>(i + 1);
+      props.text = text(0, TextAlign::Center);
+      props.borderEdges = EdgeTop;
+      button(frame,
+             Rect{static_cast<int16_t>(rect.x + i * (slotW + gap)), static_cast<int16_t>(rect.y + 30), slotW, 44},
+             props);
+    }
+  });
+
+  renderComponent(dir, "spacer.svg", "spacer", [](auto& frame, Rect rect) {
+    const Rect band{rect.x, static_cast<int16_t>(rect.y + 40), rect.width, 24};
+    frame.target().fill(band, Paint::dither(Color::LightGray));
+    frame.target().fill(Rect{band.x, band.y, band.width, 1}, Paint::solid(Color::Black));
+    frame.target().fill(Rect{band.x, static_cast<int16_t>(band.bottom() - 1), band.width, 1},
+                        Paint::solid(Color::Black));
+  });
+
+  renderComponent(dir, "text-area.svg", "textArea", [](auto& frame, Rect rect) {
+    TextAreaProps props;
+    props.text = "The quick brown fox jumps over the lazy dog.";
+    props.cursor = 19;
+    props.style = text();
+    textArea(frame, Rect{rect.x, static_cast<int16_t>(rect.y + 8), rect.width, 96}, props);
+  });
 }
 
 void renderSettings(const char* path) {
@@ -549,7 +605,7 @@ void renderSettings(const char* path) {
   field.textStyle = text();
   textField(frame, Rect{20, 274, 300, 42}, field);
 
-  const TabItem tabs[3] = {{"Books", 1, true}, {"Authors", 2, false}, {"Tags", 3, false}};
+  const TabItem tabs[3] = {{"Books", {}, {}, 1, true}, {"Authors", {}, {}, 2, false}, {"Tags", {}, {}, 3, false}};
   TabBarProps tabProps;
   tabProps.tabs = tabs;
   tabProps.count = 3;

@@ -10,6 +10,10 @@ class HalDisplay {
   // Destructor
   ~HalDisplay();
 
+  // v4.7.2: boot-time X3 panel-controller verdict. setup() probes before SD
+  // mount; begin() applies it after, where the profile switch is safe.
+  void setX3IsUc8279(bool isUc8279) { _x3IsUc8279 = isUc8279; }
+
   // Refresh modes
   enum RefreshMode {
     FULL_REFRESH,       // Full refresh with complete waveform
@@ -118,6 +122,7 @@ class HalDisplay {
 
  private:
   EInkDisplay einkDisplay;
+  bool _x3IsUc8279 = false;
 };
 
 extern HalDisplay display;

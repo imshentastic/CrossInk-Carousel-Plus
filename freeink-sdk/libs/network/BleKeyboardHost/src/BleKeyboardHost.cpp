@@ -102,16 +102,20 @@ void parseReportMapHints(const uint8_t* map, size_t len) {
 // slot decode did not handle (consumer / compact / non-standard layouts). Prefers
 // the report-map-hinted byte, else the first meaningful non-zero byte. Returns 0
 // when the report carries no code (a release frame).
-uint8_t extractPrimaryCode(const uint8_t* p, size_t n) {
+uint8_t extractPrimaryCode(const uint8_t* p, size_t n, size_t* codeIdx = nullptr) {
   const size_t lim = n < 8 ? n : 8;
   // NOTE: do NOT skip 0x01 here. In a keyboard report 0x01 is ErrorRollOver, but in
   // a consumer / vendor report it is a valid button code (e.g. a 3-byte page-turner
   // report of "01 00 00" on press, "00 00 00" on release). Only zero means "no code".
   if (g_preferredByteIndex != 0xFF && g_preferredByteIndex < n && p[g_preferredByteIndex] != 0) {
+    if (codeIdx) *codeIdx = g_preferredByteIndex;
     return p[g_preferredByteIndex];
   }
   for (size_t i = 0; i < lim; ++i) {
-    if (p[i] != 0) return p[i];
+    if (p[i] != 0) {
+      if (codeIdx) *codeIdx = i;
+      return p[i];
+    }
   }
   return 0;
 }
@@ -238,43 +242,21 @@ void doConnect(const char* addrStr, uint8_t type) {
     self().onConnectFailed("Not a HID device");
     return;
   }
-  // CrumBLE patch: skip the explicit secureConnection() call when this
-  // peripheral is already bonded — NimBLE auto-encrypts using the stored
-  // bond keys on first GATT access, and the redundant re-verification
-  // costs ~500-1000 ms on cold connect. If setupHid then fails (which is
-  // what would happen if the stored keys are stale), fall back to the
-  // classic secureConnection() → retry setupHid path.
-  const bool bonded = NimBLEDevice::isBonded(NimBLEAddress(std::string(addrStr), type));
-  if (!bonded) {
-    if (!g_client->secureConnection()) {
+  if (!g_client->secureConnection()) {
 #if FREEINK_BLE_HID_SCAN_DEBUG
-      Serial.printf("[BleHid] security failed: %s err=%d\n", addrStr, g_client->getLastError());
+    Serial.printf("[BleHid] security failed: %s err=%d\n", addrStr, g_client->getLastError());
 #endif
-      g_client->disconnect();
-      self().onConnectFailed("Pairing failed");
-      return;
-    }
+    g_client->disconnect();
+    self().onConnectFailed("Pairing failed");
+    return;
   }
   if (!setupHid(g_client)) {
-    if (bonded) {
-      // Stored keys may be stale (peripheral was re-paired elsewhere, or NVS
-      // corrupted). Try the classic re-encrypt path once before giving up.
 #if FREEINK_BLE_HID_SCAN_DEBUG
-      Serial.printf("[BleHid] HID setup failed on bonded fast-path: %s -- retrying via secureConnection()\n", addrStr);
+    Serial.printf("[BleHid] HID setup failed: %s\n", addrStr);
 #endif
-      if (!g_client->secureConnection() || !setupHid(g_client)) {
-        g_client->disconnect();
-        self().onConnectFailed("HID setup failed after retry");
-        return;
-      }
-    } else {
-#if FREEINK_BLE_HID_SCAN_DEBUG
-      Serial.printf("[BleHid] HID setup failed: %s\n", addrStr);
-#endif
-      g_client->disconnect();
-      self().onConnectFailed("No HID input report");
-      return;
-    }
+    g_client->disconnect();
+    self().onConnectFailed("No HID input report");
+    return;
   }
   self().onLinkUp(addrStr, nullptr, type);  // name resolved from scan/bond lists
 }
@@ -323,16 +305,16 @@ class ScanCB : public NimBLEScanCallbacks {
 };
 
 class ClientCB : public NimBLEClientCallbacks {
-  // CrumBLE: forward NimBLE disconnect reason into onLinkDown so the app-level
-  // observer sees it (reason 520 = early controller drop, used for the
-  // "couldn't stay connected" alert).
-  void onDisconnect(NimBLEClient*, int reason) override { self().onLinkDown(reason); }
+  void onDisconnect(NimBLEClient*, int) override { self().onLinkDown(); }
   void onPassKeyEntry(NimBLEConnInfo& connInfo) override { NimBLEDevice::injectPassKey(connInfo, 123456); }
-  // CrumBLE patch: NimBLE-Arduino 2.3.6 client callbacks have no
-  // onPassKeyDisplay(NimBLEConnInfo&) override — the method exists on
-  // server callbacks only. Bumping to 2.3.8 (which the SDK recommends)
-  // would restore it; skipping for now since Just Works bonding is what
-  // BLE page-turners use, so passkey-display isn't exercised.
+  uint32_t onPassKeyDisplay(NimBLEConnInfo&) override {
+    const uint32_t passkey = NimBLEDevice::getSecurityPasskey();
+    self().onPairingPasskey(passkey);
+#if FREEINK_BLE_HID_SCAN_DEBUG
+    Serial.printf("[BleHid] pairing passkey: %06lu\n", static_cast<unsigned long>(passkey));
+#endif
+    return passkey;
+  }
   void onConfirmPasskey(NimBLEConnInfo& connInfo, uint32_t) override {
     NimBLEDevice::injectConfirmPasskey(connInfo, true);
   }
@@ -423,21 +405,18 @@ bool BleKeyboardHost::begin(const char* hostName) {
     return false;
   }
   g_client->setConnectTimeout(kConnectTimeoutMs);
+  // Widen the link supervision timeout. The host runs on a single RISC-V core and
+  // some operations block it for several seconds (e.g. the reader rebuilding a whole
+  // chapter to reach its last page on a backward page turn across a section boundary).
+  // NimBLE's default supervision timeout is only 2.56s, so those long renders overrun
+  // it and the controller drops the link — the peripheral then fails to re-encrypt on
+  // auto-reconnect (HCI 0x08 "Connection Timeout" -> BLE_HS err 520). Request a low
+  // interval for keypress responsiveness with an 8s supervision timeout (units:
+  // interval 1.25ms, timeout 10ms) so a slow page render can't sever the connection.
+  // Peripheral-initiated updates are still rejected (see onConnParamsUpdateRequest), so
+  // these host-chosen params hold for the life of the link.
+  g_client->setConnectionParams(/*minInterval=*/12, /*maxInterval=*/24, /*latency=*/0, /*timeout=*/800);
   g_client->setClientCallbacks(&g_clientCb, false);
-  // CrumBLE patch: set aggressive connection params (matches pre-port
-  // BluetoothHIDManager field-tested values). NimBLE's stock defaults are
-  // ~48-96 ms interval which slows the 6 report-char subscribes to ~180 ms
-  // each (~1.1 s of ~6 s total handshake). 15-30 ms interval cuts subscribe
-  // to ~90 ms each, saving ~500 ms on cold connect. Supervision timeout at
-  // 6 s prevents brief hiccups from dropping the link.
-  //   interval units = 1.25 ms; timeout units = 10 ms.
-  g_client->setConnectionParams(
-      /*minInterval=*/12,     // 15 ms
-      /*maxInterval=*/24,     // 30 ms
-      /*latency=*/0,
-      /*timeout=*/600,        // 6 s supervision
-      /*scanInterval=*/60,    // 37.5 ms
-      /*scanWindow=*/30);     // 18.75 ms
 
   xTaskCreate(connTaskFn, "ble-conn", 4096, nullptr, 3, &g_connTask);
   begun_ = true;
@@ -703,11 +682,6 @@ void BleKeyboardHost::onReportIngest(const uint8_t* data, size_t len) {
   if (!data || len == 0) return;
   g_lastReportMs = millis();  // freshness for the stale-release timeout in poll()
 
-  // CrumBLE raw-report observer: fires before the standard-keyboard parser so
-  // consumers can decode device-specific framing (Game Brick byte[4], Free3-R
-  // byte[0], etc.). Runs on the NimBLE host task — must not block.
-  if (rawObs_) rawObs_(data, len);
-
 #if FREEINK_BLE_HID_REPORT_DEBUG
   {
     char buf[64];
@@ -788,8 +762,52 @@ void BleKeyboardHost::onReportIngest(const uint8_t* data, size_t len) {
   // representative code and surface it (edge-detected so one press == one event).
   const bool tryGeneric = !emittedKb && (g_hasConsumerPage || !g_hasKeyboardPage || n < 7);
   if (tryGeneric) {
-    const uint8_t code = extractPrimaryCode(p, n);
-    if (code != 0 && code != g_lastGenericCode) emitUsage(code, 0);
+    size_t codeIdx = 0;
+    const uint8_t code = extractPrimaryCode(p, n, &codeIdx);
+    // Gamepad-style modes keep constant bits in the button byte and only clear
+    // the pressed bit on release (ino gamebrick mode T: 0x13 pressed -> 0x12
+    // released, bit0 is the button). "code changed" alone emits a phantom
+    // second press on that release frame. A press must SET at least one bit
+    // the previous code didn't have; a bit-subset of the previous code is a
+    // (partial) release, never a new press. Value-coded remotes are unaffected
+    // in practice: their release frame is all-zero (code 0), and the 150 ms
+    // stale-release timeout in poll() zeroes g_lastGenericCode between any two
+    // human-separated presses.
+    const bool pressEdge = code != 0 && code != g_lastGenericCode && (code & ~g_lastGenericCode) != 0;
+    const bool releaseEdge = code != 0 && code != g_lastGenericCode && (code & ~g_lastGenericCode) == 0;
+    if (codeIdx == 0 && n >= 5) {
+      // Gamepad/axis-pair mode (ino gamebrick T): byte 0 is a status byte whose
+      // bit0 is "pressed" (0x13 press -> 0x12 release), bytes 1-4 are two 16-bit
+      // LE axes centered at ~2000. Every button raises the same pressed bit; the
+      // identity lives in where the axes sit. The FIRST press frame is not
+      // trustworthy (a direction press starts near center and ramps toward its
+      // extreme over several frames), but the release frame still carries the
+      // final held values ("12 D0 07 84 03" = up, "12 D0 07 10 0E" = down,
+      // "12 B8 0B D0 07" = A, "12 B8 0B C4 09" = B). So classify on the release
+      // edge: quantize each axis into low/center/high and emit a synthetic code
+      // from the zone pair. Both-axes-centered carries no identity (bare
+      // release) and emits nothing.
+      if (releaseEdge) {
+        uint16_t axis1, axis2;  // memcpy: p may be unaligned (RISC-V faults on unaligned loads)
+        memcpy(&axis1, p + 1, sizeof(axis1));
+        memcpy(&axis2, p + 3, sizeof(axis2));
+        constexpr uint16_t kAxisCenter = 2000;
+        constexpr uint16_t kAxisDeadband = 300;  // B rests at center+500; center noise stays inside +/-300
+        const auto zone = [](uint16_t v) -> uint8_t {
+          if (v < kAxisCenter - kAxisDeadband) return 0;
+          if (v > kAxisCenter + kAxisDeadband) return 2;
+          return 1;
+        };
+        const uint8_t zonePair = zone(axis1) * 3 + zone(axis2);
+        if (zonePair != 4) {  // 4 = both centered: nothing to bind
+          emitUsage(0x40 + zonePair, 0);
+        }
+      }
+    } else if (pressEdge) {
+      // Value-coded remotes (e.g. "01 00 00" press, all-zero release): the code
+      // byte IS the identity; emit on the press edge as before.
+      emitUsage(code, 0);
+    }
     g_lastGenericCode = code;
   } else if (emittedKb) {
     g_lastGenericCode = 0;
@@ -933,17 +951,14 @@ void BleKeyboardHost::onLinkUp(const char* addr, const char* name, uint8_t type)
   g_reconnectIdx = 0;
   connecting_ = false;
   connected_ = true;
-  // CrumBLE observer: fire AFTER state flip so consumers see connected_ == true.
-  if (linkUpObs_) linkUpObs_(addr ? addr : "", connName_);
 }
 
-void BleKeyboardHost::onLinkDown(int reason) {
+void BleKeyboardHost::onLinkDown() {
   connected_ = false;
   connecting_ = false;
   portENTER_CRITICAL(&g_mux);
   heldUsage_ = 0;
   portEXIT_CRITICAL(&g_mux);
-  if (linkDownObs_) linkDownObs_(reason);
 }
 
 void BleKeyboardHost::onConnectFailed(const char* reason) {
@@ -1043,7 +1058,7 @@ bool BleKeyboardHost::popKey(KeyEvent&) { return false; }
 void BleKeyboardHost::onScanResultIngest(const char*, const char*, int, uint8_t, bool, bool) {}
 void BleKeyboardHost::onReportIngest(const uint8_t*, size_t) {}
 void BleKeyboardHost::onLinkUp(const char*, const char*, uint8_t) {}
-void BleKeyboardHost::onLinkDown(int) {}
+void BleKeyboardHost::onLinkDown() {}
 void BleKeyboardHost::onConnectFailed(const char*) {}
 bool BleKeyboardHost::takeConnectFailure(char*, size_t) { return false; }
 void BleKeyboardHost::onPairingPasskey(uint32_t) {}

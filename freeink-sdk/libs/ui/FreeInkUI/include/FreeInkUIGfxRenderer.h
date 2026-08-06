@@ -48,6 +48,10 @@ class GfxRendererTarget final : public DrawTarget {
     device.width = static_cast<int16_t>(renderer.getScreenWidth());
     device.height = static_cast<int16_t>(renderer.getScreenHeight());
     device.orientation = static_cast<Orientation>(renderer.getOrientation());
+    // Same inverse-of-render-rotation selector as DisplayTarget: this makes
+    // touchToLogical() agree case-for-case with GfxRenderer::tapToLogical, so
+    // FreeInkUI components and the firmware's own tap path map taps identically.
+    device.touchOrientation = touchOrientationFor(device.orientation);
     device.hasButtons = true;
     return device;
   }
@@ -179,33 +183,15 @@ class GfxRendererTarget final : public DrawTarget {
               const Rotation rotation = Rotation::None) override {
     if (!bitmap || rect.empty()) return;
 
-    // Mask1: square 1-bit masks in drawIcon's rotated layout (this renderer's
-    // icon asset convention). Drawn at native size; Tile modes repeat.
-    // Per-element rotation is unsupported for this layout — ship rotated
-    // asset variants, or use BW1 masks which rotate below.
-    if (bitmap.format == BitmapFormat::Mask1) {
-      if (mode == BitmapMode::Tile || mode == BitmapMode::TileX || mode == BitmapMode::TileY) {
-        const bool tileX = mode != BitmapMode::TileY;
-        const bool tileY = mode != BitmapMode::TileX;
-        for (int y = rect.y; y < rect.bottom(); y += bitmap.height) {
-          for (int x = rect.x; x < rect.right(); x += bitmap.width) {
-            renderer.drawIcon(bitmap.data, x, y, bitmap.width, bitmap.height);
-            if (!tileX) break;
-          }
-          if (!tileY) break;
-        }
-      } else {
-        renderer.drawIcon(bitmap.data, rect.x + (rect.width - bitmap.width) / 2,
-                          rect.y + (rect.height - bitmap.height) / 2, bitmap.width, bitmap.height);
-      }
-      return;
-    }
-
-    // BW1: row-major, MSB-first, set bit = ink. The SDK's shared sampling
-    // helper handles every BitmapMode (including Stretch/Contain/Cover
-    // scaling and tiling); each ink pixel lands via drawPixel — adequate for
-    // icons and pattern fills on a 1-bit panel.
-    if (bitmap.format != BitmapFormat::BW1) return;
+    // BW1 (set bit = ink) and Mask1 (Icon convention: bit 0 = ink), both
+    // row-major natural orientation — same contract as DisplayTarget, so one
+    // BitmapRef renders identically on either target. The SDK's shared
+    // sampling helper folds the Mask1 polarity and handles every BitmapMode
+    // (including Stretch/Contain/Cover scaling and tiling); each ink pixel
+    // lands via drawPixel — adequate for icons and pattern fills on a 1-bit
+    // panel. Note: GfxRenderer::drawIcon's pre-rotated asset layout is NOT
+    // this contract; convert such assets before wrapping them in a BitmapRef.
+    if (bitmap.format != BitmapFormat::BW1 && bitmap.format != BitmapFormat::Mask1) return;
     const bool black = foreground.color != Color::White;
     forEachBitmapPixel(
         rect, bitmap, mode, [&](const int16_t px, const int16_t py) { renderer.drawPixel(px, py, black); },
@@ -245,13 +231,17 @@ class GfxRendererFrame {
  public:
   explicit GfxRendererFrame(const GfxRenderer& renderer, const int smallFontId = 0, const int bodyFontId = 0,
                             const int titleFontId = 0)
-      : target(renderer), frame(target, target.deviceContext(), input, interactions) {
+      // Frame stores a const DeviceContext&; keep the context as a member so
+      // it outlives the frame (a deviceContext() temporary would dangle and
+      // corrupt every registered hit rect).
+      : target(renderer), device(target.deviceContext()), frame(target, device, input, interactions) {
     target.setFont(GfxRendererTarget::FONT_SMALL, smallFontId);
     target.setFont(GfxRendererTarget::FONT_BODY, bodyFontId);
     target.setFont(GfxRendererTarget::FONT_TITLE, titleFontId);
   }
 
   GfxRendererTarget target;
+  DeviceContext device;
   InputSnapshot input{};
   InteractionBuffer<MaxInteractions> interactions;
   Frame<MaxInteractions> frame;

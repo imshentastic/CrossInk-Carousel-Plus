@@ -16,6 +16,9 @@ struct ButtonProps {
   TextStyle text{};
   StyleSet styles{};
   int16_t minTouchSize = 44;
+  // Icon draw size: 0 = the bitmap's native pixels; >0 scales to a square of
+  // this size (nearest-neighbor), so one asset serves several button sizes.
+  int16_t iconSize = 0;
   uint8_t radius = 0;
   // Extra hit area beyond the visual rect, per edge. Use this to give
   // adjacent controls contiguous, non-overlapping tap bands (split the gap
@@ -52,23 +55,29 @@ void button(Frame<MaxInteractions>& frame, Rect rect, const ButtonProps& props) 
 
   Rect content = rect.inset(Insets{2, 4, 2, 4});
   BitmapRef icon = props.icon ? props.icon : resolveBitmap(frame.assets(), props.iconAsset);
+  // iconSize > 0 scales the icon (nearest-neighbor Contain) instead of
+  // drawing at its native pixel size.
+  const int16_t iconW = icon ? (props.iconSize > 0 ? props.iconSize : static_cast<int16_t>(icon.width)) : 0;
+  const int16_t iconH = icon ? (props.iconSize > 0 ? props.iconSize : static_cast<int16_t>(icon.height)) : 0;
+  const BitmapMode iconMode = props.iconSize > 0 ? BitmapMode::Contain : BitmapMode::Center;
   if (icon && props.label) {
     Size labelSize = frame.target().measureText(props.text.font, props.label, props.text);
-    int16_t totalW = static_cast<int16_t>(icon.width + props.gap + labelSize.width);
+    int16_t totalW = static_cast<int16_t>(iconW + props.gap + labelSize.width);
     int16_t x = static_cast<int16_t>(content.x + (content.width - totalW) / 2);
-    Rect iconRect{x, static_cast<int16_t>(content.y + (content.height - icon.height) / 2),
-                  static_cast<int16_t>(icon.width), static_cast<int16_t>(icon.height)};
-    frame.target().bitmap(iconRect, icon, BitmapMode::Center, style.foreground);
-    Rect textRect{static_cast<int16_t>(x + icon.width + props.gap), content.y,
-                  static_cast<int16_t>(content.right() - x - icon.width - props.gap), content.height};
+    Rect iconRect{x, static_cast<int16_t>(content.y + (content.height - iconH) / 2), iconW, iconH};
+    frame.target().bitmap(iconRect, icon, iconMode, style.foreground);
+    Rect textRect{static_cast<int16_t>(x + iconW + props.gap), content.y,
+                  static_cast<int16_t>(content.right() - x - iconW - props.gap), content.height};
     TextStyle textStyle = textStyleWithForeground(props.text, style.foreground);
     textStyle.align = TextAlign::Left;
     frame.target().text(textRect, props.label, textStyle);
   } else if (icon) {
-    Rect iconRect = centeredRect(content, Size{static_cast<int16_t>(icon.width), static_cast<int16_t>(icon.height)});
-    frame.target().bitmap(iconRect, icon, BitmapMode::Center, style.foreground);
+    Rect iconRect = centeredRect(content, Size{iconW, iconH});
+    frame.target().bitmap(iconRect, icon, iconMode, style.foreground);
   } else if (props.label) {
-    frame.target().text(content, props.label, textStyleWithForeground(props.text, style.foreground));
+    TextStyle textStyle = textStyleWithForeground(props.text, style.foreground);
+    textStyle.align = TextAlign::Center;
+    frame.target().text(content, props.label, textStyle);
   }
 }
 

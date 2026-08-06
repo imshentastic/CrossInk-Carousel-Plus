@@ -57,9 +57,7 @@ struct KeyEvent {
 // A BLE device seen during a scan.
 struct DiscoveredDevice {
   char addr[18] = {0};  // "AA:BB:CC:DD:EE:FF"
-  // v18.9.9.95: name[32] -> name[20]. Names past 19 chars truncate in the
-  // scan-result picker (cosmetic). Compounded over kMaxDiscovered=4 = 48 B.
-  char name[20] = {0};  // falls back to the address when no name was received
+  char name[32] = {0};  // falls back to the address when no name was received
   int rssi = 0;
   uint8_t addrType = 0;  // BLE address type, needed to reconnect
   bool hasName = false;  // true when the advertised name was actually received
@@ -70,24 +68,16 @@ struct DiscoveredDevice {
 // A BLE HID peripheral the host has bonded with (persisted in NVS for auto-reconnect).
 struct PairedHidDevice {
   char addr[18] = {0};
-  // v18.9.9.95: name[32] -> name[20], same rationale. Over kMaxBonds=4 = 48 B.
-  char name[20] = {0};
+  char name[32] = {0};
   uint8_t addrType = 0;
 };
 using PairedKeyboard = PairedHidDevice;  // Backward-compatible SDK name.
 
 class BleKeyboardHost {
  public:
-  // CrumBLE patch v18.9.9.95: further shrink for FT-headroom parity with
-  // pre-BT-port (v18.9.9.82 already shrunk kMaxDiscovered 24 -> 8; measured
-  // BT-port static RAM cost is 5.4 KB, and we need ~5 KB back at FT-time
-  // to restore reliable TCP serve). kMaxDiscovered 8 -> 4: pairing UI now
-  // shows the 4 strongest RSSI devices, enough for typical single-remote
-  // pairing scenarios. kKeyQueueLen 16 -> 8: still 8-event auto-repeat ring.
-  // kMaxBonds stays at 4 to keep multi-device bonding capacity intact.
-  static constexpr uint8_t kMaxDiscovered = 4;
+  static constexpr uint8_t kMaxDiscovered = 24;
   static constexpr uint8_t kMaxBonds = 4;
-  static constexpr uint8_t kKeyQueueLen = 8;
+  static constexpr uint8_t kKeyQueueLen = 16;
 
   static BleKeyboardHost& getInstance();
 
@@ -142,33 +132,13 @@ class BleKeyboardHost {
   // Pop the next key event. Returns false when the queue is empty.
   bool popKey(KeyEvent& out);
 
-  // CrumBLE patch: raw-report observer, called from the NimBLE-host task each
-  // time a HID input report arrives, before BleHid's own standard-keyboard
-  // parser runs. Consumers use this to apply device-profile framing (e.g. IINE
-  // Game Brick puts its keycode in byte[4] with a bitmask; Free3-R uses byte[0])
-  // that BleHid's generic parser can't decode. Plain function pointer (no
-  // heap, no std::function) — the observer runs on a BLE callback and must
-  // not block or allocate. Pass nullptr to unhook.
-  using RawReportObserver = void (*)(const uint8_t* data, size_t len);
-  void setRawReportObserver(RawReportObserver obs) { rawObs_ = obs; }
-
-  // CrumBLE patch: link lifecycle observers. Fires on the NimBLE host task
-  // after BleHid's own state (connected_, connName_) is updated. Consumers
-  // use these to bookkeep app-level state (e.g. synthesize a
-  // ConnectedDevice entry for BluetoothHIDManager's report processor, arm
-  // reason-520 early-drop alerts). Plain function pointers.
-  using LinkUpObserver = void (*)(const char* addr, const char* name);
-  using LinkDownObserver = void (*)(int reason);
-  void setLinkUpObserver(LinkUpObserver obs) { linkUpObs_ = obs; }
-  void setLinkDownObserver(LinkDownObserver obs) { linkDownObs_ = obs; }
-
   // --- Internal: called by the NimBLE backend (not for app use). These keep the
   // public header free of NimBLE types — the .cpp translates BLE objects into
   // these plain calls. -------------------------------------------------------
   void onScanResultIngest(const char* addr, const char* name, int rssi, uint8_t type, bool hid, bool connectable);
   void onReportIngest(const uint8_t* data, size_t len);
   void onLinkUp(const char* addr, const char* name, uint8_t type);
-  void onLinkDown(int reason = 0);  // CrumBLE: reason forwarded to linkDownObs_
+  void onLinkDown();
   void onConnectFailed(const char* reason);
   void onPairingPasskey(uint32_t passkey);
 
@@ -191,11 +161,8 @@ class BleKeyboardHost {
   KeyEvent ring_[kKeyQueueLen];
   volatile uint8_t ringHead_ = 0;  // next write
   volatile uint8_t ringTail_ = 0;  // next read
-  // v18.9.9.95: shrunk from [32]/[48] to [24]/[24]. Device names past 23
-  // chars truncate in the connection popup (cosmetic only). Failure messages
-  // past 23 chars truncate in the toast (also cosmetic).
-  char connName_[24] = {0};
-  char connectFailure_[24] = {0};
+  char connName_[32] = {0};
+  char connectFailure_[48] = {0};
   volatile uint32_t pairingPasskey_ = 0;
   volatile bool connected_ = false;
   volatile bool connecting_ = false;
@@ -212,13 +179,6 @@ class BleKeyboardHost {
   volatile uint32_t heldSince_ = 0;
   volatile uint32_t lastRepeat_ = 0;
   uint8_t prevKeys_[6] = {0};  // backend-task only
-
-  // CrumBLE raw-report observer (see setRawReportObserver above). Read on the
-  // NimBLE task; written from the main task — atomic pointer write is fine on
-  // ESP32-C3 (aligned single-word).
-  RawReportObserver rawObs_ = nullptr;
-  LinkUpObserver linkUpObs_ = nullptr;
-  LinkDownObserver linkDownObs_ = nullptr;
 };
 
 }  // namespace freeink

@@ -9,9 +9,11 @@
 //   FAST -> `_fast` turbo LUTs (DTM1 holds prev frame, diffs against it)
 //   HALF -> `_half` scrub LUTs (WW==BW, WB==BB: drive to target ignoring DTM1)
 //   FULL -> `_full` OEM bank from a white DTM1 baseline + post-full settle pass
-// Grayscale: `_gc` 4-level (community AA/cover) or `_full` (factory absolute),
-// reverted via the `_half` scrub bank. DTM1/DTM2 are the controller's old/new
-// RAM planes; CDI (cmd 0x50) selects differential (0x29) vs absolute (0xA9).
+// Grayscale: `_gc` 4-level nudge (reader AA/cover) or `_full` (factory
+// absolute), reverted via the `_half` scrub bank. DTM1/DTM2 are the
+// controller's old/new RAM planes; CDI (cmd 0x50) selects differential (0x29)
+// vs absolute (0xA9). The recovered OEM standalone banks (factoryP1/P2) are
+// NOT wired up: they need the OEM's grayscale panel init (see Uc8253X3Luts.h).
 //
 // X3TwoPhase BUSY; SPI clock board-overridable (default 16 MHz).
 
@@ -33,9 +35,14 @@ struct Uc8253X3Config {
   Uc8253LutBank half;    // scrub (CDI 0xA9)
   Uc8253LutBank fast;    // turbo differential (CDI 0x29)
   Uc8253LutBank full;    // OEM full / factory (CDI 0x29)
-  Uc8253LutBank gc;        // community 4-level grayscale (CDI 0x29)
+  Uc8253LutBank gc;        // OEM 4-level grayscale nudge (CDI 0x29)
   Uc8253LutBank preBwMid;  // OEM grayscale preconditioning settle (CDI 0xA9)
-  uint8_t lutLen;          // bytes per LUT sent to the controller (42)
+  // OEM standalone grayscale banks (partial long / full short). Reference only,
+  // NOT used yet: they require the OEM grayscale panel init (different PSR/PWR/
+  // VCOM rails) and its DTM data framing — see the note in Uc8253X3Luts.h.
+  Uc8253LutBank factoryP1;  // OEM standalone gray, long bank (stock partial, CDI 0xD7)
+  Uc8253LutBank factoryP2;  // OEM standalone gray, short bank (stock full, CDI 0x97)
+  uint8_t lutLen;           // bytes per LUT sent to the controller (42)
 };
 
 const Uc8253X3Config& uc8253X3DefaultConfig();
@@ -52,6 +59,13 @@ class Uc8253X3Driver : public PanelDriver {
   void deepSleep(EpdBus& bus) override;
 
   void display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) override;
+  // Refresh split: displayStart fires the waveform and returns while the ~130-770 ms
+  // X3 waveform runs (so the render task can overlap non-SPI work); displayFinish
+  // waits BUSY out and runs the post-waveform DTM1 sync + conditioning passes.
+  // display() above is exactly displayStart()+displayFinish().
+  bool displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) override;
+  void displayFinish(EpdBus& bus, const uint8_t* fb) override;
+  bool supportsAsyncDisplay() const override { return true; }
 
   bool supportsStripGrayscale() const override { return true; }
   void displayGrayscaleBase(EpdBus& bus, const uint8_t* fb, RefreshMode fallback, bool turnOff) override;
@@ -90,6 +104,16 @@ class Uc8253X3Driver : public PanelDriver {
     bool lastBaseWasPartial = false;
     bool lsbValid = false;
   } _grayState;
+
+  // Refresh split state: what displayStart() decided, replayed by displayFinish()
+  // for the post-waveform DTM1 sync + conditioning. _pendingRefresh guards against
+  // a displayFinish() with no matching displayStart(). The just-displayed frame is
+  // NOT stashed here: the facade re-supplies it fresh to displayFinish() because
+  // the caller may release/realloc the buffer holding it in the gap.
+  bool _pendingRefresh = false;
+  bool _pendingTurnOff = false;
+  bool _pendingDoFullSync = false;
+  bool _pendingFastMode = false;
 };
 
 PanelDriver& uc8253X3Driver();
