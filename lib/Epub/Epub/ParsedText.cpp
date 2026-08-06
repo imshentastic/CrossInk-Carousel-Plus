@@ -963,9 +963,19 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
     lineWordWidthSum += wordWidths[lastBreakAt + wordIdx];
     // Count gaps: each word after the first creates a gap, unless it's a continuation
     if (wordIdx > 0 && noSpaceBeforeVec[lastBreakAt + wordIdx]) {
-      // Unicode break opportunity with no inserted Latin-style space. It is still
-      // a stretchable gap for justified CJK/Korean text.
-      actualGapCount++;
+      // Unicode break opportunity with no inserted Latin-style space. Upstream
+      // treats these as stretchable gaps for justified CJK/Korean, but we must
+      // not: computeLineBreaks measures them as exactly zero and fills the line
+      // to the margin on that basis, so any stretch added here has nowhere to
+      // go and pushes the tail of the line off the panel. Field symptom was a
+      // GLYX OVERFLOW on the last glyph of every justified Chinese line, the
+      // overshoot growing with the number of characters (1 px, then 6, 13, 18,
+      // 20), followed by a flood of out-of-range pixel writes.
+      //
+      // Leaving these out of the count means a run of CJK justifies as a solid
+      // block -- which is what it already is, since every ideograph shares one
+      // advance -- with any remainder left at the line end. Latin gaps on a
+      // mixed line still stretch normally.
     } else if (wordIdx > 0 && !continuesVec[lastBreakAt + wordIdx]) {
       actualGapCount++;
       totalNaturalGaps += renderer.getSpaceAdvance(fontId, lastCodepoint(words[lastBreakAt + wordIdx - 1]),
