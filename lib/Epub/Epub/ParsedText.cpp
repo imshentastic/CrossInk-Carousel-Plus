@@ -32,74 +32,6 @@ uint32_t firstCodepoint(const std::string& word) {
   }
 }
 
-// CJK 避头尾: closing punctuation that must not START a line. The 4.5.3
-// parser emits each CJK char as its own word, so without this a wrap can
-// land 。or ，at a line head. Both breakers treat "break before one of
-// these" as illegal; the preceding character travels down with it.
-bool isCjkLeadingPunct(uint32_t cp) {
-  switch (cp) {
-    case 0x3001:  // 、
-    case 0x3002:  // 。
-    case 0x3009:  // 〉
-    case 0x300B:  // 》
-    case 0x300D:  // 」
-    case 0x300F:  // 』
-    case 0x3011:  // 】
-    case 0xFF01:  // ！
-    case 0xFF09:  // ）
-    case 0xFF0C:  // ，
-    case 0xFF1A:  // ：
-    case 0xFF1B:  // ；
-    case 0xFF1F:  // ？
-    case 0x2019:  // ’ (standalone only in CJK context; Latin quotes stay word-attached)
-    case 0x201D:  // ”
-      return true;
-    default:
-      return false;
-  }
-}
-
-#ifdef CJK_VARIANT
-// True for codepoints that are set solid in CJK typography -- ideographs,
-// kana, CJK punctuation and fullwidth forms. Mirrors isCjkCodepointForSplit
-// in ChapterHtmlSlimParser, which is what put each of these characters in a
-// word of its own to begin with.
-bool isCjkSolidSetCodepoint(uint32_t cp) {
-  if (cp >= 0x4E00 && cp <= 0x9FFF) return true;
-  if (cp >= 0x3400 && cp <= 0x4DBF) return true;
-  if (cp >= 0x3000 && cp <= 0x303F) return true;
-  if (cp >= 0x3040 && cp <= 0x309F) return true;
-  if (cp >= 0x30A0 && cp <= 0x30FF) return true;
-  if (cp >= 0xF900 && cp <= 0xFAFF) return true;
-  if (cp >= 0xFF00 && cp <= 0xFFEF) return true;
-  return false;
-}
-#endif
-
-// Width to insert between two adjacent words on the same line.
-//
-// The 4.5.3 CJK tokenizer emits every ideograph as its own word so the line
-// breaker can wrap between characters. That makes each of them look
-// space-separated to the breakers, which would insert a full space advance
-// between every pair -- but CJK is set solid, with no inter-character space.
-// Suppressing it here is both correct typography and ~17% less width per
-// line of Chinese. Runs of CJK only: a CJK/Latin boundary keeps its space,
-// which is the conventional treatment for mixed text.
-//
-// Every gap site in this file routes through this helper -- the DP, the
-// hyphenated breaker, and extractLine -- because the widths the breakers
-// measure and the x-positions extractLine bakes into the page must agree
-// exactly, or glyphs land in the wrong place.
-int interWordGap(const GfxRenderer& renderer, int fontId, uint32_t leftCp, uint32_t rightCp,
-                 EpdFontFamily::Style style) {
-#ifdef CJK_VARIANT
-  if (isCjkSolidSetCodepoint(leftCp) && isCjkSolidSetCodepoint(rightCp)) {
-    return renderer.getKerning(fontId, leftCp, rightCp, style);
-  }
-#endif
-  return renderer.getSpaceAdvance(fontId, leftCp, rightCp, style);
-}
-
 // Returns the last codepoint of a word by scanning backward for the start of the last UTF-8 sequence.
 uint32_t lastCodepoint(const std::string& word) {
   if (word.empty()) return 0;
@@ -113,6 +45,135 @@ uint32_t lastCodepoint(const std::string& word) {
 }
 
 bool containsSoftHyphen(const std::string& word) { return word.find(SOFT_HYPHEN_UTF8) != std::string::npos; }
+
+// --- CJK / Korean line breaking (upstream crosspoint-reader #2288) ---------
+//
+// CJK text has no spaces, so a break opportunity exists between almost every
+// pair of adjacent characters. Two rule tables encode the 避头尾 (kinsoku)
+// exceptions: closers must not START a line, openers must not END one.
+
+// Closing punctuation: never allowed at the head of a line, so no break before it.
+bool isNoBreakBeforeCjkPunctuation(const uint32_t cp) {
+  switch (cp) {
+    case '.':
+    case ',':
+    case ':':
+    case ';':
+    case '!':
+    case '?':
+    case ')':
+    case ']':
+    case '}':
+    case 0x00BB:  // »
+    case 0x2019:  // ’
+    case 0x201D:  // ”
+    case 0x3001:  // 、
+    case 0x3002:  // 。
+    case 0x3009:  // 〉
+    case 0x300B:  // 》
+    case 0x300D:  // 」
+    case 0x300F:  // 』
+    case 0x3011:  // 】
+    case 0x3015:  // 〕
+    case 0x3017:  // 〗
+    case 0x3019:  // 〙
+    case 0x301B:  // 〛
+    case 0xFF01:  // ！
+    case 0xFF09:  // ）
+    case 0xFF0C:  // ，
+    case 0xFF0E:  // ．
+    case 0xFF1A:  // ：
+    case 0xFF1B:  // ；
+    case 0xFF1F:  // ？
+    case 0xFF3D:  // ］
+    case 0xFF5D:  // ｝
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Opening punctuation: never allowed at the tail of a line, so no break after it.
+bool isNoBreakAfterCjkPunctuation(const uint32_t cp) {
+  switch (cp) {
+    case '(':
+    case '[':
+    case '{':
+    case 0x00AB:  // «
+    case 0x2018:  // ‘
+    case 0x201C:  // “
+    case 0x3008:  // 〈
+    case 0x300A:  // 《
+    case 0x300C:  // 「
+    case 0x300E:  // 『
+    case 0x3010:  // 【
+    case 0x3014:  // 〔
+    case 0x3016:  // 〖
+    case 0x3018:  // 〘
+    case 0x301A:  // 〚
+    case 0xFF08:  // （
+    case 0xFF3B:  // ［
+    case 0xFF5B:  // ｛
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool containsCjkBreakableCodepoint(const std::string& text) {
+  const auto* ptr = reinterpret_cast<const unsigned char*>(text.c_str());
+  while (*ptr) {
+    const uint32_t cp = utf8NextCodepoint(&ptr);
+    if (utf8IsCjkBreakable(cp)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool hasCjkBreakOpportunityBetween(const uint32_t leftCp, const uint32_t rightCp) {
+  if (!utf8IsCjkBreakable(leftCp) && !utf8IsCjkBreakable(rightCp)) return false;
+  if (isNoBreakAfterCjkPunctuation(leftCp) || isNoBreakBeforeCjkPunctuation(rightCp)) return false;
+  if (utf8IsCombiningMark(rightCp)) return false;
+  return true;
+}
+
+// Byte offsets inside `text` where the line breaker is allowed to split a CJK run.
+// Empty when there is nothing CJK-breakable, or when kinsoku rules forbid every
+// internal break (e.g. "「」").
+std::vector<size_t> cjkCharacterBreakByteOffsets(const std::string& text) {
+  struct CodepointBoundary {
+    uint32_t cp;
+    size_t endOffset;
+  };
+
+  std::vector<CodepointBoundary> codepoints;
+  codepoints.reserve(text.size());
+  bool hasCjkBreakable = false;
+
+  const auto* ptr = reinterpret_cast<const unsigned char*>(text.c_str());
+  const auto* const start = ptr;
+  while (*ptr) {
+    const uint32_t cp = utf8NextCodepoint(&ptr);
+    if (cp == 0) break;
+    if (utf8IsCjkBreakable(cp)) {
+      hasCjkBreakable = true;
+    }
+    codepoints.push_back({cp, static_cast<size_t>(ptr - start)});
+  }
+
+  if (!hasCjkBreakable || codepoints.size() < 2) return {};
+
+  std::vector<size_t> allowedOffsets;
+  allowedOffsets.reserve(codepoints.size() - 1);
+  for (size_t i = 0; i + 1 < codepoints.size(); ++i) {
+    const uint32_t current = codepoints[i].cp;
+    const uint32_t next = codepoints[i + 1].cp;
+    if (!hasCjkBreakOpportunityBetween(current, next)) continue;
+    allowedOffsets.push_back(codepoints[i].endOffset);
+  }
+  return allowedOffsets;
+}
 
 bool isBase64LikeChar(const char c) {
   return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=';
@@ -216,19 +277,63 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
     words.emplace_back("\xc2\xb7");
     wordStyles.push_back(EpdFontFamily::REGULAR);
     wordContinues.push_back(false);
+    wordNoSpaceBefore.push_back(false);
     wordIsBionicSuffix.push_back(false);
     wordIsGuideDot.push_back(true);
     wordBackgroundBlack.push_back(false);
   }
 
-  // Already-bold text should stay fully bold; bionic splitting would make its suffix regular later.
-  if (!this->bionicReadingEnabled || (baseStyle & EpdFontFamily::BOLD) != 0) {
-    words.push_back(std::move(word));
+  const auto pushToken = [&](std::string token, const bool continues, const bool noSpaceBefore) {
+    words.push_back(std::move(token));
     wordStyles.push_back(baseStyle);
-    wordContinues.push_back(attachToPrevious);
+    wordContinues.push_back(continues);
+    wordNoSpaceBefore.push_back(noSpaceBefore);
     wordIsBionicSuffix.push_back(false);
     wordIsGuideDot.push_back(false);
     wordBackgroundBlack.push_back(backgroundBlack);
+  };
+
+  // An inline-element boundary normally glues this token to the previous one with
+  // no break allowed. When the joint is a legal CJK break opportunity, downgrade
+  // that to "break allowed, but still no synthetic space".
+  bool effectiveAttachToPrevious = attachToPrevious;
+  bool effectiveNoSpaceBefore = false;
+  if (attachToPrevious && !words.empty() &&
+      hasCjkBreakOpportunityBetween(lastCodepoint(words.back()), firstCodepoint(word))) {
+    effectiveAttachToPrevious = false;
+    effectiveNoSpaceBefore = true;
+  }
+
+  // CJK runs arrive from the parser as one token. Split them into per-character
+  // tokens at the legal break offsets so the line breaker can wrap mid-run, and
+  // mark every follow-on token noSpaceBefore so no Latin-style space is inserted.
+  if (auto breakOffsets = cjkCharacterBreakByteOffsets(word); !breakOffsets.empty()) {
+    bool firstToken = true;
+    size_t tokenStart = 0;
+    for (const size_t breakOffset : breakOffsets) {
+      if (breakOffset <= tokenStart || breakOffset > word.size()) continue;
+      pushToken(word.substr(tokenStart, breakOffset - tokenStart), firstToken ? effectiveAttachToPrevious : false,
+                firstToken ? effectiveNoSpaceBefore : true);
+      firstToken = false;
+      tokenStart = breakOffset;
+    }
+    if (tokenStart < word.size()) {
+      pushToken(word.substr(tokenStart), firstToken ? effectiveAttachToPrevious : false,
+                firstToken ? effectiveNoSpaceBefore : true);
+    }
+    return;
+  }
+
+  // CJK with no internal break opportunity (single char, or kinsoku-locked pair).
+  // Keep it whole and skip bionic splitting, which is meaningless for ideographs.
+  if (containsCjkBreakableCodepoint(word)) {
+    pushToken(std::move(word), effectiveAttachToPrevious, effectiveNoSpaceBefore);
+    return;
+  }
+
+  // Already-bold text should stay fully bold; bionic splitting would make its suffix regular later.
+  if (!this->bionicReadingEnabled || (baseStyle & EpdFontFamily::BOLD) != 0) {
+    pushToken(std::move(word), effectiveAttachToPrevious, effectiveNoSpaceBefore);
     return;
   }
 
@@ -254,6 +359,7 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
     words.reserve(newCapacity);
     wordStyles.reserve(newCapacity);
     wordContinues.reserve(newCapacity);
+    wordNoSpaceBefore.reserve(newCapacity);
     wordIsBionicSuffix.reserve(newCapacity);
     wordIsGuideDot.reserve(newCapacity);
     wordBackgroundBlack.reserve(newCapacity);
@@ -261,12 +367,13 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
 
   // Lambda helper to process and push individual sub-segments of the string
   // Use std::string_view to avoid heap allocations when slicing
-  auto processSegment = [&](std::string_view segment, bool isWord, bool attach) {
+  auto processSegment = [&](std::string_view segment, bool isWord, bool attach, bool noSpaceBefore) {
     if (!isWord) {
       // Punctuation and Numbers stay regular
       words.emplace_back(segment);
       wordStyles.push_back(baseStyle);
       wordContinues.push_back(attach);
+      wordNoSpaceBefore.push_back(noSpaceBefore);
       wordIsBionicSuffix.push_back(false);
       wordIsGuideDot.push_back(false);
       wordBackgroundBlack.push_back(backgroundBlack);
@@ -290,6 +397,7 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
         words.emplace_back(segment);
         wordStyles.push_back(static_cast<EpdFontFamily::Style>(baseStyle | EpdFontFamily::BOLD));
         wordContinues.push_back(attach);
+        wordNoSpaceBefore.push_back(noSpaceBefore);
         wordIsBionicSuffix.push_back(false);
         wordIsGuideDot.push_back(false);
         wordBackgroundBlack.push_back(backgroundBlack);
@@ -304,6 +412,7 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
         words.emplace_back(segment.substr(0, splitByteOffset));
         wordStyles.push_back(static_cast<EpdFontFamily::Style>(baseStyle | EpdFontFamily::BOLD));
         wordContinues.push_back(attach);
+        wordNoSpaceBefore.push_back(noSpaceBefore);
         wordIsBionicSuffix.push_back(false);
         wordIsGuideDot.push_back(false);
         wordBackgroundBlack.push_back(backgroundBlack);
@@ -312,6 +421,7 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
         words.emplace_back(segment.substr(splitByteOffset));
         wordStyles.push_back(baseStyle);
         wordContinues.push_back(true);
+        wordNoSpaceBefore.push_back(false);
         wordIsBionicSuffix.push_back(true);
         wordIsGuideDot.push_back(false);
         wordBackgroundBlack.push_back(backgroundBlack);
@@ -341,7 +451,8 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
 
       // Only the very first segment inherits the original attachToPrevious flag.
       // Every subsequent segment MUST attach=true so it glues seamlessly to the prefix.
-      processSegment(segment, inWordSegment, isFirstSegment ? attachToPrevious : true);
+      processSegment(segment, inWordSegment, isFirstSegment ? effectiveAttachToPrevious : true,
+                     isFirstSegment ? effectiveNoSpaceBefore : false);
 
       // Setup for the next segment
       segmentStart = currentCpStart;
@@ -353,7 +464,8 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle,
   // Process the final remaining segment
   size_t segmentLen = end - segmentStart;
   std::string_view segment(reinterpret_cast<const char*>(segmentStart), segmentLen);
-  processSegment(segment, inWordSegment, isFirstSegment ? attachToPrevious : true);
+  processSegment(segment, inWordSegment, isFirstSegment ? effectiveAttachToPrevious : true,
+                 isFirstSegment ? effectiveNoSpaceBefore : false);
 }
 // Consumes data to minimize memory usage
 void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fontId, const uint16_t viewportWidth,
@@ -390,14 +502,16 @@ void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
   std::vector<size_t> lineBreakIndices;
   if (hyphenationEnabled) {
     // Use greedy layout that can split words mid-loop when a hyphenated prefix fits.
-    lineBreakIndices = computeHyphenatedLineBreaks(renderer, fontId, pageWidth, wordWidths, wordContinues);
+    lineBreakIndices =
+        computeHyphenatedLineBreaks(renderer, fontId, pageWidth, wordWidths, wordContinues, wordNoSpaceBefore);
   } else {
-    lineBreakIndices = computeLineBreaks(renderer, fontId, pageWidth, wordWidths, wordContinues);
+    lineBreakIndices = computeLineBreaks(renderer, fontId, pageWidth, wordWidths, wordContinues, wordNoSpaceBefore);
   }
   const size_t lineCount = includeLastLine ? lineBreakIndices.size() : lineBreakIndices.size() - 1;
 
   for (size_t i = 0; i < lineCount; ++i) {
-    extractLine(i, pageWidth, wordWidths, wordContinues, lineBreakIndices, processLine, renderer, fontId);
+    extractLine(i, pageWidth, wordWidths, wordContinues, wordNoSpaceBefore, lineBreakIndices, processLine, renderer,
+                fontId);
   }
 
   // Remove consumed words so size() reflects only remaining words
@@ -406,6 +520,7 @@ void ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
     words.erase(words.begin(), words.begin() + consumed);
     wordStyles.erase(wordStyles.begin(), wordStyles.begin() + consumed);
     wordContinues.erase(wordContinues.begin(), wordContinues.begin() + consumed);
+    wordNoSpaceBefore.erase(wordNoSpaceBefore.begin(), wordNoSpaceBefore.begin() + consumed);
     wordIsBionicSuffix.erase(wordIsBionicSuffix.begin(), wordIsBionicSuffix.begin() + consumed);
     wordIsGuideDot.erase(wordIsGuideDot.begin(), wordIsGuideDot.begin() + consumed);
     wordBackgroundBlack.erase(wordBackgroundBlack.begin(), wordBackgroundBlack.begin() + consumed);
@@ -426,7 +541,8 @@ std::vector<uint16_t> ParsedText::calculateWordWidths(const GfxRenderer& rendere
 }
 
 std::vector<size_t> ParsedText::computeLineBreaks(const GfxRenderer& renderer, const int fontId, const int pageWidth,
-                                                  std::vector<uint16_t>& wordWidths, std::vector<bool>& continuesVec) {
+                                                  std::vector<uint16_t>& wordWidths, std::vector<bool>& continuesVec,
+                                                  std::vector<bool>& noSpaceBeforeVec) {
   IXPROF_SCOPE(LINEBRK);
   if (words.empty()) {
     return {};
@@ -480,9 +596,12 @@ std::vector<size_t> ParsedText::computeLineBreaks(const GfxRenderer& renderer, c
     for (size_t j = i; j < totalWordCount; ++j) {
       // Add space before word j, unless it's the first word on the line or a continuation
       int gap = 0;
-      if (j > static_cast<size_t>(i) && !continuesVec[j]) {
+      if (j > static_cast<size_t>(i) && noSpaceBeforeVec[j]) {
+        // CJK break opportunity: a legal wrap point, but set solid when joined.
+        gap = 0;
+      } else if (j > static_cast<size_t>(i) && !continuesVec[j]) {
         gap =
-            interWordGap(renderer, fontId, lastCodepoint(words[j - 1]), firstCodepoint(words[j]), wordStyles[j - 1]);
+            renderer.getSpaceAdvance(fontId, lastCodepoint(words[j - 1]), firstCodepoint(words[j]), wordStyles[j - 1]);
       } else if (j > static_cast<size_t>(i) && continuesVec[j]) {
         // Cross-boundary kerning for continuation words (e.g. nonbreaking spaces, attached punctuation)
         gap = renderer.getKerning(fontId, lastCodepoint(words[j - 1]), firstCodepoint(words[j]), wordStyles[j - 1]);
@@ -495,12 +614,6 @@ std::vector<size_t> ParsedText::computeLineBreaks(const GfxRenderer& renderer, c
 
       // Cannot break after word j if the next word attaches to it (continuation group)
       if (nextTokenAttaches(j, totalWordCount)) {
-        continue;
-      }
-
-      // CJK 避头尾: an illegal break here makes the DP rebalance the
-      // paragraph so the punctuation's preceding character wraps with it.
-      if (j + 1 < totalWordCount && words[j + 1].size() <= 4 && isCjkLeadingPunct(firstCodepoint(words[j + 1]))) {
         continue;
       }
 
@@ -576,7 +689,8 @@ void ParsedText::applyParagraphIndent() {
 // Builds break indices while opportunistically splitting the word that would overflow the current line.
 std::vector<size_t> ParsedText::computeHyphenatedLineBreaks(const GfxRenderer& renderer, const int fontId,
                                                             const int pageWidth, std::vector<uint16_t>& wordWidths,
-                                                            std::vector<bool>& continuesVec) {
+                                                            std::vector<bool>& continuesVec,
+                                                            std::vector<bool>& noSpaceBeforeVec) {
   IXPROF_SCOPE(LINEBRK);
   // Calculate first line indent (only for left/justified text).
   // Positive text-indent is normally suppressed when extraParagraphSpacing is on,
@@ -608,8 +722,11 @@ std::vector<size_t> ParsedText::computeHyphenatedLineBreaks(const GfxRenderer& r
     while (currentIndex < wordWidths.size()) {
       const bool isFirstWord = currentIndex == lineStart;
       int spacing = 0;
-      if (!isFirstWord && !continuesVec[currentIndex]) {
-        spacing = interWordGap(renderer, fontId, lastCodepoint(words[currentIndex - 1]),
+      if (!isFirstWord && noSpaceBeforeVec[currentIndex]) {
+        // CJK break opportunity: a legal wrap point, but set solid when joined.
+        spacing = 0;
+      } else if (!isFirstWord && !continuesVec[currentIndex]) {
+        spacing = renderer.getSpaceAdvance(fontId, lastCodepoint(words[currentIndex - 1]),
                                            firstCodepoint(words[currentIndex]), wordStyles[currentIndex - 1]);
       } else if (!isFirstWord && continuesVec[currentIndex]) {
         // Cross-boundary kerning for continuation words (e.g. nonbreaking spaces, attached punctuation)
@@ -647,12 +764,9 @@ std::vector<size_t> ParsedText::computeHyphenatedLineBreaks(const GfxRenderer& r
 
     // Don't break before a continuation word (e.g., orphaned "?" after "question").
     // Backtrack to the start of the continuation group so the whole group moves
-    // to the next line. Same for CJK leading punctuation (避头尾): back up one
-    // so the preceding character carries it down.
-    while (currentIndex > lineStart + 1 &&
-           (currentTokenAttaches(currentIndex) ||
-            (currentIndex < words.size() && words[currentIndex].size() <= 4 &&
-             isCjkLeadingPunct(firstCodepoint(words[currentIndex]))))) {
+    // to the next line. CJK kinsoku (避头尾) needs no handling here: addWord never
+    // emits a token boundary in front of a closer, so no break can land there.
+    while (currentIndex > lineStart + 1 && currentTokenAttaches(currentIndex)) {
       --currentIndex;
     }
 
@@ -749,6 +863,9 @@ bool ParsedText::hyphenateWordAtIndex(const size_t wordIndex, const int availabl
   // line, while "kilometer" moves to the next line.
   // wordContinues[wordIndex] is intentionally left unchanged — the prefix keeps its original attachment.
   wordContinues.insert(wordContinues.begin() + wordIndex + 1, false);
+  // The remainder starts a fresh line, so it takes a normal inter-word gap if it
+  // ever ends up joined; wordNoSpaceBefore[wordIndex] keeps the prefix's flag.
+  wordNoSpaceBefore.insert(wordNoSpaceBefore.begin() + wordIndex + 1, false);
 
   // Update cached widths to reflect the new prefix/remainder pairing.
   wordWidths[wordIndex] = static_cast<uint16_t>(chosenWidth);
@@ -802,6 +919,7 @@ bool ParsedText::splitPathologicalTokenAtIndex(const size_t wordIndex, const int
   wordIsBionicSuffix.insert(wordIsBionicSuffix.begin() + wordIndex + 1, false);
   wordIsGuideDot.insert(wordIsGuideDot.begin() + wordIndex + 1, false);
   wordContinues.insert(wordContinues.begin() + wordIndex + 1, false);
+  wordNoSpaceBefore.insert(wordNoSpaceBefore.begin() + wordIndex + 1, false);
 
   wordWidths[wordIndex] = static_cast<uint16_t>(chosenWidth);
   const uint16_t remainderWidth = remainder.size() >= PATHOLOGICAL_TOKEN_MIN_BYTES
@@ -812,7 +930,8 @@ bool ParsedText::splitPathologicalTokenAtIndex(const size_t wordIndex, const int
 }
 
 void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const std::vector<uint16_t>& wordWidths,
-                             const std::vector<bool>& continuesVec, const std::vector<size_t>& lineBreakIndices,
+                             const std::vector<bool>& continuesVec, const std::vector<bool>& noSpaceBeforeVec,
+                             const std::vector<size_t>& lineBreakIndices,
                              const std::function<void(std::shared_ptr<TextBlock>)>& processLine,
                              const GfxRenderer& renderer, const int fontId) {
   IXPROF_SCOPE(EXTRACT);
@@ -843,11 +962,15 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
   for (size_t wordIdx = 0; wordIdx < lineWordCount; wordIdx++) {
     lineWordWidthSum += wordWidths[lastBreakAt + wordIdx];
     // Count gaps: each word after the first creates a gap, unless it's a continuation
-    if (wordIdx > 0 && !continuesVec[lastBreakAt + wordIdx]) {
+    if (wordIdx > 0 && noSpaceBeforeVec[lastBreakAt + wordIdx]) {
+      // Unicode break opportunity with no inserted Latin-style space. It is still
+      // a stretchable gap for justified CJK/Korean text.
       actualGapCount++;
-      totalNaturalGaps +=
-          interWordGap(renderer, fontId, lastCodepoint(words[lastBreakAt + wordIdx - 1]),
-                                   firstCodepoint(words[lastBreakAt + wordIdx]), wordStyles[lastBreakAt + wordIdx - 1]);
+    } else if (wordIdx > 0 && !continuesVec[lastBreakAt + wordIdx]) {
+      actualGapCount++;
+      totalNaturalGaps += renderer.getSpaceAdvance(fontId, lastCodepoint(words[lastBreakAt + wordIdx - 1]),
+                                                   firstCodepoint(words[lastBreakAt + wordIdx]),
+                                                   wordStyles[lastBreakAt + wordIdx - 1]);
     } else if (wordIdx > 0 && continuesVec[lastBreakAt + wordIdx]) {
       if (words[lastBreakAt + wordIdx] == " ") {
         actualGapCount++;
@@ -901,9 +1024,13 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
     } else {
       int gap = 0;
       if (wordIdx + 1 < lineWordCount) {
-        gap = interWordGap(renderer, fontId, lastCodepoint(words[lastBreakAt + wordIdx]),
-                                       firstCodepoint(words[lastBreakAt + wordIdx + 1]),
-                                       wordStyles[lastBreakAt + wordIdx]);
+        // A CJK break opportunity contributes no natural space, but still absorbs
+        // its share of the justification stretch (see the gap-count loop above).
+        gap = noSpaceBeforeVec[lastBreakAt + wordIdx + 1]
+                  ? 0
+                  : renderer.getSpaceAdvance(fontId, lastCodepoint(words[lastBreakAt + wordIdx]),
+                                             firstCodepoint(words[lastBreakAt + wordIdx + 1]),
+                                             wordStyles[lastBreakAt + wordIdx]);
       }
       if (blockStyle.alignment == CssTextAlign::Justify && !isLastLine) {
         gap += justifyExtra;
