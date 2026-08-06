@@ -389,6 +389,11 @@ void SettingsActivity::rebuildSettingsLists() {
   // v18.9.5: BT auto-disconnect timeout right next to the sleep timeout
   // (same slider UI, same category, closely related concept).
   pushByName(systemChildren, allSettings, StrId::STR_BT_AUTO_DISCONNECT);
+  // v4.7.3: "Indexing page X of Y" popup toggle. Registered in SettingsList
+  // under STR_CAT_SYSTEM since v18.9.9.172, but the device menus are curated by
+  // hand rather than filled from the category, so it only ever appeared in the
+  // web UI (which does enumerate by category). Defaults off.
+  pushByName(systemChildren, allSettings, StrId::STR_INDEXING_SHOW_PAGE_COUNT);
   systemChildren.push_back(SettingInfo::Action(StrId::STR_LANGUAGE, SettingAction::Language));
   systemChildren.push_back(SettingInfo::Action(StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates));
   systemChildren.push_back(SettingInfo::Action(StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate));
