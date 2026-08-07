@@ -389,6 +389,7 @@ void BluetoothSettingsActivity::loop() {
   if (bannerUntil > 0 && millis() > bannerUntil) {
     banner.clear();
     bannerUntil = 0;
+    debugStatsOnlyRepaint = false;  // the banner lives outside the stats band
     requestUpdate();
   }
 
@@ -405,6 +406,7 @@ void BluetoothSettingsActivity::loop() {
         (debugLastRepaintMs == 0 || nowMs - debugLastRepaintMs >= kDebugRepaintMinIntervalMs)) {
       debugDirty.store(false, std::memory_order_relaxed);
       debugLastRepaintMs = nowMs;
+      debugStatsOnlyRepaint = true;  // only the counters moved
       requestUpdate();
     }
   }
@@ -667,7 +669,9 @@ void BluetoothSettingsActivity::render(RenderLock&&) {
   }
 #ifdef ENABLE_BT_DEBUG_MONITOR
   if (view == View::DebugMonitor) {
-    renderDebugMonitor();
+    const bool statsOnly = debugStatsOnlyRepaint;
+    debugStatsOnlyRepaint = false;
+    renderDebugMonitor(statsOnly);
     return;
   }
 #endif
@@ -908,15 +912,32 @@ void BluetoothSettingsActivity::renderButtonMap() {
   renderer.displayBuffer();
 }
 
-void BluetoothSettingsActivity::renderDebugMonitor() {
+void BluetoothSettingsActivity::renderDebugMonitor(bool statsOnly) {
   auto metrics = UITheme::getInstance().getMetrics();
   const auto pageWidth = renderer.getScreenWidth();
   const auto pageHeight = renderer.getScreenHeight();
 
-  renderer.clearScreen();
-  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, "Bluetooth Debug");
-  const char* sub = btMgr && btMgr->isDebugCaptureEnabled() ? "Capture ON" : "Capture OFF";
-  GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight}, sub);
+  const int base = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight;
+  // The dynamic band: the four stat lines, the age line, and up to five
+  // unique-key rows. Height is FIXED rather than derived from the current row
+  // count -- a shrinking list has to erase the rows it no longer draws, and a
+  // band that shrank with it would leave them on the panel. Sits well under
+  // HalDisplay::displayBufferRegion's 70%-of-screen fallback threshold.
+  constexpr int kStatsBandTopOffset = 20;
+  constexpr int kStatsBandHeight = 200;
+  const int statsBandTop = base + kStatsBandTopOffset;
+
+  if (statsOnly) {
+    // Everything outside the band is unchanged; just erase the band and
+    // repaint it. No clearScreen, no header/hints redraw.
+    renderer.fillRect(0, statsBandTop, pageWidth, kStatsBandHeight, false);
+  } else {
+    renderer.clearScreen();
+    GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight}, "Bluetooth Debug");
+    const char* sub = btMgr && btMgr->isDebugCaptureEnabled() ? "Capture ON" : "Capture OFF";
+    GUI.drawSubHeader(renderer, Rect{0, metrics.topPadding + metrics.headerHeight, pageWidth, metrics.tabBarHeight},
+                      sub);
+  }
 
   char l1[64], l2[64], l3[64], l4[64];
   unsigned int connectedCount = btMgr ? static_cast<unsigned int>(btMgr->getConnectedDevices().size()) : 0;
@@ -924,7 +945,6 @@ void BluetoothSettingsActivity::renderDebugMonitor() {
   snprintf(l2, sizeof(l2), "Key events: %u", static_cast<unsigned>(debugEventCount));
   snprintf(l3, sizeof(l3), "Unique keys: %u", static_cast<unsigned>(debugUniqueCount));
   snprintf(l4, sizeof(l4), "Last key: 0x%02X", static_cast<unsigned>(debugLastKeycode & 0xFF));
-  const int base = metrics.topPadding + metrics.headerHeight + metrics.tabBarHeight;
   renderer.drawCenteredText(UI_12_FONT_ID, base + 24, l1);
   renderer.drawCenteredText(UI_12_FONT_ID, base + 48, l2);
   renderer.drawCenteredText(UI_12_FONT_ID, base + 72, l3);
@@ -965,6 +985,13 @@ void BluetoothSettingsActivity::renderDebugMonitor() {
       renderer.drawCenteredText(UI_10_FONT_ID, uniqueStartY + static_cast<int>(renderCount) * 16, moreLine);
     }
   }
+  if (statsOnly) {
+    // Windowed update: only the counters band reaches the panel, so the rest of
+    // the screen is never driven and there is no full-frame flash per key press.
+    renderer.displayBufferRegion(0, statsBandTop, pageWidth, kStatsBandHeight);
+    return;
+  }
+
   if (!banner.empty()) {
     renderer.drawCenteredText(UI_10_FONT_ID, pageHeight - metrics.buttonHintsHeight - 16, banner.c_str());
   }

@@ -98,6 +98,10 @@ class BluetoothSettingsActivity : public Activity {
   // but the screen never moved.
   std::atomic<bool> debugDirty{false};
   unsigned long debugLastRepaintMs = 0;
+  // Set only by the debugDirty branch in loop(); consumed and cleared by
+  // render(). Anything else that repaints this view leaves it false and gets a
+  // full frame.
+  bool debugStatsOnlyRepaint = false;
   static constexpr uint8_t kDebugUniqueKeyMax = 8;
   uint8_t debugUniqueKeys[kDebugUniqueKeyMax] = {0};
   uint16_t debugUniqueCounts[kDebugUniqueKeyMax] = {0};
@@ -149,7 +153,11 @@ class BluetoothSettingsActivity : public Activity {
   void renderScan();
   void renderPaired();
   void renderButtonMap();
-  void renderDebugMonitor();
+  // statsOnly: repaint just the counters band and push it as a windowed
+  // update. The header, sub-header, banner and button hints never change while
+  // key events arrive, and pushing the whole frame for a few digits is what made
+  // the screen flash on every press.
+  void renderDebugMonitor(bool statsOnly = false);
   // Persist the captured (kind, value) bound to `button` into SETTINGS.bleKeyMap.
   // One-key-per-action: any existing slot pointing at the same button is dropped
   // first so a button can't have two keys. Returns false if all 12 slots are
