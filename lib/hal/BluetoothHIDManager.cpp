@@ -336,6 +336,9 @@ bool BluetoothHIDManager::enable() {
   }
 
   _enabled = true;
+  // Deliberate enable (BT menu entry, quick-connect) is an explicit "try now":
+  // never make the user wait out a backoff earned by earlier failures.
+  resetAutoReconnectBackoff();
   // v18.9.9.48: successful init clears the skip-teardown flag so callers
   // don't keep silent-restarting after we've re-entered a clean state.
   _nimbleStateSkippedTeardown = false;
@@ -2200,6 +2203,11 @@ void BluetoothHIDManager::updateActivity() {
   }
 }
 
+void BluetoothHIDManager::resetAutoReconnectBackoff() {
+  _reconnectFailures = 0;
+  _nextReconnectAllowedMs = 0;
+}
+
 void BluetoothHIDManager::checkAutoReconnect(bool userInputDetected) {
   if (!_enabled) {
     return;
@@ -2245,6 +2253,16 @@ void BluetoothHIDManager::checkAutoReconnect(bool userInputDetected) {
     LOG_DBG("BT", "AutoReconnect skipped: cooldown active (%lu ms)", now - lastReconnectAttempt);
     return;
   }
+
+  // 4.7.4: failure backoff. Each attempt below blocks the loop for 2-3 s when
+  // the remote isn't reachable, which reads as "the buttons are laggy". After
+  // a failure, hold off progressively (10s, 20s, 40s, ... capped at 5 min)
+  // instead of re-freezing on the next press.
+  if (_nextReconnectAllowedMs != 0 && now < _nextReconnectAllowedMs) {
+    LOG_DBG("BT", "AutoReconnect skipped: backoff for %lu more ms after %u failures",
+            _nextReconnectAllowedMs - now, static_cast<unsigned>(_reconnectFailures));
+    return;
+  }
   lastReconnectAttempt = now;
 
   if (_bondedDeviceAddress.empty()) {
@@ -2257,8 +2275,16 @@ void BluetoothHIDManager::checkAutoReconnect(bool userInputDetected) {
 
   if (connectToDevice(_bondedDeviceAddress)) {
     LOG_INF("BT", "Reconnected to bonded device %s", _bondedDeviceAddress.c_str());
+    resetAutoReconnectBackoff();
   } else {
-    LOG_ERR("BT", "Reconnect to bonded device %s failed: %s", _bondedDeviceAddress.c_str(), lastError.c_str());
+    if (_reconnectFailures < 5) _reconnectFailures++;
+    // 10s, 20s, 40s, 80s, 160s -- then hold at 300s.
+    unsigned long holdMs = 10000UL << (_reconnectFailures - 1);
+    if (holdMs > 300000UL) holdMs = 300000UL;
+    _nextReconnectAllowedMs = now + holdMs;
+    LOG_ERR("BT", "Reconnect to bonded device %s failed: %s (backoff %lu ms, failures=%u)",
+            _bondedDeviceAddress.c_str(), lastError.c_str(), holdMs,
+            static_cast<unsigned>(_reconnectFailures));
   }
 }
 

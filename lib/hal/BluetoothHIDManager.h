@@ -143,6 +143,10 @@ public:
   void setBondedDevice(const std::string& address, const std::string& name = "");
   void updateActivity();  // Call periodically to check inactivity timeout
   void checkAutoReconnect(bool userInputDetected = false);  // Reconnect bonded device when disconnected
+  // Clear the auto-reconnect failure backoff. Called on a successful connect
+  // and whenever the user deliberately acts on BT (enable, scan, pair), so an
+  // explicit "connect now" is never held off by earlier failures.
+  void resetAutoReconnectBackoff();
   
   // Check if BLE has had activity recently (within last 4 minutes)
   // Used by power manager to prevent sleep during BLE use
@@ -253,6 +257,14 @@ private:
     std::function<void(uint8_t)> _buttonActivityNotifier;
   bool _debugCaptureEnabled = false;
   std::string _bondedDeviceAddress;
+  // 4.7.4: auto-reconnect backoff. connectToDevice() BLOCKS the main loop for
+  // 2-3 s when the bonded remote is off or out of range, and the reconnect is
+  // driven by local button presses -- so a user who owns a page-turner but
+  // isn't using it right now paid that freeze on button after button. Count
+  // consecutive failures and push the next attempt out exponentially; a
+  // successful connect (or a deliberate BT enable) clears it.
+  uint8_t _reconnectFailures = 0;
+  unsigned long _nextReconnectAllowedMs = 0;
   std::string _bondedDeviceName;
   
   // Inactivity timeout (milliseconds)

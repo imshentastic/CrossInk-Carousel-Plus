@@ -27,6 +27,10 @@ class Activity {
  public:
   explicit Activity(std::string name, GfxRenderer& renderer, MappedInputManager& mappedInput)
       : name(std::move(name)), renderer(renderer), mappedInput(mappedInput) {}
+
+  // Read-only accessor for logging (ActivityManager's onEnter timing).
+  const std::string& getName() const { return name; }
+
   virtual ~Activity() = default;
   virtual void onEnter();
   virtual void onExit();

@@ -3759,6 +3759,16 @@ void setup() {
   delay(10);
   gpio.update();
   allowSleepAt = millis() + 2000;
+
+  // 4.7.4 perf instrumentation. millis() starts at 0 each boot, so this IS the
+  // boot cost -- and because navigation silent-restarts to defragment the heap,
+  // it is also the length of the pause the user sees on those transitions.
+  // Tagged with the restart target so the log says WHICH navigation path paid
+  // it. Baseline this before optimising; targets are the lean-boot skips and
+  // the entry-peak reductions that let the restart thresholds fire less often.
+  LOG_INF("PERF", "boot->ready %lu ms (silentRestart=%d target=%u lean=%d)",
+          static_cast<unsigned long>(millis()), isContinuingFromSilentReboot() ? 1 : 0,
+          static_cast<unsigned>(silentRebootTarget), g_leanBootForOta ? 1 : 0);
 }
 
 void loop() {

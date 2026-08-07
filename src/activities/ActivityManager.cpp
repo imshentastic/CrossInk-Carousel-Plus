@@ -156,7 +156,19 @@ void ActivityManager::loop() {
       currentActivity = std::move(pendingActivity);
 
       lock.unlock();  // onEnter may acquire its own lock
-      currentActivity->onEnter();
+      // 4.7.4 perf instrumentation: onEnter is where an activity does its
+      // synchronous setup (list builds, cover scans, index loads) before the
+      // first paint, so this is the other half of a navigation's felt cost --
+      // the half that does NOT involve a restart.
+      {
+        const unsigned long enterStart = millis();
+        currentActivity->onEnter();
+        const unsigned long enterMs = millis() - enterStart;
+        if (enterMs >= 150) {
+          LOG_INF("PERF", "onEnter %s took %lu ms (free=%u maxAlloc=%u)", currentActivity->getName().c_str(),
+                  enterMs, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        }
+      }
 
       // onEnter may request another pending action, we will handle it in the next loop iteration
       continue;
