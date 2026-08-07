@@ -33,6 +33,22 @@ void silentRestartToBakeSleepImages();
 bool hasPendingBakeSleepImages();
 void clearPendingBakeSleepImages();
 
+// v4.7.5: cross-restart validity marker for the library's SD walk. The walk
+// (LibraryIndex::ensureWalked -> rescan) costs ~1.5 s on a 43-book card and is
+// gated by a plain RAM bool, so every silent restart re-walked a card that had
+// not changed since the walk moments earlier.
+//
+// Only LibraryIndex may call these: it arms on a completed rescan() and clears
+// on markStale() / forgetPath() / releaseMemory(). setup() honours the marker
+// only for a clean silent restart with a successfully loaded on-disk index --
+// cold boot, power-cycle and crash restarts always re-walk. Anything that can
+// add or remove books behind the index's back (the HTTP server's upload,
+// delete, rename and WebDAV endpoints) suppresses arming for the rest of the
+// boot via LibraryIndex::suppressCrossBootWalkReuse().
+void markLibraryWalkValidForNextBoot();
+void invalidateLibraryWalkForNextBoot();
+bool isLibraryWalkStillValidFromLastBoot();
+
 // CrumBLE 4.5.5+: when loadShelfCovers triggers a silentRestart while the
 // user is on the shelf header (typical: they just pressed L/R to cycle
 // the collection, missing thumbs in the new collection's window kicked the

@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <esp_task_wdt.h>
 
+#include "LibraryIndex.h"
 #include "MappedInputManager.h"
 #include "SilentRestart.h"
 #include "WifiSelectionActivity.h"
@@ -51,6 +52,12 @@ void CalibreConnectActivity::onEnter() {
 
 void CalibreConnectActivity::onExit() {
   Activity::onExit();
+
+  // v4.7.5: Calibre can have sent books over during this session. Mirror what
+  // File Transfer's onExit already does so the next Recently Added / All Books
+  // visit re-walks and finds them, instead of relying on the restart below to
+  // reset the RAM-only walk flag.
+  LibraryIndex::getInstance().markStale();
 
   if (WiFi.getMode() != WIFI_MODE_NULL) {
     WiFi.disconnect(false);

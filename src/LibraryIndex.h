@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -65,7 +66,17 @@ class LibraryIndex {
   // mutating operations rebuild the pool wholesale.
   std::vector<char> pathPool;
   bool jsonLoaded = false;  // /.crosspoint/library_index.json has been read
-  bool walkPerformed = false;  // an SD walk has run this session (refresh or initial)
+  // An SD walk has run this session (refresh or initial).
+  //
+  // v4.7.5: atomic because it is read and written from two FreeRTOS tasks.
+  // Activity::render() runs on the ActivityManagerRender task while
+  // Activity::loop() runs on the main task and deliberately takes no
+  // RenderLock, and HomeActivity reaches the index from both (loop() sizes the
+  // shelf for navigation, render() paints it). As a plain bool the
+  // check-then-set in ensureWalked() was a data race with a ~1.2 s window --
+  // long enough that both tasks routinely passed the guard and ran concurrent
+  // rescans. Atomic alone is not sufficient; see walkMutex in the .cpp.
+  std::atomic<bool> walkPerformed{false};
   bool freshFirstBoot = false;  // begin() ran with no index file on SD — used to gate welcome UI
 
   LibraryIndex() = default;
@@ -104,7 +115,35 @@ class LibraryIndex {
   // file-server / hotspot exit paths where books may have just been
   // uploaded over WiFi — the walk itself is still lazy (deferred to
   // next virtual-collection access) so onExit stays snappy.
-  void markStale() { walkPerformed = false; }
+  // Out of line since v4.7.5: also drops the cross-restart walk marker.
+  void markStale();
+
+  // v4.7.5: stop arming the cross-restart walk marker for the remainder of
+  // this boot, and drop any marker already armed.
+  //
+  // Called from CrossPointWebServer::begin(). The server is the one component
+  // that can add or remove books without the index hearing about it: WS
+  // upload, HTTP upload, the file manager's delete/rename, and every WebDAV
+  // verb write to the card directly. Today a reboot papers over that, because
+  // walkPerformed is RAM-only and resets on every boot — which is exactly the
+  // safety net the cross-restart marker would remove.
+  //
+  // The suppression sits at the server rather than on the individual
+  // endpoints deliberately. Two separate activities start a
+  // CrossPointWebServer (File Transfer and Calibre Connect) and only File
+  // Transfer markStale()s on exit, so a per-endpoint or per-activity audit
+  // has to stay exhaustive as endpoints are added. Gating at begin() means
+  // any current or future serving path is covered by construction: if the
+  // server ran at all this boot, the next restart re-walks. The cost is one
+  // ~1.5 s walk after a transfer session, which is precisely the case where
+  // the book set probably did change.
+  void suppressCrossBootWalkReuse();
+
+  // v4.7.5: adopt the walk performed before a silent restart instead of
+  // repeating it. Only setup() calls this, and only for a clean silent
+  // restart. No-op unless the on-disk index actually loaded — a fresh or
+  // corrupt index must still walk to discover the library at all.
+  void adoptWalkFromPreviousBoot();
 
   // CrumBLE 4.5.4: read-only accessor for HomeActivity's background
   // populate pump -- only ticks when an SD walk has populated entries.
@@ -118,13 +157,8 @@ class LibraryIndex {
   // Next ensureWalked()/begin() repopulates from the on-disk JSON plus an
   // SD walk; web-server exit paths already markStale() so the rebuild is
   // automatic. Only call when nothing is actively reading the index.
-  void releaseMemory() {
-    std::vector<LibraryEntry>().swap(entries);
-    std::vector<char>().swap(pathPool);
-    std::vector<char>().swap(authorKeyPool);
-    jsonLoaded = false;
-    walkPerformed = false;
-  }
+  // Out of line since v4.7.5: also drops the cross-restart walk marker.
+  void releaseMemory();
 
   // Read accessors. Both produce a fresh vector copy — the underlying
   // index is small enough that this is cheap.
@@ -174,6 +208,9 @@ class LibraryIndex {
  private:
   bool loadFromFile();
   bool saveToFile() const;
+  // v4.7.5: the body of rescan(), minus the walk-serialising lock. Callers
+  // that already hold it (ensureWalked, rescan) use this; nothing else should.
+  void rescanUnlocked(const std::function<void(int)>& progress);
   // Recursive descent. depth caps at 8 to avoid runaway nesting. Skips
   // dot-prefixed directories (".crosspoint", ".Trashes", etc.). For each book
   // file found, appends its path to outPaths and its size (bytes) to outSizes at

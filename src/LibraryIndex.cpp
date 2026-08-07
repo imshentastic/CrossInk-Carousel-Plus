@@ -7,6 +7,7 @@
 #include <Logging.h>
 
 #include "CollectionsStore.h"
+#include "SilentRestart.h"  // v4.7.5: cross-restart walk marker
 
 #include <algorithm>
 #include <cctype>
@@ -237,7 +238,113 @@ void LibraryIndex::begin() {
   jsonLoaded = true;
 }
 
+// v4.7.5: serialises every operation that rebuilds or frees the index.
+//
+// The index is reached from two FreeRTOS tasks: Activity::render() runs on the
+// ActivityManagerRender task, Activity::loop() runs on the main task with no
+// RenderLock held (ActivityManager::loop comments that acquiring one is the
+// caller's job, and HomeActivity does not). HomeActivity touches the index
+// from both -- loop() calls cachedShelfPaths() to size the shelf for
+// navigation, render() calls it to paint -- and both land in
+// CollectionsStore::resolveBookPaths -> ensureWalked().
+//
+// Without this, ensureWalked()'s `if (walkPerformed) return` was a
+// check-then-set spanning the whole ~1.2 s walk, so both tasks passed the
+// guard and ran concurrent rescans. Field log (43 books, cold boot) showed the
+// two walks overlapping: [4671,5875] and [5552,6532]. That is not just wasted
+// time -- rescan() builds an unordered_map of string_views into the live
+// pathPool and then swaps entries/pathPool/authorKeyPool wholesale, so a
+// concurrent rescan or releaseMemory() leaves the other task's views dangling.
+//
+// Function-local static so construction is thread-safe (C++11 magic statics)
+// without depending on init order.
+static SemaphoreHandle_t walkMutex() {
+  static SemaphoreHandle_t m = xSemaphoreCreateMutex();
+  return m;
+}
+
+namespace {
+// RAII take/give. portMAX_DELAY: the operations guarded here are the only
+// writers, none of them re-enter, and every one of them must complete -- a
+// caller that gave up would proceed against a half-rebuilt index.
+struct WalkLock {
+  WalkLock() {
+    SemaphoreHandle_t m = walkMutex();
+    if (m != nullptr) xSemaphoreTake(m, portMAX_DELAY);
+  }
+  ~WalkLock() {
+    SemaphoreHandle_t m = walkMutex();
+    if (m != nullptr) xSemaphoreGive(m);
+  }
+  WalkLock(const WalkLock&) = delete;
+  WalkLock& operator=(const WalkLock&) = delete;
+};
+}  // namespace
+
+// v4.7.5: process-lifetime latch. Once anything that can change the book set
+// behind our back has run, the cross-restart walk marker stays disarmed for
+// the rest of the boot. Never cleared -- a boot that served files once can
+// serve again at any time, and re-arming would need the same exhaustive
+// endpoint audit the latch exists to avoid.
+static bool s_crossBootWalkReuseSuppressed = false;
+
+void LibraryIndex::suppressCrossBootWalkReuse() {
+  if (!s_crossBootWalkReuseSuppressed) {
+    LOG_INF("LIB", "Cross-restart walk reuse suppressed for this boot (file server started)");
+  }
+  s_crossBootWalkReuseSuppressed = true;
+  invalidateLibraryWalkForNextBoot();
+}
+
+void LibraryIndex::markStale() {
+  // Deliberately NOT locked: it touches no pool, and callers are exit paths
+  // (File Transfer / Calibre onExit) that would otherwise block up to ~1.2 s
+  // behind a walk running on the render task. walkPerformed is atomic, so the
+  // write itself is safe.
+  //
+  // A walk already in flight will still set walkPerformed = true when it
+  // finishes, swallowing this stale signal. That is survivable because the one
+  // case it matters for -- books added over the network -- also latches
+  // suppressCrossBootWalkReuse() at server start, so the next boot re-walks
+  // regardless of what this flag ends up as.
+  walkPerformed = false;
+  invalidateLibraryWalkForNextBoot();
+}
+
+void LibraryIndex::releaseMemory() {
+  // Locked: this frees the very buffers a concurrent rescan on the other task
+  // holds string_views into.
+  WalkLock lock;
+  std::vector<LibraryEntry>().swap(entries);
+  std::vector<char>().swap(pathPool);
+  std::vector<char>().swap(authorKeyPool);
+  jsonLoaded = false;
+  walkPerformed = false;
+  invalidateLibraryWalkForNextBoot();
+}
+
+void LibraryIndex::adoptWalkFromPreviousBoot() {
+  // begin() must have run and loaded a usable index. On a fresh/corrupt index
+  // freshFirstBoot is set and entries are empty -- walking is the only way to
+  // discover the library, so never short-circuit that.
+  if (!jsonLoaded || freshFirstBoot) {
+    LOG_INF("LIB", "Cross-restart walk reuse declined (jsonLoaded=%d freshFirstBoot=%d)",
+            jsonLoaded ? 1 : 0, freshFirstBoot ? 1 : 0);
+    return;
+  }
+  walkPerformed = true;
+  LOG_INF("PERF", "library walk reused from pre-restart boot (%zu entries, SD walk skipped)", entries.size());
+}
+
 void LibraryIndex::ensureWalked(const std::function<void(int)>& progress) {
+  // Unlocked fast path: once walkPerformed is true it never goes back to false
+  // without a markStale()/releaseMemory(), so a true reading here is safe and
+  // keeps the common case (every render after the first) lock-free.
+  if (walkPerformed) return;
+  WalkLock lock;
+  // Re-check under the lock. If we blocked behind the other task's walk, it has
+  // now finished and the index is already current -- this is what collapses the
+  // observed double walk into one.
   if (walkPerformed) return;
   // Restore the persisted index (with each book's firstSeen) before walking.
   // Normally a no-op (begin() ran at boot), but after releaseMemory() freed the
@@ -246,16 +353,24 @@ void LibraryIndex::ensureWalked(const std::function<void(int)>& progress) {
   // would make rescan() treat every book as newly-discovered and reset all the
   // "Recently Added" timestamps.
   begin();
-  rescan(progress);
+  rescanUnlocked(progress);
 }
 
 void LibraryIndex::rescan(const std::function<void(int)>& progress) {
+  WalkLock lock;
+  rescanUnlocked(progress);
+}
+
+void LibraryIndex::rescanUnlocked(const std::function<void(int)>& progress) {
   // Walk the whole SD, collecting every book file path and its size.
   std::vector<std::string> discovered;
   std::vector<uint32_t> discoveredSizes;
   if (progress) progress(5);
+  const unsigned long walkStartMs = millis();
   walkRecursive("/", 0, discovered, discoveredSizes);
+  const unsigned long walkMs = millis() - walkStartMs;
   const size_t walkedCount = discovered.size();
+  LOG_INF("PERF", "library SD walk %lu ms (%zu book files)", walkMs, walkedCount);
   if (progress) progress(60);
 
   // Order by a persistent monotonic "first seen by the device" counter. File
@@ -371,6 +486,10 @@ void LibraryIndex::rescan(const std::function<void(int)>& progress) {
 
   walkPerformed = true;
   saveToFile();
+  // v4.7.5: the on-disk index now matches the card, so a silent restart in the
+  // next few seconds can load it and skip re-walking. Suppressed for the rest
+  // of the boot once the file server has run -- see suppressCrossBootWalkReuse.
+  if (!s_crossBootWalkReuseSuppressed) markLibraryWalkValidForNextBoot();
   LOG_INF("LIB", "Library index now has %zu entries (walked %zu files)", entries.size(), walkedCount);
   // CrumBLE: a re-walk can add/remove books, so the BookReadingStats-derived
   // virtuals (Finished, New) might be stale relative to the new path set.
@@ -417,6 +536,9 @@ uint64_t LibraryIndex::getFirstSeen(const std::string& path) const {
 }
 
 void LibraryIndex::forgetPath(const std::string& path) {
+  // Locked: erases from `entries` and saves, both of which a concurrent rescan
+  // on the other task is actively rebuilding.
+  WalkLock lock;
   auto it = std::find_if(entries.begin(), entries.end(),
                          [&](const LibraryEntry& e) { return path == pathOf(e); });
   if (it == entries.end()) return;
@@ -428,6 +550,12 @@ void LibraryIndex::forgetPath(const std::string& path) {
   // refresh, so the slop never accumulates.
   entries.erase(it);
   saveToFile();
+  // v4.7.5: saveToFile() keeps the on-disk index consistent, so strictly the
+  // cross-restart marker could stay armed here. Dropped anyway: deletes are
+  // rare, a 1.5 s re-walk is cheap next to showing a book the user just
+  // deleted, and the caller (BookActions::clearFileMetadata) also sweeps
+  // several other stores whose consistency we are not re-verifying here.
+  invalidateLibraryWalkForNextBoot();
 }
 
 void LibraryIndex::walkRecursive(const std::string& dirPath, int depth, std::vector<std::string>& outPaths,

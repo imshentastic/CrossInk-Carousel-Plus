@@ -23,6 +23,7 @@
 #include "AppVersion.h"
 #include "CrossPointSettings.h"
 #include "FontInstaller.h"
+#include "LibraryIndex.h"
 #include "OpdsServerStore.h"
 #include "SdCardFontSystem.h"
 #include "SettingsList.h"
@@ -553,6 +554,15 @@ void CrossPointWebServer::begin() {
 
   // Store AP mode flag for later use (e.g., in handleStatus)
   apMode = isInApMode;
+
+  // v4.7.5: from here on this boot, books can appear or disappear without the
+  // LibraryIndex hearing about it -- WS upload, HTTP upload, the file
+  // manager's delete/rename, and every WebDAV write verb touch the card
+  // directly. Disarm the cross-restart walk marker so the next silent restart
+  // re-walks and discovers them. Placed at the server rather than the
+  // endpoints because both File Transfer and Calibre Connect start one of
+  // these, and only File Transfer markStale()s on exit.
+  LibraryIndex::getInstance().suppressCrossBootWalkReuse();
 
   LOG_DBG("WEB", "[MEM] Free heap before begin: %d bytes", ESP.getFreeHeap());
   LOG_DBG("WEB", "Network mode: %s", apMode ? "AP" : "STA");

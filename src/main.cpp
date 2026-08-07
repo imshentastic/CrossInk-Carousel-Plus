@@ -784,6 +784,28 @@ constexpr uint32_t COVER_HEAP_RESTART_MAGIC = 0xC0BE4500;
 RTC_NOINIT_ATTR uint32_t pendingBakeSleepImagesFlag;
 constexpr uint32_t PENDING_BAKE_SLEEP_MAGIC = 0xC0BE5EEDu;
 
+// v4.7.5: "the SD book walk that just ran is still valid" marker, so a silent
+// restart doesn't re-walk the card it walked seconds ago (~1.5 s on a 43-book
+// library). Mirrors LibraryIndex::walkPerformed, which is a plain RAM bool and
+// therefore resets on every reboot.
+//
+// This is only ever trusted when the boot is a clean silent restart (the
+// device rebooted itself; nothing could have touched the card in between) and
+// the on-disk index actually loaded. Cold boot, power-cycle and crash restarts
+// all re-walk, which is what makes an SD swap safe: RTC NOINIT is
+// uninitialized on power-up, so the magic can't survive the card being
+// changed.
+//
+// The correctness hazard is a book appearing or disappearing *before* the
+// restart without the index learning about it -- the walk is how new books are
+// discovered, so a stale marker would hide a just-uploaded book until the user
+// power-cycled. LibraryIndex arms the marker only in rescan(), and clears it in
+// markStale() / forgetPath() / releaseMemory(); CrossPointWebServer::begin()
+// suppresses arming for the rest of the boot. See LibraryIndex.h for why the
+// suppression sits at the server rather than at each upload endpoint.
+RTC_NOINIT_ATTR uint32_t libraryWalkValidFlag;
+constexpr uint32_t LIBRARY_WALK_VALID_MAGIC = 0xC0BE1B17u;
+
 // CrumBLE 4.5.7: when silent-restart-to-bt-settings fires from the reader's
 // BT enable pre-flight defrag path, remember to return to the reader when
 // the user Backs out of BT settings. Without this flag, Back pops to Home
@@ -928,6 +950,12 @@ bool hasPendingBakeSleepImages() {
   return pendingBakeSleepImagesFlag == PENDING_BAKE_SLEEP_MAGIC;
 }
 void clearPendingBakeSleepImages() { pendingBakeSleepImagesFlag = 0; }
+
+// v4.7.5: see the libraryWalkValidFlag comment above. Callers are all in
+// LibraryIndex -- nothing else should arm this.
+void markLibraryWalkValidForNextBoot() { libraryWalkValidFlag = LIBRARY_WALK_VALID_MAGIC; }
+void invalidateLibraryWalkForNextBoot() { libraryWalkValidFlag = 0; }
+bool isLibraryWalkStillValidFromLastBoot() { return libraryWalkValidFlag == LIBRARY_WALK_VALID_MAGIC; }
 
 void markPendingHomeFocusOnShelfHeader() {
   pendingHomeFocusOnShelfHeaderMagic = HOME_FOCUS_SHELF_HEADER_MAGIC;
@@ -2707,6 +2735,12 @@ void setup() {
   // one boot session all count as "attempted this session".
   if (!isSilentReboot) {
     homeBootClockSyncAttemptedMagic = 0;
+    // v4.7.5: same reasoning for the library-walk marker. The adopt site
+    // already gates on isSilentReboot so uninitialized RTC can never be acted
+    // on, but clearing it here means the flag only ever holds a value this
+    // firmware wrote -- no reliance on a 1-in-2^32 magic collision not
+    // happening on a cold boot.
+    libraryWalkValidFlag = 0;
   }
   // v18.9.9.1: read-and-clear the hard-restart flag. Set only by the
   // std::terminate handler; forces the boot path to bypass the seamless
@@ -3463,6 +3497,20 @@ void setup() {
     LOG_INF("MEM", "pre-LibraryIndex.begin: free=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
     LibraryIndex::getInstance().begin();
     LOG_INF("MEM", "post-LibraryIndex.begin: free=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
+    // v4.7.5: a silent restart is the device rebooting itself -- nothing can
+    // have touched the SD card between the walk that ran moments ago and this
+    // boot, so re-walking costs ~1.5 s to rediscover the identical library.
+    // Adopt the previous boot's walk instead when the marker is still armed.
+    //
+    // Deliberately narrow. isHardRestart excludes the terminate-handler
+    // restart: that path re-arms silentRebootMagic after a bad_alloc, and a
+    // crash mid-upload is exactly when the in-RAM view is least trustworthy.
+    // A cold boot or power-cycle never reaches here with the magic set (RTC
+    // NOINIT is uninitialized on power-up), so a swapped SD card always walks.
+    if (isSilentReboot && !isHardRestart && isLibraryWalkStillValidFromLastBoot()) {
+      LibraryIndex::getInstance().adoptWalkFromPreviousBoot();
+    }
     SeriesIndex::getInstance().begin();
     LOG_INF("MEM", "post-SeriesIndex.begin: free=%u maxAlloc=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
 
