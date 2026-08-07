@@ -160,6 +160,10 @@ class LyraFlowTheme : public LyraTheme {
   // contract — overloading it would touch every other theme. mutable
   // because drawRecentBookCover is const.
   mutable bool skipCarouselCoverLoads = false;
+  // Book index whose covers are actually on screen right now. Guards against
+  // honouring a skipCarouselCoverLoads that was computed for a different index
+  // (see drawRecentBookCover). -1 = nothing painted yet.
+  mutable int lastPaintedCoverIdx_ = -1;
 
   // CrumBLE: when a book is focused on the Collections shelf (no icon is
   // active in the icon bar), HomeActivity sets this to the focused book's

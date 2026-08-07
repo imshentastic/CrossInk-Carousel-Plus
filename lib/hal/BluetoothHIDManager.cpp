@@ -6,6 +6,8 @@
 #include <HalPowerManager.h>
 #include <WiFi.h>
 #include <esp_system.h>  // esp_get_free_heap_size (NimBLE-enable heap gate)
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>  // xTaskGetHandle / uxTaskGetStackHighWaterMark (BT stack probe)
 
 #if defined(ARDUINO) && __has_include(<esp32-hal-bt-mem.h>)
 // Arduino-ESP32 3.x releases BT controller memory during startup unless a
@@ -189,14 +191,16 @@ class ScanCallbacks : public NimBLEScanCallbacks {
 static ScanCallbacks scanCallbacks;
 
 // Client connection callbacks
+// These run on the nimble_host task, so they latch instead of logging -- same
+// invariant as the HID notify callback (see BluetoothHIDManager.h). The
+// disconnect path in particular was the deepest measured point on that stack.
 class ClientCallbacks : public NimBLEClientCallbacks {
   void onConnect(NimBLEClient* pClient) override {
-    LOG_INF("BT", "Client connected: %s", pClient->getPeerAddress().toString().c_str());
+    BluetoothHIDManager::getInstance().noteClientConnect(pClient->getPeerAddress());
   }
-  
+
   void onDisconnect(NimBLEClient* pClient, int reason) override {
-    LOG_ERR("BT", "Client disconnected: %s (reason: %d)", pClient->getPeerAddress().toString().c_str(), reason);
-    BluetoothHIDManager::getInstance().noteClientDisconnect(reason);
+    BluetoothHIDManager::getInstance().noteClientDisconnect(reason, pClient->getPeerAddress());
   }
 };
 
@@ -1002,16 +1006,26 @@ bool BluetoothHIDManager::connectToDevice(const std::string& address) {
     return true;
 }
 
-void BluetoothHIDManager::noteClientDisconnect(int reason) {
+void BluetoothHIDManager::noteClientConnect(const NimBLEAddress& addr) {
+  if (DebugEvent* ev = beginDebugEvent(DebugEventKind::ClientConnected)) {
+    copyAddressInto(ev->addr, sizeof(ev->addr), addr);
+    commitDebugEvent();
+  }
+}
+
+void BluetoothHIDManager::noteClientDisconnect(int reason, const NimBLEAddress& addr) {
   // v18.9.9.195: log bond state on every disconnect (before the intentional-
   // latch consume) so a reason-520 followed by a successful reconnect leaves
   // three snapshots in the log: post-init, disconnect-520, post-reconnect.
   // If the count/address changes between snapshots, NimBLE re-negotiated the
   // LTK on the second connect -- explaining why reconnect works.
-  {
-    char tag[48];
-    snprintf(tag, sizeof(tag), "onDisconnect reason=%d", reason);
-    logBondStoreDiag(tag);
+  //
+  // Latched, not logged: this runs on nimble_host. The drain emits the
+  // disconnect line and runs the bond-store walk on the main loop instead.
+  if (DebugEvent* ev = beginDebugEvent(DebugEventKind::ClientDisconnected)) {
+    copyAddressInto(ev->addr, sizeof(ev->addr), addr);
+    ev->reason = reason;
+    commitDebugEvent();
   }
   // A disconnect we triggered ourselves: consume the latch, no alert.
   if (_intentionalDisconnect) {
@@ -1057,14 +1071,18 @@ void BluetoothHIDManager::noteClientDisconnect(int reason) {
     // and calls connectToDevice() again). If the second attempt also
     // drops, the alert path takes over -- no infinite retry loop.
     if (!_autoReconnectConsumedThisCycle) {
-      LOG_INF("BT", "Link dropped %lums after connect (reason %d); queueing one-shot auto-reconnect",
-              since, reason);
       _autoReconnectPending = true;
       _autoReconnectConsumedThisCycle = true;
     } else {
-      LOG_INF("BT", "Link dropped %lums after connect (reason %d); auto-reconnect already used, flagging alert",
-              since, reason);
       _connectionLostAlertPending = true;
+    }
+    // Latched, not logged (nimble_host task). activeButton carries which branch
+    // ran so the drain prints the same two messages as before.
+    if (DebugEvent* ev = beginDebugEvent(DebugEventKind::LinkDropped)) {
+      ev->reason = reason;
+      ev->dtMs = static_cast<uint32_t>(since);
+      ev->activeButton = _connectionLostAlertPending ? 1 : 0;
+      commitDebugEvent();
     }
   }
 }
@@ -1262,14 +1280,18 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
   }
 
 
+  // Latched, not logged: this runs on the nimble_host task (see the deferred-
+  // logging invariant in BluetoothHIDManager.h). The hex formatting that used
+  // to live here happens in drainDebugCapture() on the main loop.
   if (g_instance->_debugCaptureEnabled) {
-    char rawBuf[128] = {0};
-    size_t offset = 0;
-    const size_t dumpLen = length < 8 ? length : 8;
-    for (size_t i = 0; i < dumpLen && offset + 4 < sizeof(rawBuf); i++) {
-      offset += snprintf(rawBuf + offset, sizeof(rawBuf) - offset, "%02X ", static_cast<unsigned>(pData[i]));
+    if (DebugEvent* ev = g_instance->beginDebugEvent(DebugEventKind::RawReport)) {
+      ev->len = static_cast<uint8_t>(length > 255 ? 255 : length);
+      const size_t dumpLen = length < sizeof(ev->data) ? length : sizeof(ev->data);
+      memcpy(ev->data, pData, dumpLen);
+      strncpy(ev->addr, device->address.c_str(), sizeof(ev->addr) - 1);
+      ev->addr[sizeof(ev->addr) - 1] = '\0';
+      g_instance->commitDebugEvent();
     }
-    LOG_INF("BTDBG", "addr=%s len=%u raw=%s", device->address.c_str(), static_cast<unsigned>(length), rawBuf);
   }
 
   auto releaseInjectedButton = [&]() {
@@ -1695,8 +1717,11 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
       device->activeInjectedButton = 0xFF;
       device->lastNormalizedPressed = false;
       isNewPressEvent = true;
-      LOG_INF("BT", "Generic stuck-release: clearing latched injection key=0x%02X idle=%lums",
-              keycode, nowMs - device->lastInjectionTime);
+      if (DebugEvent* ev = g_instance->beginDebugEvent(DebugEventKind::StuckRelease)) {
+        ev->keycode = keycode;
+        ev->dtMs = nowMs - device->lastInjectionTime;
+        g_instance->commitDebugEvent();
+      }
     }
   }
 
@@ -1704,12 +1729,18 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
       (nowMs - device->lastNormalizedEventMs) < 90) {
     isNewPressEvent = false;
     if (g_instance->_debugCaptureEnabled) {
-      LOG_INF("BTDBG", "Suppressed jitter duplicate key=0x%02X dt=%lu", keycode,
-              nowMs - device->lastNormalizedEventMs);
+      if (DebugEvent* ev = g_instance->beginDebugEvent(DebugEventKind::JitterDuplicate)) {
+        ev->keycode = keycode;
+        ev->dtMs = nowMs - device->lastNormalizedEventMs;
+        g_instance->commitDebugEvent();
+      }
     }
   }
   if (isNewPressEvent) {
-    LOG_INF("BT", ">>> BUTTON PRESSED: keycode=0x%02X <<<", keycode);
+    if (DebugEvent* ev = g_instance->beginDebugEvent(DebugEventKind::ButtonPressed)) {
+      ev->keycode = keycode;
+      g_instance->commitDebugEvent();
+    }
 
     if (g_instance->_learnInputCallback && keycode != 0x00 && keycode != 0xFF && keycodeIndex != 0xFF) {
       g_instance->_learnInputCallback(keycode, keycodeIndex);
@@ -1731,8 +1762,12 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
       mappedButton = device->activeInjectedButton;
     } else if (mappedButton != device->activeInjectedButton) {
       if (g_instance->_debugCaptureEnabled) {
-        LOG_INF("BTDBG", "Hold wobble suppressed: active=%u incoming=%u key=0x%02X", device->activeInjectedButton,
-                mappedButton, keycode);
+        if (DebugEvent* ev = g_instance->beginDebugEvent(DebugEventKind::HoldWobble)) {
+          ev->keycode = keycode;
+          ev->activeButton = device->activeInjectedButton;
+          ev->mappedButton = mappedButton;
+          g_instance->commitDebugEvent();
+        }
       }
       mappedButton = device->activeInjectedButton;
       isNewPressEvent = false;
@@ -1756,62 +1791,14 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
     }
   }
 
+  // Label lookup moved to drainDebugCapture(): both switches only ever fed a log
+  // line, and their locals were dead weight on the nimble_host task's stack.
   if (isGameBrickProfile && g_instance->_debugCaptureEnabled && isPressed) {
-    const char* keyLabel = "Unknown";
-    switch (keycode) {
-      case DeviceProfiles::KEYBOARD_UP_ARROW:
-        keyLabel = "DPad Up";
-        break;
-      case DeviceProfiles::KEYBOARD_DOWN_ARROW:
-        keyLabel = "DPad Down";
-        break;
-      case DeviceProfiles::KEYBOARD_LEFT_ARROW:
-        keyLabel = "DPad Left";
-        break;
-      case DeviceProfiles::KEYBOARD_RIGHT_ARROW:
-        keyLabel = "DPad Right";
-        break;
-      case GAMEBRICK_ACTION_A_CODE:
-        keyLabel = "A";
-        break;
-      case GAMEBRICK_ACTION_B_CODE:
-        keyLabel = "B";
-        break;
-      case 0x07:
-        keyLabel = "Up";
-        break;
-      case 0x09:
-        keyLabel = "Down";
-        break;
-      default:
-        break;
+    if (DebugEvent* ev = g_instance->beginDebugEvent(DebugEventKind::GameBrickMap)) {
+      ev->keycode = keycode;
+      ev->mappedButton = mappedButton;
+      g_instance->commitDebugEvent();
     }
-
-    const char* actionLabel = "Unmapped";
-    switch (mappedButton) {
-      case HalGPIO::BTN_UP:
-        actionLabel = "Up/PageBack";
-        break;
-      case HalGPIO::BTN_DOWN:
-        actionLabel = "Down/PageForward";
-        break;
-      case HalGPIO::BTN_LEFT:
-        actionLabel = "Left";
-        break;
-      case HalGPIO::BTN_RIGHT:
-        actionLabel = "Right";
-        break;
-      case HalGPIO::BTN_CONFIRM:
-        actionLabel = "Select";
-        break;
-      case HalGPIO::BTN_BACK:
-        actionLabel = "Back";
-        break;
-      default:
-        break;
-    }
-
-    LOG_INF("BTDBG", "GameBrick %s (0x%02X) -> %s", keyLabel, keycode, actionLabel);
   }
 
   if (!isPressed || mappedButton == 0xFF) {
@@ -1835,31 +1822,12 @@ void BluetoothHIDManager::onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t
         LOG_DBG("BT", "Game Brick: debouncing duplicate key 0x%02X (%lu ms)", keycode,
                 millis() - device->lastInjectionTime);
       } else {
-      const char* buttonName = "Unknown";
-      switch (mappedButton) {
-        case HalGPIO::BTN_UP:
-          buttonName = "Up/PageBack";
-          break;
-        case HalGPIO::BTN_DOWN:
-          buttonName = "Down/PageForward";
-          break;
-        case HalGPIO::BTN_LEFT:
-          buttonName = "Left";
-          break;
-        case HalGPIO::BTN_RIGHT:
-          buttonName = "Right";
-          break;
-        case HalGPIO::BTN_CONFIRM:
-          buttonName = "Select";
-          break;
-        case HalGPIO::BTN_BACK:
-          buttonName = "Back";
-          break;
-        default:
-          break;
-      }
       if (g_instance->_debugCaptureEnabled) {
-        LOG_INF("BT", "Mapped key 0x%02X -> %s", keycode, buttonName);
+        if (DebugEvent* ev = g_instance->beginDebugEvent(DebugEventKind::MappedKey)) {
+          ev->keycode = keycode;
+          ev->mappedButton = mappedButton;
+          g_instance->commitDebugEvent();
+        }
       }
       g_instance->_buttonInjector(mappedButton, true);
       device->activeInjectedButton = mappedButton;
@@ -2119,7 +2087,188 @@ uint8_t BluetoothHIDManager::mapKeycodeToButton(uint8_t keycode, ConnectedDevice
   return 0xFF;
 }
 
+// Producer side: runs on the nimble_host task. Does no formatting, no
+// allocation, no blocking, and no stack temporaries -- see the invariant in the
+// header. Returns the slot to fill, or nullptr when the ring is full (the event
+// is counted as dropped and the caller simply skips it).
+BluetoothHIDManager::DebugEvent* BluetoothHIDManager::beginDebugEvent(DebugEventKind kind) {
+  const uint8_t head = _debugEventHead.load(std::memory_order_relaxed);
+  const uint8_t next = static_cast<uint8_t>((head + 1) % DEBUG_EVENT_RING);
+  if (next == _debugEventTail.load(std::memory_order_acquire)) {
+    _debugEventDropped.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+  }
+  DebugEvent& ev = _debugEvents[head];
+  // Reset every field: the slot is reused, and a stale addr/data from an older
+  // event of a different kind would print as this one's.
+  ev.kind = kind;
+  ev.keycode = 0;
+  ev.mappedButton = 0xFF;
+  ev.activeButton = 0xFF;
+  ev.len = 0;
+  memset(ev.data, 0, sizeof(ev.data));
+  ev.dtMs = 0;
+  ev.reason = 0;
+  ev.addr[0] = '\0';
+  return &ev;
+}
+
+// NimBLEAddress::toString() returns a std::string (heap allocation + its own
+// frame); these callbacks run on nimble_host, so format the six bytes directly
+// into the ring slot instead.
+void BluetoothHIDManager::copyAddressInto(char* dst, size_t dstSize, const NimBLEAddress& addr) {
+  if (dst == nullptr || dstSize == 0) return;
+  // Byte order and lowercase hex match NimBLEAddress::operator std::string()
+  // (val[5]..val[0]), so the emitted lines are identical to the old ones.
+  const uint8_t* raw = addr.getVal();
+  if (raw == nullptr) {
+    dst[0] = '\0';
+    return;
+  }
+  snprintf(dst, dstSize, "%02x:%02x:%02x:%02x:%02x:%02x", raw[5], raw[4], raw[3], raw[2], raw[1], raw[0]);
+}
+
+// Publishes the slot filled by the matching beginDebugEvent().
+void BluetoothHIDManager::commitDebugEvent() {
+  const uint8_t head = _debugEventHead.load(std::memory_order_relaxed);
+  const uint8_t next = static_cast<uint8_t>((head + 1) % DEBUG_EVENT_RING);
+  // Release: the slot's contents must be visible before the index moves, so the
+  // consumer never reads a half-written event.
+  _debugEventHead.store(next, std::memory_order_release);
+}
+
+namespace {
+
+const char* btButtonLabel(uint8_t button) {
+  switch (button) {
+    case HalGPIO::BTN_UP: return "Up/PageBack";
+    case HalGPIO::BTN_DOWN: return "Down/PageForward";
+    case HalGPIO::BTN_LEFT: return "Left";
+    case HalGPIO::BTN_RIGHT: return "Right";
+    case HalGPIO::BTN_CONFIRM: return "Select";
+    case HalGPIO::BTN_BACK: return "Back";
+    default: return "Unknown";
+  }
+}
+
+const char* gameBrickKeyLabel(uint8_t keycode) {
+  switch (keycode) {
+    case DeviceProfiles::KEYBOARD_UP_ARROW: return "DPad Up";
+    case DeviceProfiles::KEYBOARD_DOWN_ARROW: return "DPad Down";
+    case DeviceProfiles::KEYBOARD_LEFT_ARROW: return "DPad Left";
+    case DeviceProfiles::KEYBOARD_RIGHT_ARROW: return "DPad Right";
+    case GAMEBRICK_ACTION_A_CODE: return "A";
+    case GAMEBRICK_ACTION_B_CODE: return "B";
+    case 0x07: return "Up";
+    case 0x09: return "Down";
+    default: return "Unknown";
+  }
+}
+
+}  // namespace
+
+// Consumer side: runs on the main loop task (16 KB stack), where printf-style
+// formatting and the serial write are affordable.
+void BluetoothHIDManager::drainDebugCapture() {
+  uint8_t tail = _debugEventTail.load(std::memory_order_relaxed);
+  while (tail != _debugEventHead.load(std::memory_order_acquire)) {
+    const DebugEvent ev = _debugEvents[tail];
+    tail = static_cast<uint8_t>((tail + 1) % DEBUG_EVENT_RING);
+    _debugEventTail.store(tail, std::memory_order_release);
+
+    switch (ev.kind) {
+      case DebugEventKind::RawReport: {
+        char rawBuf[32] = {0};
+        size_t offset = 0;
+        const size_t dumpLen = ev.len < sizeof(ev.data) ? ev.len : sizeof(ev.data);
+        for (size_t i = 0; i < dumpLen && offset + 4 < sizeof(rawBuf); i++) {
+          offset += snprintf(rawBuf + offset, sizeof(rawBuf) - offset, "%02X ", static_cast<unsigned>(ev.data[i]));
+        }
+        LOG_INF("BTDBG", "addr=%s len=%u raw=%s", ev.addr, static_cast<unsigned>(ev.len), rawBuf);
+        break;
+      }
+      case DebugEventKind::ButtonPressed:
+        LOG_INF("BT", ">>> BUTTON PRESSED: keycode=0x%02X <<<", ev.keycode);
+        break;
+      case DebugEventKind::JitterDuplicate:
+        LOG_INF("BTDBG", "Suppressed jitter duplicate key=0x%02X dt=%lu", ev.keycode,
+                static_cast<unsigned long>(ev.dtMs));
+        break;
+      case DebugEventKind::HoldWobble:
+        LOG_INF("BTDBG", "Hold wobble suppressed: active=%u incoming=%u key=0x%02X", ev.activeButton, ev.mappedButton,
+                ev.keycode);
+        break;
+      case DebugEventKind::GameBrickMap:
+        LOG_INF("BTDBG", "GameBrick %s (0x%02X) -> %s", gameBrickKeyLabel(ev.keycode), ev.keycode,
+                ev.mappedButton == 0xFF ? "Unmapped" : btButtonLabel(ev.mappedButton));
+        break;
+      case DebugEventKind::MappedKey:
+        LOG_INF("BT", "Mapped key 0x%02X -> %s", ev.keycode, btButtonLabel(ev.mappedButton));
+        break;
+      case DebugEventKind::StuckRelease:
+        LOG_INF("BT", "Generic stuck-release: clearing latched injection key=0x%02X idle=%lums", ev.keycode,
+                static_cast<unsigned long>(ev.dtMs));
+        break;
+      case DebugEventKind::ClientConnected:
+        LOG_INF("BT", "Client connected: %s", ev.addr);
+        break;
+      case DebugEventKind::ClientDisconnected: {
+        LOG_ERR("BT", "Client disconnected: %s (reason: %d)", ev.addr, static_cast<int>(ev.reason));
+        // The bond-store walk moved here with the log line it belongs to: it
+        // calls into NimBLE and formats two more lines, which is exactly the
+        // cost the nimble_host stack could not absorb.
+        char tag[48];
+        snprintf(tag, sizeof(tag), "onDisconnect reason=%d", static_cast<int>(ev.reason));
+        logBondStoreDiag(tag);
+        break;
+      }
+      case DebugEventKind::LinkDropped:
+        if (ev.activeButton != 0) {
+          LOG_INF("BT", "Link dropped %lums after connect (reason %d); auto-reconnect already used, flagging alert",
+                  static_cast<unsigned long>(ev.dtMs), static_cast<int>(ev.reason));
+        } else {
+          LOG_INF("BT", "Link dropped %lums after connect (reason %d); queueing one-shot auto-reconnect",
+                  static_cast<unsigned long>(ev.dtMs), static_cast<int>(ev.reason));
+        }
+        break;
+    }
+  }
+
+  const uint16_t dropped = _debugEventDropped.exchange(0, std::memory_order_relaxed);
+  if (dropped != 0) {
+    LOG_INF("BTDBG", "dropped %u capture events (ring full)", static_cast<unsigned>(dropped));
+  }
+
+  // Stack headroom on the task the HID notify callback runs on. The 4.7.3 field
+  // panic is that task's canary, and the canary is only checked at a context
+  // switch -- so the reported task is the one whose stack was clobbered, not
+  // necessarily the code that clobbered it. Measured statically, our own chain
+  // off onHIDNotify is small (160 B frame + ~50 B deepest callee), which is
+  // nowhere near the 2560 B budget. This prints the real minimum so the next
+  // capture session says whether the budget is genuinely the ceiling or whether
+  // something else on that task is eating it. Only while capture is on, only
+  // when the figure gets worse -- so it stays a handful of lines per session.
+  if (_debugCaptureEnabled) {
+    static UBaseType_t worstStackFree = static_cast<UBaseType_t>(-1);
+    TaskHandle_t hostTask = xTaskGetHandle("nimble_host");
+    if (hostTask != nullptr) {
+      // ESP-IDF's uxTaskGetStackHighWaterMark reports bytes, not words.
+      const UBaseType_t stackFree = uxTaskGetStackHighWaterMark(hostTask);
+      if (stackFree < worstStackFree) {
+        worstStackFree = stackFree;
+        LOG_INF("BTDBG", "nimble_host stack low-water: %u bytes free",
+                static_cast<unsigned>(stackFree));
+      }
+    }
+  }
+}
+
 void BluetoothHIDManager::updateActivity() {
+  // Emit anything the HID notify callback latched. Must run before the
+  // maintenance work below so a burst of reports is logged in the tick it
+  // arrived in rather than the next one.
+  drainDebugCapture();
+
   unsigned long now = millis();
 
   for (auto& device : _connectedDevices) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <atomic>
 #include <string>
 #include <vector>
 #include <functional>
@@ -9,6 +10,7 @@
 
 // Forward declarations
 class NimBLEClient;
+class NimBLEAddress;
 class NimBLERemoteCharacteristic;
 class NimBLEAdvertisedDevice;
 
@@ -165,12 +167,15 @@ public:
   void onScanComplete(int reason);
   static void onHIDNotify(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify);
 
+  // CrumBLE: called from the NimBLE connect callback. Latches only -- it runs on
+  // the nimble_host task (see the deferred-logging invariant below).
+  void noteClientConnect(const NimBLEAddress& addr);
   // CrumBLE: called from the NimBLE disconnect callback with the HCI reason.
   // Flags an alert when a link drops on its own shortly after connecting --
   // typically the connect spike craters free heap and the controller times the
   // link out (HCI 0x08 / reason 520), which otherwise fails silently and leaves
   // the user wondering why Bluetooth "didn't connect".
-  void noteClientDisconnect(int reason);
+  void noteClientDisconnect(int reason, const NimBLEAddress& addr);
   // Consumes the pending "connection lost" flag (one-shot). The app polls this
   // and shows a clear message.
   bool takeConnectionLostAlert() {
@@ -202,6 +207,73 @@ private:
   ~BluetoothHIDManager();
   BluetoothHIDManager(const BluetoothHIDManager&) = delete;
   BluetoothHIDManager& operator=(const BluetoothHIDManager&) = delete;
+
+  // ── Deferred HID logging ───────────────────────────────────────────────────
+  // INVARIANT: onHIDNotify() and anything it calls must NEVER reach logPrintf --
+  // no LOG_INF, no LOG_ERR. (The LOG_DBG lines still in that path compile to
+  // nothing at the shipping LOG_LEVEL=1; treat them as debug-env only and do not
+  // add more.) That callback runs on the nimble_host task, whose stack is 2560 B
+  // (CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE, platformio.ini) as part of the
+  // NimBLE heap trims. One logPrintf frame there costs a 256-byte line buffer
+  // plus vsnprintf's working set plus the USB-CDC write; with BT Debug Capture
+  // on, a single report emitted up to four of them behind a 128-byte hex
+  // scratch buffer and blew the task ("A stack overflow in task nimble_host has
+  // been detected", 4.7.3 field report -- next boot came up with
+  // bt:enable-entry as the last checkpoint and reset=PANIC).
+  //
+  // Instead the callback records a fixed-size event (no formatting, no
+  // allocation) and drainDebugCapture(), reached from the main loop through
+  // updateActivity(), does the printf work on the loop task's 16 KB stack.
+  // Deferred lines keep their order relative to each other; they can appear up
+  // to one loop tick after lines emitted directly by other subsystems.
+  enum class DebugEventKind : uint8_t {
+    RawReport,          // addr, len, data[]  -- the BTDBG hex dump
+    ButtonPressed,      // keycode
+    JitterDuplicate,    // keycode, dtMs
+    HoldWobble,         // activeButton, mappedButton, keycode
+    GameBrickMap,       // keycode, mappedButton
+    MappedKey,          // keycode, mappedButton
+    StuckRelease,       // keycode, dtMs
+    // Link events. NOT gated on debug capture -- these always log. They are here
+    // because NimBLE's connect/disconnect callbacks run on nimble_host too, and
+    // the disconnect path was the deepest point measured on that stack (212 bytes
+    // free of 2560, from a device low-water probe): four logPrintf frames plus a
+    // bond-store walk, on top of NimBLE's own teardown chain.
+    ClientConnected,     // addr
+    ClientDisconnected,  // addr, reason -- drain also runs the bond-store dump
+    LinkDropped,         // reason, dtMs (ms since connect)
+  };
+  struct DebugEvent {
+    DebugEventKind kind = DebugEventKind::RawReport;
+    uint8_t keycode = 0;
+    uint8_t mappedButton = 0xFF;
+    uint8_t activeButton = 0xFF;
+    uint8_t len = 0;
+    uint8_t data[8] = {0};
+    uint32_t dtMs = 0;
+    int32_t reason = 0;
+    char addr[18] = {0};  // "aa:bb:cc:dd:ee:ff"
+  };
+  // Single-producer (nimble_host) / single-consumer (loop) ring. A full ring
+  // drops the newest event and bumps the counter rather than blocking the BLE
+  // task -- capture is a diagnostic, never worth stalling the link for.
+  //
+  // The producer fills the ring slot IN PLACE (beginDebugEvent -> write fields
+  // -> commitDebugEvent) rather than building a DebugEvent on the stack and
+  // copying it in. On a 2560-byte task a 40-byte temporary per call site is not
+  // free, and the whole point of this ring is to keep that frame as small as it
+  // can be. Only the nimble_host task may call these two.
+  static constexpr uint8_t DEBUG_EVENT_RING = 8;
+  DebugEvent _debugEvents[DEBUG_EVENT_RING];
+  std::atomic<uint8_t> _debugEventHead{0};
+  std::atomic<uint8_t> _debugEventTail{0};
+  std::atomic<uint16_t> _debugEventDropped{0};
+  DebugEvent* beginDebugEvent(DebugEventKind kind);  // nullptr when the ring is full
+  void commitDebugEvent();
+  void drainDebugCapture();
+  // Formats a BLE address into a fixed buffer without NimBLEAddress::toString()'s
+  // std::string (heap allocation on the nimble_host task).
+  static void copyAddressInto(char* dst, size_t dstSize, const NimBLEAddress& addr);
 
   void cleanup();
   uint16_t parseHIDReport(uint8_t* data, size_t length);

@@ -460,6 +460,17 @@ void LyraCarouselTheme::drawButtonMenu(GfxRenderer& renderer, Rect rect, int but
 
   const MenuLayoutMetrics metrics = computeMenuLayout(renderer, buttonCount);
 
+  // Self-clear the icon band before painting it. HomeActivity only calls
+  // clearScreen() when its cover-tile snapshot restore fails; on the restore
+  // path the framebuffer still holds the previous frame's pixels, and the
+  // selection highlight below is purely additive -- the previous selection's
+  // black tile stayed behind it, so moving focus along the row left a trail of
+  // black squares under the icons. Every other paint here already self-clears
+  // its region (see the label line at the end of this function); the icon band
+  // was the one that did not. The highlight is centred within tileH, so this
+  // band covers it exactly.
+  renderer.fillRect(0, metrics.rowY, renderer.getScreenWidth(), metrics.tileH, false);
+
   for (int i = 0; i < buttonCount; ++i) {
     const int tileX = i * metrics.tileW;
     const int iconX = tileX + (metrics.tileW - kMenuIconSize) / 2;

@@ -265,21 +265,36 @@ void EpdBus::waitRefreshComplete(const char* tag) {
   xSemaphoreTake(s_epdRefreshDone, 0);  // drain any stale token
   attachInterrupt(digitalPinToInterrupt(_pins.busy), epdBusyIsr, doneEdge);
 
-  // Fast path: the waveform already finished (edge passed before we armed, or a
-  // no-op refresh) — BUSY sits at the done level. Nothing to wait for. Safe
-  // against the arm/edge race: the binary semaphore latches a give from the ISR,
-  // so a take below returns immediately if the edge fired just after arming.
-  if (digitalRead(_pins.busy) == doneLevel) {
-    detachInterrupt(digitalPinToInterrupt(_pins.busy));
-    xSemaphoreTake(s_epdRefreshDone, 0);
-    return;
-  }
-
-  // Long sleep — fire the power hooks (if any) around it, matching the poll path.
+  // CrumBLE-local patch (4.7.4): completion is decided by the BUSY *level*, never
+  // by "an edge arrived". A controller that drops BUSY between the phases of one
+  // update sequence (observed class of behaviour on SSD1677 0x22 vendor sequences)
+  // produces a real completion-polarity edge mid-waveform; an edge-only wait
+  // returns there and the caller resumes writing controller RAM while the panel is
+  // still driving. The re-read after the 1 ms settle rejects those transients: a
+  // dip is back at the working level by then, a genuine completion is not. The
+  // loop re-arms and keeps waiting, so a spurious edge costs one extra wakeup.
+  //
+  // The take is sliced rather than one 30 s block so a genuinely missed edge (ISR
+  // not delivered) degrades to a slow poll instead of a 30 s stall. On a ~400 ms
+  // refresh that is ~8 wakeups against the ~400 of a plain 1 ms poll, so the point
+  // of the ISR wait — not burning the CPU through the waveform — survives.
+  constexpr TickType_t EDGE_WAIT_SLICE_MS = 50;
   const bool hook = (_busyWaitBeginHook != nullptr);
-  if (hook) _busyWaitBeginHook();
-  xSemaphoreTake(s_epdRefreshDone, pdMS_TO_TICKS(30000));
-  if (hook && _busyWaitEndHook != nullptr) _busyWaitEndHook();
+  bool hookFired = false;
+  while (true) {
+    if (digitalRead(_pins.busy) == doneLevel) {
+      delay(1);  // let a sub-millisecond dip pass before believing it
+      if (digitalRead(_pins.busy) == doneLevel) break;
+    }
+    if (millis() - start > 30000) break;
+    // Fire the power hooks (if any) around the sleep, matching the poll path.
+    if (hook && !hookFired) {
+      hookFired = true;
+      _busyWaitBeginHook();
+    }
+    xSemaphoreTake(s_epdRefreshDone, pdMS_TO_TICKS(EDGE_WAIT_SLICE_MS));
+  }
+  if (hookFired && _busyWaitEndHook != nullptr) _busyWaitEndHook();
 
   detachInterrupt(digitalPinToInterrupt(_pins.busy));
   if (tag && Serial) {

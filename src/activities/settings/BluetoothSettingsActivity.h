@@ -2,6 +2,7 @@
 
 #include <BluetoothHIDManager.h>
 #include <GfxRenderer.h>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -82,9 +83,21 @@ class BluetoothSettingsActivity : public Activity {
   uint8_t functionIndex = 0;        // selected row in the SelectFunction list
 
   // ---- CrumBLE-only: debug monitor state -------------------------------
+  // These counters are written from the BLE HID input callback, which runs on
+  // the nimble_host task, and read by render() on the main loop. The race is
+  // benign for a diagnostic readout (worst case one frame shows a stale count),
+  // and the alternative -- a lock around a display update -- is not worth it.
   uint16_t debugLastKeycode = 0;
   uint32_t debugEventCount = 0;
   unsigned long debugLastEventMs = 0;
+  // Set by that same callback to mean "the numbers changed, repaint". The
+  // callback must NOT call requestUpdate() itself: it would drive a panel
+  // refresh from the BLE task. loop() consumes this on the main loop, the same
+  // way the ButtonMap view polls pendingKeyKind. Without it the Debug Monitor
+  // painted once on entry and never again -- key events reached the serial log
+  // but the screen never moved.
+  std::atomic<bool> debugDirty{false};
+  unsigned long debugLastRepaintMs = 0;
   static constexpr uint8_t kDebugUniqueKeyMax = 8;
   uint8_t debugUniqueKeys[kDebugUniqueKeyMax] = {0};
   uint16_t debugUniqueCounts[kDebugUniqueKeyMax] = {0};

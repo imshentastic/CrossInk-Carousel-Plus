@@ -275,6 +275,33 @@ class HomeActivity final : public Activity {
   bool coverBufferStored = false;  // Track if cover buffer is stored
   uint8_t* coverBuffer = nullptr;  // HomeActivity's own buffer for cover image
   size_t coverBufferSize = 0;      // Bytes allocated to coverBuffer
+  // What coverBuffer actually holds, and the exact rect it was captured from.
+  // storeCoverBuffer() chooses its region from the ACTIVE theme (Flow snapshots
+  // the shelf strip, the 1.3 carousel themes snapshot the cover tile), so
+  // restoreCoverBuffer() has to put those bytes back in the same place. It used
+  // to re-derive the region by asking which rect member happened to be non-zero,
+  // and shelfSnapshotRect* is never cleared when the user leaves Flow. After a
+  // Flow -> Carousel theme switch the restore therefore pasted a cover-tile
+  // snapshot into the shelf strip and still reported success: render() skipped
+  // its clearScreen(), the theme was told the buffer had been restored and
+  // skipped repainting the covers, and the carousel came out as an empty book
+  // frame -- or, on fast left/right, a title that advanced while the cover under
+  // it did not. Recording the region at capture time makes the two agree by
+  // construction.
+  enum class CoverSnapshotRegion : uint8_t { None, FullFrame, ShelfStrip, CoverTile };
+  CoverSnapshotRegion coverBufferRegion = CoverSnapshotRegion::None;
+  int coverBufferRectX = 0;
+  int coverBufferRectY = 0;
+  int coverBufferRectW = 0;
+  int coverBufferRectH = 0;
+  // Theme that captured the snapshot. Nothing invalidates coverBuffer when the
+  // user changes theme, so without this a Flow shelf-strip capture stays
+  // restorable under Carousel: the region tag above would put it back in the
+  // right rect, but they are the previous theme's pixels, and the restore
+  // reporting success still suppresses render()'s clearScreen(). Refuse the
+  // restore across a theme change and let the caller repaint from scratch.
+  // 0xFF = nothing captured yet.
+  uint8_t coverBufferTheme = 0xFF;
   // Logical rect last passed to drawRecentBookCover. The cover snapshot only
   // needs to cover this region, not the entire framebuffer, so we cache the
   // tile instead of all 48 KB. Set in render() before the call.

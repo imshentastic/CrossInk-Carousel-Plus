@@ -240,6 +240,21 @@ void Ssd1677Driver::writeRam(EpdBus& bus, uint8_t ramCmd, const uint8_t* data, u
   bus.data(data, static_cast<uint16_t>(size));
 }
 
+// CrumBLE-local patch (4.7.4): the blocking waits below are bus.waitBusy(), NOT
+// bus.waitRefreshComplete(). Upstream switched them to the ISR/edge wait in the
+// e6a8048 resync that shipped in 4.7.3, and that is the 4.7.3 display regression
+// (persistent black highlight on the carousel icon row; covers that never
+// repaint). waitRefreshComplete() returns on the FIRST falling edge of BUSY. The
+// SSD1677 does not hold BUSY high across a whole 0x22 vendor sequence — it drops
+// it between the power-up and display phases — so the edge wait can return while
+// the waveform is still driving. displayImpl() then writes BW+RED RAM for its
+// post-refresh baseline resync on top of a live update: the frame lands
+// half-painted and, worse, the RED plane now claims a frame the glass never
+// finished showing, so every later differential FAST refresh skips those pixels.
+// waitBusy() samples the BUSY *level* every 1 ms and cannot see a sub-millisecond
+// dip, which is why 4.7.1 and everything before it were correct. Keep it that way
+// until the dip is characterised on a scope; the ISR wait only saves poll cycles
+// during a refresh the UI is blocked on anyway.
 void Ssd1677Driver::refresh(EpdBus& bus, RefreshMode mode, bool turnOff, bool async) {
 #if defined(SSD1677_PROBE_DEBUG) && SSD1677_PROBE_DEBUG
   const uint32_t dbgStart = millis();
@@ -277,7 +292,7 @@ void Ssd1677Driver::refresh(EpdBus& bus, RefreshMode mode, bool turnOff, bool as
     bus.cmd(CMD_DISPLAY_UPDATE_CTRL2);
     bus.data(seqOverride);
     bus.cmd(CMD_MASTER_ACTIVATION);
-    if (!async) bus.waitRefreshComplete("refresh");
+    if (!async) bus.waitBusy("refresh");  // level poll, not the edge wait — see above
     // The sequence powered the panel down at the end, but keep the flag truthful
     // to intent: leave it "on" between active updates so display() doesn't force a
     // full HALF refresh next time (which would defeat fast refresh). turnOff marks
@@ -316,7 +331,7 @@ void Ssd1677Driver::refresh(EpdBus& bus, RefreshMode mode, bool turnOff, bool as
   bus.cmd(CMD_DISPLAY_UPDATE_CTRL2);
   bus.data(displayMode);
   bus.cmd(CMD_MASTER_ACTIVATION);
-  if (!async) bus.waitRefreshComplete("refresh");
+  if (!async) bus.waitBusy("refresh");  // level poll, not the edge wait — see above
 #if defined(SSD1677_PROBE_DEBUG) && SSD1677_PROBE_DEBUG
   // esp_rom_printf hits the always-on IDF console; Serial (HWCDC) drops on S3.
   esp_rom_printf("[SSD1677] %s refresh %ums (ctrl2=0x%x)\n", dbgMode, (unsigned)(millis() - dbgStart), displayMode);

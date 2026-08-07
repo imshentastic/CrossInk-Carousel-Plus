@@ -2952,6 +2952,10 @@ bool HomeActivity::storeCoverBuffer() {
   // across snapshots; only realloc when a size change demands it (Flow
   // <-> non-Flow theme switch, never in a single session in practice).
   coverBufferStored = false;
+  // Any early return below leaves the previous contents in place but they are no
+  // longer a valid snapshot of the current frame; drop the region tag so a
+  // restore can't put stale bytes back (see CoverSnapshotRegion in the header).
+  coverBufferRegion = CoverSnapshotRegion::None;
   const bool isFlow =
       static_cast<CrossPointSettings::UI_THEME>(SETTINGS.uiTheme) == CrossPointSettings::UI_THEME::LYRA_FLOW;
   if (isFlow) {
@@ -2998,6 +3002,12 @@ bool HomeActivity::storeCoverBuffer() {
       // Don't free -- the next call will reuse the slot.
       return false;
     }
+    coverBufferRegion = CoverSnapshotRegion::ShelfStrip;
+    coverBufferTheme = static_cast<uint8_t>(SETTINGS.uiTheme);
+    coverBufferRectX = shelfSnapshotRectX;
+    coverBufferRectY = shelfSnapshotRectY;
+    coverBufferRectW = shelfSnapshotRectW;
+    coverBufferRectH = shelfSnapshotRectH;
     return true;
   }
   // Non-Flow (CrossInk 1.3 carousel): snapshot just the cover tile. render()
@@ -3032,42 +3042,54 @@ bool HomeActivity::storeCoverBuffer() {
     // next storeCoverBuffer() will reuse the slot.
     return false;
   }
+  coverBufferRegion = CoverSnapshotRegion::CoverTile;
+  coverBufferTheme = static_cast<uint8_t>(SETTINGS.uiTheme);
+  coverBufferRectX = coverRectX;
+  coverBufferRectY = coverRectY;
+  coverBufferRectW = coverRectW;
+  coverBufferRectH = coverRectH;
   return true;
 }
 
 bool HomeActivity::restoreCoverBuffer() {
   if (!coverBuffer) return false;
-  // CrumBLE 4.5.5+: Flow theme now snapshots just the shelf strip rather
-  // than the full framebuffer. Three cases to handle:
-  //   (1) coverBufferSize matches full framebuffer -> legacy full-frame
-  //       restore (memcpy). Kept for backwards-compat in case a code
-  //       path still allocates a full-size buffer (e.g. mid-session
-  //       theme switch).
-  //   (2) shelfSnapshotRect is set and the buffer size matches -> Flow
-  //       partial-restore; copy back to the shelf strip region.
-  //   (3) coverRect is set and the buffer size matches -> non-Flow
-  //       cover-tile restore (1.3 carousel themes).
-  if (coverBufferSize == renderer.getBufferSize()) {
-    uint8_t* frameBuffer = renderer.getFrameBuffer();
-    if (!frameBuffer) return false;
-    memcpy(frameBuffer, coverBuffer, coverBufferSize);
-    return true;
-  }
-  if (shelfSnapshotRectW > 0 && shelfSnapshotRectH > 0) {
-    const size_t shelfBytes = renderer.getRegionByteSize(
-        shelfSnapshotRectX, shelfSnapshotRectY, shelfSnapshotRectW, shelfSnapshotRectH);
-    if (shelfBytes > 0 && shelfBytes <= coverBufferSize) {
-      // Buffer may be larger than the rect (we pre-alloc the landscape
-      // worst case at onEnter so a portrait shelf strip leaves headroom).
-      // copyBufferToRegion respects the rect bounds and only reads the
-      // first `shelfBytes`.
-      return renderer.copyBufferToRegion(shelfSnapshotRectX, shelfSnapshotRectY,
-                                         shelfSnapshotRectW, shelfSnapshotRectH,
+  // Put the bytes back exactly where storeCoverBuffer() took them from. The
+  // region and rect are recorded at capture time (see CoverSnapshotRegion in the
+  // header) rather than re-derived here: the old version guessed from whichever
+  // rect member was non-zero, and because shelfSnapshotRect* survives leaving
+  // Flow, a Flow -> Carousel theme switch made every cover-tile snapshot restore
+  // into the shelf strip and still report success.
+  // Captured under a different theme: the bytes are that theme's layout, and no
+  // existing path invalidates the snapshot on a theme change. Refusing here
+  // makes render() fall back to clearScreen() + a full repaint, which is what a
+  // theme switch needs anyway.
+  if (coverBufferTheme != static_cast<uint8_t>(SETTINGS.uiTheme)) return false;
+  switch (coverBufferRegion) {
+    case CoverSnapshotRegion::None:
+      return false;
+    case CoverSnapshotRegion::FullFrame: {
+      uint8_t* frameBuffer = renderer.getFrameBuffer();
+      if (!frameBuffer || coverBufferSize < renderer.getBufferSize()) return false;
+      memcpy(frameBuffer, coverBuffer, renderer.getBufferSize());
+      return true;
+    }
+    case CoverSnapshotRegion::ShelfStrip:
+    case CoverSnapshotRegion::CoverTile: {
+      if (coverBufferRectW <= 0 || coverBufferRectH <= 0) return false;
+      // The rect may have moved since capture (orientation change, theme metrics
+      // reload). Restoring the captured bytes into a different rect would smear
+      // them across the frame, so treat that as "no snapshot" and let the caller
+      // fall back to a full clear + repaint.
+      const size_t bytes =
+          renderer.getRegionByteSize(coverBufferRectX, coverBufferRectY, coverBufferRectW, coverBufferRectH);
+      if (bytes == 0 || bytes > coverBufferSize) return false;
+      // The buffer may be larger than the rect (the landscape worst case is
+      // pre-allocated at onEnter); copyBufferToRegion respects the rect bounds.
+      return renderer.copyBufferToRegion(coverBufferRectX, coverBufferRectY, coverBufferRectW, coverBufferRectH,
                                          coverBuffer, coverBufferSize);
     }
   }
-  if (coverRectW <= 0 || coverRectH <= 0) return false;
-  return renderer.copyBufferToRegion(coverRectX, coverRectY, coverRectW, coverRectH, coverBuffer, coverBufferSize);
+  return false;
 }
 
 void HomeActivity::freeCoverBuffer() {
@@ -3082,6 +3104,7 @@ void HomeActivity::freeCoverBuffer() {
   // lifetime singleton so 'leaking' the buffer is fine -- it lives as
   // long as the device is on.
   coverBufferStored = false;
+  coverBufferRegion = CoverSnapshotRegion::None;  // contents are stale, not restorable
 }
 
 void HomeActivity::freeCarouselFrames() {
@@ -4461,6 +4484,19 @@ void HomeActivity::render(RenderLock&&) {
   bool bufferRestored = coverBufferStored && restoreCoverBuffer();
   if (!bufferRestored) {
     renderer.clearScreen();
+    // clearScreen() just wiped the cover pixels, so the framebuffer no longer
+    // holds them -- and `coverRendered` is precisely the claim that it does.
+    // LyraCarouselTheme::drawRecentBookCover draws nothing at all when that flag
+    // is set (`if (!coverRendered)` guards the whole paint), so leaving it true
+    // across a clear yields a blank carousel on a white screen: the empty book
+    // frame seen when moving down off the carousel, with the render profile
+    // showing a ~2 ms carousel stage instead of the usual ~550 ms.
+    //
+    // It used to be masked rather than fixed: restoreCoverBuffer() returned true
+    // spuriously (it restored the wrong region, see CoverSnapshotRegion), which
+    // skipped this clear and left the previous frame's covers on screen. With
+    // the restore now honest, the stale flag has to be corrected here.
+    coverRendered = false;
   }
   const unsigned long slowT1 = millis();
   // Reset per-render: set true if any progress popup gets drawn over the

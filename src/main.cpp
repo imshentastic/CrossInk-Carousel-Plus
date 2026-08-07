@@ -127,6 +127,10 @@ static unsigned long allowSleepAt = 0;
 // Updated each main-loop iteration; read by the BLE HID manager via a
 // callback so it can decide whether to inject reader-only buttons.
 static bool gBluetoothReaderContext = false;
+// Set from the BLE button injector (nimble_host task) when a remote key mapped
+// to "Refresh Screen" is pressed; consumed on the main loop, which is where the
+// panel waveform belongs. volatile: written from another task, polled here.
+static volatile bool gBlePendingScreenRefresh = false;
 
 // Fonts
 // tiny-cjk (OMIT_ITALIC_FONTS): drop the italic + bold-italic reader faces
@@ -3220,11 +3224,13 @@ void setup() {
       // action and the renderer waveform already self-terminates.
       constexpr uint8_t kBtnActionRefreshScreen = 0xFE;
       if (buttonIndex == kBtnActionRefreshScreen) {
-        if (pressed) {
-          LOG_DBG("MAIN", "BLE-mapped Refresh Screen action triggered");
-          RenderLock lock;
-          renderer.displayBuffer(HalDisplay::HALF_REFRESH);
-        }
+        // CrumBLE 4.7.4: latch, don't refresh here. This injector is called
+        // from the HID notify callback on the nimble_host task, whose stack is
+        // 3072 bytes; taking a RenderLock and running a ~1.7 s HALF waveform
+        // from there both risks that stack and blocks the BLE host task long
+        // enough for the link's supervision timeout to drop it. The main loop
+        // consumes the flag below.
+        if (pressed) gBlePendingScreenRefresh = true;
         return;
       }
       gpio.setVirtualButtonState(buttonIndex, pressed);
@@ -3751,6 +3757,13 @@ void loop() {
   auto& btMgr = BluetoothHIDManager::getInstance();
   const bool userInputDetectedForBt = gpio.wasAnyPressed() || gpio.wasAnyReleased();
   btMgr.updateActivity();
+  // Deferred "Refresh Screen" from a BLE-mapped key (see setButtonInjector).
+  if (gBlePendingScreenRefresh) {
+    gBlePendingScreenRefresh = false;
+    LOG_DBG("MAIN", "BLE-mapped Refresh Screen action triggered");
+    RenderLock lock;
+    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+  }
   // checkAutoReconnect can block for 2-3 s calling connectToDevice() when a
   // reconnect to the bonded remote is in flight. If the user impatiently
   // taps Back during that freeze, the release lands on the next iteration

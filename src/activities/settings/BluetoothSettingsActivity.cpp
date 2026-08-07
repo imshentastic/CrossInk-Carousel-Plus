@@ -325,6 +325,9 @@ void BluetoothSettingsActivity::handleMenuConfirm() {
           debugUniqueCounts[debugUniqueCount] = 1;
           debugUniqueCount++;
         }
+        // Ask loop() for the repaint; never render from this task (see the
+        // debugDirty comment in the header).
+        debugDirty.store(true, std::memory_order_release);
       });
       view = View::DebugMonitor;
       requestUpdate();
@@ -388,6 +391,24 @@ void BluetoothSettingsActivity::loop() {
     bannerUntil = 0;
     requestUpdate();
   }
+
+#ifdef ENABLE_BT_DEBUG_MONITOR
+  // Debug Monitor: the BLE HID callback latched new counters; repaint here, on
+  // the main loop. Throttled because one repaint is a ~570 ms panel refresh --
+  // mashing the remote would otherwise queue a refresh per press and the screen
+  // would run permanently behind. The flag is left set when throttled, so the
+  // next tick picks it up and nothing is lost.
+  if (view == View::DebugMonitor) {
+    constexpr unsigned long kDebugRepaintMinIntervalMs = 400;
+    const unsigned long nowMs = millis();
+    if (debugDirty.load(std::memory_order_acquire) &&
+        (debugLastRepaintMs == 0 || nowMs - debugLastRepaintMs >= kDebugRepaintMinIntervalMs)) {
+      debugDirty.store(false, std::memory_order_relaxed);
+      debugLastRepaintMs = nowMs;
+      requestUpdate();
+    }
+  }
+#endif
 
   // ButtonMap / debug sub-views own their own input + render flow.
   if (view == View::ButtonMap) {

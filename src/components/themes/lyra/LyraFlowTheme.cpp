@@ -229,7 +229,7 @@ void LyraFlowTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const 
   // we only log when we actually pay that cost so the skip-path doesn't
   // spam the console.
   const unsigned long carT0 = millis();
-  const bool wasFullRepaint = !skipCarouselCoverLoads;
+  bool wasFullRepaint = !skipCarouselCoverLoads;
   if (recentBooks.empty()) {
     drawEmptyRecents(renderer, rect);
     return;
@@ -255,6 +255,21 @@ void LyraFlowTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const 
   } else {
     const int decoded = selectorIndex - count;
     if (decoded >= 0 && decoded < count) curIdx = decoded;
+  }
+
+  // Defence in depth against a skip that doesn't match what we're about to
+  // paint. HomeActivity decides skipCarouselCoverLoads from its OWN decode of
+  // selectorIndex (canSkipCovers / effectiveCenterIdx); if that ever disagrees
+  // with the index decoded here, honouring the skip leaves the previous book's
+  // covers on screen underneath a freshly drawn title -- the title block below
+  // sits outside the skip guard and always repaints. That is exactly the
+  // reported "left/right moves the title but the cover doesn't change".
+  // Comparing against the index whose covers we actually painted last makes the
+  // theme self-consistent no matter what the caller computed. This can only
+  // downgrade a skip to a repaint, never the reverse.
+  if (skipCarouselCoverLoads && curIdx != lastPaintedCoverIdx_) {
+    skipCarouselCoverLoads = false;
+    wasFullRepaint = true;  // keep the RPROF stage log honest
   }
 
   // The carousel chrome (header date, footer hints, etc.) is drawn by
@@ -495,6 +510,7 @@ void LyraFlowTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const 
   unsigned long carT2 = carT1;  // after 4 side covers (overwritten in full-repaint branch)
   unsigned long carT3 = carT1;  // after center cover paint
   if (!skipCarouselCoverLoads) {
+    lastPaintedCoverIdx_ = curIdx;  // covers below are painted for this book
     if (count >= 5) drawStackedCover(idx3, true, true);
     if (count >= 4) drawStackedCover(idx5, false, true);
     if (count >= 2) drawStackedCover(idx2, true, false);
