@@ -52,6 +52,15 @@ class Epub {
   explicit Epub(std::string filepath, const std::string& cacheDir);
   ~Epub() = default;
   static std::string cachePathForFilePath(const std::string& filepath, const std::string& cacheDir);
+  // v4.7.5: SD-free "where would this book's WxH thumbnail live" derivation.
+  // Equivalent to Epub(filepath, cacheDir).getThumbBmpPath() resolved for the
+  // given dimensions, but touches no SD: the constructor stats the card for
+  // the legacy-cache migration, and callers that only want to probe for an
+  // already-generated thumbnail should not pay for that. Kept here rather
+  // than assembled at the call site so the on-disk thumbnail layout stays
+  // owned by this class.
+  static std::string thumbBmpPathForDimensions(const std::string& filepath, const std::string& cacheDir, int width,
+                                               int height);
   std::string& getBasePath() { return contentBasePath; }
   bool load(bool buildIfMissing = true, bool skipLoadingCss = false);
   bool clearCache() const;

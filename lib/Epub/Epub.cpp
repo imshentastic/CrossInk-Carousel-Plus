@@ -248,6 +248,11 @@ Epub::Epub(std::string filepath, const std::string& cacheDir) : filepath(std::mo
   migrateLegacyCachePath(cacheDir);
 }
 
+std::string Epub::thumbBmpPathForDimensions(const std::string& filepath, const std::string& cacheDir, int width,
+                                            int height) {
+  return getThumbBmpPathForDimensions(cachePathForFilePath(filepath, cacheDir), width, height);
+}
+
 std::string Epub::cachePathForFilePath(const std::string& filepath, const std::string& cacheDir) {
   // Keep on-disk EPUB cache keys stable across standard library/toolchain changes.
   return cacheDir + "/epub_" + std::to_string(ZipFile::fnvHash64(filepath.c_str(), filepath.size()));

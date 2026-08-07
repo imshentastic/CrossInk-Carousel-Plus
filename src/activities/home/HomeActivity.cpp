@@ -1245,8 +1245,49 @@ void HomeActivity::loadShelfCovers(int cellWidth, int cellHeight, int scrollOffs
   const int progressIncrement = 90 / std::max(1, windowSize);
   int processed = 0;
 
+  const unsigned long shelfCoverPassStartMs = millis();
+  int cachedProbeHits = 0;
+
   for (int i = start; i < end; ++i) {
     const auto& bookPath = allPaths[i];
+
+    // v4.7.5: thumb-first probe. Every check below this point exists to decide
+    // whether we need to GENERATE a thumbnail, but the overwhelmingly common
+    // case on a settled library is that the thumbnail is already on SD and
+    // none of them matter. Ordered as it was, the already-cached cell paid
+    // four SD stats before reaching the one that answers the question:
+    //
+    //   Storage.exists(bookPath)             stat 1
+    //   CoverThumbStatus::isMarkedFailed()   stat 2 (marker file)
+    //   Epub(bookPath, ...) ctor             stat 3 (legacy-cache migration)
+    //   Storage.exists(resolved)             stat 4 (the actual answer)
+    //
+    // SD path lookups are the expensive primitive on this stack (the same
+    // reason the library walk costs ~1.5 s), so this ran ~4x longer than it
+    // needed to on the first Home paint of every boot -- the paint the user
+    // actually waits on, since v316's shelfCoversLoaded gate makes later
+    // renders skip the whole pass.
+    //
+    // Probe the resolved thumbnail directly using the static, SD-free path
+    // derivation. A hit means the thumbnail exists, which is the only thing
+    // the loop body would have concluded anyway. A miss falls through to the
+    // unchanged full sequence, so generation behaviour (including the legacy
+    // cache migration the Epub ctor performs) is untouched.
+    //
+    // EPUB only: Xtc::getThumbBmpPath() emits a HEIGHT-only template, which
+    // sends UITheme::getCoverThumbPath down a legacy-fallback branch that
+    // stats SD itself -- not reproducible without duplicating that logic,
+    // and XTC is rare enough not to be worth the coupling.
+    if (FsHelpers::hasEpubExtension(bookPath)) {
+      const std::string cachedThumb =
+          Epub::thumbBmpPathForDimensions(bookPath, "/.crosspoint", cellWidth, cellHeight);
+      if (Storage.exists(cachedThumb.c_str())) {
+        cachedProbeHits++;
+        processed++;
+        continue;
+      }
+    }
+
     if (!Storage.exists(bookPath.c_str())) {
       processed++;
       continue;
@@ -1411,6 +1452,13 @@ void HomeActivity::loadShelfCovers(int cellWidth, int cellHeight, int scrollOffs
   }
 
   shelfCoversLoaded = true;
+  // v4.7.5: this pass runs once per boot (and again after any event that
+  // clears shelfCoversLoaded), so its cost lands squarely on the first Home
+  // paint. `probeHits` is the number of cells answered by the single-stat
+  // thumb-first probe; when it equals the window size the pass did the
+  // minimum possible SD work.
+  LOG_INF("PERF", "loadShelfCovers %lu ms (window=%d probeHits=%d)", millis() - shelfCoverPassStartMs, end - start,
+          cachedProbeHits);
   // Only request a follow-up redraw if we actually produced new thumbs this
   // pass. If the only "work" was failed generations (now recorded in
   // failedShelfCovers and skipped next time), requesting another update
