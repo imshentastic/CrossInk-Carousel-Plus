@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <string>
@@ -5200,6 +5201,39 @@ void HomeActivity::onBookmarksOpen() {
 // v18.9.9.267: sleep-bake first-boot suggestion. See header comment.
 namespace {
 constexpr const char* kSleepBakeDeclinedSidecar = "/.crosspoint/sleep_bake_prompt_declined";
+// 4.7.4: verdict cache for the scan below. Field timing (X4, 35 sleep images,
+// 23 of them transparent/grey): the scan cost ~1.8 s of the ~6.9 s
+// boot->ready on a navigation silent-restart, every single boot, to reach the
+// same "0 unbaked" answer -- because deciding a file is unbakeable means
+// opening and parsing its PNG/BMP header, and an unbakeable file can never
+// become bakeable. Cache "<nameCount> <unbaked>" and re-probe only when the
+// number of files in the sleep dir changes (an upload/delete), which is the
+// only way the answer can move without us being the ones to move it.
+constexpr const char* kSleepBakeScanCache = "/.crosspoint/sleep_bake_scan";
+
+bool readSleepBakeScanCache(size_t nameCount, int& outUnbaked) {
+  FsFile f;
+  if (!Storage.openFileForRead("SLPP", kSleepBakeScanCache, f)) return false;
+  char buf[32] = {0};
+  const size_t n = f.read(reinterpret_cast<uint8_t*>(buf), sizeof(buf) - 1);
+  f.close();
+  if (n == 0) return false;
+  unsigned cachedCount = 0;
+  int cachedUnbaked = 0;
+  if (std::sscanf(buf, "%u %d", &cachedCount, &cachedUnbaked) != 2) return false;
+  if (cachedCount != nameCount) return false;
+  outUnbaked = cachedUnbaked;
+  return true;
+}
+
+void writeSleepBakeScanCache(size_t nameCount, int unbaked) {
+  FsFile f;
+  if (!Storage.openFileForWrite("SLPP", kSleepBakeScanCache, f)) return;
+  char buf[32];
+  const int len = std::snprintf(buf, sizeof(buf), "%u %d", (unsigned)nameCount, unbaked);
+  if (len > 0) f.write(reinterpret_cast<const uint8_t*>(buf), (size_t)len);
+  f.close();
+}
 
 // Count PNG/BMP files in /.sleep/ (or /sleep/) that DON'T have a
 // paired .slp companion. Bounded (<30 entries typical) and cheap --
@@ -5228,6 +5262,17 @@ int countUnbakedSleepImages() {
       names.emplace_back(name);
     }
     dir.close();
+
+    // Cheap path: the directory listing above is the only cost we always pay.
+    // If the file count is unchanged since the last full scan, reuse its
+    // verdict instead of re-parsing every PNG/BMP header.
+    int cachedUnbaked = 0;
+    if (readSleepBakeScanCache(names.size(), cachedUnbaked)) {
+      LOG_INF("SLPP", "%s: %d unbaked (cached, %u files unchanged)", dirPath, cachedUnbaked,
+              (unsigned)names.size());
+      return cachedUnbaked;
+    }
+
     int unbaked = 0;
     int unbakeable = 0;
     for (const auto& n : names) {
@@ -5261,6 +5306,7 @@ int countUnbakedSleepImages() {
     }
     LOG_INF("SLPP", "%s: %u unbaked (of %u total; %u unbakeable transparent/grey)",
             dirPath, (unsigned)unbaked, (unsigned)names.size(), (unsigned)unbakeable);
+    writeSleepBakeScanCache(names.size(), unbaked);
     return unbaked;
   }
   return 0;
@@ -5304,6 +5350,9 @@ void HomeActivity::maybeShowSleepBakePrompt() {
           return;
         }
         if (chosen == 0) {
+          // 4.7.4: baking changes the verdict without changing the file
+          // count, so drop the scan cache -- the next scan must re-probe.
+          Storage.remove(kSleepBakeScanCache);
           // "Bake now" -- silent-restart to run the bake with fresh
           // ~93 KB heap. Same path Settings > Bake Sleep Images uses.
           silentRestartToBakeSleepImages();
