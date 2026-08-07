@@ -851,6 +851,11 @@ void SettingsActivity::toggleCurrentSetting() {
         // v18.9.9.222: wipe cached author keys so the next Sort by Author
         // re-populates via OPF peek. Picks up v220's ';'-split and
         // trailing-punctuation stripping on pre-existing entries.
+        // 4.7.4: Settings-target silent-restarts skip the boot library load
+        // (below), so the index may not be resident here. begin() is
+        // idempotent; without it resetAuthorKeys would clear an EMPTY index
+        // and saveToFile() it, destroying the user's library index.
+        LibraryIndex::getInstance().begin();
         LibraryIndex::getInstance().resetAuthorKeys();
         GUI.drawPopup(renderer, tr(STR_AUTHOR_KEYS_REBUILT));
         delay(1500);

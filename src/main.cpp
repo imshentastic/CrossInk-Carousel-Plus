@@ -2935,6 +2935,14 @@ void setup() {
   // so the shelf is ready without a first-visit rebuild delay.
   const bool isLibraryLightBoot = isOtaSilentReboot ||
       (isSilentReboot && (snapshotTarget == SILENT_REBOOT_TARGET_READER ||
+                          // 4.7.4: Settings was missing from this list, so the
+                          // most common navigation restart (in-book or Home ->
+                          // Settings, which trips the 45 KB/30 KB pre-flight
+                          // after a reading session) paid a full LibraryIndex +
+                          // SeriesIndex + CollectionsStore load it never uses.
+                          // The one Settings action that touches the index
+                          // (Rebuild Author Keys) now begin()s it on demand.
+                          snapshotTarget == SILENT_REBOOT_TARGET_SETTINGS ||
                           snapshotTarget == SILENT_REBOOT_TARGET_BT_SETTINGS ||
                           snapshotTarget == SILENT_REBOOT_TARGET_KOREADER_AUTH ||
                           snapshotTarget == SILENT_REBOOT_TARGET_OPDS_BROWSER ||
