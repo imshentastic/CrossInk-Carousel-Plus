@@ -226,6 +226,8 @@ void SettingsActivity::rebuildSettingsLists() {
   pushByName(displaySleepImage, allSettings, StrId::STR_SLEEP_COVER_MODE);
   pushByName(displaySleepImage, allSettings, StrId::STR_SLEEP_COVER_FILTER);
   pushByName(displaySleepImage, allSettings, StrId::STR_CYCLE_SCREENSAVER_ON_TAP);
+  pushByName(displaySleepImage, allSettings, StrId::STR_SLEEP_CYCLE_DOUBLE_TAP_BACK);
+  pushByName(displaySleepImage, allSettings, StrId::STR_SLEEP_CYCLE_DAILY_MODE);
   pushByName(displaySleepImage, allSettings, StrId::STR_SLEEP_CYCLE_SKIP_GRAYSCALE);
 
   // Display > Theme & Layout: visual chrome for the everything-except-book
