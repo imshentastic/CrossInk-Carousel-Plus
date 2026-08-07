@@ -467,7 +467,17 @@ inline SettingInfo buildSleepScreenSetting() {
 inline const std::vector<SettingInfo>& getSettingsListBase() {
   static const std::vector<SettingInfo> baseList = [] {
     std::vector<SettingInfo> v;
-    v.reserve(64);
+    // v4.7.5: MUST stay >= the number of add() calls below (69 at time of
+    // writing). SettingInfo is a ~200-byte struct (three enum vectors, four
+    // std::function slots, a children vector), and this list is a function-
+    // local static that lives for the whole process -- so an under-reserve is
+    // not a transient cost. At reserve(64) the 69 add()s pushed capacity to
+    // 128, leaving ~59 unused slots (~13 KB of DRAM) resident forever on a
+    // device with ~380 KB total. Overshooting wastes the same way, so keep the
+    // headroom small and bump it deliberately; the check after the loop shouts
+    // if a new setting outgrows it.
+    constexpr size_t kBaseSettingsReserve = 72;
+    v.reserve(kBaseSettingsReserve);
     auto add = [&v](SettingInfo setting) { v.push_back(std::move(setting)); };
 
     // --- Display ---
@@ -826,13 +836,32 @@ inline const std::vector<SettingInfo>& getSettingsListBase() {
                                                      "tiltPageTurn", StrId::STR_CAT_CONTROLS));
       }
     }
+    // v4.7.5: drift guard for kBaseSettingsReserve. Growing past the reserve
+    // doubles capacity and strands the difference for the life of the process,
+    // which is silent and invisible in testing -- this is how the list came to
+    // sit at capacity 128 for 69 entries. Deliberately not a log call: this
+    // runs during static init, potentially before logging is up. Shrinking to
+    // fit costs one transient reallocation on the rare boot where the reserve
+    // was outgrown, and keeps the resident cost honest either way.
+    if (v.size() > kBaseSettingsReserve) v.shrink_to_fit();
     return v;
   }();
   return baseList;
 }
 
 inline std::vector<SettingInfo> getSettingsList(const SdCardFontRegistry* registry = nullptr) {
-  std::vector<SettingInfo> v = getSettingsListBase();
+  // v4.7.5: reserve before copying. The two font-fallback rows below are NOT
+  // in the base list (see the v18.9.9.318 note), so they are always appended
+  // -- and a plain copy-construct allocates capacity exactly equal to the
+  // source size. The first append therefore reallocated the whole vector,
+  // briefly holding the old ~69-element buffer and a new ~138-element one at
+  // the same time. At ~200 bytes per SettingInfo that is a ~30 KB transient
+  // spike, on the exact path whose heap peak makes SettingsActivity::onEnter
+  // decide to silent-restart. Reserving up front makes this one allocation.
+  const std::vector<SettingInfo>& base = getSettingsListBase();
+  std::vector<SettingInfo> v;
+  v.reserve(base.size() + 2);
+  v.assign(base.begin(), base.end());
   // v18.9.9.318: baseList never added placeholders for STR_UI_FONT_FALLBACK
   // or STR_UI_FONT_FALLBACK_SIZE, so the previous "replace via find_if"
   // pattern silently no-op'd -- the settings never made it into

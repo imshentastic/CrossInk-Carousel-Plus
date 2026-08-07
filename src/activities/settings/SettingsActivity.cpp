@@ -206,7 +206,24 @@ void SettingsActivity::rebuildSettingsLists() {
   // reader activity ran -- otherwise the font-family picker shows stale list.
   sdFontSystem.refreshIfDirty();
 
+  // v4.7.5: the flat-list copy is the single biggest allocation in the rebuild
+  // (one SettingInfo per registered setting, ~200 bytes each). Split out from
+  // the caller's overall "rebuildSettingsLists cost" line so the copy and the
+  // tree build can be attributed separately.
+  const uint32_t flatListFreeBefore = ESP.getFreeHeap();
   auto allSettings = getSettingsList(&sdFontSystem.registry());
+  LOG_INF("PERF", "settings flat list: %zu rows, free %u->%u (%d) maxAlloc=%u", allSettings.size(),
+          static_cast<unsigned>(flatListFreeBefore), static_cast<unsigned>(ESP.getFreeHeap()),
+          static_cast<int>(ESP.getFreeHeap()) - static_cast<int>(flatListFreeBefore),
+          static_cast<unsigned>(ESP.getMaxAllocHeap()));
+
+  // v4.7.5: every submenu vector below is reserved to its final row count.
+  // SettingInfo is a ~200-byte struct, so an unreserved push loop of 7 rows
+  // allocates at 1, 2, 4 and 8 elements and frees the first three -- and ~20 of
+  // these vectors are built back to back, so the freed odd-sized blocks are a
+  // direct fragmentation source. onEnter's pre-flight refuses on maxAlloc
+  // (contiguous) as well as free bytes, so the fragmentation matters as much as
+  // the total. Counts are upper bounds; a few rows are conditional on hardware.
 
   // === Display submenu ============================================
   // v18.9.9.306: sleep configuration split into two submenus. The prior
@@ -218,11 +235,13 @@ void SettingsActivity::rebuildSettingsLists() {
   //   Sleep Image  : cover crop/fit + filter (grayscale/inverted), tap-
   //                  to-cycle behavior, skip-grayscale-on-cycle toggle.
   std::vector<SettingInfo> displaySleepScreen;
+  displaySleepScreen.reserve(3);
   pushByName(displaySleepScreen, allSettings, StrId::STR_SLEEP_SCREEN);
   pushByName(displaySleepScreen, allSettings, StrId::STR_SLEEP_SCREEN_ORDER);
   pushByName(displaySleepScreen, allSettings, StrId::STR_QUICK_RESUME);
 
   std::vector<SettingInfo> displaySleepImage;
+  displaySleepImage.reserve(6);
   pushByName(displaySleepImage, allSettings, StrId::STR_SLEEP_COVER_MODE);
   pushByName(displaySleepImage, allSettings, StrId::STR_SLEEP_COVER_FILTER);
   pushByName(displaySleepImage, allSettings, StrId::STR_CYCLE_SCREENSAVER_ON_TAP);
@@ -238,12 +257,14 @@ void SettingsActivity::rebuildSettingsLists() {
   // without also enabling the in-book status-bar clock (they were
   // conflated on the same setting between v341-v342).
   std::vector<SettingInfo> displayThemeLayout;
+  displayThemeLayout.reserve(4);
   pushByName(displayThemeLayout, allSettings, StrId::STR_UI_THEME);
   pushByName(displayThemeLayout, allSettings, StrId::STR_RECENT_BOOKS_VIEW);
   pushByName(displayThemeLayout, allSettings, StrId::STR_HIDE_BATTERY);
   pushByName(displayThemeLayout, allSettings, StrId::STR_HOME_CLOCK);
 
   std::vector<SettingInfo> displayChildren;
+  displayChildren.reserve(4);
   displayChildren.push_back(SettingInfo::Submenu(StrId::STR_SLEEP_SCREEN, std::move(displaySleepScreen)));
   displayChildren.push_back(SettingInfo::Submenu(StrId::STR_SETTINGS_SLEEP_IMAGE, std::move(displaySleepImage)));
   displayChildren.push_back(SettingInfo::Submenu(StrId::STR_SETTINGS_THEME_LAYOUT, std::move(displayThemeLayout)));
@@ -253,6 +274,7 @@ void SettingsActivity::rebuildSettingsLists() {
 
   // === Reader submenu =============================================
   std::vector<SettingInfo> readerFont;
+  readerFont.reserve(5);
   pushByName(readerFont, allSettings, StrId::STR_FONT_FAMILY);
   pushByName(readerFont, allSettings, StrId::STR_FONT_SIZE);
   // v18.9.9.306: UI Font Fallback + Size picker restored for CJK / non-
@@ -270,6 +292,7 @@ void SettingsActivity::rebuildSettingsLists() {
   // page-render behaviour, so grouping with the other layout knobs
   // reads better than a bare row at Reader root.
   std::vector<SettingInfo> readerLayout;
+  readerLayout.reserve(7);
   pushByName(readerLayout, allSettings, StrId::STR_LINE_SPACING);
   pushByName(readerLayout, allSettings, StrId::STR_ORIENTATION);
   pushByName(readerLayout, allSettings, StrId::STR_SCREEN_MARGIN);
@@ -282,6 +305,7 @@ void SettingsActivity::rebuildSettingsLists() {
   // Guide Dots are text-style choices and belong under Style, next to
   // Hyphenation and text AA.
   std::vector<SettingInfo> readerStyle;
+  readerStyle.reserve(7);
   pushByName(readerStyle, allSettings, StrId::STR_EMBEDDED_STYLE);
   pushByName(readerStyle, allSettings, StrId::STR_HYPHENATION);
   pushByName(readerStyle, allSettings, StrId::STR_TEXT_AA);
@@ -298,6 +322,7 @@ void SettingsActivity::rebuildSettingsLists() {
   // toggle, not a reading aid. See StatusBarSettingsActivity ITEM_STABLE_PAGE_NUMBERS.
 
   std::vector<SettingInfo> readerChildren;
+  readerChildren.reserve(5);
   readerChildren.push_back(SettingInfo::Submenu(StrId::STR_SETTINGS_FONT, std::move(readerFont)));
   readerChildren.push_back(SettingInfo::Submenu(StrId::STR_SETTINGS_LAYOUT, std::move(readerLayout)));
   readerChildren.push_back(SettingInfo::Submenu(StrId::STR_SETTINGS_STYLE, std::move(readerStyle)));
@@ -314,10 +339,12 @@ void SettingsActivity::rebuildSettingsLists() {
 
   // === Controls submenu ===========================================
   std::vector<SettingInfo> controlsPower;
+  controlsPower.reserve(2);
   pushByName(controlsPower, allSettings, StrId::STR_SHORT_PWR_BTN);
   pushByName(controlsPower, allSettings, StrId::STR_LONG_PRESS_ACTION);
 
   std::vector<SettingInfo> controlsFront;
+  controlsFront.reserve(5);
   controlsFront.push_back(SettingInfo::Action(StrId::STR_REMAP_FRONT_BUTTONS, SettingAction::RemapFrontButtons));
   controlsFront.push_back(
       SettingInfo::Action(StrId::STR_REMAP_FRONT_BUTTONS_READER, SettingAction::RemapFrontButtonsReader));
@@ -326,6 +353,7 @@ void SettingsActivity::rebuildSettingsLists() {
   pushByName(controlsFront, allSettings, StrId::STR_LONG_PRESS_MENU_ACTION);
 
   std::vector<SettingInfo> controlsSide;
+  controlsSide.reserve(4);
   pushByName(controlsSide, allSettings, StrId::STR_SIDE_BTN_LAYOUT);
   pushByKey(controlsSide, allSettings, "sideButtonOrientationAware");
   pushByName(controlsSide, allSettings, StrId::STR_SIDE_BTN_LONG_PRESS);
@@ -336,6 +364,7 @@ void SettingsActivity::rebuildSettingsLists() {
   }
 
   std::vector<SettingInfo> controlsChildren;
+  controlsChildren.reserve(3);
   controlsChildren.push_back(SettingInfo::Submenu(StrId::STR_POWER_BUTTON, std::move(controlsPower)));
   controlsChildren.push_back(SettingInfo::Submenu(StrId::STR_FRONT_BUTTONS, std::move(controlsFront)));
   controlsChildren.push_back(SettingInfo::Submenu(StrId::STR_SIDE_BUTTONS, std::move(controlsSide)));
@@ -344,11 +373,13 @@ void SettingsActivity::rebuildSettingsLists() {
 
   // === Library submenu ============================================
   std::vector<SettingInfo> libraryFiles;
+  libraryFiles.reserve(3);
   pushByName(libraryFiles, allSettings, StrId::STR_SHOW_HIDDEN_FILES);
   pushByName(libraryFiles, allSettings, StrId::STR_REMOVE_READ_FROM_RECENTS);
   pushByName(libraryFiles, allSettings, StrId::STR_MOVE_FINISHED_TO_READ);
 
   std::vector<SettingInfo> libraryChildren;
+  libraryChildren.reserve(3);
   libraryChildren.push_back(SettingInfo::Submenu(StrId::STR_SETTINGS_FILES, std::move(libraryFiles)));
   pushByName(libraryChildren, allSettings, StrId::STR_SERIES_DETECTION);
   pushByName(libraryChildren, allSettings, StrId::STR_OPTIMIZE_CHAPTER_INDEXING);
@@ -361,6 +392,7 @@ void SettingsActivity::rebuildSettingsLists() {
   // depends on WiFi and drives the reading-stats infra on X4 devices.
   // Bluetooth Setup then KOReader / OPDS follow.
   std::vector<SettingInfo> syncChildren;
+  syncChildren.reserve(1);
   syncChildren.push_back(SettingInfo::Action(StrId::STR_WIFI_NETWORKS, SettingAction::Network));
   // v18.9.9.305: Sync Time (Clock & Stats). Relocated from Customise
   // Status Bar so X4 users (no DS3231 -> that menu never showed clock
@@ -373,6 +405,7 @@ void SettingsActivity::rebuildSettingsLists() {
   // previously only reachable via Reader > Customise Status Bar (where
   // it couldn't be found without knowing to look there).
   std::vector<SettingInfo> syncTimeChildren;
+  syncTimeChildren.reserve(2);
   syncTimeChildren.push_back(SettingInfo::Action(StrId::STR_CLOCK_SYNC, SettingAction::ClockSync));
   syncTimeChildren.push_back(SettingInfo::Action(StrId::STR_CLOCK_UTC_OFFSET, SettingAction::ClockUtcOffset));
   syncChildren.push_back(SettingInfo::Submenu(StrId::STR_CLOCK_SYNC_NOW, std::move(syncTimeChildren)));
@@ -393,6 +426,7 @@ void SettingsActivity::rebuildSettingsLists() {
   // easier to find (they aren't display settings, they're one-shot
   // maintenance operations) and clears out Display > General entirely.
   std::vector<SettingInfo> functionsChildren;
+  functionsChildren.reserve(4);
   // v18.9.9.212: manual bulk-bake for Flow carousel perspective + center
   // tiles. Complements the automatic lazy-bake so the user isn't
   // surprised by the first-render slowdown on each book.
@@ -410,6 +444,7 @@ void SettingsActivity::rebuildSettingsLists() {
 
   // === System submenu =============================================
   std::vector<SettingInfo> systemChildren;
+  systemChildren.reserve(8);
   pushByName(systemChildren, allSettings, StrId::STR_TIME_TO_SLEEP);
   // v18.9.5: BT auto-disconnect timeout right next to the sleep timeout
   // (same slider UI, same category, closely related concept).

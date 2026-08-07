@@ -3,6 +3,7 @@
 
 #include <functional>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "CrossPointSettings.h"
@@ -227,6 +228,19 @@ struct SettingInfo {
     return s;
   }
 };
+
+// v4.7.5: SettingInfo must stay nothrow-move-constructible. std::vector falls
+// back to COPYING elements when growing if the move constructor can throw
+// (copy_if_noexcept, for the strong exception guarantee) -- and a copy here
+// means deep-copying three enum vectors and four std::function slots per row,
+// on a struct that already runs ~200 bytes. That turns every unreserved
+// push_back in the settings-tree build into a heap spike, on precisely the
+// path whose peak makes SettingsActivity::onEnter silent-restart. std::
+// function's move is only noexcept from C++20 on, so this is load-bearing:
+// if a member is ever added whose move can throw, this fires here rather than
+// showing up as an unexplained regression in the Settings entry heap peak.
+static_assert(std::is_nothrow_move_constructible<SettingInfo>::value,
+              "SettingInfo must be nothrow-move-constructible or vector growth silently deep-copies");
 
 inline size_t settingEnumOptionCount(const SettingInfo& setting) {
   return setting.enumStringValues.empty() ? setting.enumValues.size() : setting.enumStringValues.size();
