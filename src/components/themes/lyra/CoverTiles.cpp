@@ -58,8 +58,17 @@ bool loadTile(const std::string& coverPath, uint8_t role, uint8_t expFormat,
               uint8_t* dst, size_t dstBytes) {
   if (dst == nullptr || expW <= 0 || expH <= 0 || expStride <= 0) return false;
   const std::string path = tilePathFor(coverPath, role);
-  FsFile f;
-  if (!Storage.openFileForRead(kModuleTag, path, f)) return false;
+  // v4.7.5: Storage.open() rather than openFileForRead(). A missing tile is
+  // the normal, expected outcome -- it means "not baked yet", and the caller
+  // handles it by baking one. openFileForRead routes through the SDK's
+  // SDCardManager, which unconditionally Serial.printf()s "File does not
+  // exist" with no log level, so it cannot be quieted by tag or filtered out.
+  // That printed four lines per shelf paint before the tiles existed, and
+  // would print forever for a book with no cover art (nothing to bake from).
+  // open() is the same read path without the narration, and costs no extra
+  // SD lookup the way an exists() pre-check would.
+  FsFile f = Storage.open(path.c_str());
+  if (!f) return false;
 
   uint8_t hdr[kHeaderSize];
   if (f.read(hdr, kHeaderSize) != kHeaderSize) {

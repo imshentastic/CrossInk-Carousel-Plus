@@ -1004,6 +1004,16 @@ void LyraFlowTheme::drawBookshelfStrip(GfxRenderer& renderer, Rect rect, const c
   // on the left to signal "this is multiple books bound together".
   constexpr int kSeriesSpineWidth = 6;
 
+  // v4.7.5: one reusable pre-baked-tile buffer for the whole cell run. At
+  // 100x150 the 2bpp packed cell is 25 * 150 = 3750 bytes, so this is far too
+  // big for the stack (see the 256-byte rule) and pointlessly churny to
+  // allocate per cell. nothrow because `new` aborts on this target: a null
+  // buffer just means every cell takes the decode path below, which is
+  // exactly the pre-v4.7.5 behaviour.
+  const int tileStride = (kCellWidth + 3) / 4;
+  const size_t tileBytes = static_cast<size_t>(tileStride) * static_cast<size_t>(kCellHeight);
+  std::unique_ptr<uint8_t[]> tileBuf(tileBytes > 0 ? new (std::nothrow) uint8_t[tileBytes] : nullptr);
+
   for (int i = 0; i < actualDrawn; ++i) {
     const int spineIdx = scrollOffset + i;
     // Row-major iteration: i = 0..cellsPerRow-1 fills top row, cellsPerRow..
@@ -1035,6 +1045,25 @@ void LyraFlowTheme::drawBookshelfStrip(GfxRenderer& renderer, Rect rect, const c
     bool drewThumb = false;
     if (spineIdx < static_cast<int>(coverPaths.size()) && !coverPaths[spineIdx].empty()) {
       const std::string& cellPath = coverPaths[spineIdx];
+
+      // v4.7.5: pre-baked tile first. A hit is a ~3.7 KB read plus a straight
+      // blit -- no SD-streamed BMP decode, and critically no dependence on the
+      // renderer's image-cache budget, which refuses under the fragmented heap
+      // a cold boot's library walk leaves behind. Miss falls through to the
+      // decode paths below, which bake the tile on the way past.
+      if (tileBuf) {
+        std::memset(tileBuf.get(), 0xFF, tileBytes);
+        if (CoverTiles::loadTile(cellPath, CoverTiles::kRoleShelfCell, CoverTiles::kFormat2bpp,
+                                 kCellWidth, kCellHeight, tileStride,
+                                 0, 0, 0,  // perspective params unused for shelf cells
+                                 tileBuf.get(), tileBytes)) {
+          renderer.drawPacked2bpp(tileBuf.get(), tileStride, x, y, kCellWidth, kCellHeight);
+          drewThumb = true;
+        }
+      }
+    }
+    if (!drewThumb && spineIdx < static_cast<int>(coverPaths.size()) && !coverPaths[spineIdx].empty()) {
+      const std::string& cellPath = coverPaths[spineIdx];
       // CrumBLE Phase A perf: try the in-RAM cache first. Cache hit blits
       // a pre-scaled 1bpp buffer (~1 ms). Cache miss (budget tight under
       // BLE / low heap) falls back to direct drawBitmap so the cell
@@ -1049,20 +1078,35 @@ void LyraFlowTheme::drawBookshelfStrip(GfxRenderer& renderer, Rect rect, const c
       int srcW = 0, srcH = 0;
       const bool cacheHit =
           renderer.getCachedBitmapDimensions(handle, &srcW, &srcH) && srcW > 0 && srcH > 0;
-      auto applyAspectFillAndDrawCached = [&](int sw, int sh) {
+      // Aspect-FILL crop, shared by both decode paths and by the tile bake so
+      // a baked tile is pixel-identical to what the direct draw would produce.
+      auto aspectFillCrop = [&](int sw, int sh, float& cropX, float& cropY) {
         const float srcRatio = static_cast<float>(sw) / static_cast<float>(sh);
         const float targetRatio = static_cast<float>(kCellWidth) / static_cast<float>(kCellHeight);
-        float cropX = 0.0f;
-        float cropY = 0.0f;
+        cropX = 0.0f;
+        cropY = 0.0f;
         if (srcRatio > targetRatio) {
           cropX = std::max(0.0f, 1.0f - (targetRatio / srcRatio));
         } else if (srcRatio < targetRatio) {
           cropY = std::max(0.0f, 1.0f - (srcRatio / targetRatio));
         }
-        renderer.drawCachedBitmap(handle, x, y, kCellWidth, kCellHeight, cropX, cropY);
       };
       if (cacheHit) {
-        applyAspectFillAndDrawCached(srcW, srcH);
+        float cropX = 0.0f;
+        float cropY = 0.0f;
+        aspectFillCrop(srcW, srcH, cropX, cropY);
+        if (tileBuf) {
+          // Render once into the packed buffer, blit it, and keep it: the next
+          // paint of this cell skips the decode entirely. Same order the
+          // carousel's centre-thumb bake uses.
+          std::memset(tileBuf.get(), 0xFF, tileBytes);
+          renderer.renderCachedBitmapToPacked2bpp(handle, kCellWidth, kCellHeight, tileBuf.get(), cropX, cropY);
+          renderer.drawPacked2bpp(tileBuf.get(), tileStride, x, y, kCellWidth, kCellHeight);
+          CoverTiles::saveTile(cellPath, CoverTiles::kRoleShelfCell, CoverTiles::kFormat2bpp,
+                               kCellWidth, kCellHeight, tileStride, 0, 0, 0, tileBuf.get(), tileBytes);
+        } else {
+          renderer.drawCachedBitmap(handle, x, y, kCellWidth, kCellHeight, cropX, cropY);
+        }
         drewThumb = true;
       } else {
         // Cache miss (low-heap budget or file open in cache failed):
@@ -1073,17 +1117,21 @@ void LyraFlowTheme::drawBookshelfStrip(GfxRenderer& renderer, Rect rect, const c
         if (Storage.openFileForRead("LFT", cellPath, file)) {
           Bitmap fallback(file);
           if (fallback.parseHeaders() == BmpReaderError::Ok && fallback.getWidth() > 0 && fallback.getHeight() > 0) {
-            const float srcRatio =
-                static_cast<float>(fallback.getWidth()) / static_cast<float>(fallback.getHeight());
-            const float targetRatio = static_cast<float>(kCellWidth) / static_cast<float>(kCellHeight);
             float cropX = 0.0f;
             float cropY = 0.0f;
-            if (srcRatio > targetRatio) {
-              cropX = std::max(0.0f, 1.0f - (targetRatio / srcRatio));
-            } else if (srcRatio < targetRatio) {
-              cropY = std::max(0.0f, 1.0f - (srcRatio / targetRatio));
+            aspectFillCrop(fallback.getWidth(), fallback.getHeight(), cropX, cropY);
+            if (tileBuf) {
+              // This is the path a cold boot actually takes -- the image cache
+              // refused on budget -- so it is the one that most needs to leave
+              // a tile behind for next time.
+              std::memset(tileBuf.get(), 0xFF, tileBytes);
+              renderer.renderBitmapToPacked2bpp(fallback, kCellWidth, kCellHeight, tileBuf.get(), cropX, cropY);
+              renderer.drawPacked2bpp(tileBuf.get(), tileStride, x, y, kCellWidth, kCellHeight);
+              CoverTiles::saveTile(cellPath, CoverTiles::kRoleShelfCell, CoverTiles::kFormat2bpp,
+                                   kCellWidth, kCellHeight, tileStride, 0, 0, 0, tileBuf.get(), tileBytes);
+            } else {
+              renderer.drawBitmap(fallback, x, y, kCellWidth, kCellHeight, cropX, cropY);
             }
-            renderer.drawBitmap(fallback, x, y, kCellWidth, kCellHeight, cropX, cropY);
             drewThumb = true;
           }
           file.close();

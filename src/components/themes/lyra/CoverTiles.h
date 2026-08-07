@@ -59,6 +59,21 @@ constexpr uint8_t kRoleRightFar = 4;
 // fit dimensions per book; if the source cover changes, the fit dims
 // change -> load rejects -> re-bake.
 constexpr uint8_t kRoleCenterThumb = 5;
+// v4.7.5: Flow bookshelf cell. Aspect-FILL with crop (the shelf crops to a
+// 2:3 cell; the center thumb above aspect-FITS), so it needs its own role
+// even though the header shape is identical -- a fit-baked tile and a
+// fill-baked tile can share dimensions but differ in pixels. Perspective
+// params unused: pass 0 on both save and load.
+//
+// This role exists to take cover decode off the shelf's first paint. The
+// cell BMPs are already stored at exactly cell size, so the old cost was
+// not scaling -- it was the SD open plus a Bitmap decode through the
+// renderer's LRU image cache, which refuses to allocate when maxAlloc is
+// low. On a cold boot the library walk fragments the heap just before the
+// shelf paints, so the cache refused and every cell fell back to a direct
+// streamed decode. A .tile read needs no decode and no cache budget, which
+// removes that heap coupling rather than just making it cheaper.
+constexpr uint8_t kRoleShelfCell = 6;
 
 // Derive the tile file path from the resolved cover-thumb path. E.g.
 // "/covers/abcd-320.bmp" + role=1 -> "/covers/abcd-320-1.tile". Handles
