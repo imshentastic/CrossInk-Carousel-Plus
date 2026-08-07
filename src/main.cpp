@@ -1558,7 +1558,24 @@ static void flushDeferredPersistenceForSilentRestart() {
   // would skip. flushIfDirtyNow / flushDeferredSaveNowBypassGate
   // ignore debounce and write immediately since we're about to lose
   // in-memory state to ESP.restart().
-  SETTINGS.flushIfDirtyNow();
+  if (!SETTINGS.flushIfDirtyNow()) {
+    // 4.7.4: the write refused for lack of contiguous heap (20 KB floor) and
+    // the user's change was about to be lost across the restart -- observed in
+    // a field log at maxAlloc=19444, just under the bar. The deep-sleep path
+    // already solves this by lending the framebuffer's ~48 KB to the write;
+    // do the same here, then put it back so the snapshot below still runs.
+    // Freeing and immediately re-taking the same block makes the realloc very
+    // likely to succeed; if it does not, the snapshot's own null-guard skips
+    // the seamless repaint. Losing a cosmetic no-flash transition is a better
+    // trade than losing a setting the user deliberately changed.
+    LOG_INF("MAIN", "Silent restart: flush refused for heap; lending framebuffer to retry");
+    display.releaseFrameBuffers();
+    const bool wrote = SETTINGS.flushIfDirtyNow();
+    if (!renderer.restoreFrameBufferAfterBuild()) {
+      LOG_ERR("MAIN", "Silent restart: framebuffer realloc failed after loan (setting %s)",
+              wrote ? "saved" : "still lost");
+    }
+  }
   CollectionsStore::getInstance().flushDeferredSaveNowBypassGate();
 }
 
